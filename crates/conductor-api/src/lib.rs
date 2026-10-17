@@ -1,3 +1,4 @@
+use std::future::IntoFuture;
 use std::io;
 use std::sync::{
     Arc,
@@ -854,24 +855,34 @@ pub async fn serve(
             timestamp_ms()
         );
     });
+    let server_shutdown = Arc::clone(&shutdown);
     let server = axum::serve(
         listener,
         router_with_recovery(manager, worker, recovery_ready, request_timeout),
     )
-    .with_graceful_shutdown(async move {
-        while !shutdown.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
+    .with_graceful_shutdown(wait_for_shutdown(server_shutdown))
+    .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result,
+        _ = wait_for_shutdown(shutdown) => {
+            match tokio::time::timeout(Duration::from_secs(5), &mut server).await {
+                Ok(result) => result,
+                Err(_) => {
+                    eprintln!(
+                        "{{\"timestampMs\":{},\"severity\":\"warn\",\"component\":\"api\",\"event\":\"shutdown_deadline_elapsed\",\"timeout_seconds\":5}}",
+                        timestamp_ms()
+                    );
+                    Ok(())
+                }
+            }
         }
-    });
-    match tokio::time::timeout(Duration::from_secs(5), server).await {
-        Ok(result) => result,
-        Err(_) => {
-            eprintln!(
-                "{{\"timestampMs\":{},\"severity\":\"warn\",\"component\":\"api\",\"event\":\"shutdown_deadline_elapsed\",\"timeout_seconds\":5}}",
-                timestamp_ms()
-            );
-            Ok(())
-        }
+    }
+}
+
+async fn wait_for_shutdown(shutdown: Arc<AtomicBool>) {
+    while !shutdown.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
