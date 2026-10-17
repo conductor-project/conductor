@@ -1,0 +1,21 @@
+[package]
+name = "conductor"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+conductor-core.workspace = true
+conductor-manager.workspace = true
+conductor-worker.workspace = true
+conductor-process.workspace = true
+conductor-api.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ctrlc.workspace = true
+clap.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

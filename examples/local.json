@@ -1,0 +1,8 @@
+{
+  "role": "all",
+  "listen": "127.0.0.1:8080",
+  "manager_data_dir": "./state/manager",
+  "worker_data_dir": "./state/worker",
+  "worker_id": "local-worker",
+  "worker_concurrency": 2
+}

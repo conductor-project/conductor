@@ -1,0 +1,175 @@
+use std::fs;
+use std::net::{SocketAddr, TcpListener};
+use std::path::PathBuf;
+use std::process::ExitCode;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
+use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
+use serde::Deserialize;
+
+#[derive(Debug, Parser)]
+#[command(name = "conductor", version, about = "Conductor job and run agent")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Run the Conductor agent.
+    Agent {
+        /// Path to the strict JSON configuration file.
+        #[arg(long)]
+        config: PathBuf,
+        /// Override the role in the configuration file.
+        #[arg(long, value_enum)]
+        role: Option<Role>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    role: Role,
+    listen: SocketAddr,
+    manager_data_dir: PathBuf,
+    worker_data_dir: PathBuf,
+    worker_id: String,
+    worker_concurrency: usize,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, ValueEnum)]
+#[serde(rename_all = "lowercase")]
+enum Role {
+    Manager,
+    Worker,
+    All,
+}
+
+impl Role {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Manager => "manager",
+            Self::Worker => "worker",
+            Self::All => "all",
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!(
+                "{{\"event\":\"startup_failed\",\"error\":{}}}",
+                serde_json::to_string(&error.to_string())
+                    .unwrap_or_else(|_| "\"unknown error\"".into())
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            print!("{error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let Commands::Agent {
+        config: config_path,
+        role: role_override,
+    } = cli.command;
+    let config_text = fs::read_to_string(config_path)?;
+    let mut config: Config = serde_json::from_str(&config_text)?;
+    if let Some(role) = role_override {
+        config.role = role;
+    }
+    validate(&config)?;
+    if !matches!(config.role, Role::All) {
+        return Err(format!(
+            "standalone role '{}' is unsupported until remote transport is implemented",
+            config.role.name()
+        )
+        .into());
+    }
+    let listener = TcpListener::bind(config.listen)?;
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr()?;
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let signal_shutdown = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || signal_shutdown.store(true, Ordering::SeqCst))?;
+    eprintln!(
+        "{{\"event\":\"agent_started\",\"role\":\"all\",\"address\":{}}}",
+        serde_json::to_string(&address.to_string())?
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::from_std(listener)?;
+        conductor_api::serve(listener, shutdown).await
+    })?;
+    Ok(())
+}
+
+fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    if !config.listen.ip().is_loopback() {
+        return Err("listen address must be an IPv4 or IPv6 loopback address".into());
+    }
+    if config.worker_id.is_empty()
+        || config.worker_id.len() > 128
+        || !config
+            .worker_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+    {
+        return Err("worker_id must contain 1-128 ASCII letters, digits, '-', '_' or '.'".into());
+    }
+    if config.worker_concurrency == 0 {
+        return Err("worker_concurrency must be greater than zero".into());
+    }
+    if config.manager_data_dir.as_os_str().is_empty()
+        || config.worker_data_dir.as_os_str().is_empty()
+    {
+        return Err("data directories must not be empty".into());
+    }
+    if config.manager_data_dir == config.worker_data_dir {
+        return Err("manager_data_dir and worker_data_dir must be separate".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::panic::catch_unwind;
+
+    #[test]
+    fn release_profile_keeps_overflow_and_debug_assertions() {
+        if !cfg!(debug_assertions) {
+            assert!(
+                catch_unwind(|| {
+                    let max = std::hint::black_box(u8::MAX);
+                    let one = std::hint::black_box(1_u8);
+                    let _ = max + one;
+                })
+                .is_err()
+            );
+            assert!(
+                catch_unwind(|| debug_assert!(false, "release assertions must remain enabled"))
+                    .is_err()
+            );
+        }
+    }
+}
