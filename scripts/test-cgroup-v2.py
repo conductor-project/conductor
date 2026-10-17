@@ -138,6 +138,7 @@ def main():
             "worker_data_dir": str(state / "worker"),
             "worker_id": worker_id,
             "worker_concurrency": 2,
+            "request_timeout_ms": 10000,
             "cgroup_v2": {
                 "enabled": True,
                 "delegatedRoot": str(delegated_root),
