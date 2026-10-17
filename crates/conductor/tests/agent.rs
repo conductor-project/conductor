@@ -414,6 +414,17 @@ fn job_json(id: &str, command: &[&str]) -> Vec<u8> {
     .expect("encode job")
 }
 
+fn decode_log_chunk(encoded: &str) -> [u8; 4] {
+    use base64::Engine;
+
+    let mut bytes = [0; 4];
+    let length = base64::engine::general_purpose::STANDARD
+        .decode_slice(encoded, &mut bytes)
+        .unwrap();
+    assert!(length <= bytes.len());
+    bytes
+}
+
 fn job_with(id: &str, command: &[String], cwd: &str, env: serde_json::Value) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "id": id,
@@ -1137,6 +1148,7 @@ fn actual_binary_inherits_environment_only_when_job_opts_in() {
         .recv_timeout(Duration::from_secs(5))
         .expect("agent readiness");
     let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(event["event"], "agent_started", "{line}");
     let address: SocketAddr = event["address"].as_str().unwrap().parse().unwrap();
     let payload = serde_json::to_vec(&serde_json::json!({
         "id":"inherit-environment",
@@ -1393,4 +1405,247 @@ fn actual_binary_cleans_process_group_members_and_keeps_terminal_history() {
         process_state.trim().is_empty() || process_state.trim_start().starts_with('Z'),
         "workload remained alive after shutdown: {process_state}"
     );
+}
+
+#[test]
+fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata() {
+    let path = TempDir::new("logs");
+    let config = write_config(
+        &path,
+        "all",
+        "127.0.0.1:0",
+        ",\"log_max_bytes_per_stream\":4,\"log_retention_runs\":1",
+    );
+    let config_contents = fs::read_to_string(&config)
+        .unwrap()
+        .replace("\"worker_concurrency\":1", "\"worker_concurrency\":2");
+    fs::write(&config, config_contents).unwrap();
+    let child = command(&config, None)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start agent");
+    let mut child = Agent(child);
+    let stderr = child.0.stderr.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stderr).read_line(&mut line);
+        let _ = sender.send(line);
+    });
+    let line = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+    let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(event["event"], "agent_started", "{line}");
+    let address: SocketAddr = event["address"].as_str().unwrap().parse().unwrap();
+
+    let job = serde_json::json!({
+        "id":"binary-logs",
+        "command":["/bin/sh", "-c", "printf '\\000\\377\\303\\251'; printf '\\000\\376\\014' >&2; (head -c 1048576 /dev/zero) & (head -c 1048576 /dev/zero >&2) & wait; sleep 0.3"],
+        "cwd":"/tmp"
+    });
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &serde_json::to_vec(&job).unwrap()
+        )
+        .0,
+        201
+    );
+    let (status, accepted) = http(address, "POST", "/v1/jobs/binary-logs/runs", None, &[]);
+    assert_eq!(status, 202, "{accepted}");
+    let run_id = serde_json::from_str::<serde_json::Value>(&accepted).unwrap()["runId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_for_run_state(address, &run_id, &["running"], Duration::from_secs(2));
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let chunk = loop {
+        let (status, body) = http(
+            address,
+            "GET",
+            &format!("/v1/runs/{run_id}/logs?stream=stdout&offset=0&limit=2"),
+            None,
+            &[],
+        );
+        assert_eq!(status, 200, "{body}");
+        let chunk: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if chunk["nextOffset"].as_u64().unwrap_or_default() >= 2 {
+            break chunk;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "log reader did not observe output: {chunk}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(chunk["dataEncoding"], "base64");
+    assert_eq!(
+        decode_log_chunk(chunk["data"].as_str().unwrap())[..2],
+        [0, 255]
+    );
+    assert_eq!(chunk["offset"], 0);
+    assert_eq!(chunk["nextOffset"], 2);
+    assert_eq!(chunk["streamClosed"], false);
+
+    let (status, chunk) = http(
+        address,
+        "GET",
+        &format!("/v1/runs/{run_id}/logs?stream=stdout&offset=2&limit=2"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "{chunk}");
+    let chunk: serde_json::Value = serde_json::from_str(&chunk).unwrap();
+    assert_eq!(
+        decode_log_chunk(chunk["data"].as_str().unwrap())[..2],
+        [195, 169]
+    );
+    assert_eq!(chunk["truncated"], true);
+
+    let finished = wait_for_run_state(address, &run_id, &["succeeded"], Duration::from_secs(3));
+    assert_eq!(finished["state"], "succeeded");
+    let (status, chunk) = http(
+        address,
+        "GET",
+        &format!("/v1/runs/{run_id}/logs?stream=stderr&offset=0&limit=8"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "{chunk}");
+    let chunk: serde_json::Value = serde_json::from_str(&chunk).unwrap();
+    assert_eq!(
+        decode_log_chunk(chunk["data"].as_str().unwrap())[..3],
+        [0, 254, 12]
+    );
+    assert_eq!(chunk["streamClosed"], true);
+    assert_eq!(chunk["eof"], true);
+    assert_eq!(chunk["truncated"], true);
+    let (status, empty) = http(
+        address,
+        "GET",
+        &format!("/v1/runs/{run_id}/logs?stream=stdout&offset=99"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200);
+    let empty: serde_json::Value = serde_json::from_str(&empty).unwrap();
+    assert_eq!(empty["data"], "");
+    assert_eq!(empty["eof"], true);
+    let (status, body) = http(
+        address,
+        "GET",
+        &format!("/v1/runs/{run_id}/logs?stream=stdout&limit=0"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 400, "{body}");
+    let active_job = job_json(
+        "retention-active",
+        &["/bin/sh", "-c", "printf active; sleep 5"],
+    );
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &active_job
+        )
+        .0,
+        201
+    );
+    let (status, active_accepted) =
+        http(address, "POST", "/v1/jobs/retention-active/runs", None, &[]);
+    assert_eq!(status, 202, "{active_accepted}");
+    let active_id = serde_json::from_str::<serde_json::Value>(&active_accepted).unwrap()["runId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_for_run_state(address, &active_id, &["running"], Duration::from_secs(2));
+    let second_job = job_json("retention-followup", &["/bin/true"]);
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &second_job
+        )
+        .0,
+        201
+    );
+    start_and_poll(address, "retention-followup");
+    let (status, body) = http(
+        address,
+        "GET",
+        &format!("/v1/runs/{run_id}/logs?stream=stdout"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 410, "{body}");
+    let (status, body) = http(
+        address,
+        "GET",
+        &format!("/v1/runs/{active_id}/logs?stream=stdout"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "active logs were pruned: {body}");
+    let (status, body) = http(
+        address,
+        "GET",
+        "/v1/runs/unknown-run/logs?stream=stdout",
+        None,
+        &[],
+    );
+    assert_eq!(status, 404, "{body}");
+    let (status, body) = http(
+        address,
+        "GET",
+        &format!("/v1/runs/{run_id}/logs?stream=stdout&limit=65537"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = http(
+        address,
+        "GET",
+        &format!("/v1/runs/{run_id}/logs?stream=other"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"]["code"],
+        "invalid_log_query"
+    );
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
+    let (mut restarted, address) = start(&path, "all", None);
+    let (status, body) = http(
+        address,
+        "GET",
+        &format!("/v1/runs/{active_id}/logs?stream=stdout"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    let logs: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(logs["streamClosed"], true);
+    assert_eq!(logs["eof"], true);
+    fs::remove_file(path.join("worker/runs").join(format!("{active_id}.stdout"))).unwrap();
+    let (status, body) = http(
+        address,
+        "GET",
+        &format!("/v1/runs/{active_id}/logs?stream=stdout"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 404, "{body}");
+    signal(&restarted, "INT");
+    wait_for_exit(&mut restarted);
 }

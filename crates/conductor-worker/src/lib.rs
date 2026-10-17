@@ -1,8 +1,8 @@
 //! Worker-owned process supervision, persistence, deadlines, and captured output.
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -14,13 +14,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::OpenOptionsExt;
 
 use conductor_core::{
-    InspectRun, JobSpec, MAX_WORKER_CAPACITY, RunFailureReason, RunObservation, RunState,
-    RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId,
+    InspectRun, JobSpec, LogStream, MAX_LOG_CHUNK_BYTES, MAX_WORKER_CAPACITY, ReadRunLogs,
+    RunFailureReason, RunLogChunk, RunLogStatus, RunObservation, RunState, RunTerminationReason,
+    StartRun, StopRun, WorkerDescriptor, WorkerId,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+pub const DEFAULT_LOG_MAX_BYTES_PER_STREAM: u64 = 8 * 1024 * 1024;
+pub const DEFAULT_LOG_RETENTION_RUNS: usize = 100;
+pub const MAX_LOG_MAX_BYTES_PER_STREAM: u64 = 1024 * 1024 * 1024;
+pub const MAX_LOG_RETENTION_RUNS: usize = 10_000;
 
 /// Worker execution seam implemented by the host-specific process crate.
 pub trait ExecutionBackend: Send + Sync {
@@ -40,7 +45,24 @@ pub enum WorkerError {
     RunConflict,
     WorkerMismatch,
     ShuttingDown,
+    LogsNotFound,
+    LogsPruned,
     StorageUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LogPolicy {
+    pub max_bytes_per_stream: u64,
+    pub retention_runs: usize,
+}
+
+impl Default for LogPolicy {
+    fn default() -> Self {
+        Self {
+            max_bytes_per_stream: DEFAULT_LOG_MAX_BYTES_PER_STREAM,
+            retention_runs: DEFAULT_LOG_RETENTION_RUNS,
+        }
+    }
 }
 
 struct WorkerState {
@@ -65,6 +87,7 @@ pub struct WorkerService {
     worker_id: WorkerId,
     capacity: usize,
     state_directory: PathBuf,
+    log_policy: LogPolicy,
     backend: Arc<dyn ExecutionBackend>,
     state: Arc<SharedWorkerState>,
     supervisors: Mutex<Vec<JoinHandle<()>>>,
@@ -84,11 +107,36 @@ impl WorkerService {
         capacity: usize,
         backend: Arc<dyn ExecutionBackend>,
     ) -> io::Result<Self> {
+        Self::open_with_log_policy(
+            state_directory,
+            worker_id,
+            capacity,
+            LogPolicy::default(),
+            backend,
+        )
+    }
+
+    pub fn open_with_log_policy(
+        state_directory: impl AsRef<Path>,
+        worker_id: WorkerId,
+        capacity: usize,
+        log_policy: LogPolicy,
+        backend: Arc<dyn ExecutionBackend>,
+    ) -> io::Result<Self> {
         let state_directory = state_directory.as_ref().to_path_buf();
         if capacity == 0 || capacity > MAX_WORKER_CAPACITY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "worker capacity must be between 1 and 1000",
+            ));
+        }
+        if log_policy.max_bytes_per_stream == 0
+            || log_policy.max_bytes_per_stream > MAX_LOG_MAX_BYTES_PER_STREAM
+            || log_policy.retention_runs > MAX_LOG_RETENTION_RUNS
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker log limits are outside the supported range",
             ));
         }
         let log_directory = state_directory.join("runs");
@@ -160,7 +208,7 @@ impl WorkerService {
         let schema_version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(storage_error)?;
-        if !(0..=1).contains(&schema_version) {
+        if !(0..=2).contains(&schema_version) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "worker database schema is newer than supported",
@@ -189,11 +237,38 @@ impl WorkerService {
                     observation_json TEXT NOT NULL,
                     state TEXT NOT NULL,
                     revision INTEGER NOT NULL CHECK (revision > 0)
+                );
+                CREATE TABLE run_logs (
+                    run_id TEXT PRIMARY KEY NOT NULL REFERENCES runs(run_id),
+                    stdout_closed INTEGER NOT NULL DEFAULT 0 CHECK (stdout_closed IN (0, 1)),
+                    stderr_closed INTEGER NOT NULL DEFAULT 0 CHECK (stderr_closed IN (0, 1)),
+                    stdout_truncated INTEGER NOT NULL DEFAULT 0 CHECK (stdout_truncated IN (0, 1)),
+                    stderr_truncated INTEGER NOT NULL DEFAULT 0 CHECK (stderr_truncated IN (0, 1)),
+                    pruned INTEGER NOT NULL DEFAULT 0 CHECK (pruned IN (0, 1)),
+                    completed_at_ms INTEGER
                 );",
                 )
                 .map_err(storage_error)?;
             transaction
-                .pragma_update(None, "user_version", 1)
+                .pragma_update(None, "user_version", 2)
+                .map_err(storage_error)?;
+            transaction.commit().map_err(storage_error)?;
+        } else if schema_version == 1 {
+            let transaction = connection.unchecked_transaction().map_err(storage_error)?;
+            transaction
+                .execute_batch(
+                    "CREATE TABLE run_logs (
+                    run_id TEXT PRIMARY KEY NOT NULL REFERENCES runs(run_id),
+                    stdout_closed INTEGER NOT NULL DEFAULT 1 CHECK (stdout_closed IN (0, 1)),
+                    stderr_closed INTEGER NOT NULL DEFAULT 1 CHECK (stderr_closed IN (0, 1)),
+                    stdout_truncated INTEGER NOT NULL DEFAULT 0 CHECK (stdout_truncated IN (0, 1)),
+                    stderr_truncated INTEGER NOT NULL DEFAULT 0 CHECK (stderr_truncated IN (0, 1)),
+                    pruned INTEGER NOT NULL DEFAULT 0 CHECK (pruned IN (0, 1)),
+                    completed_at_ms INTEGER
+                );
+                INSERT INTO run_logs (run_id) SELECT run_id FROM runs;
+                PRAGMA user_version = 2;",
+                )
                 .map_err(storage_error)?;
             transaction.commit().map_err(storage_error)?;
         } else {
@@ -214,6 +289,7 @@ impl WorkerService {
             worker_id,
             capacity,
             state_directory,
+            log_policy,
             backend,
             state: Arc::new(SharedWorkerState(Mutex::new(WorkerState {
                 connection,
@@ -223,6 +299,7 @@ impl WorkerService {
             lifecycle: Mutex::new(false),
         };
         service.mark_interrupted_runs_unknown()?;
+        service.enforce_legacy_log_limits()?;
         Ok(service)
     }
 
@@ -281,6 +358,12 @@ impl WorkerService {
                 params![spec.id().as_str(), spec_json, observation_json, observation.state().as_str(), observation.revision() as i64],
             ).map_err(|_| WorkerError::StorageUnavailable)?;
             transaction
+                .execute(
+                    "INSERT INTO run_logs (run_id) VALUES (?1)",
+                    [spec.id().as_str()],
+                )
+                .map_err(|_| WorkerError::StorageUnavailable)?;
+            transaction
                 .commit()
                 .map_err(|_| WorkerError::StorageUnavailable)?;
             observation
@@ -291,9 +374,37 @@ impl WorkerService {
             .ok_or(WorkerError::StorageUnavailable)?;
         self.persist(&starting)?;
 
+        let stdout_path = self
+            .state_directory
+            .join("runs")
+            .join(format!("{}.stdout", spec.id()));
+        let stderr_path = self
+            .state_directory
+            .join("runs")
+            .join(format!("{}.stderr", spec.id()));
+        let stdout_file = match prepare_log_file(&stdout_path) {
+            Ok(file) => file,
+            Err(_) => {
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stdout);
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stderr);
+                return self.finish_backend_failure(starting);
+            }
+        };
+        let stderr_file = match prepare_log_file(&stderr_path) {
+            Ok(file) => file,
+            Err(_) => {
+                drop(stdout_file);
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stdout);
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stderr);
+                return self.finish_backend_failure(starting);
+            }
+        };
+
         let mut child = match self.backend.spawn(spec.job()) {
             Ok(child) => child,
             Err(_) => {
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stdout);
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stderr);
                 return self.finish_spawn_failure(starting);
             }
         };
@@ -305,19 +416,25 @@ impl WorkerService {
         let Some(stderr) = child.stderr.take() else {
             return self.abort_spawned_child(child, group_id, starting);
         };
-        let stdout_path = self
-            .state_directory
-            .join("runs")
-            .join(format!("{}.stdout", spec.id()));
-        let stderr_path = self
-            .state_directory
-            .join("runs")
-            .join(format!("{}.stderr", spec.id()));
-        let stdout_reader = match spawn_capture(stdout, stdout_path) {
+        let stdout_reader = match spawn_capture(
+            stdout,
+            stdout_file,
+            self.log_policy.max_bytes_per_stream,
+            Arc::clone(&self.state),
+            spec.id().to_string(),
+            LogStream::Stdout,
+        ) {
             Ok(reader) => reader,
             Err(_) => return self.abort_spawned_child(child, group_id, starting),
         };
-        let stderr_reader = match spawn_capture(stderr, stderr_path) {
+        let stderr_reader = match spawn_capture(
+            stderr,
+            stderr_file,
+            self.log_policy.max_bytes_per_stream,
+            Arc::clone(&self.state),
+            spec.id().to_string(),
+            LogStream::Stderr,
+        ) {
             Ok(reader) => reader,
             Err(_) => return self.abort_spawned_child(child, group_id, starting),
         };
@@ -355,6 +472,8 @@ impl WorkerService {
             .ok_or(WorkerError::StorageUnavailable)?;
         let timeout = spec.job().timeout_ms().map(Duration::from_millis);
         let grace = Duration::from_millis(spec.job().termination_grace_ms());
+        let log_directory = self.state_directory.join("runs");
+        let retention_runs = self.log_policy.retention_runs;
         let supervisor_observation = running.clone();
         let child_slot = Arc::new(Mutex::new(Some(child)));
         let supervisor_child = Arc::clone(&child_slot);
@@ -378,6 +497,8 @@ impl WorkerService {
                         launched_at,
                         timeout,
                         grace,
+                        log_directory,
+                        retention_runs,
                     });
                 }
             });
@@ -431,6 +552,79 @@ impl WorkerService {
             .map_err(|_| WorkerError::StorageUnavailable)?
             .map(|json| serde_json::from_str(&json).map_err(|_| WorkerError::StorageUnavailable))
             .transpose()
+    }
+
+    pub fn read_logs(&self, command: ReadRunLogs) -> Result<RunLogChunk, WorkerError> {
+        if command.limit() == 0 || command.limit() > MAX_LOG_CHUNK_BYTES {
+            return Err(WorkerError::StorageUnavailable);
+        }
+        let id = command.run_id();
+        let state = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let run_exists: bool = state
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE run_id = ?1)",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        if !run_exists {
+            return Err(WorkerError::LogsNotFound);
+        }
+        let log_state: Option<(bool, bool, bool)> = state
+            .connection
+            .query_row(
+                "SELECT CASE WHEN ?2 = 'stdout' THEN stdout_closed ELSE stderr_closed END,
+                        CASE WHEN ?2 = 'stdout' THEN stdout_truncated ELSE stderr_truncated END,
+                        pruned
+                 FROM run_logs WHERE run_id = ?1",
+                params![id.as_str(), command.stream().as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let (closed, truncated, pruned) = log_state.ok_or(WorkerError::LogsNotFound)?;
+        drop(state);
+        if pruned {
+            return Err(WorkerError::LogsPruned);
+        }
+        let path = self.log_path(id.as_str(), command.stream());
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Err(WorkerError::LogsNotFound);
+            }
+            Err(_) => return Err(WorkerError::StorageUnavailable),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(WorkerError::StorageUnavailable);
+        }
+        let file_len = metadata.len();
+        let mut file = File::open(path).map_err(|_| WorkerError::StorageUnavailable)?;
+        file.seek(SeekFrom::Start(command.offset()))
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let mut data = Vec::with_capacity(
+            command
+                .limit()
+                .min(file_len.saturating_sub(command.offset()) as usize),
+        );
+        file.take(command.limit() as u64)
+            .read_to_end(&mut data)
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let next_offset = command.offset().saturating_add(data.len() as u64);
+        let eof = closed && next_offset >= file_len;
+        Ok(RunLogChunk::new(
+            id.clone(),
+            command.stream(),
+            command.offset(),
+            next_offset,
+            data,
+            RunLogStatus::new(closed, eof, truncated),
+        ))
     }
 
     pub fn stop(&self, command: StopRun) -> Result<RunObservation, WorkerError> {
@@ -634,6 +828,111 @@ impl WorkerService {
         transaction.commit().map_err(storage_error)
     }
 
+    fn log_path(&self, run_id: &str, stream: LogStream) -> PathBuf {
+        self.state_directory
+            .join("runs")
+            .join(format!("{run_id}.{}", stream.as_str()))
+    }
+
+    fn mark_log_closed(&self, run_id: &str, stream: LogStream) {
+        let Ok(state) = self.state.0.lock() else {
+            return;
+        };
+        let (column, other_column) = match stream {
+            LogStream::Stdout => ("stdout_closed", "stderr_closed"),
+            LogStream::Stderr => ("stderr_closed", "stdout_closed"),
+        };
+        let sql = format!(
+            "UPDATE run_logs SET {column} = 1,
+             completed_at_ms = CASE WHEN {other_column} = 1 THEN ?1 ELSE completed_at_ms END
+             WHERE run_id = ?2"
+        );
+        if let Ok(timestamp) = now_ms() {
+            let _ = state.connection.execute(&sql, params![timestamp, run_id]);
+        }
+    }
+
+    fn enforce_legacy_log_limits(&self) -> io::Result<()> {
+        let ids = {
+            let state = self
+                .state
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("worker state lock poisoned"))?;
+            let mut statement = state
+                .connection
+                .prepare("SELECT run_id FROM run_logs WHERE pruned = 0")
+                .map_err(storage_error)?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(storage_error)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(storage_error)?
+        };
+        for id in ids {
+            for stream in [LogStream::Stdout, LogStream::Stderr] {
+                let path = self.log_path(&id, stream);
+                let length = match fs::symlink_metadata(&path) {
+                    Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "worker log path must be a regular file",
+                        ));
+                    }
+                    Ok(metadata) => metadata.len(),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        let file = prepare_log_file(&path)?;
+                        drop(file);
+                        0
+                    }
+                    Err(error) => return Err(error),
+                };
+                if length > self.log_policy.max_bytes_per_stream {
+                    let file = OpenOptions::new().write(true).open(&path)?;
+                    file.set_len(self.log_policy.max_bytes_per_stream)?;
+                    self.mark_log_truncated(&id, stream)?;
+                }
+            }
+            self.mark_log_closed(&id, LogStream::Stdout);
+            self.mark_log_closed(&id, LogStream::Stderr);
+            if let Ok(state) = self.state.0.lock()
+                && let Ok(timestamp) = now_ms()
+            {
+                let _ = state.connection.execute(
+                    "UPDATE run_logs SET completed_at_ms = ?1 WHERE run_id = ?2 AND completed_at_ms IS NULL",
+                    params![timestamp, id],
+                );
+            }
+        }
+        self.prune_completed_logs()
+    }
+
+    fn mark_log_truncated(&self, run_id: &str, stream: LogStream) -> io::Result<()> {
+        let state = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("worker state lock poisoned"))?;
+        let column = match stream {
+            LogStream::Stdout => "stdout_truncated",
+            LogStream::Stderr => "stderr_truncated",
+        };
+        let sql = format!("UPDATE run_logs SET {column} = 1 WHERE run_id = ?1");
+        state
+            .connection
+            .execute(&sql, [run_id])
+            .map_err(storage_error)?;
+        Ok(())
+    }
+
+    fn prune_completed_logs(&self) -> io::Result<()> {
+        prune_completed_logs_shared(
+            &self.state,
+            &self.state_directory.join("runs"),
+            self.log_policy.retention_runs,
+        )
+    }
+
     fn persist(&self, observation: &RunObservation) -> Result<(), WorkerError> {
         let serialized =
             serde_json::to_string(observation).map_err(|_| WorkerError::StorageUnavailable)?;
@@ -653,6 +952,8 @@ impl WorkerService {
     }
 
     fn finish_spawn_failure(&self, current: RunObservation) -> Result<RunObservation, WorkerError> {
+        self.mark_log_closed(current.run_id().as_str(), LogStream::Stdout);
+        self.mark_log_closed(current.run_id().as_str(), LogStream::Stderr);
         let finished = now_ms().map_err(|_| WorkerError::StorageUnavailable)?;
         let failed = current
             .next_revision(
@@ -665,6 +966,7 @@ impl WorkerService {
             )
             .ok_or(WorkerError::StorageUnavailable)?;
         self.persist(&failed)?;
+        let _ = self.prune_completed_logs();
         Ok(failed)
     }
 
@@ -677,6 +979,8 @@ impl WorkerService {
         let _ = self.backend.kill_process_group(group_id);
         let _ = child.kill();
         let _ = child.wait();
+        self.mark_log_closed(current.run_id().as_str(), LogStream::Stdout);
+        self.mark_log_closed(current.run_id().as_str(), LogStream::Stderr);
         self.finish_backend_failure(current)
     }
 
@@ -696,31 +1000,146 @@ impl WorkerService {
             )
             .ok_or(WorkerError::StorageUnavailable)?;
         self.persist(&failed)?;
+        let _ = self.prune_completed_logs();
         Ok(failed)
     }
 }
 
+fn prepare_log_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true).read(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path)
+}
+
 fn spawn_capture<R: Read + Send + 'static>(
     mut source: R,
-    path: PathBuf,
+    mut output: File,
+    byte_cap: u64,
+    state: Arc<SharedWorkerState>,
+    run_id: String,
+    stream: LogStream,
 ) -> io::Result<JoinHandle<io::Result<()>>> {
     thread::Builder::new().spawn(move || {
-        let mut options = OpenOptions::new();
-        options.create_new(true).write(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut output = options.open(path)?;
         let mut buffer = [0_u8; 8192];
-        loop {
-            let count = source.read(&mut buffer)?;
-            if count == 0 {
-                break;
+        let mut written = 0_u64;
+        let mut truncated = false;
+        let capture_result = (|| {
+            loop {
+                let count = source.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                let keep = (count as u64).min(byte_cap.saturating_sub(written)) as usize;
+                if keep > 0 {
+                    output.write_all(&buffer[..keep])?;
+                    written += keep as u64;
+                }
+                if keep < count && !truncated {
+                    truncated = true;
+                    set_log_truncated(&state, &run_id, stream)?;
+                }
             }
-            output.write_all(&buffer[..count])?;
-        }
-        output.sync_all()?;
-        Ok(())
+            output.sync_all()?;
+            Ok(())
+        })();
+        let close_result = close_log_stream(&state, &run_id, stream);
+        capture_result.and(close_result)
     })
+}
+
+fn set_log_truncated(state: &SharedWorkerState, run_id: &str, stream: LogStream) -> io::Result<()> {
+    let column = match stream {
+        LogStream::Stdout => "stdout_truncated",
+        LogStream::Stderr => "stderr_truncated",
+    };
+    let sql = format!("UPDATE run_logs SET {column} = 1 WHERE run_id = ?1");
+    let state = state
+        .0
+        .lock()
+        .map_err(|_| io::Error::other("worker state lock poisoned"))?;
+    state
+        .connection
+        .execute(&sql, [run_id])
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+fn close_log_stream(state: &SharedWorkerState, run_id: &str, stream: LogStream) -> io::Result<()> {
+    let (closed, other_closed) = match stream {
+        LogStream::Stdout => ("stdout_closed", "stderr_closed"),
+        LogStream::Stderr => ("stderr_closed", "stdout_closed"),
+    };
+    let sql = format!(
+        "UPDATE run_logs SET {closed} = 1,
+         completed_at_ms = CASE WHEN {other_closed} = 1 THEN ?1 ELSE completed_at_ms END
+         WHERE run_id = ?2"
+    );
+    let timestamp = now_ms()?;
+    let state = state
+        .0
+        .lock()
+        .map_err(|_| io::Error::other("worker state lock poisoned"))?;
+    state
+        .connection
+        .execute(&sql, params![timestamp, run_id])
+        .map_err(storage_error)?;
+    Ok(())
+}
+
+fn prune_completed_logs_shared(
+    state: &SharedWorkerState,
+    log_directory: &Path,
+    retention_runs: usize,
+) -> io::Result<()> {
+    let candidates = {
+        let worker_state = state
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("worker state lock poisoned"))?;
+        let mut statement = worker_state
+            .connection
+            .prepare(
+                "SELECT run_id FROM run_logs
+                 WHERE pruned = 0 AND stdout_closed = 1 AND stderr_closed = 1
+                 ORDER BY completed_at_ms DESC, run_id DESC LIMIT -1 OFFSET ?1",
+            )
+            .map_err(storage_error)?;
+        statement
+            .query_map([retention_runs as i64], |row| row.get::<_, String>(0))
+            .map_err(storage_error)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_error)?
+    };
+    for id in candidates {
+        for stream in [LogStream::Stdout, LogStream::Stderr] {
+            let path = log_directory.join(format!("{id}.{}", stream.as_str()));
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "worker log path must be a regular file",
+                    ));
+                }
+                Ok(_) => fs::remove_file(path)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let worker_state = state
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("worker state lock poisoned"))?;
+        worker_state
+            .connection
+            .execute(
+                "UPDATE run_logs SET pruned = 1 WHERE run_id = ?1 AND stdout_closed = 1 AND stderr_closed = 1",
+                [id],
+            )
+            .map_err(storage_error)?;
+    }
+    Ok(())
 }
 
 struct RunSupervision {
@@ -735,6 +1154,8 @@ struct RunSupervision {
     launched_at: std::time::Instant,
     timeout: Option<Duration>,
     grace: Duration,
+    log_directory: PathBuf,
+    retention_runs: usize,
 }
 
 fn supervise(supervision: RunSupervision) {
@@ -750,6 +1171,8 @@ fn supervise(supervision: RunSupervision) {
         launched_at,
         timeout,
         grace,
+        log_directory,
+        retention_runs,
     } = supervision;
     let group_id = child.id();
     let mut wait_failed = false;
@@ -825,11 +1248,13 @@ fn supervise(supervision: RunSupervision) {
         thread::sleep(Duration::from_millis(10));
     };
     let _ = backend.kill_process_group(group_id);
-    let output_failed = stdout_reader.join().map_or(true, |result| result.is_err())
-        || stderr_reader.join().map_or(true, |result| result.is_err());
+    // Output persistence is best effort. A failed log writer must not rewrite
+    // the process's exit result; both readers are joined to reap their threads.
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
     let finished = now_ms().unwrap_or(current.requested_at_ms());
     let (run_state, exit_code, signal, failure) = match status {
-        Some(status) if !wait_failed && !output_failed => status_observation(status),
+        Some(status) if !wait_failed => status_observation(status),
         _ => (
             RunState::Failed,
             None,
@@ -875,6 +1300,7 @@ fn supervise(supervision: RunSupervision) {
     if let Ok(mut state) = state.0.lock() {
         state.active_groups.remove(&run_id);
     }
+    let _ = prune_completed_logs_shared(&state, &log_directory, retention_runs);
 }
 
 fn status_observation(

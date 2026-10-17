@@ -7,11 +7,18 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Path, Query, State, rejection::JsonRejection};
+use axum::extract::{
+    DefaultBodyLimit, Path, Query, State,
+    rejection::{JsonRejection, QueryRejection},
+};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use conductor_core::{JobId, JobSpec, RunId, RunState, WorkerId};
+use base64::Engine;
+use conductor_core::{
+    DEFAULT_LOG_CHUNK_BYTES, JobId, JobSpec, LogStream, MAX_LOG_CHUNK_BYTES, ReadRunLogs, RunId,
+    RunState, WorkerId,
+};
 use conductor_manager::{JobService, ManagerError, WorkerPort};
 use serde::{Deserialize, Serialize};
 
@@ -27,11 +34,33 @@ struct RunCollection {
     runs: Vec<conductor_core::RunObservation>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunLogsResponse {
+    run_id: String,
+    stream: LogStream,
+    offset: u64,
+    next_offset: u64,
+    data_encoding: &'static str,
+    data: String,
+    stream_closed: bool,
+    eof: bool,
+    truncated: bool,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RunFilters {
     job_id: Option<String>,
     state: Option<RunState>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RunLogFilters {
+    stream: LogStream,
+    offset: Option<u64>,
     limit: Option<usize>,
 }
 
@@ -83,6 +112,7 @@ pub fn router(manager: Arc<JobService>, worker: Arc<dyn WorkerPort>) -> Router {
         .route("/v1/jobs/{id}/runs", post(start_run))
         .route("/v1/runs", get(list_runs))
         .route("/v1/runs/{id}", get(get_run))
+        .route("/v1/runs/{id}/logs", get(get_run_logs))
         .route("/v1/runs/{id}/stop", post(stop_run))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
@@ -277,6 +307,77 @@ async fn stop_run(State(state): State<Arc<ApiState>>, Path(raw_id): Path<String>
     }
 }
 
+async fn get_run_logs(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+    filters: Result<Query<RunLogFilters>, QueryRejection>,
+) -> Response {
+    let Query(filters) = match filters {
+        Ok(filters) => filters,
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_log_query",
+                "the log query parameters are invalid",
+            );
+        }
+    };
+    let Ok(run_id) = RunId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_run_id",
+            "the run ID is invalid",
+        );
+    };
+    let offset = filters.offset.unwrap_or(0);
+    let limit = filters.limit.unwrap_or(DEFAULT_LOG_CHUNK_BYTES);
+    if limit == 0 || limit > MAX_LOG_CHUNK_BYTES {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_log_limit",
+            "limit must be between 1 and 65536 bytes",
+        );
+    }
+    let command = ReadRunLogs::new(run_id, filters.stream, offset, limit);
+    match state.manager.read_logs(command, state.worker.as_ref()) {
+        Ok(chunk) => (
+            StatusCode::OK,
+            Json(RunLogsResponse {
+                run_id: chunk.run_id().to_string(),
+                stream: chunk.stream(),
+                offset: chunk.offset(),
+                next_offset: chunk.next_offset(),
+                data_encoding: "base64",
+                data: match encode_base64(chunk.data()) {
+                    Ok(data) => data,
+                    Err(()) => {
+                        return error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "internal_error",
+                            "the bounded log chunk could not be encoded",
+                        );
+                    }
+                },
+                stream_closed: chunk.stream_closed(),
+                eof: chunk.eof(),
+                truncated: chunk.truncated(),
+            }),
+        )
+            .into_response(),
+        Err(error_value) => manager_error(error_value),
+    }
+}
+
+fn encode_base64(bytes: &[u8]) -> Result<String, ()> {
+    let encoded_length = bytes.len().checked_add(2).ok_or(())? / 3 * 4;
+    let mut encoded = vec![0; encoded_length];
+    let written = base64::engine::general_purpose::STANDARD
+        .encode_slice(bytes, &mut encoded)
+        .map_err(|_| ())?;
+    encoded.truncate(written);
+    String::from_utf8(encoded).map_err(|_| ())
+}
+
 async fn list_runs(
     State(state): State<Arc<ApiState>>,
     Query(filters): Query<RunFilters>,
@@ -334,6 +435,16 @@ fn manager_error(error_value: ManagerError) -> Response {
             StatusCode::NOT_FOUND,
             "run_not_found",
             "the run does not exist",
+        ),
+        ManagerError::LogsNotFound => error(
+            StatusCode::NOT_FOUND,
+            "logs_not_found",
+            "the run has no stored output logs",
+        ),
+        ManagerError::LogsPruned => error(
+            StatusCode::GONE,
+            "logs_pruned",
+            "the run output logs were removed by retention",
         ),
         ManagerError::WorkerUnavailable => error(
             StatusCode::SERVICE_UNAVAILABLE,

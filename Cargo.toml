@@ -29,6 +29,7 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 tokio = { version = "1", default-features = false, features = ["net", "rt", "time"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 nix = { version = "0.31.3", default-features = false, features = ["process", "signal"] }
+base64 = { version = "0.22.1", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

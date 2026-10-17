@@ -11,6 +11,8 @@ const DEFAULT_TERMINATION_GRACE_MS: u64 = 5_000;
 const MAX_TERMINATION_GRACE_MS: u64 = 300_000;
 const MAX_TIMEOUT_MS: u64 = 604_800_000;
 pub const MAX_WORKER_CAPACITY: usize = 1_000;
+pub const DEFAULT_LOG_CHUNK_BYTES: usize = 4_096;
+pub const MAX_LOG_CHUNK_BYTES: usize = 65_536;
 
 /// An identifier failed the stable ASCII identifier format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -337,6 +339,137 @@ impl RunObservation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StopRun {
     run_id: RunId,
+}
+
+/// One worker-owned output stream for a run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+}
+
+impl LogStream {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+/// Bounded byte-range read from one run output stream.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReadRunLogs {
+    run_id: RunId,
+    stream: LogStream,
+    offset: u64,
+    limit: usize,
+}
+
+impl ReadRunLogs {
+    pub fn new(run_id: RunId, stream: LogStream, offset: u64, limit: usize) -> Self {
+        Self {
+            run_id,
+            stream,
+            offset,
+            limit,
+        }
+    }
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+    pub fn stream(&self) -> LogStream {
+        self.stream
+    }
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
+/// Reply to a bounded log read. `data` contains raw bytes for transport encoding.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunLogChunk {
+    run_id: RunId,
+    stream: LogStream,
+    offset: u64,
+    next_offset: u64,
+    data: Vec<u8>,
+    stream_closed: bool,
+    eof: bool,
+    truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunLogStatus {
+    stream_closed: bool,
+    eof: bool,
+    truncated: bool,
+}
+
+impl RunLogStatus {
+    pub fn new(stream_closed: bool, eof: bool, truncated: bool) -> Self {
+        Self {
+            stream_closed,
+            eof,
+            truncated,
+        }
+    }
+}
+
+impl RunLogChunk {
+    pub fn new(
+        run_id: RunId,
+        stream: LogStream,
+        offset: u64,
+        next_offset: u64,
+        data: Vec<u8>,
+        status: RunLogStatus,
+    ) -> Self {
+        Self {
+            run_id,
+            stream,
+            offset,
+            next_offset,
+            data,
+            stream_closed: status.stream_closed,
+            eof: status.eof,
+            truncated: status.truncated,
+        }
+    }
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+    pub fn stream(&self) -> LogStream {
+        self.stream
+    }
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+    pub fn into_data(self) -> Vec<u8> {
+        self.data
+    }
+    pub fn stream_closed(&self) -> bool {
+        self.stream_closed
+    }
+    pub fn eof(&self) -> bool {
+        self.eof
+    }
+    pub fn truncated(&self) -> bool {
+        self.truncated
+    }
 }
 
 impl StopRun {
