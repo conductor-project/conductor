@@ -366,7 +366,8 @@ pub struct WorkerService {
     reader_reaper: ReaderReaper,
     runtime: Runtime,
     supervisors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
-    lifecycle: Mutex<bool>,
+    lifecycle: Mutex<()>,
+    draining: AtomicBool,
 }
 
 impl Drop for WorkerService {
@@ -610,7 +611,8 @@ impl WorkerService {
             reader_reaper: ReaderReaper::new()?,
             runtime,
             supervisors: Mutex::new(Vec::new()),
-            lifecycle: Mutex::new(false),
+            lifecycle: Mutex::new(()),
+            draining: AtomicBool::new(false),
         };
         service.mark_interrupted_runs_unknown()?;
         service.enforce_legacy_log_limits()?;
@@ -618,11 +620,11 @@ impl WorkerService {
     }
 
     pub fn start(&self, command: StartRun) -> Result<RunObservation, WorkerError> {
-        let lifecycle = self
+        let _lifecycle = self
             .lifecycle
             .lock()
             .map_err(|_| WorkerError::StorageUnavailable)?;
-        if *lifecycle {
+        if self.draining.load(Ordering::SeqCst) {
             return Err(WorkerError::ShuttingDown);
         }
         let spec = command.spec();
@@ -1119,10 +1121,7 @@ impl WorkerService {
     }
 
     pub fn is_draining(&self) -> bool {
-        self.lifecycle
-            .lock()
-            .map(|draining| *draining)
-            .unwrap_or(true)
+        self.draining.load(Ordering::SeqCst)
     }
 
     pub fn is_degraded(&self) -> bool {
@@ -1131,27 +1130,19 @@ impl WorkerService {
 
     /// Stop admission immediately and notify every live supervisor to begin cleanup.
     pub fn begin_shutdown(&self) {
+        self.draining.store(true, Ordering::SeqCst);
         self.shutdown_signal.send_replace(true);
-        if let Ok(mut lifecycle) = self.lifecycle.lock() {
-            *lifecycle = true;
-        } else {
-            return;
-        }
-        if let Ok(state) = self.state.0.lock() {
-            for active in state.active_groups.values() {
-                let _ = active.intent.compare_exchange(
-                    INTENT_NONE,
-                    INTENT_SHUTDOWN,
-                    Ordering::SeqCst,
-                    Ordering::SeqCst,
-                );
-                active.notify.notify_one();
-            }
-        }
     }
 
     pub fn shutdown(&self) -> io::Result<()> {
         self.begin_shutdown();
+        // Wait for any start already inside the lifecycle gate to either
+        // reject startup or transfer its process to a registered supervisor.
+        drop(
+            self.lifecycle
+                .lock()
+                .map_err(|_| io::Error::other("worker lifecycle lock poisoned"))?,
+        );
         let deadline = std::time::Instant::now() + SHUTDOWN_TIMEOUT;
         loop {
             let active = self
@@ -1819,6 +1810,14 @@ async fn supervise(supervision: RunSupervision) {
     let timeout_deadline = timeout.map(|limit| tokio::time::Instant::from_std(launched_at + limit));
     let mut status = None;
     let mut wait_failed = false;
+    if *shutdown_signal.borrow() {
+        let _ = intent.compare_exchange(
+            INTENT_NONE,
+            INTENT_SHUTDOWN,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
     loop {
         if let Some(child) = spawned.child.as_mut() {
             match child.try_wait() {
@@ -1844,6 +1843,16 @@ async fn supervise(supervision: RunSupervision) {
         }
         tokio::select! {
             _ = control_notify.notified() => {},
+            changed = shutdown_signal.changed() => {
+                if changed.is_ok() && *shutdown_signal.borrow() {
+                    let _ = intent.compare_exchange(
+                        INTENT_NONE,
+                        INTENT_SHUTDOWN,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                }
+            },
             _ = tokio::time::sleep(Duration::from_millis(10)) => {},
             _ = async {
                 match timeout_deadline {

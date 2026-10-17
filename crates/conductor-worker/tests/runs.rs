@@ -704,6 +704,55 @@ fn pending_output_readers_do_not_block_other_run_deadlines() {
     }
 }
 
+#[test]
+fn shutdown_announcement_is_lock_free_and_start_races_stay_owned() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let marker = directory.0.join("startup-release");
+    *backend.ready_file.lock().unwrap() = Some(marker.clone());
+    let service = Arc::new(open_worker(&directory, 2, Arc::clone(&backend)));
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let starting_service = Arc::clone(&service);
+    let starting = thread::spawn(move || {
+        let result = starting_service.start(StartRun::new(run(
+            "shutdown-race",
+            job("shutdown-race", vec!["/bin/sleep".into(), "30".into()]),
+        )));
+        started_tx.send(result).unwrap();
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while backend.spawns.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
+
+    let readiness_started = std::time::Instant::now();
+    assert!(!service.is_draining());
+    assert!(readiness_started.elapsed() < Duration::from_millis(50));
+    let shutdown_started = std::time::Instant::now();
+    service.begin_shutdown();
+    assert!(shutdown_started.elapsed() < Duration::from_millis(50));
+    assert!(service.is_draining());
+
+    fs::write(marker, "continue").unwrap();
+    starting.join().unwrap();
+    assert_eq!(
+        started_rx.recv().unwrap().unwrap().state(),
+        RunState::Running
+    );
+    let rejected = service.start(StartRun::new(run(
+        "after-shutdown",
+        job("after-shutdown", vec!["/bin/true".into()]),
+    )));
+    assert_eq!(rejected, Err(WorkerError::ShuttingDown));
+    service.shutdown().unwrap();
+    assert_eq!(
+        wait_for(&service, "shutdown-race").state(),
+        RunState::Cancelled
+    );
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
+}
+
 #[cfg(unix)]
 const OUTPUT_DEADLINE_TEST_LIMIT: Duration = Duration::from_millis(500);
 
