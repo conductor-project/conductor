@@ -192,6 +192,7 @@ dependencies = [
 name = "conductor-manager"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "conductor-core",
  "rusqlite",
  "serde_json",

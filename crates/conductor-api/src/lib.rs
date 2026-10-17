@@ -11,7 +11,7 @@ use axum::extract::{
     DefaultBodyLimit, Path, Query, State,
     rejection::{JsonRejection, QueryRejection},
 };
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine;
@@ -19,19 +19,27 @@ use conductor_core::{
     DEFAULT_LOG_CHUNK_BYTES, JobId, JobSpec, LogStream, MAX_LOG_CHUNK_BYTES, ReadRunLogs, RunId,
     RunState, WorkerId,
 };
-use conductor_manager::{JobService, ManagerError, WorkerPort};
+use conductor_manager::{
+    DEFAULT_PAGE_SIZE, JobService, MAX_PAGE_SIZE, ManagerError, QueryError, WorkerPort,
+};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+const MAX_PENDING_STARTS: usize = 32;
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct JobCollection {
     jobs: Vec<JobSpec>,
+    next_cursor: Option<String>,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RunCollection {
     runs: Vec<conductor_core::RunObservation>,
+    next_cursor: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -54,6 +62,14 @@ struct RunFilters {
     job_id: Option<String>,
     state: Option<RunState>,
     limit: Option<usize>,
+    cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PageFilters {
+    limit: Option<usize>,
+    cursor: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -69,7 +85,7 @@ struct ApiState {
     worker: Arc<dyn WorkerPort>,
     worker_id: WorkerId,
     worker_capacity: usize,
-    process_execution: bool,
+    start_admission: Arc<Semaphore>,
 }
 
 #[derive(Serialize)]
@@ -103,7 +119,7 @@ pub fn router(manager: Arc<JobService>, worker: Arc<dyn WorkerPort>) -> Router {
         worker,
         worker_id: descriptor.worker_id().clone(),
         worker_capacity: descriptor.capacity(),
-        process_execution: descriptor.supports_process_execution(),
+        start_admission: Arc::new(Semaphore::new(MAX_PENDING_STARTS)),
     });
     Router::new()
         .route("/healthz", get(healthz))
@@ -158,14 +174,28 @@ async fn create_job(
     }
 }
 
-async fn list_jobs(State(state): State<Arc<ApiState>>) -> Response {
-    match state.manager.list() {
-        Ok(jobs) => (StatusCode::OK, Json(JobCollection { jobs })).into_response(),
-        Err(_) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "the manager could not access job storage",
-        ),
+async fn list_jobs(
+    State(state): State<Arc<ApiState>>,
+    filters: Result<Query<PageFilters>, QueryRejection>,
+) -> Response {
+    let Query(filters) = match filters {
+        Ok(filters) => filters,
+        Err(_) => return invalid_page_query(),
+    };
+    let limit = filters.limit.unwrap_or(DEFAULT_PAGE_SIZE);
+    if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+        return invalid_page_query();
+    }
+    match state.manager.list_page(limit, filters.cursor.as_deref()) {
+        Ok(page) => (
+            StatusCode::OK,
+            Json(JobCollection {
+                jobs: page.items,
+                next_cursor: page.next_cursor,
+            }),
+        )
+            .into_response(),
+        Err(error) => query_error(error),
     }
 }
 
@@ -220,21 +250,11 @@ async fn delete_job(State(state): State<Arc<ApiState>>, Path(raw_id): Path<Strin
     }
 }
 
-async fn start_run(State(state): State<Arc<ApiState>>, Path(raw_job_id): Path<String>) -> Response {
-    if state.worker.is_draining() {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "worker_draining",
-            "the local worker is shutting down and no longer accepts runs",
-        );
-    }
-    if !state.process_execution {
-        return error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "worker_unavailable",
-            "the local worker does not advertise process execution",
-        );
-    }
+async fn start_run(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_job_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
     let Ok(job_id) = JobId::new(raw_job_id) else {
         return error(
             StatusCode::BAD_REQUEST,
@@ -242,29 +262,117 @@ async fn start_run(State(state): State<Arc<ApiState>>, Path(raw_job_id): Path<St
             "the job ID is invalid",
         );
     };
-    match state.manager.start_run(
-        &job_id,
-        &state.worker_id,
-        state.worker_capacity,
-        state.worker.as_ref(),
-    ) {
-        Ok(observation) => {
-            let location = format!("/v1/runs/{}", observation.run_id());
-            let mut response = (StatusCode::ACCEPTED, Json(observation)).into_response();
-            match HeaderValue::from_str(&location) {
-                Ok(value) => {
-                    response.headers_mut().insert(header::LOCATION, value);
-                    response
-                }
-                Err(_) => error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    "the run location could not be constructed",
-                ),
-            }
+    let idempotency_key = match parse_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(()) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_idempotency_key",
+                "Idempotency-Key must be 1-128 ASCII letters, digits, '.', '_', '~', or '-'",
+            );
         }
-        Err(error) => manager_error(error),
+    };
+    let idempotency_key = idempotency_key.map(str::to_owned);
+    if let Some(key) = idempotency_key.as_deref() {
+        match replay_run(&state, job_id.clone(), key.to_owned()).await {
+            Err(error) => return manager_error(error),
+            Ok(Some(observation)) => return accepted_run(observation),
+            Ok(None) => {}
+        }
     }
+    let permit = match Arc::clone(&state.start_admission).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            if let Some(key) = idempotency_key.as_deref()
+                && let Ok(Some(observation)) =
+                    replay_run(&state, job_id.clone(), key.to_owned()).await
+            {
+                return accepted_run(observation);
+            }
+            let mut response = error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "start_admission_saturated",
+                "too many run submissions are being processed",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
+    };
+    let manager = Arc::clone(&state.manager);
+    let worker = Arc::clone(&state.worker);
+    let worker_id = state.worker_id.clone();
+    let worker_capacity = state.worker_capacity;
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        manager.start_run_with_key(
+            &job_id,
+            &worker_id,
+            worker_capacity,
+            idempotency_key.as_deref(),
+            worker.as_ref(),
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(observation)) => accepted_run(observation),
+        Ok(Err(error)) => manager_error(error),
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "the run admission worker stopped unexpectedly",
+        ),
+    }
+}
+
+async fn replay_run(
+    state: &Arc<ApiState>,
+    job_id: JobId,
+    key: String,
+) -> Result<Option<conductor_core::RunObservation>, ManagerError> {
+    let manager = Arc::clone(&state.manager);
+    let worker = Arc::clone(&state.worker);
+    tokio::task::spawn_blocking(move || manager.replay_run(&job_id, &key, worker.as_ref()))
+        .await
+        .map_err(|_| ManagerError::WorkerUnavailable)?
+}
+
+fn accepted_run(observation: conductor_core::RunObservation) -> Response {
+    let location = format!("/v1/runs/{}", observation.run_id());
+    let mut response = (StatusCode::ACCEPTED, Json(observation)).into_response();
+    match HeaderValue::from_str(&location) {
+        Ok(value) => {
+            response.headers_mut().insert(header::LOCATION, value);
+            response
+        }
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "the run location could not be constructed",
+        ),
+    }
+}
+
+fn parse_idempotency_key(headers: &HeaderMap) -> Result<Option<&str>, ()> {
+    let values = headers.get_all("idempotency-key");
+    let mut values = values.iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(());
+    }
+    let value = value.to_str().map_err(|_| ())?;
+    if value.is_empty()
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._~-".contains(&byte))
+    {
+        return Err(());
+    }
+    Ok(Some(value))
 }
 
 async fn get_run(State(state): State<Arc<ApiState>>, Path(raw_id): Path<String>) -> Response {
@@ -380,8 +488,12 @@ fn encode_base64(bytes: &[u8]) -> Result<String, ()> {
 
 async fn list_runs(
     State(state): State<Arc<ApiState>>,
-    Query(filters): Query<RunFilters>,
+    filters: Result<Query<RunFilters>, QueryRejection>,
 ) -> Response {
+    let Query(filters) = match filters {
+        Ok(filters) => filters,
+        Err(_) => return invalid_page_query(),
+    };
     let job_id = match filters.job_id {
         Some(raw) => match JobId::new(raw) {
             Ok(id) => Some(id),
@@ -395,22 +507,58 @@ async fn list_runs(
         },
         None => None,
     };
-    match state
-        .manager
-        .list_runs(job_id.as_ref(), filters.state, filters.limit.unwrap_or(100))
-    {
-        Ok(runs) => {
-            let mut refreshed = Vec::with_capacity(runs.len());
-            for run in runs {
+    let limit = filters.limit.unwrap_or(DEFAULT_PAGE_SIZE);
+    if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+        return invalid_page_query();
+    }
+    match state.manager.list_runs_page(
+        job_id.as_ref(),
+        filters.state,
+        limit,
+        filters.cursor.as_deref(),
+    ) {
+        Ok(page) => {
+            let mut refreshed = Vec::with_capacity(page.items.len());
+            for run in page.items {
                 match state.manager.get_run(run.run_id(), state.worker.as_ref()) {
                     Ok(Some(current)) => refreshed.push(current),
                     Ok(None) => {}
                     Err(error) => return manager_error(error),
                 }
             }
-            (StatusCode::OK, Json(RunCollection { runs: refreshed })).into_response()
+            (
+                StatusCode::OK,
+                Json(RunCollection {
+                    runs: refreshed,
+                    next_cursor: page.next_cursor,
+                }),
+            )
+                .into_response()
         }
-        Err(error) => manager_error(error),
+        Err(error) => query_error(error),
+    }
+}
+
+fn invalid_page_query() -> Response {
+    error(
+        StatusCode::BAD_REQUEST,
+        "invalid_page_query",
+        "limit or cursor is invalid for this collection",
+    )
+}
+
+fn query_error(error_value: QueryError) -> Response {
+    match error_value {
+        QueryError::InvalidCursor => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_cursor",
+            "the cursor is malformed or does not match the collection filters",
+        ),
+        QueryError::StorageUnavailable => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "the manager could not access collection storage",
+        ),
     }
 }
 
@@ -426,11 +574,22 @@ fn manager_error(error_value: ManagerError) -> Response {
             "job_conflict",
             "the job has an active or unresolved run",
         ),
-        ManagerError::CapacityReached => error(
-            StatusCode::TOO_MANY_REQUESTS,
-            "worker_capacity_reached",
-            "the local worker has no available capacity",
+        ManagerError::IdempotencyConflict => error(
+            StatusCode::CONFLICT,
+            "idempotency_key_conflict",
+            "the Idempotency-Key was already used for a different request",
         ),
+        ManagerError::CapacityReached => {
+            let mut response = error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "worker_capacity_reached",
+                "the local worker has no available capacity",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            response
+        }
         ManagerError::RunNotFound => error(
             StatusCode::NOT_FOUND,
             "run_not_found",

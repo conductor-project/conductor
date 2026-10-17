@@ -8,6 +8,7 @@ use std::{fs, io};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+use base64::Engine;
 use conductor_core::{
     InspectRun, JobId, JobSpec, ReadRunLogs, RunFailureReason, RunId, RunLogChunk, RunObservation,
     RunSpec, RunState, RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId,
@@ -16,8 +17,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 
 /// Temporary limit for active jobs. Pagination is a later milestone.
 pub const MAX_JOBS: usize = 1_000;
-const MAX_RESERVED_JOB_IDS: usize = 10_000;
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,7 +33,37 @@ pub enum RunStoreError {
     JobNotFound,
     JobConflict,
     CapacityReached,
+    IdempotencyConflict,
     StorageUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryError {
+    InvalidCursor,
+    StorageUnavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
+}
+
+pub const DEFAULT_PAGE_SIZE: usize = 50;
+pub const MAX_PAGE_SIZE: usize = 100;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RunAdmission {
+    pub spec: RunSpec,
+    pub replay: Option<RunObservation>,
+}
+
+impl std::ops::Deref for RunAdmission {
+    type Target = RunSpec;
+
+    fn deref(&self) -> &Self::Target {
+        &self.spec
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,14 +92,24 @@ pub trait WorkerPort: Send + Sync {
 pub trait JobRepository: Send + Sync {
     fn insert(&self, job: JobSpec) -> Result<(), JobStoreError>;
     fn get(&self, id: &JobId) -> Result<Option<JobSpec>, JobStoreError>;
-    fn list(&self) -> Result<Vec<JobSpec>, JobStoreError>;
+    fn list_jobs_page(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Page<JobSpec>, QueryError>;
     fn delete(&self, id: &JobId) -> Result<bool, JobStoreError>;
     fn create_run(
         &self,
         job_id: &JobId,
         worker_id: &WorkerId,
         worker_capacity: usize,
-    ) -> Result<RunSpec, RunStoreError>;
+        idempotency_key: Option<&str>,
+    ) -> Result<RunAdmission, RunStoreError>;
+    fn get_idempotent_run(
+        &self,
+        key: &str,
+    ) -> Result<Option<(JobId, RunObservation)>, RunStoreError>;
+    fn delete_unaccepted_run(&self, id: &RunId) -> Result<(), RunStoreError>;
     fn get_run(&self, id: &RunId) -> Result<Option<RunObservation>, RunStoreError>;
     fn list_active_runs(
         &self,
@@ -82,6 +122,13 @@ pub trait JobRepository: Send + Sync {
         state: Option<RunState>,
         limit: usize,
     ) -> Result<Vec<RunObservation>, RunStoreError>;
+    fn list_runs_page(
+        &self,
+        job_id: Option<&JobId>,
+        state: Option<RunState>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Page<RunObservation>, QueryError>;
     fn record_observation(&self, observation: &RunObservation) -> Result<(), RunStoreError>;
 }
 
@@ -225,8 +272,37 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
             .prepare("SELECT id, spec_json, created_at_ms, deleted_at_ms FROM jobs LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
         connection
-            .prepare("SELECT run_id, job_id, worker_id, job_spec_json, observation_json, revision, state FROM runs LIMIT 0")
+            .prepare("SELECT run_id, job_id, worker_id, job_spec_json, observation_json, revision, state, idempotency_key, request_fingerprint, run_order FROM runs LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
+        return Ok(());
+    }
+
+    if version == 2 {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(MigrationError::Sqlite)?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE runs ADD COLUMN idempotency_key TEXT;
+                 ALTER TABLE runs ADD COLUMN request_fingerprint TEXT;
+                 ALTER TABLE runs ADD COLUMN run_order INTEGER NOT NULL DEFAULT 0;
+                 UPDATE runs SET run_order = rowid;
+                 CREATE UNIQUE INDEX runs_by_idempotency_key ON runs(idempotency_key) WHERE idempotency_key IS NOT NULL;",
+            )
+            .map_err(MigrationError::Sqlite)?;
+        transaction
+            .execute_batch(
+                "CREATE UNIQUE INDEX runs_by_run_order ON runs(run_order);
+                 CREATE INDEX runs_by_job_run_order ON runs(job_id, run_order DESC);
+                 CREATE INDEX runs_by_state_run_order ON runs(state, run_order DESC);
+                 CREATE INDEX runs_by_job_state_run_order ON runs(job_id, state, run_order DESC);
+                 UPDATE run_sequence SET value = MAX(value, (SELECT COALESCE(MAX(run_order), 0) FROM runs));",
+            )
+            .map_err(MigrationError::Sqlite)?;
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(MigrationError::Sqlite)?;
+        transaction.commit().map_err(MigrationError::Sqlite)?;
         return Ok(());
     }
 
@@ -289,10 +365,18 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
             job_spec_json TEXT NOT NULL,
             observation_json TEXT NOT NULL,
             revision INTEGER NOT NULL CHECK (revision > 0),
-            state TEXT NOT NULL
+            state TEXT NOT NULL,
+            idempotency_key TEXT,
+            request_fingerprint TEXT,
+            run_order INTEGER NOT NULL
         );
         CREATE INDEX runs_by_state_worker ON runs(state, worker_id);
         CREATE INDEX runs_by_job_created ON runs(job_id, run_id);
+        CREATE INDEX runs_by_run_order ON runs(run_order DESC);
+        CREATE INDEX runs_by_job_run_order ON runs(job_id, run_order DESC);
+        CREATE INDEX runs_by_state_run_order ON runs(state, run_order DESC);
+        CREATE INDEX runs_by_job_state_run_order ON runs(job_id, state, run_order DESC);
+        CREATE UNIQUE INDEX runs_by_idempotency_key ON runs(idempotency_key) WHERE idempotency_key IS NOT NULL;
         CREATE TABLE run_sequence (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL);
         INSERT INTO run_sequence (id, value) VALUES (1, 0);",
         )
@@ -306,6 +390,35 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
 fn table_columns(connection: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut statement = connection.prepare("PRAGMA table_info(jobs)")?;
     statement.query_map([], |row| row.get(1))?.collect()
+}
+
+fn encode_cursor(payload: &str) -> String {
+    let length = payload.len() / 3 * 4
+        + match payload.len() % 3 {
+            0 => 0,
+            remainder => remainder + 1,
+        };
+    let mut encoded = vec![0; length];
+    let Ok(written) =
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode_slice(payload, &mut encoded)
+    else {
+        return String::new();
+    };
+    encoded.truncate(written);
+    String::from_utf8(encoded).unwrap_or_default()
+}
+
+fn decode_cursor(cursor: &str) -> Result<String, QueryError> {
+    if cursor.is_empty() || cursor.len() > 512 {
+        return Err(QueryError::InvalidCursor);
+    }
+    let mut decoded = [0_u8; 384];
+    let length = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode_slice(cursor, &mut decoded)
+        .map_err(|_| QueryError::InvalidCursor)?;
+    std::str::from_utf8(&decoded[..length])
+        .map(str::to_owned)
+        .map_err(|_| QueryError::InvalidCursor)
 }
 
 impl JobRepository for SqliteJobRepository {
@@ -338,10 +451,7 @@ impl JobRepository for SqliteJobRepository {
                 |row| row.get(0),
             )
             .map_err(|_| JobStoreError::StorageUnavailable)?;
-        let reserved_count: i64 = transaction
-            .query_row("SELECT COUNT(*) FROM jobs", [], |row| row.get(0))
-            .map_err(|_| JobStoreError::StorageUnavailable)?;
-        if active_count >= MAX_JOBS as i64 || reserved_count >= MAX_RESERVED_JOB_IDS as i64 {
+        if active_count >= MAX_JOBS as i64 {
             return Err(JobStoreError::LimitExceeded);
         }
         transaction
@@ -375,24 +485,148 @@ impl JobRepository for SqliteJobRepository {
             .transpose()
     }
 
-    fn list(&self) -> Result<Vec<JobSpec>, JobStoreError> {
+    fn list_runs_page(
+        &self,
+        job_id: Option<&JobId>,
+        state_filter: Option<RunState>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Page<RunObservation>, QueryError> {
+        if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+            return Err(QueryError::InvalidCursor);
+        }
+        let filter_job = job_id.map(JobId::as_str).unwrap_or("-");
+        let filter_state = state_filter.map(RunState::as_str).unwrap_or("-");
+        let before_rowid = match cursor {
+            Some(cursor) => {
+                let payload = decode_cursor(cursor)?;
+                let mut parts = payload.split('|');
+                if parts.next() != Some("r")
+                    || parts.next() != Some(filter_job)
+                    || parts.next() != Some(filter_state)
+                {
+                    return Err(QueryError::InvalidCursor);
+                }
+                let run_order = parts
+                    .next()
+                    .ok_or(QueryError::InvalidCursor)?
+                    .parse::<i64>()
+                    .map_err(|_| QueryError::InvalidCursor)?;
+                if parts.next().is_some() || run_order <= 0 {
+                    return Err(QueryError::InvalidCursor);
+                }
+                Some(run_order)
+            }
+            None => None,
+        };
         let connection = self
             .connection
             .lock()
-            .map_err(|_| JobStoreError::StorageUnavailable)?;
+            .map_err(|_| QueryError::StorageUnavailable)?;
+        let mut query = String::from("SELECT run_order, observation_json FROM runs WHERE 1 = 1");
+        let mut values = Vec::with_capacity(4);
+        if let Some(job_id) = job_id {
+            query.push_str(" AND job_id = ?");
+            values.push(rusqlite::types::Value::Text(job_id.as_str().to_owned()));
+        }
+        if let Some(state_filter) = state_filter {
+            query.push_str(" AND state = ?");
+            values.push(rusqlite::types::Value::Text(
+                state_filter.as_str().to_owned(),
+            ));
+        }
+        if let Some(before_order) = before_rowid {
+            query.push_str(" AND run_order < ?");
+            values.push(rusqlite::types::Value::Integer(before_order));
+        }
+        query.push_str(" ORDER BY run_order DESC LIMIT ?");
+        values.push(rusqlite::types::Value::Integer((limit + 1) as i64));
         let mut statement = connection
-            .prepare(
-                "SELECT spec_json FROM jobs WHERE deleted_at_ms IS NULL ORDER BY id COLLATE BINARY",
-            )
-            .map_err(|_| JobStoreError::StorageUnavailable)?;
+            .prepare(&query)
+            .map_err(|_| QueryError::StorageUnavailable)?;
         let rows = statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|_| JobStoreError::StorageUnavailable)?;
-        rows.map(|row| {
-            let serialized = row.map_err(|_| JobStoreError::StorageUnavailable)?;
-            serde_json::from_str(&serialized).map_err(|_| JobStoreError::StorageUnavailable)
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| QueryError::StorageUnavailable)?;
+        let rows = rows
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| QueryError::StorageUnavailable)?;
+        let has_more = rows.len() > limit;
+        let page_rows = &rows[..rows.len().min(limit)];
+        let items = page_rows
+            .iter()
+            .map(|(_, json)| serde_json::from_str(json).map_err(|_| QueryError::StorageUnavailable))
+            .collect::<Result<Vec<RunObservation>, _>>()?;
+        let next_cursor = if has_more {
+            page_rows
+                .last()
+                .map(|(rowid, _)| encode_cursor(&format!("r|{filter_job}|{filter_state}|{rowid}")))
+        } else {
+            None
+        };
+        Ok(Page { items, next_cursor })
+    }
+
+    fn list_jobs_page(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Page<JobSpec>, QueryError> {
+        if !(1..=MAX_PAGE_SIZE).contains(&limit) {
+            return Err(QueryError::InvalidCursor);
+        }
+        let after_id = match cursor {
+            Some(cursor) => {
+                let payload = decode_cursor(cursor)?;
+                let Some(id) = payload.strip_prefix("j|") else {
+                    return Err(QueryError::InvalidCursor);
+                };
+                JobId::new(id.to_owned()).map_err(|_| QueryError::InvalidCursor)?;
+                Some(id.to_owned())
+            }
+            None => None,
+        };
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| QueryError::StorageUnavailable)?;
+        let query = if after_id.is_some() {
+            "SELECT id, spec_json FROM jobs WHERE deleted_at_ms IS NULL AND id > ?1 ORDER BY id COLLATE BINARY ASC LIMIT ?2"
+        } else {
+            "SELECT id, spec_json FROM jobs WHERE deleted_at_ms IS NULL ORDER BY id COLLATE BINARY ASC LIMIT ?1"
+        };
+        let mut values = Vec::with_capacity(2);
+        if let Some(after_id) = after_id {
+            values.push(rusqlite::types::Value::Text(after_id));
+        }
+        values.push(rusqlite::types::Value::Integer((limit + 1) as i64));
+        let mut statement = connection
+            .prepare(query)
+            .map_err(|_| QueryError::StorageUnavailable)?;
+        let rows = statement
+            .query_map(rusqlite::params_from_iter(values), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| QueryError::StorageUnavailable)?;
+        let mut jobs = rows
+            .map(|row| {
+                let (_, json) = row.map_err(|_| QueryError::StorageUnavailable)?;
+                serde_json::from_str(&json).map_err(|_| QueryError::StorageUnavailable)
+            })
+            .collect::<Result<Vec<JobSpec>, _>>()?;
+        let has_more = jobs.len() > limit;
+        jobs.truncate(limit);
+        let next_cursor = if has_more {
+            jobs.last()
+                .map(|job| encode_cursor(&format!("j|{}", job.id())))
+        } else {
+            None
+        };
+        Ok(Page {
+            items: jobs,
+            next_cursor,
         })
-        .collect()
     }
 
     fn delete(&self, id: &JobId) -> Result<bool, JobStoreError> {
@@ -431,7 +665,8 @@ impl JobRepository for SqliteJobRepository {
         job_id: &JobId,
         worker_id: &WorkerId,
         worker_capacity: usize,
-    ) -> Result<RunSpec, RunStoreError> {
+        idempotency_key: Option<&str>,
+    ) -> Result<RunAdmission, RunStoreError> {
         let mut connection = self
             .connection
             .lock()
@@ -439,6 +674,31 @@ impl JobRepository for SqliteJobRepository {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| RunStoreError::StorageUnavailable)?;
+        if let Some(key) = idempotency_key {
+            let existing: Option<(String, String, String, String)> = transaction
+                .query_row(
+                    "SELECT job_id, job_spec_json, observation_json, request_fingerprint FROM runs WHERE idempotency_key = ?1",
+                    [key],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(|_| RunStoreError::StorageUnavailable)?;
+            if let Some((existing_job, spec_json, observation_json, fingerprint)) = existing {
+                let spec: RunSpec = serde_json::from_str(&spec_json)
+                    .map_err(|_| RunStoreError::StorageUnavailable)?;
+                let expected_fingerprint = serde_json::to_string(spec.job())
+                    .map_err(|_| RunStoreError::StorageUnavailable)?;
+                if existing_job != job_id.as_str() || fingerprint != expected_fingerprint {
+                    return Err(RunStoreError::IdempotencyConflict);
+                }
+                let observation: RunObservation = serde_json::from_str(&observation_json)
+                    .map_err(|_| RunStoreError::StorageUnavailable)?;
+                return Ok(RunAdmission {
+                    spec,
+                    replay: Some(observation),
+                });
+            }
+        }
         let job_json = transaction
             .query_row(
                 "SELECT spec_json FROM jobs WHERE id = ?1 AND deleted_at_ms IS NULL",
@@ -483,16 +743,58 @@ impl JobRepository for SqliteJobRepository {
         );
         let spec_json =
             serde_json::to_string(&spec).map_err(|_| RunStoreError::StorageUnavailable)?;
+        let fingerprint =
+            serde_json::to_string(spec.job()).map_err(|_| RunStoreError::StorageUnavailable)?;
         let observation_json =
             serde_json::to_string(&observation).map_err(|_| RunStoreError::StorageUnavailable)?;
         transaction.execute(
-            "INSERT INTO runs (run_id, job_id, worker_id, job_spec_json, observation_json, revision, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![spec.id().as_str(), job_id.as_str(), worker_id.as_str(), spec_json, observation_json, observation.revision() as i64, observation.state().as_str()],
+            "INSERT INTO runs (run_id, job_id, worker_id, job_spec_json, observation_json, revision, state, idempotency_key, request_fingerprint, run_order) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![spec.id().as_str(), job_id.as_str(), worker_id.as_str(), spec_json, observation_json, observation.revision() as i64, observation.state().as_str(), idempotency_key, idempotency_key.map(|_| fingerprint.as_str()), sequence],
         ).map_err(|_| RunStoreError::StorageUnavailable)?;
         transaction
             .commit()
             .map_err(|_| RunStoreError::StorageUnavailable)?;
-        Ok(spec)
+        Ok(RunAdmission { spec, replay: None })
+    }
+
+    fn get_idempotent_run(
+        &self,
+        key: &str,
+    ) -> Result<Option<(JobId, RunObservation)>, RunStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let existing = connection
+            .query_row(
+                "SELECT job_id, observation_json FROM runs WHERE idempotency_key = ?1",
+                [key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        existing
+            .map(|(job_id, observation)| {
+                let job_id = JobId::new(job_id).map_err(|_| RunStoreError::StorageUnavailable)?;
+                let observation = serde_json::from_str(&observation)
+                    .map_err(|_| RunStoreError::StorageUnavailable)?;
+                Ok((job_id, observation))
+            })
+            .transpose()
+    }
+
+    fn delete_unaccepted_run(&self, id: &RunId) -> Result<(), RunStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        connection
+            .execute(
+                "DELETE FROM runs WHERE run_id = ?1 AND state = 'requested'",
+                [id.as_str()],
+            )
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        Ok(())
     }
 
     fn get_run(&self, id: &RunId) -> Result<Option<RunObservation>, RunStoreError> {
@@ -598,6 +900,7 @@ pub enum ManagerError {
     JobNotFound,
     JobConflict,
     CapacityReached,
+    IdempotencyConflict,
     RunNotFound,
     WorkerUnavailable,
     WorkerDraining,
@@ -636,8 +939,12 @@ impl JobService {
         self.repository.get(id).map_err(map_store_error)
     }
 
-    pub fn list(&self) -> Result<Vec<JobSpec>, ManagerError> {
-        self.repository.list().map_err(map_store_error)
+    pub fn list_page(
+        &self,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Page<JobSpec>, QueryError> {
+        self.repository.list_jobs_page(limit, cursor)
     }
 
     pub fn delete(&self, id: &JobId) -> Result<bool, ManagerError> {
@@ -651,6 +958,25 @@ impl JobService {
         worker_capacity: usize,
         worker: &dyn WorkerPort,
     ) -> Result<RunObservation, ManagerError> {
+        self.start_run_with_key(job_id, worker_id, worker_capacity, None, worker)
+    }
+
+    pub fn start_run_with_key(
+        &self,
+        job_id: &JobId,
+        worker_id: &WorkerId,
+        worker_capacity: usize,
+        idempotency_key: Option<&str>,
+        worker: &dyn WorkerPort,
+    ) -> Result<RunObservation, ManagerError> {
+        if let Some(key) = idempotency_key
+            && let Some(observation) = self.replay_run(job_id, key, worker)?
+        {
+            return Ok(observation);
+        }
+        if !worker.descriptor().supports_process_execution() {
+            return Err(ManagerError::WorkerUnavailable);
+        }
         if worker.is_draining() {
             return Err(ManagerError::WorkerDraining);
         }
@@ -670,16 +996,26 @@ impl JobService {
         }
         let spec = self
             .repository
-            .create_run(job_id, worker_id, worker_capacity)
+            .create_run(job_id, worker_id, worker_capacity, idempotency_key)
             .map_err(map_run_error)?;
+        if let Some(replay) = spec.replay {
+            return self
+                .get_run(replay.run_id(), worker)?
+                .ok_or(ManagerError::StorageUnavailable);
+        }
+        let spec = spec.spec;
         let observation = match worker.start(StartRun::new(spec.clone())) {
             Ok(observation) => observation,
             Err(WorkerPortError::CapacityReached) => {
-                self.mark_dispatch_failure(&spec, RunFailureReason::CapacityRejected, true)?;
+                self.repository
+                    .delete_unaccepted_run(spec.id())
+                    .map_err(|_| ManagerError::StorageUnavailable)?;
                 return Err(ManagerError::CapacityReached);
             }
             Err(WorkerPortError::ShuttingDown) => {
-                self.mark_dispatch_failure(&spec, RunFailureReason::BackendFailure, true)?;
+                self.repository
+                    .delete_unaccepted_run(spec.id())
+                    .map_err(|_| ManagerError::StorageUnavailable)?;
                 return Err(ManagerError::WorkerDraining);
             }
             Err(
@@ -703,6 +1039,25 @@ impl JobService {
             .record_observation(&observation)
             .map_err(|_| ManagerError::StorageUnavailable)?;
         Ok(observation)
+    }
+
+    pub fn replay_run(
+        &self,
+        job_id: &JobId,
+        idempotency_key: &str,
+        worker: &dyn WorkerPort,
+    ) -> Result<Option<RunObservation>, ManagerError> {
+        let Some((existing_job, observation)) = self
+            .repository
+            .get_idempotent_run(idempotency_key)
+            .map_err(|_| ManagerError::StorageUnavailable)?
+        else {
+            return Ok(None);
+        };
+        if existing_job != *job_id {
+            return Err(ManagerError::IdempotencyConflict);
+        }
+        self.get_run(observation.run_id(), worker)
     }
 
     pub fn get_run(
@@ -860,6 +1215,16 @@ impl JobService {
             .list_runs(job_id, state, limit.min(MAX_RUNS_RESPONSE))
             .map_err(|_| ManagerError::StorageUnavailable)
     }
+
+    pub fn list_runs_page(
+        &self,
+        job_id: Option<&JobId>,
+        state: Option<RunState>,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Page<RunObservation>, QueryError> {
+        self.repository.list_runs_page(job_id, state, limit, cursor)
+    }
 }
 
 fn map_store_error(error: JobStoreError) -> ManagerError {
@@ -876,6 +1241,7 @@ fn map_run_error(error: RunStoreError) -> ManagerError {
         RunStoreError::JobNotFound => ManagerError::JobNotFound,
         RunStoreError::JobConflict => ManagerError::JobConflict,
         RunStoreError::CapacityReached => ManagerError::CapacityReached,
+        RunStoreError::IdempotencyConflict => ManagerError::IdempotencyConflict,
         RunStoreError::StorageUnavailable => ManagerError::StorageUnavailable,
     }
 }
