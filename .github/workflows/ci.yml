@@ -38,6 +38,14 @@ jobs:
         run: cargo +1.99.1 test --release --workspace --locked --all-targets --all-features
       - name: Build release
         run: cargo +1.99.1 build --workspace --locked --release
+      - name: Prepare delegated cgroup v2 subtree
+        run: |
+          sudo sh -c 'printf "+cpu +memory +pids" > /sys/fs/cgroup/cgroup.subtree_control'
+          sudo mkdir /sys/fs/cgroup/conductor-ci
+          sudo chown "$(id -un):$(id -gn)" /sys/fs/cgroup/conductor-ci
+          printf 'CONDUCTOR_CGROUP_ROOT=/sys/fs/cgroup/conductor-ci\n' >> "$GITHUB_ENV"
+      - name: Test real cgroup v2 enforcement and recovery
+        run: python3 scripts/test-cgroup-v2.py --binary target/release/conductor --delegated-root "$CONDUCTOR_CGROUP_ROOT"
       - name: Qualify Linux run capacity
         run: python3 scripts/qualify-linux-capacity.py --binary target/release/conductor --runs 64
       - name: Run release lifecycle demo

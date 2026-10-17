@@ -44,13 +44,19 @@ pub const MAX_LOG_RETENTION_RUNS: usize = 10_000;
 /// Worker execution seam implemented by the host-specific process crate.
 pub trait ExecutionBackend: Send + Sync {
     /// Spawn one job in a dedicated process group with stdin closed and output piped.
-    fn spawn(&self, job: &JobSpec) -> io::Result<Child>;
+    fn spawn(&self, run_id: &str, job: &JobSpec) -> io::Result<Child>;
 
     /// Request graceful termination of every process in the execution group.
     fn terminate_process_group(&self, group_id: u32) -> io::Result<()>;
 
     /// Force-kill every process still in the execution's process group.
     fn kill_process_group(&self, group_id: u32) -> io::Result<()>;
+
+    /// Finish backend-owned resources after the process subtree has been killed.
+    /// Implementations must bound this operation because it runs on the reader reaper.
+    fn cleanup_execution(&self, _group_id: u32) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +102,7 @@ struct ReaderReapRequest {
     readers: Vec<JoinHandle<io::Result<()>>>,
     completion: Option<oneshot::Sender<io::Result<()>>>,
     cleanup_permit: OwnedSemaphorePermit,
+    cleanup: Option<Box<dyn FnMut() -> io::Result<()> + Send>>,
 }
 
 #[derive(Clone)]
@@ -163,6 +170,7 @@ impl ReaderReaper {
         child: Option<Child>,
         readers: Vec<JoinHandle<io::Result<()>>>,
         cleanup_permit: OwnedSemaphorePermit,
+        cleanup: Option<Box<dyn FnMut() -> io::Result<()> + Send>>,
     ) -> io::Result<oneshot::Receiver<io::Result<()>>> {
         let (completion, receiver) = oneshot::channel();
         if readers.is_empty() && child.is_none() {
@@ -175,6 +183,7 @@ impl ReaderReaper {
             readers,
             completion: Some(completion),
             cleanup_permit,
+            cleanup,
         }) {
             Ok(()) => {}
             Err(TrySendError::Full(request)) => {
@@ -195,6 +204,7 @@ impl ReaderReaper {
         child: Option<Child>,
         readers: Vec<JoinHandle<io::Result<()>>>,
         cleanup_permit: OwnedSemaphorePermit,
+        cleanup: Option<Box<dyn FnMut() -> io::Result<()> + Send>>,
     ) {
         if readers.is_empty() && child.is_none() {
             return;
@@ -205,6 +215,7 @@ impl ReaderReaper {
             readers,
             completion: None,
             cleanup_permit,
+            cleanup,
         };
         match self.sender.try_send(request) {
             Ok(()) => {}
@@ -254,11 +265,29 @@ fn finish_reap_request(request: ReaderReapRequest, pending: &AtomicUsize) {
         readers,
         completion,
         cleanup_permit: _cleanup_permit,
+        cleanup,
     } = request;
     let result = reap_child_and_readers(child, readers);
+    if let Some(mut cleanup) = cleanup {
+        let mut next_diagnostic = std::time::Instant::now();
+        loop {
+            match cleanup() {
+                Ok(()) => break,
+                Err(error) => {
+                    if std::time::Instant::now() >= next_diagnostic {
+                        emit_worker_diagnostic("execution_cleanup_retry", "", &error);
+                        next_diagnostic = std::time::Instant::now() + Duration::from_secs(5);
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        }
+    }
     pending.fetch_sub(1, Ordering::SeqCst);
     if let Some(completion) = completion {
         let _ = completion.send(result);
+    } else if let Err(error) = result {
+        emit_worker_diagnostic("execution_cleanup_failed", "", &error);
     }
 }
 
@@ -334,6 +363,12 @@ struct SpawnGuard {
 }
 
 impl SpawnGuard {
+    fn cleanup_callback(&self) -> Box<dyn FnMut() -> io::Result<()> + Send> {
+        let backend = Arc::clone(&self.backend);
+        let group_id = self.group_id;
+        Box::new(move || backend.cleanup_execution(group_id))
+    }
+
     fn cleanup(&mut self) -> io::Result<()> {
         if self.cleaned {
             return Ok(());
@@ -369,6 +404,7 @@ impl SpawnGuard {
             self.child.take(),
             std::mem::take(&mut self.readers),
             cleanup_permit,
+            Some(self.cleanup_callback()),
         )
     }
 }
@@ -414,6 +450,7 @@ impl Drop for SpawnGuard {
                 self.child.take(),
                 std::mem::take(&mut self.readers),
                 cleanup_permit,
+                Some(self.cleanup_callback()),
             );
         }
     }
@@ -862,9 +899,10 @@ impl WorkerService {
             }
         };
 
-        let child = match self.backend.spawn(spec.job()) {
+        let child = match self.backend.spawn(spec.id().as_str(), spec.job()) {
             Ok(child) => child,
-            Err(_) => {
+            Err(error) => {
+                emit_worker_diagnostic("execution_launch_failed", spec.id().as_str(), &error);
                 self.mark_log_closed(spec.id().as_str(), LogStream::Stdout);
                 self.mark_log_closed(spec.id().as_str(), LogStream::Stderr);
                 return self.finish_spawn_failure(starting);

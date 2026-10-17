@@ -679,6 +679,9 @@ pub enum JobValidationError {
     InvalidEnvironmentValue,
     InvalidTimeout,
     InvalidTerminationGrace,
+    InvalidCpuLimit,
+    InvalidMemoryLimit,
+    InvalidProcessLimit,
 }
 
 impl fmt::Display for JobValidationError {
@@ -692,6 +695,13 @@ impl fmt::Display for JobValidationError {
             Self::InvalidEnvironmentValue => "environment values must not contain NUL bytes",
             Self::InvalidTimeout => "timeoutMs must be between 1 and 604800000",
             Self::InvalidTerminationGrace => "terminationGraceMs must be between 0 and 300000",
+            Self::InvalidCpuLimit => {
+                "CPU quota and period must be supplied together and within supported bounds"
+            }
+            Self::InvalidMemoryLimit => {
+                "memory limits must be at least 4 MiB and within supported bounds"
+            }
+            Self::InvalidProcessLimit => "pidsMax must be between 1 and 1048576",
         })
     }
 }
@@ -709,6 +719,8 @@ pub struct JobSpec {
     inherit_env: bool,
     timeout_ms: Option<u64>,
     termination_grace_ms: u64,
+    #[serde(default, skip_serializing_if = "ResourceLimits::is_empty")]
+    resource_limits: ResourceLimits,
 }
 
 #[derive(Deserialize)]
@@ -725,6 +737,82 @@ struct RawJobSpec {
     timeout_ms: Option<u64>,
     #[serde(default = "default_termination_grace_ms")]
     termination_grace_ms: u64,
+    #[serde(default)]
+    resource_limits: ResourceLimits,
+}
+
+/// Optional Linux cgroup v2 resource limits requested by an immutable job.
+/// These values never grant privileges and are always constrained by the
+/// administrator's configured worker policy.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cpu_quota_us: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cpu_period_us: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory_max_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory_swap_max_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pids_max: Option<u32>,
+}
+
+impl ResourceLimits {
+    pub fn new(
+        cpu_quota_us: Option<u64>,
+        cpu_period_us: Option<u64>,
+        memory_max_bytes: Option<u64>,
+        memory_swap_max_bytes: Option<u64>,
+        pids_max: Option<u32>,
+    ) -> Result<Self, JobValidationError> {
+        if cpu_quota_us.is_some() != cpu_period_us.is_some()
+            || cpu_quota_us.is_some_and(|quota| !(1_000..=1_000_000_000).contains(&quota))
+            || cpu_period_us.is_some_and(|period| !(1_000..=1_000_000).contains(&period))
+        {
+            return Err(JobValidationError::InvalidCpuLimit);
+        }
+        if memory_max_bytes.is_some_and(|bytes| !(4 * 1024 * 1024..=u64::MAX - 1).contains(&bytes))
+            || memory_swap_max_bytes.is_some_and(|bytes| bytes == u64::MAX)
+        {
+            return Err(JobValidationError::InvalidMemoryLimit);
+        }
+        if pids_max.is_some_and(|pids| !(1..=1_048_576).contains(&pids)) {
+            return Err(JobValidationError::InvalidProcessLimit);
+        }
+        Ok(Self {
+            cpu_quota_us,
+            cpu_period_us,
+            memory_max_bytes,
+            memory_swap_max_bytes,
+            pids_max,
+        })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.cpu_quota_us.is_none()
+            && self.cpu_period_us.is_none()
+            && self.memory_max_bytes.is_none()
+            && self.memory_swap_max_bytes.is_none()
+            && self.pids_max.is_none()
+    }
+
+    pub fn cpu_quota_us(&self) -> Option<u64> {
+        self.cpu_quota_us
+    }
+    pub fn cpu_period_us(&self) -> Option<u64> {
+        self.cpu_period_us
+    }
+    pub fn memory_max_bytes(&self) -> Option<u64> {
+        self.memory_max_bytes
+    }
+    pub fn memory_swap_max_bytes(&self) -> Option<u64> {
+        self.memory_swap_max_bytes
+    }
+    pub fn pids_max(&self) -> Option<u32> {
+        self.pids_max
+    }
 }
 
 impl JobSpec {
@@ -774,7 +862,22 @@ impl JobSpec {
             inherit_env,
             timeout_ms,
             termination_grace_ms,
+            resource_limits: ResourceLimits::default(),
         })
+    }
+
+    pub fn with_resource_limits(
+        mut self,
+        resource_limits: ResourceLimits,
+    ) -> Result<Self, JobValidationError> {
+        self.resource_limits = ResourceLimits::new(
+            resource_limits.cpu_quota_us,
+            resource_limits.cpu_period_us,
+            resource_limits.memory_max_bytes,
+            resource_limits.memory_swap_max_bytes,
+            resource_limits.pids_max,
+        )?;
+        Ok(self)
     }
 
     pub fn id(&self) -> &JobId {
@@ -798,6 +901,9 @@ impl JobSpec {
     pub fn termination_grace_ms(&self) -> u64 {
         self.termination_grace_ms
     }
+    pub fn resource_limits(&self) -> &ResourceLimits {
+        &self.resource_limits
+    }
 }
 
 impl TryFrom<RawJobSpec> for JobSpec {
@@ -812,7 +918,8 @@ impl TryFrom<RawJobSpec> for JobSpec {
             raw.inherit_env,
             raw.timeout_ms,
             raw.termination_grace_ms,
-        )
+        )?
+        .with_resource_limits(raw.resource_limits)
     }
 }
 

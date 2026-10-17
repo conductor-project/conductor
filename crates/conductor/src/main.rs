@@ -36,6 +36,16 @@ enum Commands {
         #[arg(long, value_enum)]
         role: Option<Role>,
     },
+    /// Internal launcher used only to enter a configured cgroup before exec.
+    #[command(hide = true)]
+    InternalLaunch {
+        #[arg(long)]
+        cgroup_path: PathBuf,
+        #[arg(long)]
+        ready_socket: PathBuf,
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -53,6 +63,19 @@ struct Config {
     log_retention_runs: usize,
     #[serde(default = "default_request_timeout_ms")]
     request_timeout_ms: u64,
+    #[serde(default)]
+    cgroup_v2: CgroupV2Config,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CgroupV2Config {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    delegated_root: Option<PathBuf>,
+    #[serde(default)]
+    maximums: conductor_core::ResourceLimits,
 }
 
 fn default_log_max_bytes_per_stream() -> u64 {
@@ -87,7 +110,7 @@ impl Role {
 
 fn main() -> ExitCode {
     match run() {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(error) => {
             eprintln!(
                 "{{\"timestampMs\":{},\"severity\":\"error\",\"component\":\"agent\",\"event\":\"startup_failed\",\"message\":{}}}",
@@ -100,7 +123,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run() -> Result<(), Box<dyn std::error::Error>> {
+fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error)
@@ -110,14 +133,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             ) =>
         {
             print!("{error}");
-            return Ok(());
+            return Ok(ExitCode::SUCCESS);
         }
         Err(error) => return Err(error.into()),
     };
-    let Commands::Agent {
-        config: config_path,
-        role: role_override,
-    } = cli.command;
+    let (config_path, role_override) = match cli.command {
+        Commands::Agent { config, role } => (config, role),
+        Commands::InternalLaunch {
+            cgroup_path,
+            ready_socket,
+            command,
+        } => {
+            return Ok(ExitCode::from(conductor_process::internal_launch(
+                &cgroup_path,
+                &ready_socket,
+                &command,
+            ) as u8));
+        }
+    };
     let config_text = fs::read_to_string(config_path)?;
     let mut config: Config = serde_json::from_str(&config_text)?;
     if let Some(role) = role_override {
@@ -144,12 +177,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             max_bytes_per_stream: config.log_max_bytes_per_stream,
             retention_runs: config.log_retention_runs,
         },
-        Arc::new(conductor_process::HostProcessBackend),
+        process_backend(&config)?,
     )?);
     let worker_port: Arc<dyn WorkerPort> = Arc::new(LocalWorkerPort(Arc::clone(&worker)));
     let listener = TcpListener::bind(config.listen)?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
+    let cgroup_v2_enabled = config.cgroup_v2.enabled;
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal_shutdown = Arc::clone(&shutdown);
     let signal_worker = Arc::clone(&worker);
@@ -158,9 +192,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         signal_shutdown.store(true, Ordering::SeqCst);
     })?;
     eprintln!(
-        "{{\"timestampMs\":{},\"severity\":\"info\",\"component\":\"agent\",\"event\":\"agent_started\",\"role\":\"all\",\"address\":{}}}",
+        "{{\"timestampMs\":{},\"severity\":\"info\",\"component\":\"agent\",\"event\":\"agent_started\",\"role\":\"all\",\"address\":{},\"cgroupV2Enabled\":{}}}",
         timestamp_ms(),
-        serde_json::to_string(&address.to_string())?
+        serde_json::to_string(&address.to_string())?,
+        cgroup_v2_enabled
     );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -179,7 +214,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_result = worker.shutdown();
     serve_result?;
     shutdown_result?;
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+fn process_backend(
+    config: &Config,
+) -> Result<Arc<dyn conductor_worker::ExecutionBackend>, Box<dyn std::error::Error>> {
+    if config.cgroup_v2.enabled {
+        let root = config
+            .cgroup_v2
+            .delegated_root
+            .as_deref()
+            .ok_or("cgroup_v2.delegated_root is required when cgroup_v2.enabled is true")?;
+        let backend = conductor_process::HostProcessBackend::with_cgroup_v2(
+            root,
+            &config.worker_id,
+            config.cgroup_v2.maximums.clone(),
+            std::env::current_exe()?,
+        )?;
+        Ok(Arc::new(backend))
+    } else {
+        Ok(Arc::new(conductor_process::HostProcessBackend::default()))
+    }
 }
 
 fn timestamp_ms() -> u128 {
@@ -272,6 +328,22 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     if !(100..=120_000).contains(&config.request_timeout_ms) {
         return Err("request_timeout_ms must be between 100 and 120000".into());
     }
+    if config.cgroup_v2.enabled != config.cgroup_v2.delegated_root.is_some() {
+        return Err(
+            "cgroup_v2 requires enabled=true with delegated_root, or enabled=false without delegated_root".into(),
+        );
+    }
+    let maximums = &config.cgroup_v2.maximums;
+    conductor_core::ResourceLimits::new(
+        maximums.cpu_quota_us(),
+        maximums.cpu_period_us(),
+        maximums.memory_max_bytes(),
+        maximums.memory_swap_max_bytes(),
+        maximums.pids_max(),
+    )?;
+    if !config.cgroup_v2.enabled && !maximums.is_empty() {
+        return Err("cgroup_v2.maximums requires cgroup_v2.enabled=true".into());
+    }
     if config.manager_data_dir.as_os_str().is_empty()
         || config.worker_data_dir.as_os_str().is_empty()
     {
@@ -286,7 +358,7 @@ mod tests {
     use std::panic::catch_unwind;
     use std::path::PathBuf;
 
-    use super::{Config, Role, default_request_timeout_ms, validate};
+    use super::{CgroupV2Config, Config, Role, default_request_timeout_ms, validate};
 
     fn config(listen: &str) -> Config {
         Config {
@@ -299,6 +371,7 @@ mod tests {
             log_max_bytes_per_stream: conductor_worker::DEFAULT_LOG_MAX_BYTES_PER_STREAM,
             log_retention_runs: conductor_worker::DEFAULT_LOG_RETENTION_RUNS,
             request_timeout_ms: default_request_timeout_ms(),
+            cgroup_v2: CgroupV2Config::default(),
         }
     }
 

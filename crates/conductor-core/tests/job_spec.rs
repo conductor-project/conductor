@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use conductor_core::{JobId, JobSpec, RunFailureReason, RunId, RunSpec, RunState, WorkerId};
+use conductor_core::{
+    JobId, JobSpec, ResourceLimits, RunFailureReason, RunId, RunSpec, RunState, WorkerId,
+};
 
 #[test]
 fn identifiers_enforce_stable_ascii_constraints() {
@@ -110,6 +112,34 @@ fn constructor_accepts_explicit_environment_and_timeout() {
     .expect("valid spec");
     assert!(job.inherit_env());
     assert_eq!(job.timeout_ms(), Some(30_000));
+}
+
+#[test]
+fn job_resource_limits_validate_and_round_trip_without_changing_legacy_json() {
+    let valid = r#"{"id":"limited","command":["/usr/bin/true"],"cwd":"/tmp","resourceLimits":{"cpuQuotaUs":50000,"cpuPeriodUs":100000,"memoryMaxBytes":67108864,"memorySwapMaxBytes":0,"pidsMax":32}}"#;
+    let job: JobSpec = serde_json::from_str(valid).expect("valid resource limits");
+    assert_eq!(job.resource_limits().cpu_quota_us(), Some(50_000));
+    assert_eq!(job.resource_limits().cpu_period_us(), Some(100_000));
+    assert_eq!(job.resource_limits().memory_max_bytes(), Some(67_108_864));
+    assert_eq!(job.resource_limits().memory_swap_max_bytes(), Some(0));
+    assert_eq!(job.resource_limits().pids_max(), Some(32));
+    let decoded: JobSpec = serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
+    assert_eq!(decoded, job);
+
+    for limits in [
+        r#"{"cpuQuotaUs":1000}"#,
+        r#"{"cpuQuotaUs":0,"cpuPeriodUs":100000}"#,
+        r#"{"cpuQuotaUs":1000,"cpuPeriodUs":999}"#,
+        r#"{"memoryMaxBytes":1024}"#,
+        r#"{"pidsMax":0}"#,
+        r#"{"unknown":1}"#,
+    ] {
+        let input = format!(
+            r#"{{"id":"limited","command":["/usr/bin/true"],"cwd":"/tmp","resourceLimits":{limits}}}"#
+        );
+        assert!(serde_json::from_str::<JobSpec>(&input).is_err(), "{input}");
+    }
+    assert!(ResourceLimits::new(Some(1_000), Some(100_000), None, None, Some(1)).is_ok());
 }
 
 #[test]

@@ -12,6 +12,8 @@ Restart=no
 KillSignal=SIGTERM
 TimeoutStopSec=15s
 KillMode=control-group
+# Required when cgroup_v2.enabled is true in agent.json.
+Delegate=cpu memory pids
 UMask=0077
 
 [Install]
