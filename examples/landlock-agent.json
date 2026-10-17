@@ -9,7 +9,7 @@
     "mode": "required",
     "protectedPaths": ["/opt/conductor/credentials"],
     "grants": [
-      {"id": "printf", "path": "/usr/bin/printf", "execute": true},
+      {"id": "printf", "path": "/usr/bin/printf", "read": true, "execute": true},
       {"id": "libc", "path": "/lib/x86_64-linux-gnu/libc.so.6", "read": true},
       {"id": "loader", "path": "/lib64/ld-linux-x86-64.so.2", "read": true, "execute": true}
     ]

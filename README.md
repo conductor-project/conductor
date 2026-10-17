@@ -158,7 +158,7 @@ Keep the workload UID from writing cgroup control files or migrating itself outs
 
 Administrators configure named `grants`, each bound to one absolute file or directory path and any combination of `read`, `write`, and `execute`. A job's immutable `filesystemPolicy.grants` list can select only those identifiers; it cannot submit paths or add rights. Directory grants apply recursively. `read` permits file reads and directory listing. `write` permits file writes and truncation, directory/file creation, removal, symlink creation, and the Landlock `refer` operation used for links and renames. Cross-directory rename is controlled by `refer` and must be allowed by the applicable grants on both sides. `execute` permits executing files under the grant. Ordinary Unix permissions still apply, so Landlock never elevates access.
 
-Use narrow grants for the job executable, its dynamic loader and shared libraries, input files/directories, and output directories. Conductor does not infer or automatically grant these paths. The daemon opens administrator paths into pinned descriptors, resolves symlink aliases at configuration time, and builds Landlock rules from those descriptors in its fresh launcher. Grants that overlap manager/worker state, the source configuration, cgroup controls, configured `protectedPaths`, or known credential locations are rejected. Overlapping grants cannot give a nested path more rights than its ancestor; a broader allow rule is never treated as if a nested rule denied access. Keep credential paths in `protectedPaths` when they are stored outside the built-in protected locations.
+Use narrow grants for the job executable, its dynamic loader and shared libraries, input files/directories, and output directories. Executable files need both `read` and `execute` so the kernel can load their contents; dynamic loaders also need both. Conductor does not infer or automatically grant these paths. The daemon opens administrator paths into pinned descriptors, resolves symlink aliases at configuration time, and builds Landlock rules from those descriptors in its fresh launcher. Grants that overlap manager/worker state, the source configuration, cgroup controls, configured `protectedPaths`, or known credential locations are rejected. Overlapping grants cannot give a nested path more rights than its ancestor; a broader allow rule is never treated as if a nested rule denied access. Keep credential paths in `protectedPaths` when they are stored outside the built-in protected locations.
 
 For example, first inspect the executable's actual dependency paths with `ldd /usr/bin/printf`, then configure exact paths for that host rather than granting `/usr`, `/lib`, or `/etc` wholesale:
 
@@ -168,7 +168,7 @@ For example, first inspect the executable's actual dependency paths with `ldd /u
     "mode": "required",
     "protectedPaths": ["/opt/conductor/credentials"],
     "grants": [
-      {"id": "printf", "path": "/usr/bin/printf", "execute": true},
+      {"id": "printf", "path": "/usr/bin/printf", "read": true, "execute": true},
       {"id": "libc", "path": "/usr/lib/x86_64-linux-gnu/libc.so.6", "read": true},
       {"id": "loader", "path": "/lib64/ld-linux-x86-64.so.2", "read": true, "execute": true},
       {"id": "output", "path": "/var/lib/conductor/jobs/output", "write": true}

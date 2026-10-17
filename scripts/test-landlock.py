@@ -121,8 +121,8 @@ def wait_run(address, run_id, expected, timeout=10):
     raise TimeoutError(f"run did not reach {sorted(expected)}: {last}")
 
 
-def output(address, run_id):
-    status, body = request(address, "GET", f"/v1/runs/{run_id}/logs?stream=stdout&limit=65536")
+def output(address, run_id, stream="stdout"):
+    status, body = request(address, "GET", f"/v1/runs/{run_id}/logs?stream={stream}&limit=65536")
     if status != 200:
         raise RuntimeError(f"run logs returned HTTP {status}")
     return base64.b64decode(body["data"], validate=True).decode("utf-8")
@@ -209,7 +209,7 @@ def main():
         output_dir.mkdir(mode=0o700)
 
         grants = [
-            {"id": "fixture", "path": str(fixture), "execute": True},
+            {"id": "fixture", "path": str(fixture), "read": True, "execute": True},
             {"id": "input", "path": str(input_alias), "read": True},
             {"id": "output", "path": str(output_dir), "write": True},
         ]
@@ -272,7 +272,8 @@ def main():
             run_id = accepted["runId"]
             outcome = wait_run(address, run_id, {"succeeded", "failed"})
             log = output(address, run_id)
-            assert outcome["state"] == "succeeded", f"fixture failed: {outcome}; logs={log}; stderr={agent_log.read_text(errors='replace')}"
+            error_log = output(address, run_id, "stderr")
+            assert outcome["state"] == "succeeded", f"fixture failed: {outcome}; stdout={log}; stderr={error_log}; agent={agent_log.read_text(errors='replace')}"
             for evidence in (
                 "approved_input_read=1",
                 "input_truncate_denied=1",
