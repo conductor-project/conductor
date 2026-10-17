@@ -3,8 +3,8 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,6 +12,7 @@ use conductor_core::{
     JobId, JobSpec, RunFailureReason, RunId, RunSpec, RunState, StartRun, WorkerId,
 };
 use conductor_worker::{ExecutionBackend, WorkerError, WorkerService};
+use rusqlite::Connection;
 
 struct TempDir(PathBuf);
 
@@ -42,6 +43,8 @@ impl Drop for TempDir {
 #[derive(Default)]
 struct TestBackend {
     spawns: AtomicUsize,
+    kill_failures: AtomicUsize,
+    ready_file: Mutex<Option<PathBuf>>,
 }
 
 impl ExecutionBackend for TestBackend {
@@ -54,15 +57,61 @@ impl ExecutionBackend for TestBackend {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
         if !job.inherit_env() {
             command.env_clear();
         }
         command.envs(job.env());
-        command.spawn()
+        let mut child = command.spawn()?;
+        if let Some(ready_file) = self.ready_file.lock().unwrap().as_ref() {
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            while !ready_file.exists() && std::time::Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            if !ready_file.exists() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "test child did not reach its ready point",
+                ));
+            }
+        }
+        Ok(child)
     }
 
-    fn kill_process_group(&self, _group_id: u32) -> io::Result<()> {
-        Ok(())
+    fn kill_process_group(&self, group_id: u32) -> io::Result<()> {
+        if self
+            .kill_failures
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |failures| {
+                failures.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "injected process-group cleanup failure",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use nix::errno::Errno;
+            use nix::sys::signal::{Signal, killpg};
+            use nix::unistd::Pid;
+            match killpg(Pid::from_raw(group_id as i32), Signal::SIGKILL) {
+                Ok(()) | Err(Errno::ESRCH) => Ok(()),
+                Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = group_id;
+            Ok(())
+        }
     }
 
     fn terminate_process_group(&self, _group_id: u32) -> io::Result<()> {
@@ -228,4 +277,105 @@ fn worker_reports_spawn_exit_signal_and_capacity_outcomes() {
         signaled.failure_reason(),
         Some(RunFailureReason::SignalTerminated)
     );
+}
+
+#[test]
+fn process_is_cleaned_up_when_running_observation_cannot_be_persisted() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let marker = directory.0.join("should-not-run");
+    let descendant_pid = directory.0.join("descendant.pid");
+    *backend.ready_file.lock().unwrap() = Some(descendant_pid.clone());
+    let service = open_worker(&directory, 1, Arc::clone(&backend));
+    let connection = Connection::open(directory.0.join("worker.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_running BEFORE UPDATE OF state ON runs
+             WHEN NEW.state = 'running'
+             BEGIN SELECT RAISE(FAIL, 'injected running persistence failure'); END;",
+        )
+        .unwrap();
+    drop(connection);
+    let spec = run(
+        "persist-failure",
+        job(
+            "persist-failure",
+            vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "sleep 30 & echo $! > {}; wait; touch {}",
+                    descendant_pid.display(),
+                    marker.display()
+                ),
+            ],
+        ),
+    );
+    assert_eq!(
+        service.start(StartRun::new(spec.clone())),
+        Err(WorkerError::StorageUnavailable)
+    );
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
+    assert!(!marker.exists());
+    let pid = fs::read_to_string(&descendant_pid).unwrap();
+    #[cfg(unix)]
+    {
+        let pid = pid.trim().parse::<i32>().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err());
+    }
+    let observed = service
+        .inspect(conductor_core::InspectRun::new(spec.id().clone()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.state(), RunState::Failed);
+
+    // An idempotent retry returns the recorded result and never starts a
+    // second process for the run whose first launch was cleaned up.
+    assert_eq!(service.start(StartRun::new(spec)), Ok(observed));
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn uncertain_process_group_cleanup_keeps_run_unknown_and_cancels_readers() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    backend.kill_failures.store(1, Ordering::SeqCst);
+    let service = open_worker(&directory, 1, Arc::clone(&backend));
+    let connection = Connection::open(directory.0.join("worker.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_running BEFORE UPDATE OF state ON runs
+             WHEN NEW.state = 'running'
+             BEGIN SELECT RAISE(FAIL, 'injected running persistence failure'); END;",
+        )
+        .unwrap();
+    drop(connection);
+    let spec = run(
+        "cleanup-uncertain",
+        job("cleanup-uncertain", vec!["/bin/sleep".into(), "30".into()]),
+    );
+
+    let cleanup_started = std::time::Instant::now();
+    assert_eq!(
+        service.start(StartRun::new(spec.clone())),
+        Err(WorkerError::StorageUnavailable)
+    );
+    assert!(cleanup_started.elapsed() < Duration::from_secs(2));
+    let observed = service
+        .inspect(conductor_core::InspectRun::new(spec.id().clone()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.state(), RunState::Unknown);
+    assert_eq!(
+        observed.failure_reason(),
+        Some(RunFailureReason::OutcomeUnknown)
+    );
+    assert_eq!(service.start(StartRun::new(spec)), Ok(observed));
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
 }

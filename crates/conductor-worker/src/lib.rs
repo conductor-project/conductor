@@ -5,10 +5,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::fd::AsFd;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -19,6 +22,9 @@ use conductor_core::{
     RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId, WorkerStatus,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+
+#[cfg(unix)]
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -74,6 +80,102 @@ struct WorkerState {
 struct ActiveGroup {
     group_id: u32,
     intent: Arc<AtomicU8>,
+}
+
+/// Owns a spawned process until supervision takes responsibility for it.
+/// Dropping the guard is a last-resort cleanup path; callers should use
+/// `cleanup` when they need to observe cleanup failures.
+struct SpawnGuard {
+    backend: Arc<dyn ExecutionBackend>,
+    group_id: u32,
+    child: Option<Child>,
+    readers: Vec<JoinHandle<io::Result<()>>>,
+    cancel_readers: Arc<AtomicBool>,
+    cleaned: bool,
+}
+
+impl SpawnGuard {
+    fn cleanup(&mut self) -> io::Result<()> {
+        if self.cleaned {
+            return Ok(());
+        }
+        self.cancel_readers.store(true, Ordering::SeqCst);
+        let mut first_error = self.backend.kill_process_group(self.group_id).err();
+        if let Some(child) = &mut self.child {
+            if let Err(error) = child.kill()
+                && error.kind() != io::ErrorKind::InvalidInput
+            {
+                first_error.get_or_insert(error);
+            }
+            if let Err(error) = child.wait() {
+                first_error.get_or_insert(error);
+            }
+            self.child.take();
+        }
+        for reader in self.readers.drain(..) {
+            match reader.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(_) => {
+                    first_error.get_or_insert(io::Error::other("output reader panicked"));
+                }
+            }
+        }
+        if first_error.is_none() {
+            self.cleaned = true;
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn finish_readers(&mut self) -> io::Result<()> {
+        let mut first_error = None;
+        for reader in self.readers.drain(..) {
+            match reader.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(_) => {
+                    first_error.get_or_insert(io::Error::other("output reader panicked"));
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
+
+trait CaptureRead: Read + Send {
+    fn wait_readable(&self, cancelled: &AtomicBool) -> io::Result<bool>;
+}
+
+#[cfg(unix)]
+impl<T: Read + Send + AsFd> CaptureRead for T {
+    fn wait_readable(&self, cancelled: &AtomicBool) -> io::Result<bool> {
+        if cancelled.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let mut descriptors = [PollFd::new(
+            self.as_fd(),
+            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
+        )];
+        let ready = poll(&mut descriptors, PollTimeout::from(50_u16)).map_err(io::Error::from)?;
+        Ok(ready > 0 && !cancelled.load(Ordering::SeqCst))
+    }
+}
+
+#[cfg(not(unix))]
+impl<T: Read + Send> CaptureRead for T {
+    fn wait_readable(&self, cancelled: &AtomicBool) -> io::Result<bool> {
+        Ok(!cancelled.load(Ordering::SeqCst))
+    }
+}
+
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
 }
 
 const INTENT_NONE: u8 = 0;
@@ -428,7 +530,7 @@ impl WorkerService {
             }
         };
 
-        let mut child = match self.backend.spawn(spec.job()) {
+        let child = match self.backend.spawn(spec.job()) {
             Ok(child) => child,
             Err(_) => {
                 self.mark_log_closed(spec.id().as_str(), LogStream::Stdout);
@@ -438,11 +540,19 @@ impl WorkerService {
         };
         let launched_at = std::time::Instant::now();
         let group_id = child.id();
-        let Some(stdout) = child.stdout.take() else {
-            return self.abort_spawned_child(child, group_id, starting);
+        let mut spawned = SpawnGuard {
+            backend: Arc::clone(&self.backend),
+            group_id,
+            child: Some(child),
+            readers: Vec::with_capacity(2),
+            cancel_readers: Arc::new(AtomicBool::new(false)),
+            cleaned: false,
         };
-        let Some(stderr) = child.stderr.take() else {
-            return self.abort_spawned_child(child, group_id, starting);
+        let Some(stdout) = spawned.child.as_mut().and_then(|child| child.stdout.take()) else {
+            return self.abort_startup(spawned, starting);
+        };
+        let Some(stderr) = spawned.child.as_mut().and_then(|child| child.stderr.take()) else {
+            return self.abort_startup(spawned, starting);
         };
         let stdout_reader = match spawn_capture(
             stdout,
@@ -451,10 +561,12 @@ impl WorkerService {
             Arc::clone(&self.state),
             spec.id().to_string(),
             LogStream::Stdout,
+            Arc::clone(&spawned.cancel_readers),
         ) {
             Ok(reader) => reader,
-            Err(_) => return self.abort_spawned_child(child, group_id, starting),
+            Err(_) => return self.abort_startup(spawned, starting),
         };
+        spawned.readers.push(stdout_reader);
         let stderr_reader = match spawn_capture(
             stderr,
             stderr_file,
@@ -462,21 +574,35 @@ impl WorkerService {
             Arc::clone(&self.state),
             spec.id().to_string(),
             LogStream::Stderr,
+            Arc::clone(&spawned.cancel_readers),
         ) {
             Ok(reader) => reader,
-            Err(_) => return self.abort_spawned_child(child, group_id, starting),
+            Err(_) => return self.abort_startup(spawned, starting),
         };
-        let started = now_ms().map_err(|_| WorkerError::StorageUnavailable)?;
+        spawned.readers.push(stderr_reader);
+        let started = match now_ms() {
+            Ok(started) => started,
+            Err(_) => return self.abort_startup(spawned, starting),
+        };
         let running = starting
             .next_revision(RunState::Running, Some(started), None, None, None, None)
-            .ok_or(WorkerError::StorageUnavailable)?;
-        self.persist(&running)?;
+            .ok_or(WorkerError::StorageUnavailable);
+        let running = match running {
+            Ok(running) => running,
+            Err(_) => return self.abort_startup(spawned, starting),
+        };
+        if self.persist(&running).is_err() {
+            let _ = self.abort_startup(spawned, running);
+            return Err(WorkerError::StorageUnavailable);
+        }
         {
-            let mut state = self
-                .state
-                .0
-                .lock()
-                .map_err(|_| WorkerError::StorageUnavailable)?;
+            let mut state = match self.state.0.lock() {
+                Ok(state) => state,
+                Err(_) => {
+                    let _ = self.abort_startup(spawned, running);
+                    return Err(WorkerError::StorageUnavailable);
+                }
+            };
             state.active_groups.insert(
                 spec.id().to_string(),
                 ActiveGroup {
@@ -489,37 +615,44 @@ impl WorkerService {
         let state = Arc::clone(&self.state);
         let backend = Arc::clone(&self.backend);
         let run_id = spec.id().to_string();
-        let control = self
-            .state
-            .0
-            .lock()
-            .map_err(|_| WorkerError::StorageUnavailable)?
-            .active_groups
-            .get(spec.id().as_str())
-            .map(|active| Arc::clone(&active.intent))
-            .ok_or(WorkerError::StorageUnavailable)?;
+        let control = match self.state.0.lock() {
+            Ok(state) => state
+                .active_groups
+                .get(spec.id().as_str())
+                .map(|active| Arc::clone(&active.intent))
+                .ok_or(WorkerError::StorageUnavailable),
+            Err(_) => Err(WorkerError::StorageUnavailable),
+        };
+        let control = match control {
+            Ok(control) => control,
+            Err(_) => {
+                if let Ok(mut state) = self.state.0.lock() {
+                    state.active_groups.remove(spec.id().as_str());
+                }
+                let _ = self.abort_startup(spawned, running);
+                return Err(WorkerError::StorageUnavailable);
+            }
+        };
         let timeout = spec.job().timeout_ms().map(Duration::from_millis);
         let grace = Duration::from_millis(spec.job().termination_grace_ms());
         let log_directory = self.state_directory.join("runs");
         let retention_runs = self.log_policy.retention_runs;
         let supervisor_observation = running.clone();
-        let child_slot = Arc::new(Mutex::new(Some(child)));
+        let child_slot = Arc::new(Mutex::new(Some(spawned)));
         let supervisor_child = Arc::clone(&child_slot);
         let supervisor = thread::Builder::new()
             .name(format!("conductor-run-{run_id}"))
             .spawn(move || {
-                let child = supervisor_child
+                let spawned = supervisor_child
                     .lock()
                     .ok()
-                    .and_then(|mut child| child.take());
-                if let Some(child) = child {
+                    .and_then(|mut spawned| spawned.take());
+                if let Some(spawned) = spawned {
                     supervise(RunSupervision {
                         state,
                         backend,
                         run_id,
-                        child,
-                        stdout_reader,
-                        stderr_reader,
+                        spawned,
                         current: supervisor_observation,
                         control,
                         launched_at,
@@ -534,16 +667,18 @@ impl WorkerService {
             Ok(supervisor) => supervisor,
             Err(_) => {
                 if let Ok(mut slot) = child_slot.lock()
-                    && let Some(mut child) = slot.take()
+                    && let Some(spawned) = slot.take()
+                    && self.abort_startup(spawned, running.clone()).is_err()
                 {
-                    let _ = self.backend.kill_process_group(group_id);
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    if let Ok(mut state) = self.state.0.lock() {
+                        state.active_groups.remove(spec.id().as_str());
+                    }
+                    return Err(WorkerError::StorageUnavailable);
                 }
                 if let Ok(mut state) = self.state.0.lock() {
                     state.active_groups.remove(spec.id().as_str());
                 }
-                return self.finish_backend_failure(running);
+                return Err(WorkerError::StorageUnavailable);
             }
         };
         let mut supervisors = self
@@ -1097,18 +1232,46 @@ impl WorkerService {
         Ok(failed)
     }
 
-    fn abort_spawned_child(
+    fn abort_startup(
         &self,
-        mut child: Child,
-        group_id: u32,
+        mut spawned: SpawnGuard,
         current: RunObservation,
     ) -> Result<RunObservation, WorkerError> {
-        let _ = self.backend.kill_process_group(group_id);
-        let _ = child.kill();
-        let _ = child.wait();
+        let cleanup = spawned.cleanup();
+        let cleanup_succeeded = cleanup.is_ok();
+        if let Err(error) = cleanup {
+            eprintln!(
+                "{{\"timestampMs\":{},\"severity\":\"error\",\"component\":\"worker\",\"event\":\"startup_cleanup_failed\",\"runId\":{},\"errorKind\":{}}}",
+                now_ms().unwrap_or_default(),
+                serde_json::to_string(current.run_id().as_str()).unwrap_or_else(|_| "null".into()),
+                serde_json::to_string(&format!("{:?}", error.kind()))
+                    .unwrap_or_else(|_| "null".into())
+            );
+        }
         self.mark_log_closed(current.run_id().as_str(), LogStream::Stdout);
         self.mark_log_closed(current.run_id().as_str(), LogStream::Stderr);
-        self.finish_backend_failure(current)
+        let finished = now_ms().map_err(|_| WorkerError::StorageUnavailable)?;
+        let failed = current
+            .next_revision(
+                if cleanup_succeeded {
+                    RunState::Failed
+                } else {
+                    RunState::Unknown
+                },
+                current.started_at_ms(),
+                cleanup_succeeded.then_some(finished),
+                None,
+                None,
+                Some(if cleanup_succeeded {
+                    RunFailureReason::BackendFailure
+                } else {
+                    RunFailureReason::OutcomeUnknown
+                }),
+            )
+            .ok_or(WorkerError::StorageUnavailable)?;
+        self.persist(&failed)?;
+        let _ = self.prune_completed_logs();
+        Ok(failed)
     }
 
     fn finish_backend_failure(
@@ -1140,20 +1303,29 @@ fn prepare_log_file(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
-fn spawn_capture<R: Read + Send + 'static>(
+fn spawn_capture<R: CaptureRead + 'static>(
     mut source: R,
     mut output: File,
     byte_cap: u64,
     state: Arc<SharedWorkerState>,
     run_id: String,
     stream: LogStream,
+    cancelled: Arc<AtomicBool>,
 ) -> io::Result<JoinHandle<io::Result<()>>> {
     thread::Builder::new().spawn(move || {
         let mut buffer = [0_u8; 8192];
         let mut written = 0_u64;
         let mut truncated = false;
+        let mut was_cancelled = false;
         let capture_result = (|| {
             loop {
+                if !source.wait_readable(&cancelled)? {
+                    if cancelled.load(Ordering::SeqCst) {
+                        was_cancelled = true;
+                        break;
+                    }
+                    continue;
+                }
                 let count = source.read(&mut buffer)?;
                 if count == 0 {
                     break;
@@ -1168,10 +1340,16 @@ fn spawn_capture<R: Read + Send + 'static>(
                     set_log_truncated(&state, &run_id, stream)?;
                 }
             }
-            output.sync_all()?;
+            if !was_cancelled {
+                output.sync_all()?;
+            }
             Ok(())
         })();
-        let close_result = close_log_stream(&state, &run_id, stream);
+        let close_result = if was_cancelled {
+            Ok(())
+        } else {
+            close_log_stream(&state, &run_id, stream)
+        };
         capture_result.and(close_result)
     })
 }
@@ -1273,9 +1451,7 @@ struct RunSupervision {
     state: Arc<SharedWorkerState>,
     backend: Arc<dyn ExecutionBackend>,
     run_id: String,
-    child: Child,
-    stdout_reader: JoinHandle<io::Result<()>>,
-    stderr_reader: JoinHandle<io::Result<()>>,
+    spawned: SpawnGuard,
     current: RunObservation,
     control: Arc<AtomicU8>,
     launched_at: std::time::Instant,
@@ -1290,9 +1466,7 @@ fn supervise(supervision: RunSupervision) {
         state,
         backend,
         run_id,
-        mut child,
-        stdout_reader,
-        stderr_reader,
+        mut spawned,
         mut current,
         control: intent,
         launched_at,
@@ -1301,10 +1475,13 @@ fn supervise(supervision: RunSupervision) {
         log_directory,
         retention_runs,
     } = supervision;
-    let group_id = child.id();
+    let group_id = spawned.group_id;
     let mut wait_failed = false;
     let mut termination_deadline = None;
     let (status, wait_failed) = loop {
+        let Some(child) = spawned.child.as_mut() else {
+            break (None, true);
+        };
         match child.try_wait() {
             Ok(Some(exit)) => break (Some(exit), wait_failed),
             Ok(None) => {}
@@ -1375,10 +1552,10 @@ fn supervise(supervision: RunSupervision) {
         thread::sleep(Duration::from_millis(10));
     };
     let _ = backend.kill_process_group(group_id);
-    // Output persistence is best effort. A failed log writer must not rewrite
-    // the process's exit result; both readers are joined to reap their threads.
-    let _ = stdout_reader.join();
-    let _ = stderr_reader.join();
+    // A failed log writer must not rewrite the process exit result. Joining
+    // readers ensures their resources are reclaimed before the run is released.
+    let _ = spawned.finish_readers();
+    spawned.child.take();
     let finished = now_ms().unwrap_or(current.requested_at_ms());
     let (run_state, exit_code, signal, failure) = match status {
         Some(status) if !wait_failed => status_observation(status),
