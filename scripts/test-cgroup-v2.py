@@ -136,6 +136,7 @@ def main():
             },
         }
         config_path = state / "agent.json"
+        agent_log = state / "agent.stderr.log"
         config_path.write_text(json.dumps(config), encoding="utf-8")
 
         def launch():
@@ -143,7 +144,7 @@ def main():
                 [str(args.binary.resolve()), "agent", "--config", str(config_path)],
                 cwd=state,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=agent_log.open("ab"),
             )
 
         process = launch()
@@ -245,6 +246,9 @@ def main():
             assert wait_run(address, crash_run, {"unknown"})["state"] == "unknown"
             assert not list(worker_root.glob("run-*")), "restart left an owned cgroup behind"
             print(json.dumps({"status": "passed", "enforcement": "real cgroup v2", "runs": len(run_ids)}))
+        except Exception as error:
+            diagnostic = agent_log.read_text(encoding="utf-8", errors="replace")
+            raise RuntimeError(f"{error}; agent stderr:\n{diagnostic}") from error
         finally:
             if process.poll() is None:
                 process.send_signal(signal.SIGINT)
