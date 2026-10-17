@@ -2311,7 +2311,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
     assert_eq!(status, 400, "{body}");
     let active_job = job_json(
         "retention-active",
-        &["/bin/sh", "-c", "printf active; sleep 5"],
+        &["/bin/sh", "-c", "printf active; sleep 60"],
     );
     assert_eq!(
         http(
@@ -2332,6 +2332,27 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
         .unwrap()
         .to_owned();
     wait_for_run_state(address, &active_id, &["running"], Duration::from_secs(2));
+    let active_log_deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (status, body) = http(
+            address,
+            "GET",
+            &format!("/v1/runs/{active_id}/logs?stream=stdout"),
+            None,
+            &[],
+        );
+        if status == 200 {
+            let chunk: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(chunk["streamClosed"], false, "{body}");
+            break;
+        }
+        assert_eq!(status, 404, "active log request failed: {body}");
+        assert!(
+            Instant::now() < active_log_deadline,
+            "active stream was not created: {body}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     let second_job = job_json("retention-followup", &["/bin/true"]);
     assert_eq!(
         http(
