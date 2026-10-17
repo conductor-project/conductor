@@ -63,6 +63,21 @@ fn service(path: &TempDir) -> JobService {
     JobService::open_sqlite(path.database()).expect("open manager database")
 }
 
+fn all_jobs(manager: &JobService) -> Vec<JobSpec> {
+    let mut jobs = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = manager
+            .list_page(100, cursor.as_deref())
+            .expect("read bounded job page");
+        jobs.extend(page.items);
+        let Some(next) = page.next_cursor else {
+            return jobs;
+        };
+        cursor = Some(next);
+    }
+}
+
 #[test]
 fn jobs_and_timestamps_survive_reopen_and_deleted_ids_remain_reserved() {
     let directory = TempDir::new();
@@ -70,9 +85,7 @@ fn jobs_and_timestamps_survive_reopen_and_deleted_ids_remain_reserved() {
     manager.register(job("zeta")).expect("register zeta");
     manager.register(job("alpha")).expect("register alpha");
     assert_eq!(
-        manager
-            .list()
-            .unwrap()
+        all_jobs(&manager)
             .iter()
             .map(|value| value.id().as_str())
             .collect::<Vec<_>>(),
@@ -109,7 +122,7 @@ fn jobs_and_timestamps_survive_reopen_and_deleted_ids_remain_reserved() {
         reopened.register(job("zeta")),
         Err(ManagerError::DuplicateJob)
     );
-    assert_eq!(reopened.list().unwrap().len(), 1);
+    assert_eq!(all_jobs(&reopened).len(), 1);
 
     let connection = Connection::open(directory.database()).expect("inspect reopened database");
     let (persisted_created_at, persisted_deleted_at): (i64, Option<i64>) = connection
@@ -143,7 +156,7 @@ fn legacy_schema_migrates_transactionally_and_repeated_startup_is_stable() {
     drop(manager);
 
     let reopened = service(&directory);
-    assert_eq!(reopened.list().unwrap(), vec![job("legacy")]);
+    assert_eq!(all_jobs(&reopened), vec![job("legacy")]);
     drop(reopened);
     let connection = Connection::open(directory.database()).expect("inspect migrated database");
     let (version, created_at, deleted_at): (i64, i64, Option<i64>) = connection
@@ -153,9 +166,58 @@ fn legacy_schema_migrates_transactionally_and_repeated_startup_is_stable() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read migrated schema and fixture");
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
     assert_eq!(created_at, 1234);
     assert_eq!(deleted_at, None);
+}
+
+#[test]
+fn schema_two_migration_adds_idempotency_and_indexed_run_order() {
+    let directory = TempDir::new();
+    let connection = Connection::open(directory.database()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE jobs (
+                id TEXT PRIMARY KEY NOT NULL,
+                spec_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                deleted_at_ms INTEGER CHECK (deleted_at_ms IS NULL OR deleted_at_ms >= 0)
+             );
+             CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY NOT NULL,
+                job_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                job_spec_json TEXT NOT NULL,
+                observation_json TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision > 0),
+                state TEXT NOT NULL
+             );
+             CREATE INDEX runs_by_state_worker ON runs(state, worker_id);
+             CREATE INDEX runs_by_job_created ON runs(job_id, run_id);
+             CREATE TABLE run_sequence (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL);
+             INSERT INTO run_sequence (id, value) VALUES (1, 0);
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let manager = service(&directory);
+    drop(manager);
+    let connection = Connection::open(directory.database()).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    let columns = connection
+        .prepare("PRAGMA table_info(runs)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(version, 3);
+    assert!(columns.iter().any(|column| column == "idempotency_key"));
+    assert!(columns.iter().any(|column| column == "request_fingerprint"));
+    assert!(columns.iter().any(|column| column == "run_order"));
 }
 
 #[test]
@@ -212,7 +274,7 @@ fn concurrent_registration_has_one_winner_and_deterministic_conflicts() {
             .count(),
         WRITERS - 1
     );
-    assert_eq!(manager.list().unwrap().len(), 1);
+    assert_eq!(all_jobs(&manager).len(), 1);
 }
 
 #[test]
@@ -224,7 +286,7 @@ fn active_job_limit_is_enforced_and_deletion_releases_a_slot() {
             .register(job(&format!("job-{index}")))
             .expect("register within active job limit");
     }
-    assert_eq!(manager.list().unwrap().len(), MAX_JOBS);
+    assert_eq!(all_jobs(&manager).len(), MAX_JOBS);
     assert_eq!(
         manager.register(job("over-limit")),
         Err(ManagerError::JobLimitReached)
@@ -233,7 +295,7 @@ fn active_job_limit_is_enforced_and_deletion_releases_a_slot() {
     manager
         .register(job("replacement"))
         .expect("deleted job frees active capacity");
-    assert_eq!(manager.list().unwrap().len(), MAX_JOBS);
+    assert_eq!(all_jobs(&manager).len(), MAX_JOBS);
 }
 
 #[test]
@@ -267,7 +329,7 @@ fn manager_admission_reserves_job_and_worker_capacity_transactionally() {
     repository.insert(job("second")).unwrap();
     let worker = WorkerId::new("local").unwrap();
     let first = repository
-        .create_run(&JobId::new("first").unwrap(), &worker, 1)
+        .create_run(&JobId::new("first").unwrap(), &worker, 1, None)
         .unwrap();
     assert_eq!(first.id().as_str(), "run-1");
     assert_eq!(
@@ -279,7 +341,7 @@ fn manager_admission_reserves_job_and_worker_capacity_transactionally() {
         Err(conductor_manager::JobStoreError::ActiveRunConflict)
     );
     assert_eq!(
-        repository.create_run(&JobId::new("second").unwrap(), &worker, 1),
+        repository.create_run(&JobId::new("second").unwrap(), &worker, 1, None),
         Err(RunStoreError::CapacityReached)
     );
 
@@ -298,7 +360,7 @@ fn manager_admission_reserves_job_and_worker_capacity_transactionally() {
     assert_eq!(repository.get_run(first.id()).unwrap().unwrap(), completed);
 
     let second = repository
-        .create_run(&JobId::new("second").unwrap(), &worker, 1)
+        .create_run(&JobId::new("second").unwrap(), &worker, 1, None)
         .unwrap();
     assert_eq!(second.id().as_str(), "run-2");
     assert_eq!(
@@ -312,6 +374,49 @@ fn manager_admission_reserves_job_and_worker_capacity_transactionally() {
             .len(),
         1
     );
+}
+
+#[test]
+fn idempotency_keys_replay_across_capacity_completion_and_database_reopen() {
+    let directory = TempDir::new();
+    let repository = SqliteJobRepository::open(directory.database()).unwrap();
+    repository.insert(job("first")).unwrap();
+    repository.insert(job("other")).unwrap();
+    let worker = WorkerId::new("local").unwrap();
+    let first = repository
+        .create_run(&JobId::new("first").unwrap(), &worker, 1, Some("retry-1"))
+        .unwrap();
+    assert!(first.replay.is_none());
+    let replay = repository
+        .create_run(&JobId::new("first").unwrap(), &worker, 1, Some("retry-1"))
+        .unwrap();
+    assert_eq!(replay.spec.id(), first.spec.id());
+    assert_eq!(replay.replay.unwrap().state(), RunState::Requested);
+    assert_eq!(
+        repository.create_run(&JobId::new("other").unwrap(), &worker, 1, Some("retry-1")),
+        Err(RunStoreError::IdempotencyConflict)
+    );
+
+    let requested = repository.get_run(first.spec.id()).unwrap().unwrap();
+    let terminal = requested
+        .next_revision(
+            RunState::Succeeded,
+            Some(requested.requested_at_ms()),
+            Some(requested.requested_at_ms() + 1),
+            Some(0),
+            None,
+            None,
+        )
+        .unwrap();
+    repository.record_observation(&terminal).unwrap();
+    drop(repository);
+
+    let reopened = SqliteJobRepository::open(directory.database()).unwrap();
+    let replay = reopened
+        .create_run(&JobId::new("first").unwrap(), &worker, 1, Some("retry-1"))
+        .unwrap();
+    assert_eq!(replay.spec.id(), first.spec.id());
+    assert_eq!(replay.replay.unwrap(), terminal);
 }
 
 #[test]
@@ -348,7 +453,8 @@ fn version_one_manager_database_migrates_runs_and_accepts_timeout_specs() {
             .create_run(
                 &JobId::new("timed").unwrap(),
                 &WorkerId::new("worker").unwrap(),
-                1
+                1,
+                None
             )
             .unwrap()
             .job()
@@ -359,7 +465,7 @@ fn version_one_manager_database_migrates_runs_and_accepts_timeout_specs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, 3);
 }
 
 struct FullWorker(WorkerId);
@@ -487,10 +593,9 @@ fn rejected_worker_admission_does_not_leave_a_stale_manager_reservation() {
             10,
         )
         .unwrap();
-    assert_eq!(runs.len(), 2);
     assert!(
-        runs.iter()
-            .all(|run| run.failure_reason() == Some(RunFailureReason::CapacityRejected))
+        runs.is_empty(),
+        "rejected admission must not create a run record"
     );
 }
 
@@ -526,7 +631,7 @@ fn stop_intent_is_durable_and_terminal_runs_are_unchanged() {
     repository.insert(job("stoppable")).unwrap();
     let worker_id = WorkerId::new("worker").unwrap();
     let spec = repository
-        .create_run(&JobId::new("stoppable").unwrap(), &worker_id, 1)
+        .create_run(&JobId::new("stoppable").unwrap(), &worker_id, 1, None)
         .unwrap();
     let manager = JobService::new(repository.clone());
     let worker = UncertainWorker(worker_id);

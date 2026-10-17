@@ -373,6 +373,17 @@ fn http_with_headers(
     content_type: Option<&str>,
     body: &[u8],
 ) -> (u16, String, String) {
+    http_with_custom_headers(address, method, path, content_type, &[], body)
+}
+
+fn http_with_custom_headers(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    content_type: Option<&str>,
+    extra_headers: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, String, String) {
     let mut stream = TcpStream::connect(address).expect("connect to agent");
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
@@ -388,6 +399,9 @@ fn http_with_headers(
     .expect("write request headers");
     if let Some(content_type) = content_type {
         write!(stream, "Content-Type: {content_type}\r\n").expect("write content type");
+    }
+    for (name, value) in extra_headers {
+        write!(stream, "{name}: {value}\r\n").expect("write custom header");
     }
     stream.write_all(b"\r\n").expect("finish request headers");
     stream.write_all(body).expect("write request body");
@@ -1648,4 +1662,267 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
     assert_eq!(status, 404, "{body}");
     signal(&restarted, "INT");
     wait_for_exit(&mut restarted);
+}
+
+#[test]
+fn actual_binary_deduplicates_concurrent_and_restarted_run_submissions() {
+    let path = TempDir::new("idempotency");
+    let (mut child, address) = start(&path, "all", None);
+    let marker = path.join("launches");
+    let job = serde_json::json!({
+        "id":"idempotent",
+        "command":["/bin/sh", "-c", format!("printf x >> {}; sleep 0.2", marker.display())],
+        "cwd":"/tmp"
+    });
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &serde_json::to_vec(&job).unwrap()
+        )
+        .0,
+        201
+    );
+    let (status, _, body) = http_with_custom_headers(
+        address,
+        "POST",
+        "/v1/jobs/idempotent/runs",
+        None,
+        &[("Idempotency-Key", "contains space")],
+        &[],
+    );
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"]["code"],
+        "invalid_idempotency_key"
+    );
+
+    let callers = (0..12)
+        .map(|_| {
+            thread::spawn(move || {
+                http_with_custom_headers(
+                    address,
+                    "POST",
+                    "/v1/jobs/idempotent/runs",
+                    None,
+                    &[("Idempotency-Key", "same-operation")],
+                    &[],
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    let responses = callers
+        .into_iter()
+        .map(|caller| caller.join().unwrap())
+        .collect::<Vec<_>>();
+    let mut run_ids = Vec::new();
+    for (status, headers, body) in responses {
+        assert_eq!(status, 202, "{headers}\n{body}");
+        let run: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|error| panic!("invalid run response {headers:?} {body:?}: {error}"));
+        run_ids.push(run["runId"].as_str().unwrap().to_owned());
+    }
+    assert!(run_ids.iter().all(|id| id == &run_ids[0]));
+    wait_for_run_state(address, &run_ids[0], &["succeeded"], Duration::from_secs(3));
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "x");
+
+    let other_job = job_json("other-idempotent", &["/bin/true"]);
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &other_job
+        )
+        .0,
+        201
+    );
+    let (status, _, body) = http_with_custom_headers(
+        address,
+        "POST",
+        "/v1/jobs/other-idempotent/runs",
+        None,
+        &[("Idempotency-Key", "same-operation")],
+        &[],
+    );
+    assert_eq!(status, 409, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["error"]["code"],
+        "idempotency_key_conflict"
+    );
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
+
+    let (mut restarted, address) = start(&path, "all", None);
+    let (status, _, body) = http_with_custom_headers(
+        address,
+        "POST",
+        "/v1/jobs/idempotent/runs",
+        None,
+        &[("Idempotency-Key", "same-operation")],
+        &[],
+    );
+    assert_eq!(status, 202, "{body}");
+    let replay: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(replay["runId"], run_ids[0]);
+    assert_eq!(fs::read_to_string(&marker).unwrap(), "x");
+    signal(&restarted, "INT");
+    wait_for_exit(&mut restarted);
+}
+
+#[test]
+fn actual_binary_paginates_jobs_and_runs_with_filter_bound_cursors() {
+    let path = TempDir::new("pagination");
+    let (mut child, address) = start(&path, "all", None);
+    for id in ["page-a", "page-b", "page-c", "page-d"] {
+        let job = job_json(id, &["/bin/true"]);
+        assert_eq!(
+            http(address, "POST", "/v1/jobs", Some("application/json"), &job).0,
+            201
+        );
+        start_and_poll(address, id);
+    }
+
+    let (status, body) = http(address, "GET", "/v1/jobs?limit=2", None, &[]);
+    assert_eq!(status, 200, "{body}");
+    let first: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(first["jobs"].as_array().unwrap().len(), 2);
+    let cursor = first["nextCursor"].as_str().unwrap();
+    let concurrent_job = job_json("page-bb", &["/bin/true"]);
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &concurrent_job
+        )
+        .0,
+        201
+    );
+    let (status, body) = http(
+        address,
+        "GET",
+        &format!("/v1/jobs?limit=2&cursor={cursor}"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    let second: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(second["jobs"].as_array().unwrap().len(), 2);
+    assert_eq!(second["jobs"][0]["id"], "page-bb");
+    assert_eq!(second["jobs"][1]["id"], "page-c");
+    let cursor = second["nextCursor"].as_str().unwrap();
+    let (status, body) = http(
+        address,
+        "GET",
+        &format!("/v1/jobs?limit=2&cursor={cursor}"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    let third: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(third["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(third["jobs"][0]["id"], "page-d");
+
+    let (status, body) = http(address, "GET", "/v1/runs?limit=2", None, &[]);
+    assert_eq!(status, 200, "{body}");
+    let first: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(first["runs"].as_array().unwrap().len(), 2);
+    let cursor = first["nextCursor"].as_str().unwrap();
+    let (status, body) = http(
+        address,
+        "GET",
+        &format!("/v1/runs?limit=2&jobId=page-a&cursor={cursor}"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 400, "cursor must be bound to its filters: {body}");
+    let (status, body) = http(
+        address,
+        "GET",
+        &format!("/v1/runs?limit=2&cursor={cursor}"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    let second: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(second["runs"].as_array().unwrap().len(), 2);
+    assert!(second["nextCursor"].is_null());
+
+    let (status, body) = http(address, "GET", "/v1/jobs?limit=101", None, &[]);
+    assert_eq!(status, 400, "{body}");
+    let (status, body) = http(address, "GET", "/v1/jobs?cursor=broken", None, &[]);
+    assert_eq!(status, 400, "{body}");
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
+}
+
+#[test]
+fn capacity_rejection_does_not_consume_an_idempotency_key() {
+    let path = TempDir::new("capacity-key");
+    let (mut child, address) = start(&path, "all", None);
+    for (id, command) in [
+        ("occupying", vec!["/bin/sh", "-c", "sleep 5"]),
+        ("retry-after-capacity", vec!["/bin/sh", "-c", "exit 0"]),
+    ] {
+        let job = job_json(id, &command);
+        assert_eq!(
+            http(address, "POST", "/v1/jobs", Some("application/json"), &job).0,
+            201
+        );
+    }
+    let (status, accepted) = http(address, "POST", "/v1/jobs/occupying/runs", None, &[]);
+    assert_eq!(status, 202, "{accepted}");
+    let run_id = serde_json::from_str::<serde_json::Value>(&accepted).unwrap()["runId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_for_run_state(address, &run_id, &["running"], Duration::from_secs(2));
+
+    let (status, headers, body) = http_with_custom_headers(
+        address,
+        "POST",
+        "/v1/jobs/retry-after-capacity/runs",
+        None,
+        &[("Idempotency-Key", "reuse-after-429")],
+        &[],
+    );
+    assert_eq!(status, 429, "{body}");
+    assert!(
+        headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case("Retry-After: 1"))
+    );
+    let (status, _) = http(
+        address,
+        "POST",
+        &format!("/v1/runs/{run_id}/stop"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 202);
+    wait_for_run_state(address, &run_id, &["cancelled"], Duration::from_secs(3));
+
+    let (status, _, body) = http_with_custom_headers(
+        address,
+        "POST",
+        "/v1/jobs/retry-after-capacity/runs",
+        None,
+        &[("Idempotency-Key", "reuse-after-429")],
+        &[],
+    );
+    assert_eq!(status, 202, "{body}");
+    let run: serde_json::Value = serde_json::from_str(&body).unwrap();
+    wait_for_run_state(
+        address,
+        run["runId"].as_str().unwrap(),
+        &["succeeded"],
+        Duration::from_secs(3),
+    );
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
 }

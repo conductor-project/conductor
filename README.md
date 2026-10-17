@@ -46,7 +46,7 @@ curl --fail http://127.0.0.1:8080/v1/jobs/hello
 curl --fail -X DELETE http://127.0.0.1:8080/v1/jobs/hello
 ```
 
-`POST /v1/jobs` returns 201 with the validated immutable definition; duplicate and previously deleted IDs return 409. `GET /v1/jobs` returns `{"jobs":[...]}` ordered by ID. `GET /v1/jobs/{id}` returns 200 or 404, and `DELETE /v1/jobs/{id}` returns 204 or 404. Deletion reserves the ID so it cannot refer to a different definition later. The manager currently accepts up to 1,000 active jobs and reserves up to 10,000 IDs; request bodies are limited to 65,536 bytes. These limits are temporary until pagination is implemented.
+`POST /v1/jobs` returns 201 with the validated immutable definition; duplicate and previously deleted IDs return 409. `GET /v1/jobs` returns `{"jobs":[...],"nextCursor":...}` in ascending ID order. `GET /v1/jobs/{id}` returns 200 or 404, and `DELETE /v1/jobs/{id}` returns 204 or 404. Deletion reserves the ID so it cannot refer to a different definition later. The manager accepts up to 1,000 active jobs; deleted-ID reservations remain durable. Request bodies are limited to 65,536 bytes.
 
 Start and inspect a run using the checked-in [success example](examples/job.json), [failure example](examples/job-failure.json), [cancellable example](examples/job-cancellable.json), and [deadline example](examples/job-timeout.json):
 
@@ -67,7 +67,16 @@ curl --fail-with-body -X POST http://127.0.0.1:8080/v1/jobs/deadline/runs
 curl --fail http://127.0.0.1:8080/v1/runs
 ```
 
-Run start returns 202 and a relative `Location: /v1/runs/{runId}` header. Poll that URL for `requested`, `starting`, `running`, then a terminal state. `GET /v1/runs` accepts `jobId`, `state`, and `limit`; responses are capped at 100 observations. Results include requested/start/finish timestamps, exit code or termination signal, a structured `failureReason`, and an optional `terminationReason`. Run IDs are not process IDs. Starting a job that already has an active or unresolved run, or deleting it while that run is held, returns 409. A full local worker returns 429. Job `timeoutMs` starts when the process is launched and is measured with a monotonic clock; queue/admission time does not count.
+Run start returns 202 and a relative `Location: /v1/runs/{runId}` header. Poll that URL for `requested`, `starting`, `running`, then a terminal state. `GET /v1/runs` accepts `jobId`, `state`, `limit`, and `cursor`; both list endpoints default to 50 entries and allow at most 100. Responses provide an opaque `nextCursor` when another page exists. Job pages are ordered by ID; run pages use descending insertion order. Cursors are bound to endpoint filters. They keep a scan from repeating earlier rows while concurrent inserts arrive; run state changes or job deletion between pages can affect which filtered rows remain visible, so pages are not a cross-request snapshot. Results include requested/start/finish timestamps, exit code or termination signal, a structured `failureReason`, and an optional `terminationReason`. Run IDs are not process IDs. Starting a job that already has an active or unresolved run, or deleting it while that run is held, returns 409. A full local worker returns 429 with `Retry-After: 1`. Job `timeoutMs` starts when the process is launched and is measured with a monotonic clock; queue/admission time does not count.
+
+Run submission accepts an optional `Idempotency-Key` header containing 1–128 ASCII letters, digits, `.`, `_`, `~`, or `-`. Keys are global to this manager database and are retained with their run history. Repeating the same key for the same immutable job returns the original run, including after completion and restart. Reusing it for another job returns 409; validation and capacity rejection do not consume a key. This deduplicates the request and process launch, but it cannot make external process side effects exactly once. Up to 32 start requests are admitted concurrently; excess new starts return 429 with `Retry-After: 1`. Health, stop, result, and log requests do not use these start slots.
+
+```sh
+curl --fail-with-body -X POST -H 'Idempotency-Key: demo-start-1' \
+  http://127.0.0.1:8080/v1/jobs/hello/runs
+curl --fail http://127.0.0.1:8080/v1/jobs?limit=50
+curl --fail 'http://127.0.0.1:8080/v1/runs?jobId=hello&limit=50'
+```
 
 Stop a run with `POST /v1/runs/{runId}/stop`. The manager records `stopping` before dispatch, and the endpoint returns 202 while cleanup is in progress. Repeating the request is safe; stopping an already terminal run returns its unchanged result with 200. The worker sends SIGTERM to the owned process group, waits the job's `terminationGraceMs`, then sends SIGKILL to remaining ordinary group members. A natural exit wins if the supervisor observes it before a stop/deadline request; after termination intent is recorded, the terminal state is `cancelled` or `timed_out`, with the actual exit code/signal preserved. `terminationReason` is `cancelled`, `deadline_exceeded`, or `shutdown`. Cancellation does not roll back external side effects.
 
