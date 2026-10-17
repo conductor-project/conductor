@@ -493,6 +493,24 @@ fn actual_binary_shuts_down_on_sigterm() {
 }
 
 #[test]
+fn actual_binary_keeps_serving_after_shutdown_grace_period() {
+    let path = TempDir::new("daemon-lifetime");
+    let (mut child, address) = start(&path, "all", None);
+    let deadline = Instant::now() + Duration::from_millis(5_500);
+    while Instant::now() < deadline {
+        assert_eq!(
+            child.0.try_wait().expect("poll daemon"),
+            None,
+            "daemon exited without a shutdown signal"
+        );
+        assert_eq!(http(address, "GET", "/healthz", None, &[]).0, 200);
+        thread::sleep(Duration::from_millis(100));
+    }
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
+}
+
+#[test]
 fn role_override_can_enable_combined_mode_and_standalone_roles_fail() {
     let path = TempDir::new("roles");
     let (mut child, _) = start(&path, "manager", Some("all"));
