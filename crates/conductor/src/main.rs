@@ -40,9 +40,11 @@ enum Commands {
     #[command(name = "__internal-launch", hide = true)]
     InternalLaunch {
         #[arg(long)]
-        cgroup_path: PathBuf,
+        cgroup_path: Option<PathBuf>,
         #[arg(long)]
         ready_socket: PathBuf,
+        #[arg(long)]
+        landlock_policy_file: Option<PathBuf>,
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
@@ -51,6 +53,8 @@ enum Commands {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Config {
+    #[serde(skip)]
+    source_config_path: PathBuf,
     role: Role,
     listen: SocketAddr,
     manager_data_dir: PathBuf,
@@ -65,6 +69,8 @@ struct Config {
     request_timeout_ms: u64,
     #[serde(default)]
     cgroup_v2: CgroupV2Config,
+    #[serde(default)]
+    landlock: LandlockConfig,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -76,6 +82,41 @@ struct CgroupV2Config {
     delegated_root: Option<PathBuf>,
     #[serde(default)]
     maximums: conductor_core::ResourceLimits,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct LandlockConfig {
+    #[serde(default)]
+    mode: LandlockModeConfig,
+    #[serde(default)]
+    grants: Vec<LandlockGrantConfig>,
+    #[serde(default)]
+    protected_paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum LandlockModeConfig {
+    #[default]
+    Disabled,
+    Optional,
+    Required,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct LandlockGrantConfig {
+    id: String,
+    path: PathBuf,
+    #[serde(default)]
+    read: bool,
+    #[serde(default)]
+    write: bool,
+    #[serde(default)]
+    execute: bool,
 }
 
 fn default_log_max_bytes_per_stream() -> u64 {
@@ -124,6 +165,8 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    close_fds::set_fds_cloexec_threadsafe(3, &[]);
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error)
@@ -142,17 +185,21 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Commands::InternalLaunch {
             cgroup_path,
             ready_socket,
+            landlock_policy_file,
             command,
         } => {
             return Ok(ExitCode::from(conductor_process::internal_launch(
-                &cgroup_path,
+                cgroup_path.as_deref(),
                 &ready_socket,
+                landlock_policy_file.as_deref(),
                 &command,
             ) as u8));
         }
     };
+    let source_config_path = fs::canonicalize(&config_path)?;
     let config_text = fs::read_to_string(config_path)?;
     let mut config: Config = serde_json::from_str(&config_text)?;
+    config.source_config_path = source_config_path;
     if let Some(role) = role_override {
         config.role = role;
     }
@@ -179,6 +226,8 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         },
         process_backend(&config)?,
     )?);
+    #[cfg(target_os = "linux")]
+    close_fds::set_fds_cloexec_threadsafe(3, &[]);
     let worker_port: Arc<dyn WorkerPort> = Arc::new(LocalWorkerPort(Arc::clone(&worker)));
     let listener = TcpListener::bind(config.listen)?;
     listener.set_nonblocking(true)?;
@@ -192,10 +241,15 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         signal_shutdown.store(true, Ordering::SeqCst);
     })?;
     eprintln!(
-        "{{\"timestampMs\":{},\"severity\":\"info\",\"component\":\"agent\",\"event\":\"agent_started\",\"role\":\"all\",\"address\":{},\"cgroupV2Enabled\":{}}}",
+        "{{\"timestampMs\":{},\"severity\":\"info\",\"component\":\"agent\",\"event\":\"agent_started\",\"role\":\"all\",\"address\":{},\"cgroupV2Enabled\":{},\"landlockMode\":{}}}",
         timestamp_ms(),
         serde_json::to_string(&address.to_string())?,
-        cgroup_v2_enabled
+        cgroup_v2_enabled,
+        serde_json::to_string(match config.landlock.mode {
+            LandlockModeConfig::Disabled => "disabled",
+            LandlockModeConfig::Optional => "optional",
+            LandlockModeConfig::Required => "required",
+        })?
     );
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -220,20 +274,83 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
 fn process_backend(
     config: &Config,
 ) -> Result<Arc<dyn conductor_worker::ExecutionBackend>, Box<dyn std::error::Error>> {
-    if config.cgroup_v2.enabled {
-        let root = config
-            .cgroup_v2
-            .delegated_root
-            .as_deref()
-            .ok_or("cgroup_v2.delegated_root is required when cgroup_v2.enabled is true")?;
-        let backend = conductor_process::HostProcessBackend::with_cgroup_v2(
-            root,
-            &config.worker_id,
-            config.cgroup_v2.maximums.clone(),
+    #[cfg(target_os = "linux")]
+    {
+        let mut backend = if config.cgroup_v2.enabled {
+            let root = config
+                .cgroup_v2
+                .delegated_root
+                .as_deref()
+                .ok_or("cgroup_v2.delegated_root is required when cgroup_v2.enabled is true")?;
+            conductor_process::HostProcessBackend::with_cgroup_v2(
+                root,
+                &config.worker_id,
+                config.cgroup_v2.maximums.clone(),
+                std::env::current_exe()?,
+            )?
+        } else {
+            conductor_process::HostProcessBackend::default()
+        };
+        backend = backend.with_landlock(
+            match config.landlock.mode {
+                LandlockModeConfig::Disabled => conductor_process::LandlockMode::Disabled,
+                LandlockModeConfig::Optional => conductor_process::LandlockMode::Optional,
+                LandlockModeConfig::Required => conductor_process::LandlockMode::Required,
+            },
+            config
+                .landlock
+                .grants
+                .iter()
+                .map(|grant| conductor_process::LandlockGrantConfig {
+                    id: grant.id.clone(),
+                    path: grant.path.clone(),
+                    read: grant.read,
+                    write: grant.write,
+                    execute: grant.execute,
+                })
+                .collect(),
+            &{
+                let mut protected = vec![
+                    config.manager_data_dir.clone(),
+                    config.worker_data_dir.clone(),
+                    config.source_config_path.clone(),
+                ];
+                protected.extend(config.landlock.protected_paths.iter().cloned());
+                if let Some(home) = std::env::var_os("HOME") {
+                    let home = PathBuf::from(home);
+                    protected.extend([home.join(".ssh"), home.join(".aws"), home.join(".config")]);
+                }
+                protected.extend([
+                    PathBuf::from("/etc/shadow"),
+                    PathBuf::from("/etc/gshadow"),
+                    PathBuf::from("/etc/ssh"),
+                ]);
+                if let Ok(homes) = fs::read_dir("/home") {
+                    for home in homes.flatten() {
+                        let home = home.path();
+                        protected.extend([
+                            home.join(".ssh"),
+                            home.join(".aws"),
+                            home.join(".config"),
+                        ]);
+                    }
+                }
+                if config.cgroup_v2.enabled
+                    && let Some(root) = &config.cgroup_v2.delegated_root
+                {
+                    protected.push(root.clone());
+                }
+                protected
+            },
             std::env::current_exe()?,
         )?;
         Ok(Arc::new(backend))
-    } else {
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        if config.landlock.mode != LandlockModeConfig::Disabled || config.cgroup_v2.enabled {
+            return Err("cgroup v2 and Landlock enforcement are available only on Linux".into());
+        }
         Ok(Arc::new(conductor_process::HostProcessBackend::default()))
     }
 }
@@ -372,6 +489,8 @@ mod tests {
             log_retention_runs: conductor_worker::DEFAULT_LOG_RETENTION_RUNS,
             request_timeout_ms: default_request_timeout_ms(),
             cgroup_v2: CgroupV2Config::default(),
+            landlock: super::LandlockConfig::default(),
+            source_config_path: PathBuf::new(),
         }
     }
 

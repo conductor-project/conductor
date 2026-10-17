@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""Exercise real Landlock policy, inheritance, and filesystem operation boundaries."""
+
+import argparse
+import base64
+import http.client
+import json
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+
+FIXTURE_SOURCE = r"""
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static int denied(const char *path, int flags) {
+  errno = 0;
+  int fd = open(path, flags);
+  if (fd >= 0) { close(fd); return 0; }
+  return errno == EACCES || errno == EPERM;
+}
+
+static int no_unintended_fds(void) {
+  long limit = sysconf(_SC_OPEN_MAX);
+  if (limit < 0 || limit > 4096) limit = 4096;
+  for (int fd = 3; fd < limit; ++fd)
+    if (fcntl(fd, F_GETFD) >= 0 || errno != EBADF) return 0;
+  return 1;
+}
+
+int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "--sleep") == 0)
+    for (;;) sleep(60);
+  if (argc == 3 && strcmp(argv[1], "--child") == 0)
+    return denied(argv[2], O_RDONLY) ? 0 : 21;
+  if (argc != 5) return 2;
+  printf("no_unintended_fds=%d\n", no_unintended_fds());
+  char buffer[64] = {0};
+  int fd = open(argv[1], O_RDONLY);
+  if (fd < 0 || read(fd, buffer, sizeof(buffer) - 1) <= 0) return 3;
+  close(fd);
+  if (strcmp(buffer, "approved-input\n") != 0) return 4;
+  printf("approved_input_read=1\n");
+  printf("input_truncate_denied=%d\n", denied(argv[1], O_WRONLY | O_TRUNC));
+  printf("input_remove_denied=%d\n", unlink(argv[1]) < 0 && (errno == EACCES || errno == EPERM));
+  printf("input_rename_denied=%d\n", rename(argv[1], argv[2]) < 0 && (errno == EACCES || errno == EPERM));
+  printf("state_read_denied=%d\n", denied(argv[3], O_RDONLY));
+  printf("cgroup_read_denied=%d\n", denied(argv[4], O_RDONLY));
+  char output[4096];
+  if (snprintf(output, sizeof(output), "%s/result.txt", argv[2]) >= (int)sizeof(output)) return 5;
+  fd = open(output, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+  if (fd < 0 || write(fd, "approved-output\n", 16) != 16) return 6;
+  close(fd);
+  printf("approved_output_write=1\n");
+  pid_t child = fork();
+  if (child < 0) return 7;
+  if (child == 0) {
+    char *child_args[] = {argv[0], "--child", argv[3], NULL};
+    execv(argv[0], child_args);
+    _exit(22);
+  }
+  int status = 0;
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 8;
+  printf("child_exec_inherited_denial=1\n");
+  return 0;
+}
+"""
+
+
+def request(address, method, route, payload=None):
+    body = None if payload is None else json.dumps(payload, separators=(",", ":"))
+    connection = http.client.HTTPConnection(*address, timeout=35)
+    try:
+        headers = {} if body is None else {"Content-Type": "application/json"}
+        connection.request(method, route, body=body, headers=headers)
+        response = connection.getresponse()
+        raw = response.read()
+        return response.status, json.loads(raw) if raw else None
+    finally:
+        connection.close()
+
+
+def wait_agent(process, address):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError("Conductor exited during Landlock integration coverage")
+        try:
+            status, body = request(address, "GET", "/readyz")
+            if status == 200 and body["status"] == "ready":
+                return
+        except (OSError, TimeoutError, http.client.HTTPException):
+            pass
+        time.sleep(0.02)
+    raise TimeoutError("Conductor did not become ready within 10 seconds")
+
+
+def wait_run(address, run_id, expected, timeout=10):
+    deadline = time.monotonic() + timeout
+    last = None
+    while time.monotonic() < deadline:
+        status, last = request(address, "GET", f"/v1/runs/{run_id}")
+        if status != 200:
+            raise RuntimeError(f"run inspection returned HTTP {status}")
+        if last["state"] in expected:
+            return last
+        time.sleep(0.02)
+    raise TimeoutError(f"run did not reach {sorted(expected)}: {last}")
+
+
+def output(address, run_id, stream="stdout"):
+    status, body = request(address, "GET", f"/v1/runs/{run_id}/logs?stream={stream}&limit=65536")
+    if status != 200:
+        raise RuntimeError(f"run logs returned HTTP {status}")
+    return base64.b64decode(body["data"], validate=True).decode("utf-8")
+
+
+def wait_cgroups_empty(worker_root, timeout=6):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not list(worker_root.glob("run-*")):
+            return
+        time.sleep(0.02)
+    raise TimeoutError("Landlock run left an owned cgroup behind")
+
+
+def reap_owned_groups(worker_root):
+    if not worker_root.exists():
+        return
+    for group in worker_root.glob("run-*"):
+        try:
+            (group / "cgroup.kill").write_text("1", encoding="ascii")
+            deadline = time.monotonic() + 6
+            while time.monotonic() < deadline:
+                events = (group / "cgroup.events").read_text(encoding="ascii")
+                if "populated 0" in events.splitlines():
+                    group.rmdir()
+                    break
+                time.sleep(0.02)
+        except OSError:
+            pass
+
+
+def worker_cgroup_root(delegated_root, worker_id):
+    value = 0xCBF29CE484222325
+    for byte in worker_id.encode():
+        value ^= byte
+        value = (value * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return delegated_root / f"conductor-{value:016x}"
+
+
+def runtime_paths(binary):
+    result = subprocess.run(["ldd", str(binary)], check=True, capture_output=True, text=True)
+    paths = set()
+    for token in re.findall(r"(?:=>\s+)?(/[^\s()]+)", result.stdout):
+        path = Path(token)
+        if path.exists():
+            paths.add(path.resolve(strict=True))
+    if not paths:
+        raise RuntimeError("could not identify dynamic executable dependencies")
+    return sorted(paths)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", type=Path, default=Path("target/release/conductor"))
+    parser.add_argument("--delegated-root", type=Path, required=True)
+    args = parser.parse_args()
+    if sys.platform != "linux":
+        parser.error("real Landlock integration coverage requires Linux")
+    if not args.binary.is_file():
+        parser.error("release binary does not exist")
+    delegated_root = args.delegated_root.resolve(strict=True)
+    if not (delegated_root / "cgroup.procs").is_file():
+        raise RuntimeError("delegated cgroup control path is unavailable")
+
+    with tempfile.TemporaryDirectory(prefix="conductor-landlock-") as temporary:
+        root = Path(temporary)
+        manager = root / "manager"
+        worker = root / "worker"
+        manager.mkdir(mode=0o700)
+        worker.mkdir(mode=0o700)
+        secret = manager / "credential-fixture"
+        secret.write_text("not-for-jobs\n", encoding="utf-8")
+        secret.chmod(0o644)
+        source = root / "fixture.c"
+        source.write_text(FIXTURE_SOURCE, encoding="utf-8")
+        fixture = root / "fixture"
+        subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(fixture)], check=True)
+
+        input_path = root / "input.txt"
+        input_path.write_text("approved-input\n", encoding="utf-8")
+        input_alias = root / "input-alias"
+        input_alias.symlink_to(input_path)
+        output_dir = root / "output"
+        output_dir.mkdir(mode=0o700)
+
+        grants = [
+            {"id": "fixture", "path": str(fixture), "read": True, "execute": True},
+            {"id": "input", "path": str(input_alias), "read": True},
+            {"id": "output", "path": str(output_dir), "write": True},
+        ]
+        for index, dependency in enumerate(runtime_paths(fixture)):
+            loader = "ld-linux" in dependency.name or "ld-musl" in dependency.name
+            grants.append({"id": f"runtime-{index}", "path": str(dependency), "read": True, "execute": loader})
+
+        with socket.socket() as reserved:
+            reserved.bind(("127.0.0.1", 0))
+            port = reserved.getsockname()[1]
+        address = ("127.0.0.1", port)
+        config = {
+            "role": "all",
+            "listen": f"127.0.0.1:{port}",
+            "manager_data_dir": str(manager),
+            "worker_data_dir": str(worker),
+            "worker_id": "landlock-test",
+            "worker_concurrency": 2,
+            "cgroup_v2": {
+                "enabled": True,
+                "delegatedRoot": str(delegated_root),
+                "maximums": {"pidsMax": 32},
+            },
+            "landlock": {"mode": "required", "grants": grants},
+        }
+        config_path = root / "agent.json"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        agent_log = root / "agent.stderr.log"
+
+        # Prove the daemon identity can see the protected fixtures before Landlock applies.
+        secret.read_text(encoding="utf-8")
+        (delegated_root / "cgroup.procs").read_text(encoding="ascii")
+
+        def launch():
+            inherited_secret_fd = os.open(secret, os.O_RDONLY)
+            try:
+                return subprocess.Popen(
+                    [str(args.binary.resolve()), "agent", "--config", str(config_path)],
+                    cwd=root,
+                    stdout=subprocess.DEVNULL,
+                    stderr=agent_log.open("ab"),
+                    pass_fds=(inherited_secret_fd,),
+                )
+            finally:
+                os.close(inherited_secret_fd)
+
+        process = launch()
+        try:
+            wait_agent(process, address)
+            job = {
+                "id": "landlock-fixture",
+                "command": [str(fixture), str(input_path), str(output_dir), str(secret), str(delegated_root / "cgroup.procs")],
+                "cwd": str(root),
+                "filesystemPolicy": {"grants": [grant["id"] for grant in grants]},
+            }
+            status, _ = request(address, "POST", "/v1/jobs", job)
+            assert status == 201, f"fixture registration returned HTTP {status}"
+            status, accepted = request(address, "POST", "/v1/jobs/landlock-fixture/runs")
+            assert status == 202, f"fixture run start returned HTTP {status}: {accepted}"
+            run_id = accepted["runId"]
+            outcome = wait_run(address, run_id, {"succeeded", "failed"})
+            log = output(address, run_id)
+            error_log = output(address, run_id, "stderr")
+            assert outcome["state"] == "succeeded", f"fixture failed: {outcome}; stdout={log}; stderr={error_log}; agent={agent_log.read_text(errors='replace')}"
+            for evidence in (
+                "approved_input_read=1",
+                "input_truncate_denied=1",
+                "input_remove_denied=1",
+                "input_rename_denied=1",
+                "state_read_denied=1",
+                "cgroup_read_denied=1",
+                "approved_output_write=1",
+                "child_exec_inherited_denial=1",
+                "no_unintended_fds=1",
+            ):
+                assert evidence in log, f"missing enforcement evidence {evidence}: {log}"
+            assert (output_dir / "result.txt").read_text(encoding="utf-8") == "approved-output\n"
+            grant_ids = [grant["id"] for grant in grants]
+            worker_root = worker_cgroup_root(delegated_root, config["worker_id"])
+
+            # Cancellation and deadlines still reap the cgroup while Landlock is active.
+            for job_id, extra, expected in (
+                ("landlock-cancel", {"terminationGraceMs": 100}, "cancelled"),
+                ("landlock-deadline", {"timeoutMs": 200}, "timed_out"),
+            ):
+                limited = {
+                    "id": job_id,
+                    "command": [str(fixture), "--sleep"],
+                    "cwd": str(root),
+                    "filesystemPolicy": {"grants": grant_ids},
+                    **extra,
+                }
+                status, _ = request(address, "POST", "/v1/jobs", limited)
+                assert status == 201, f"{job_id} registration returned HTTP {status}"
+                status, accepted = request(address, "POST", f"/v1/jobs/{job_id}/runs")
+                assert status == 202, f"{job_id} start returned HTTP {status}"
+                if expected == "cancelled":
+                    wait_run(address, accepted["runId"], {"running"})
+                    status, _ = request(address, "POST", f"/v1/runs/{accepted['runId']}/stop")
+                    assert status in (200, 202), f"Landlock stop returned HTTP {status}"
+                outcome = wait_run(address, accepted["runId"], {expected})
+                assert outcome["state"] == expected, f"{job_id} ended in {outcome['state']}"
+                wait_cgroups_empty(worker_root)
+
+            # The named grant policy persists with its immutable job definition across restart.
+            process.send_signal(signal.SIGINT)
+            process.wait(timeout=8)
+            process = launch()
+            wait_agent(process, address)
+            status, persisted = request(address, "GET", "/v1/jobs/landlock-fixture")
+            assert status == 200, "Landlock job was not persisted across restart"
+            assert persisted["filesystemPolicy"] == {"grants": grant_ids}
+
+            # The required mode cannot be disabled by omitting a policy or selecting an unknown grant.
+            for job_id, policy in (("missing-policy", None), ("unknown-grant", {"grants": ["not-approved"]})):
+                rejected = {
+                    "id": job_id,
+                    "command": [str(fixture), str(input_path), str(output_dir), str(secret), str(delegated_root / "cgroup.procs")],
+                    "cwd": str(root),
+                }
+                if policy is not None:
+                    rejected["filesystemPolicy"] = policy
+                status, _ = request(address, "POST", "/v1/jobs", rejected)
+                assert status == 201, f"{job_id} registration returned HTTP {status}"
+                status, accepted = request(address, "POST", f"/v1/jobs/{job_id}/runs")
+                assert status == 202, f"{job_id} start returned HTTP {status}"
+                outcome = wait_run(address, accepted["runId"], {"failed"})
+                assert outcome["state"] == "failed", f"{job_id} unexpectedly ran: {outcome}"
+
+            disabled_job = {
+                "id": "disable-required-policy",
+                "command": [str(fixture), str(input_path), str(output_dir), str(secret), str(delegated_root / "cgroup.procs")],
+                "cwd": str(root),
+                "filesystemPolicy": {"grants": ["fixture"], "enabled": False},
+            }
+            status, _ = request(address, "POST", "/v1/jobs", disabled_job)
+            assert status == 422, "job was allowed to disable mandatory filesystem enforcement"
+
+            # A path grant must not overlap state, cgroup controls, or a protected ancestor.
+            broad_config = dict(config)
+            broad_config["manager_data_dir"] = str(root / "broad-manager")
+            broad_config["worker_data_dir"] = str(root / "broad-worker")
+            broad_config["cgroup_v2"] = {"enabled": False}
+            broad_config["landlock"] = {
+                "mode": "required",
+                "grants": [{"id": "broad", "path": str(root), "read": True}],
+            }
+            broad_path = root / "broad.json"
+            broad_path.write_text(json.dumps(broad_config), encoding="utf-8")
+            rejected_agent = subprocess.run(
+                [str(args.binary.resolve()), "agent", "--config", str(broad_path)],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            assert rejected_agent.returncode != 0, "broad protected ancestor grant was accepted"
+            assert "overlap Conductor state or control paths" in rejected_agent.stderr, rejected_agent.stderr
+
+            nested = output_dir / "nested"
+            nested.mkdir()
+            broad_config["landlock"]["grants"] = [
+                {"id": "outer-read", "path": str(output_dir), "read": True},
+                {"id": "nested-write", "path": str(nested), "write": True},
+            ]
+            nested_path = root / "nested.json"
+            nested_path.write_text(json.dumps(broad_config), encoding="utf-8")
+            rejected_nested = subprocess.run(
+                [str(args.binary.resolve()), "agent", "--config", str(nested_path)],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            assert rejected_nested.returncode != 0, "a nested grant widened an ancestor policy"
+            assert "nested Landlock grants cannot widen" in rejected_nested.stderr
+            print(json.dumps({"status": "passed", "enforcement": "real Landlock ABI >= 3", "evidence": 9}))
+        finally:
+            if process.poll() is None:
+                process.send_signal(signal.SIGINT)
+                try:
+                    process.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+            reap_owned_groups(worker_cgroup_root(delegated_root, config["worker_id"]))
+
+
+if __name__ == "__main__":
+    main()
+

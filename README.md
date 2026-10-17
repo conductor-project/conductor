@@ -2,7 +2,7 @@
 
 Conductor is an early-stage Linux daemon for managing and running jobs. MVP1 targets one `conductor` binary that combines manager and worker responsibilities behind explicit interfaces. It validates and stores immutable job definitions, starts local host processes, and records run observations through a loopback HTTP API. Job definitions and run history survive agent restarts; a process whose outcome becomes ambiguous across a crash is marked `unknown` and is not automatically replayed.
 
-The host process backend runs with the daemon user's operating-system permissions and network access. It is not a security sandbox. Each process starts in a dedicated process group; ordinary group members are force-cleaned after the leader exits and during daemon shutdown. A process can deliberately leave its group, so process groups alone are not containment. Optional Linux cgroup v2 enforcement places the launcher in a per-run cgroup before it executes the job, applies CPU, memory, swap, and process-count limits, and cleans up descendants that leave the process group. It does not provide filesystem or network isolation, and workloads sharing the daemon UID may interfere with cgroup files if the administrator has not protected the delegated hierarchy.
+The host process backend runs with the daemon user's operating-system permissions and network access. It is not a security sandbox. Each process starts in a dedicated process group; ordinary group members are force-cleaned after the leader exits and during daemon shutdown. A process can deliberately leave its group, so process groups alone are not containment. Optional Linux cgroup v2 enforcement places the launcher in a per-run cgroup before it executes the job, applies CPU, memory, swap, and process-count limits, and cleans up descendants that leave the process group. It does not provide filesystem or network isolation, and workloads sharing the daemon UID may interfere with cgroup files if the administrator has not protected the delegated hierarchy. Optional Landlock enforcement restricts filesystem operations for selected jobs; it supplements Unix permissions and does not isolate networking or mounts, hide all metadata, revoke already-open handles, or prevent every same-UID interaction.
 
 ## Requirements
 
@@ -151,6 +151,39 @@ The optional job field `resourceLimits` accepts `cpuQuotaUs` with `cpuPeriodUs` 
 ```
 
 Keep the workload UID from writing cgroup control files or migrating itself outside the delegated subtree. A delegated root owned by the same UID as the workload is not itself a security boundary. Cgroups provide resource limits and descendant cleanup only; they do not hide host metadata, restrict files or network, or prevent all same-user interference. When cgroup enforcement is disabled, jobs that request resource limits fail before their executable is launched.
+
+### Landlock filesystem policy
+
+`landlock.mode` has three values and defaults to `disabled` for compatibility. Existing jobs without a `filesystemPolicy` keep their current behavior in `disabled` mode. In `optional` mode, jobs that omit `filesystemPolicy` also run without Landlock; jobs that provide it must be fully enforced. In `required` mode, every job must provide a policy, and omission, an unknown grant, unsupported kernel ABI, or any setup error fails the run before its executable runs. A job cannot disable required enforcement.
+
+Administrators configure named `grants`, each bound to one absolute file or directory path and any combination of `read`, `write`, and `execute`. A job's immutable `filesystemPolicy.grants` list can select only those identifiers; it cannot submit paths or add rights. Directory grants apply recursively. `read` permits file reads and directory listing. `write` permits file writes and truncation, directory/file creation, removal, symlink creation, and the Landlock `refer` operation used for links and renames. Cross-directory rename is controlled by `refer` and must be allowed by the applicable grants on both sides. `execute` permits executing files under the grant. Ordinary Unix permissions still apply, so Landlock never elevates access.
+
+Use narrow grants for the job executable, its dynamic loader and shared libraries, input files/directories, and output directories. Executable files need both `read` and `execute` so the kernel can load their contents; dynamic loaders also need both. Conductor does not infer or automatically grant these paths. The daemon opens administrator paths into pinned descriptors, resolves symlink aliases at configuration time, and builds Landlock rules from those descriptors in its fresh launcher. Grants that overlap manager/worker state, the source configuration, cgroup controls, configured `protectedPaths`, or known credential locations are rejected. Overlapping grants cannot give a nested path more rights than its ancestor; a broader allow rule is never treated as if a nested rule denied access. Keep credential paths in `protectedPaths` when they are stored outside the built-in protected locations.
+
+For example, first inspect the executable's actual dependency paths with `ldd /usr/bin/printf`, then configure exact paths for that host rather than granting `/usr`, `/lib`, or `/etc` wholesale:
+
+```json
+{
+  "landlock": {
+    "mode": "required",
+    "protectedPaths": ["/opt/conductor/credentials"],
+    "grants": [
+      {"id": "printf", "path": "/usr/bin/printf", "read": true, "execute": true},
+      {"id": "libc", "path": "/usr/lib/x86_64-linux-gnu/libc.so.6", "read": true},
+      {"id": "loader", "path": "/lib64/ld-linux-x86-64.so.2", "read": true, "execute": true},
+      {"id": "output", "path": "/var/lib/conductor/jobs/output", "write": true}
+    ]
+  }
+}
+```
+
+The job selects only the identifiers it needs:
+
+```json
+{"id":"printf-job","command":["/usr/bin/printf","hello\\n"],"cwd":"/tmp","filesystemPolicy":{"grants":["printf","libc","loader"]}}
+```
+
+The library requires Landlock ABI 3 or newer, including truncate and rename rights. Rules use hard compatibility requirements and Conductor checks for full enforcement; it never falls back to a partial ruleset or unrestricted execution. At startup, Conductor marks inherited descriptors close-on-exec before opening state and repeats the check after backend initialization. The Linux CI fixture passes an extra readable descriptor to the daemon and verifies it does not reach job code, then checks restrictions across child processes and replacement executables. Landlock still cannot revoke file descriptors opened before enforcement, mediate every metadata or filesystem operation, or prevent all interference between processes sharing the daemon UID. Cgroups remain an independent resource and descendant-cleanup boundary.
 
 ### systemd operation
 

@@ -10,5 +10,9 @@
   "request_timeout_ms": 10000,
   "cgroup_v2": {
     "enabled": false
+  },
+  "landlock": {
+    "mode": "disabled",
+    "grants": []
   }
 }

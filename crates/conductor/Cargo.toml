@@ -17,6 +17,9 @@ ctrlc.workspace = true
 clap.workspace = true
 tokio.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+close_fds.workspace = true
+
 [dev-dependencies]
 base64.workspace = true
 rusqlite.workspace = true

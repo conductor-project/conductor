@@ -29,6 +29,8 @@ axum = { version = "0.8", default-features = false, features = ["http1", "json",
 tokio = { version = "1", default-features = false, features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 nix = { version = "0.31.3", default-features = false, features = ["poll", "process", "signal"] }
+landlock = { version = "0.4.7", default-features = false }
+close_fds = { version = "0.3.2", default-features = false }
 base64 = { version = "0.22.1", default-features = false }
 
 [workspace.lints.rust]

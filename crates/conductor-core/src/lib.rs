@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 
 const MAX_IDENTIFIER_LENGTH: usize = 128;
+const MAX_FILESYSTEM_GRANTS_PER_JOB: usize = 64;
 const DEFAULT_TERMINATION_GRACE_MS: u64 = 5_000;
 const MAX_TERMINATION_GRACE_MS: u64 = 300_000;
 const MAX_TIMEOUT_MS: u64 = 604_800_000;
@@ -682,6 +683,7 @@ pub enum JobValidationError {
     InvalidCpuLimit,
     InvalidMemoryLimit,
     InvalidProcessLimit,
+    InvalidFilesystemPolicy,
 }
 
 impl fmt::Display for JobValidationError {
@@ -702,6 +704,9 @@ impl fmt::Display for JobValidationError {
                 "memory limits must be at least 4 MiB and within supported bounds"
             }
             Self::InvalidProcessLimit => "pidsMax must be between 1 and 1048576",
+            Self::InvalidFilesystemPolicy => {
+                "filesystemPolicy must contain at most 64 unique grant identifiers"
+            }
         })
     }
 }
@@ -721,6 +726,8 @@ pub struct JobSpec {
     termination_grace_ms: u64,
     #[serde(default, skip_serializing_if = "ResourceLimits::is_empty")]
     resource_limits: ResourceLimits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    filesystem_policy: Option<FilesystemPolicy>,
 }
 
 #[derive(Deserialize)]
@@ -739,6 +746,39 @@ struct RawJobSpec {
     termination_grace_ms: u64,
     #[serde(default)]
     resource_limits: ResourceLimits,
+    #[serde(default)]
+    filesystem_policy: Option<FilesystemPolicy>,
+}
+
+/// An immutable selection of administrator-approved filesystem grants.
+/// Jobs select configured grants by identifier and cannot submit paths.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FilesystemPolicy {
+    grants: Vec<String>,
+}
+
+impl FilesystemPolicy {
+    pub fn new(grants: Vec<String>) -> Result<Self, JobValidationError> {
+        let mut seen = std::collections::BTreeSet::new();
+        if grants.len() > MAX_FILESYSTEM_GRANTS_PER_JOB
+            || grants.iter().any(|grant| {
+                grant.is_empty()
+                    || grant.len() > MAX_IDENTIFIER_LENGTH
+                    || !grant
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+                    || !seen.insert(grant.as_str())
+            })
+        {
+            return Err(JobValidationError::InvalidFilesystemPolicy);
+        }
+        Ok(Self { grants })
+    }
+
+    pub fn grants(&self) -> &[String] {
+        &self.grants
+    }
 }
 
 /// Optional Linux cgroup v2 resource limits requested by an immutable job.
@@ -863,6 +903,7 @@ impl JobSpec {
             timeout_ms,
             termination_grace_ms,
             resource_limits: ResourceLimits::default(),
+            filesystem_policy: None,
         })
     }
 
@@ -904,6 +945,18 @@ impl JobSpec {
     pub fn resource_limits(&self) -> &ResourceLimits {
         &self.resource_limits
     }
+    pub fn with_filesystem_policy(
+        mut self,
+        filesystem_policy: Option<FilesystemPolicy>,
+    ) -> Result<Self, JobValidationError> {
+        self.filesystem_policy = filesystem_policy
+            .map(|policy| FilesystemPolicy::new(policy.grants))
+            .transpose()?;
+        Ok(self)
+    }
+    pub fn filesystem_policy(&self) -> Option<&FilesystemPolicy> {
+        self.filesystem_policy.as_ref()
+    }
 }
 
 impl TryFrom<RawJobSpec> for JobSpec {
@@ -919,7 +972,8 @@ impl TryFrom<RawJobSpec> for JobSpec {
             raw.timeout_ms,
             raw.termination_grace_ms,
         )?
-        .with_resource_limits(raw.resource_limits)
+        .with_resource_limits(raw.resource_limits)?
+        .with_filesystem_policy(raw.filesystem_policy)
     }
 }
 
