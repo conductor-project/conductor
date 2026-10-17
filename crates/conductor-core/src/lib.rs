@@ -136,9 +136,12 @@ pub struct WorkerStatus {
     process_execution: bool,
     capacity: usize,
     used_slots: usize,
+    live_processes: usize,
     unknown_runs: usize,
+    pending_persistence: usize,
     available_slots: usize,
     available: bool,
+    degraded: bool,
     draining: bool,
     observed_at_ms: i64,
 }
@@ -160,12 +163,30 @@ impl WorkerStatus {
             process_execution: descriptor.supports_process_execution(),
             capacity,
             used_slots: used_slots.min(capacity),
+            live_processes: used_slots.min(capacity),
             unknown_runs: unknown_runs.min(used_slots),
+            pending_persistence: 0,
             available_slots: capacity.saturating_sub(used_slots),
             available,
+            degraded: false,
             draining,
             observed_at_ms,
         }
+    }
+
+    pub fn with_runtime_state(
+        mut self,
+        live_processes: usize,
+        pending_persistence: usize,
+        degraded: bool,
+    ) -> Self {
+        self.live_processes = live_processes.min(self.capacity);
+        self.pending_persistence = pending_persistence.min(self.capacity);
+        self.degraded = degraded;
+        if degraded {
+            self.available = false;
+        }
+        self
     }
 
     pub fn worker_id(&self) -> &WorkerId {
@@ -183,14 +204,23 @@ impl WorkerStatus {
     pub fn used_slots(&self) -> usize {
         self.used_slots
     }
+    pub fn live_processes(&self) -> usize {
+        self.live_processes
+    }
     pub fn unknown_runs(&self) -> usize {
         self.unknown_runs
+    }
+    pub fn pending_persistence(&self) -> usize {
+        self.pending_persistence
     }
     pub fn available_slots(&self) -> usize {
         self.available_slots
     }
     pub fn available(&self) -> bool {
         self.available
+    }
+    pub fn degraded(&self) -> bool {
+        self.degraded
     }
     pub fn draining(&self) -> bool {
         self.draining

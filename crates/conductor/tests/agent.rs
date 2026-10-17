@@ -8,6 +8,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use rusqlite::Connection;
+
 struct TempDir(PathBuf);
 
 impl TempDir {
@@ -1623,6 +1625,114 @@ fn actual_binary_turns_interrupted_runs_unknown_without_replaying_them() {
     );
     signal(&recovered, "INT");
     wait_for_exit(&mut recovered);
+}
+
+#[test]
+fn actual_binary_recovers_pending_terminal_persistence_as_unknown_without_replay() {
+    let path = TempDir::new("terminal-persistence-crash");
+    let marker = path.join("workload-started");
+    let payload = job_with(
+        "terminal-pending",
+        &[
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            format!("echo started >> {}; sleep 0.1; exit 9", marker.display()),
+        ],
+        "/tmp",
+        serde_json::json!({}),
+    );
+    let config = write_config(&path, "all", "127.0.0.1:0", "");
+    let mut child = Agent(
+        command(&config, None)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start agent"),
+    );
+    let stderr = child.0.stderr.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stderr).read_line(&mut line);
+        let _ = sender.send(line);
+    });
+    let line = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("agent readiness");
+    let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(event["event"], "agent_started", "{line}");
+    let address: SocketAddr = event["address"].as_str().unwrap().parse().unwrap();
+    wait_for_ready(address);
+
+    let connection = Connection::open(path.join("worker/worker.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_terminal BEFORE UPDATE OF state ON runs
+             WHEN NEW.state IN ('succeeded', 'failed', 'cancelled', 'timed_out')
+             BEGIN SELECT RAISE(FAIL, 'injected terminal persistence failure'); END;",
+        )
+        .unwrap();
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &payload
+        )
+        .0,
+        201
+    );
+    let (status, accepted) = http(address, "POST", "/v1/jobs/terminal-pending/runs", None, &[]);
+    assert_eq!(status, 202, "{accepted}");
+    let run: serde_json::Value = serde_json::from_str(&accepted).unwrap();
+    let run_id = run["runId"].as_str().unwrap().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, body) = http(address, "GET", "/v1/workers/test-worker", None, &[]);
+        assert_eq!(status, 200, "{body}");
+        let worker_status: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if worker_status["pendingPersistence"] == 1 {
+            assert_eq!(worker_status["degraded"], true);
+            assert_eq!(worker_status["usedSlots"], 1);
+            assert_eq!(worker_status["liveProcesses"], 0);
+            assert_eq!(worker_status["available"], false);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "terminal persistence did not become pending"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let (status, readiness) = http(address, "GET", "/readyz", None, &[]);
+    assert_eq!(status, 503, "{readiness}");
+    assert!(readiness.contains("degraded"));
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
+
+    signal(&child, "KILL");
+    let _ = child.0.wait().expect("kill agent with pending persistence");
+    drop(connection);
+
+    let connection = Connection::open(path.join("worker/worker.sqlite3")).unwrap();
+    connection
+        .execute_batch("DROP TRIGGER reject_terminal;")
+        .unwrap();
+    drop(connection);
+    let (mut restarted, address) = start(&path, "all", None);
+    let (status, body) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
+    assert_eq!(status, 200, "{body}");
+    let observation: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(observation["state"], "unknown");
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    let (status, body) = http(address, "GET", "/v1/workers/test-worker", None, &[]);
+    assert_eq!(status, 200, "{body}");
+    let worker_status: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(worker_status["pendingPersistence"], 0);
+    assert_eq!(worker_status["unknownRuns"], 1);
+    assert_eq!(worker_status["degraded"], false);
+    signal(&restarted, "TERM");
+    wait_for_exit(&mut restarted);
 }
 
 #[test]

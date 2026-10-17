@@ -200,6 +200,10 @@ impl WorkerPort for LocalWorkerPort {
         self.0.is_draining()
     }
 
+    fn is_degraded(&self) -> bool {
+        self.0.is_degraded()
+    }
+
     fn start(&self, command: StartRun) -> Result<conductor_core::RunObservation, WorkerPortError> {
         self.0.start(command).map_err(map_worker_error)
     }

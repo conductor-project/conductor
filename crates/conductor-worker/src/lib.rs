@@ -185,6 +185,40 @@ const INTENT_SHUTDOWN: u8 = 3;
 
 struct SharedWorkerState(Mutex<WorkerState>);
 
+struct PendingPersistence {
+    observations: Mutex<BTreeMap<String, RunObservation>>,
+    degraded: AtomicBool,
+}
+
+impl PendingPersistence {
+    fn insert(&self, observation: RunObservation) -> io::Result<()> {
+        self.degraded.store(true, Ordering::SeqCst);
+        self.observations
+            .lock()
+            .map_err(|_| io::Error::other("pending persistence lock poisoned"))?
+            .insert(observation.run_id().to_string(), observation);
+        Ok(())
+    }
+
+    fn remove(&self, run_id: &str) -> io::Result<()> {
+        let mut observations = self
+            .observations
+            .lock()
+            .map_err(|_| io::Error::other("pending persistence lock poisoned"))?;
+        observations.remove(run_id);
+        self.degraded
+            .store(!observations.is_empty(), Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn len(&self) -> io::Result<usize> {
+        self.observations
+            .lock()
+            .map(|observations| observations.len())
+            .map_err(|_| io::Error::other("pending persistence lock poisoned"))
+    }
+}
+
 pub struct WorkerService {
     worker_id: WorkerId,
     capacity: usize,
@@ -193,6 +227,7 @@ pub struct WorkerService {
     log_policy: LogPolicy,
     backend: Arc<dyn ExecutionBackend>,
     state: Arc<SharedWorkerState>,
+    pending: Arc<PendingPersistence>,
     supervisors: Mutex<Vec<JoinHandle<()>>>,
     lifecycle: Mutex<bool>,
 }
@@ -424,6 +459,10 @@ impl WorkerService {
                 connection,
                 active_groups: BTreeMap::new(),
             }))),
+            pending: Arc::new(PendingPersistence {
+                observations: Mutex::new(BTreeMap::new()),
+                degraded: AtomicBool::new(false),
+            }),
             supervisors: Mutex::new(Vec::new()),
             lifecycle: Mutex::new(false),
         };
@@ -470,6 +509,9 @@ impl WorkerService {
                 }
                 return serde_json::from_str(&stored_observation)
                     .map_err(|_| WorkerError::StorageUnavailable);
+            }
+            if self.is_degraded() {
+                return Err(WorkerError::StorageUnavailable);
             }
             let active_count: i64 = transaction.query_row(
                 "SELECT COUNT(*) FROM runs WHERE state IN ('requested', 'starting', 'running', 'stopping', 'unknown')",
@@ -613,6 +655,7 @@ impl WorkerService {
         }
 
         let state = Arc::clone(&self.state);
+        let pending = Arc::clone(&self.pending);
         let backend = Arc::clone(&self.backend);
         let run_id = spec.id().to_string();
         let control = match self.state.0.lock() {
@@ -650,6 +693,7 @@ impl WorkerService {
                 if let Some(spawned) = spawned {
                     supervise(RunSupervision {
                         state,
+                        pending,
                         backend,
                         run_id,
                         spawned,
@@ -939,15 +983,22 @@ impl WorkerService {
             .map_err(|_| WorkerError::StorageUnavailable)?;
         let used = usize::try_from(used).map_err(|_| WorkerError::StorageUnavailable)?;
         let unknown = usize::try_from(unknown).map_err(|_| WorkerError::StorageUnavailable)?;
+        let live_processes = state.active_groups.len();
         let observed_at = now_ms().map_err(|_| WorkerError::StorageUnavailable)?;
+        let pending = self
+            .pending
+            .len()
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let degraded = self.is_degraded();
         Ok(WorkerStatus::new(
             self.descriptor(),
             used,
             unknown,
-            !draining,
+            !draining && !degraded,
             draining,
             observed_at,
-        ))
+        )
+        .with_runtime_state(live_processes, pending, degraded))
     }
 
     pub fn is_draining(&self) -> bool {
@@ -955,6 +1006,10 @@ impl WorkerService {
             .lock()
             .map(|draining| *draining)
             .unwrap_or(true)
+    }
+
+    pub fn is_degraded(&self) -> bool {
+        self.pending.degraded.load(Ordering::SeqCst)
     }
 
     /// Stop admission immediately and notify every live supervisor to begin cleanup.
@@ -987,7 +1042,11 @@ impl WorkerService {
                 .map_err(|_| io::Error::other("worker state lock poisoned"))?
                 .active_groups
                 .len();
-            if active == 0 || std::time::Instant::now() >= deadline {
+            let pending = self
+                .pending
+                .len()
+                .map_err(|_| io::Error::other("pending persistence lock poisoned"))?;
+            if (active == 0 && pending == 0) || std::time::Instant::now() >= deadline {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
@@ -1016,7 +1075,11 @@ impl WorkerService {
                 .map_err(|_| io::Error::other("worker state lock poisoned"))?
                 .active_groups
                 .len();
-            if active == 0 {
+            let pending = self
+                .pending
+                .len()
+                .map_err(|_| io::Error::other("pending persistence lock poisoned"))?;
+            if active == 0 && pending == 0 {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
@@ -1028,6 +1091,11 @@ impl WorkerService {
             .map_err(|_| io::Error::other("worker state lock poisoned"))?
             .active_groups
             .is_empty()
+            || self
+                .pending
+                .len()
+                .map_err(|_| io::Error::other("pending persistence lock poisoned"))?
+                > 0
         {
             first_error.get_or_insert(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1447,8 +1515,82 @@ fn prune_completed_logs_shared(
     Ok(())
 }
 
+fn persist_terminal_observation(
+    state: &SharedWorkerState,
+    terminal: &RunObservation,
+) -> io::Result<()> {
+    let mut state = state
+        .0
+        .lock()
+        .map_err(|_| io::Error::other("worker state lock poisoned"))?;
+    let transaction = state
+        .connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(storage_error)?;
+    let current_json = transaction
+        .query_row(
+            "SELECT observation_json FROM runs WHERE run_id = ?1",
+            [terminal.run_id().as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(storage_error)?
+        .ok_or_else(|| io::Error::other("terminal run record is missing"))?;
+    let current: RunObservation = serde_json::from_str(&current_json).map_err(storage_error)?;
+    if current.state().is_terminal() {
+        transaction.commit().map_err(storage_error)?;
+        return Ok(());
+    }
+    let next = if current.revision() < terminal.revision() {
+        terminal.clone()
+    } else {
+        current
+            .next_revision(
+                terminal.state(),
+                terminal.started_at_ms(),
+                terminal.finished_at_ms(),
+                terminal.exit_code(),
+                terminal.termination_signal(),
+                terminal.failure_reason(),
+            )
+            .ok_or_else(|| io::Error::other("observation revision exhausted"))?
+            .with_optional_termination_reason(terminal.termination_reason())
+    };
+    let serialized = serde_json::to_string(&next).map_err(storage_error)?;
+    let changed = transaction
+        .execute(
+            "UPDATE runs SET observation_json = ?1, revision = ?2, state = ?3 WHERE run_id = ?4 AND revision = ?5 AND state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
+            params![serialized, next.revision() as i64, next.state().as_str(), next.run_id().as_str(), current.revision() as i64],
+        )
+        .map_err(storage_error)?;
+    if changed != 1 {
+        return Err(io::Error::other("terminal observation was not persisted"));
+    }
+    transaction.commit().map_err(storage_error)
+}
+
+fn emit_worker_diagnostic(event: &str, run_id: &str, error: &io::Error) {
+    eprintln!(
+        "{{\"timestampMs\":{},\"severity\":\"error\",\"component\":\"worker\",\"event\":{},\"runId\":{},\"errorKind\":{}}}",
+        now_ms().unwrap_or_default(),
+        serde_json::to_string(event).unwrap_or_else(|_| "null".into()),
+        serde_json::to_string(run_id).unwrap_or_else(|_| "null".into()),
+        serde_json::to_string(&format!("{:?}", error.kind())).unwrap_or_else(|_| "null".into()),
+    );
+}
+
+fn emit_worker_event(event: &str, run_id: &str) {
+    eprintln!(
+        "{{\"timestampMs\":{},\"severity\":\"info\",\"component\":\"worker\",\"event\":{},\"runId\":{}}}",
+        now_ms().unwrap_or_default(),
+        serde_json::to_string(event).unwrap_or_else(|_| "null".into()),
+        serde_json::to_string(run_id).unwrap_or_else(|_| "null".into()),
+    );
+}
+
 struct RunSupervision {
     state: Arc<SharedWorkerState>,
+    pending: Arc<PendingPersistence>,
     backend: Arc<dyn ExecutionBackend>,
     run_id: String,
     spawned: SpawnGuard,
@@ -1464,6 +1606,7 @@ struct RunSupervision {
 fn supervise(supervision: RunSupervision) {
     let RunSupervision {
         state,
+        pending,
         backend,
         run_id,
         mut spawned,
@@ -1554,7 +1697,9 @@ fn supervise(supervision: RunSupervision) {
     let _ = backend.kill_process_group(group_id);
     // A failed log writer must not rewrite the process exit result. Joining
     // readers ensures their resources are reclaimed before the run is released.
-    let _ = spawned.finish_readers();
+    if let Err(error) = spawned.finish_readers() {
+        emit_worker_diagnostic("log_capture_failed", run_id.as_str(), &error);
+    }
     spawned.child.take();
     let finished = now_ms().unwrap_or(current.requested_at_ms());
     let (run_state, exit_code, signal, failure) = match status {
@@ -1593,18 +1738,35 @@ fn supervise(supervision: RunSupervision) {
             None => value,
         });
     if let Some(terminal) = terminal
-        && let Ok(serialized) = serde_json::to_string(&terminal)
-        && let Ok(state) = state.0.lock()
+        && let Err(error) = persist_terminal_observation(&state, &terminal)
     {
-        let _ = state.connection.execute(
-            "UPDATE runs SET observation_json = ?1, revision = ?2, state = ?3 WHERE run_id = ?4 AND revision < ?2 AND state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
-            params![serialized, terminal.revision() as i64, terminal.state().as_str(), terminal.run_id().as_str()],
-        );
+        pending.degraded.store(true, Ordering::SeqCst);
+        let _ = pending.insert(terminal.clone());
+        if let Ok(mut state) = state.0.lock() {
+            state.active_groups.remove(&run_id);
+        }
+        emit_worker_diagnostic("terminal_persistence_pending", run_id.as_str(), &error);
+        let mut retry_delay = Duration::from_millis(50);
+        loop {
+            thread::sleep(retry_delay);
+            match persist_terminal_observation(&state, &terminal) {
+                Ok(()) => {
+                    let _ = pending.remove(run_id.as_str());
+                    break;
+                }
+                Err(_) => {
+                    retry_delay = (retry_delay * 2).min(Duration::from_secs(5));
+                }
+            }
+        }
+        emit_worker_event("terminal_persistence_recovered", run_id.as_str());
     }
     if let Ok(mut state) = state.0.lock() {
         state.active_groups.remove(&run_id);
     }
-    let _ = prune_completed_logs_shared(&state, &log_directory, retention_runs);
+    if let Err(error) = prune_completed_logs_shared(&state, &log_directory, retention_runs) {
+        emit_worker_diagnostic("log_retention_failed", run_id.as_str(), &error);
+    }
 }
 
 fn status_observation(

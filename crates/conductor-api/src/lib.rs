@@ -209,7 +209,10 @@ async fn healthz() -> impl IntoResponse {
 }
 
 async fn readyz(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    if state.recovery_ready.load(Ordering::SeqCst) && !state.worker.is_draining() {
+    if state.recovery_ready.load(Ordering::SeqCst)
+        && !state.worker.is_draining()
+        && !state.worker.is_degraded()
+    {
         (
             StatusCode::OK,
             r#"{"status":"ready","role":"all","capabilities":["local_process_execution"]}"#,
@@ -218,6 +221,11 @@ async fn readyz(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             r#"{"status":"draining","role":"all","capabilities":["local_process_execution"]}"#,
+        )
+    } else if state.worker.is_degraded() {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"status":"degraded","role":"all","capabilities":["local_process_execution"]}"#,
         )
     } else {
         (

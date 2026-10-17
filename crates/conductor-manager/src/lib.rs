@@ -83,6 +83,9 @@ pub trait WorkerPort: Send + Sync {
     fn is_draining(&self) -> bool {
         false
     }
+    fn is_degraded(&self) -> bool {
+        false
+    }
     fn start(&self, command: StartRun) -> Result<RunObservation, WorkerPortError>;
     fn inspect(&self, command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError>;
     fn stop(&self, command: StopRun) -> Result<RunObservation, WorkerPortError>;
