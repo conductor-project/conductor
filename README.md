@@ -9,6 +9,7 @@ The host process backend runs with the daemon user's operating-system permission
 - Linux for the supported daemon deployment.
 - Rust 1.99.1 with `rustfmt` and `clippy` (installed by `rust-toolchain.toml`).
 - `curl` and `jq` for the HTTP walkthrough.
+- Python 3.9 or newer for the reproducible agent demo and release probe.
 
 ## Build and check
 
@@ -34,6 +35,17 @@ curl --fail http://127.0.0.1:8080/readyz
 ```
 
 The agent prints a structured startup event with its bound address to stderr. `/healthz` reports liveness; `/readyz` reports whether recovery permits new work. Stop it with Ctrl-C or SIGTERM and verify it exits successfully. `--role all` runs the combined baseline; `--role manager` and `--role worker` are recognized but fail as unsupported until remote transport is available. A CLI role overrides the JSON `role` value.
+
+### Reproducible lifecycle demo
+
+After building the release binary, run the checked-in client demo:
+
+```sh
+cargo build --workspace --locked --release
+python3 scripts/demo-agent.py --binary target/release/conductor
+```
+
+The demo creates isolated manager/worker state and an ephemeral loopback listener, waits for `/readyz`, then exercises job registration, concurrent runs within capacity, concurrent idempotency-key replay, stdout/stderr retrieval, bounded large-output retention, stop, process failure, launch failure, timeout, capacity rejection, graceful shutdown, restart, persisted results, and retained logs. It prints a success line only after these observations pass. `--include-crash` adds a separate crash scenario: the fixture records its own child PID, the demo terminates that exact PID, verifies cleanup, then explicitly resolves the recovered `unknown` run as `abandoned`. The script cleans up its agent and fixture processes on failure or interruption. Failures print recent run states and bounded daemon diagnostics. CI runs this demo against the release binary.
 
 ## Job definition API
 
@@ -69,6 +81,17 @@ curl --fail http://127.0.0.1:8080/v1/runs
 ```
 
 Run start returns 202 and a relative `Location: /v1/runs/{runId}` header. Poll that URL for `requested`, `starting`, `running`, then a terminal state. `GET /v1/runs` accepts `jobId`, `state`, `limit`, and `cursor`; both list endpoints default to 50 entries and allow at most 100. Responses provide an opaque `nextCursor` when another page exists. Job pages are ordered by ID; run pages use descending insertion order. Cursors are bound to endpoint filters. They keep a scan from repeating earlier rows while concurrent inserts arrive; run state changes or job deletion between pages can affect which filtered rows remain visible, so pages are not a cross-request snapshot. Results include requested/start/finish timestamps, exit code or termination signal, a structured `failureReason`, and an optional `terminationReason`. Run IDs are not process IDs. Starting a job that already has an active or unresolved run, or deleting it while that run is held, returns 409. A full local worker returns 429 with `Retry-After: 1`. Job `timeoutMs` starts when the process is launched and is measured with a monotonic clock; queue/admission time does not count.
+
+Run outcomes are observable through `GET /v1/runs/{runId}`:
+
+| Outcome | Meaning |
+| --- | --- |
+| `succeeded` | The process exited with status 0. |
+| `failed` | The process exited nonzero or could not be launched; inspect `failureReason` and `exitCode`. |
+| `cancelled` | An operator stop or graceful daemon shutdown terminated the process group; inspect `terminationReason`. |
+| `timed_out` | The configured execution deadline expired; `terminationReason` is `deadline_exceeded`. |
+| `unknown` | Restart recovery cannot determine whether the process ran or finished; capacity remains reserved pending operator action. |
+| `abandoned` | An operator explicitly resolved an `unknown` run after external cleanup; this is not a successful execution result. |
 
 Run submission accepts an optional `Idempotency-Key` header containing 1–128 ASCII letters, digits, `.`, `_`, `~`, or `-`. Keys are global to this manager database and are retained with their run history. Repeating the same key for the same immutable job returns the original run, including after completion and restart. Reusing it for another job returns 409; validation and capacity rejection do not consume a key. This deduplicates the request and process launch, but it cannot make external process side effects exactly once. Up to 32 start requests are admitted concurrently; excess new starts return 429 with `Retry-After: 1`. Health, stop, result, and log requests do not use these start slots.
 
@@ -124,6 +147,8 @@ The manager database is `manager.sqlite3` in `manager_data_dir`. SQLite uses WAL
 ## Architecture
 
 HTTP handlers in `conductor-api` call manager operations. `conductor-manager` owns desired state and assignment. `conductor-worker` owns process supervision, worker persistence, deadlines, logs, and observed execution state. `conductor-process` contains host process mechanics. `conductor-core` holds shared contracts only. The `conductor` binary composes the pieces through explicit interfaces. See [AGENTS.md](AGENTS.md) for boundaries and contribution rules.
+
+MVP1 runs Linux host processes with the daemon user's permissions and network access in combined local mode. The loopback API has no remote authentication. It does not provide distributed placement, automatic retries, automatic daemon restart/recovery of workloads, or process isolation. Use OS service controls and permissions according to the trust level of the jobs; process-group cleanup is lifecycle management, not containment.
 
 ## Contribution
 

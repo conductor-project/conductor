@@ -537,6 +537,26 @@ fn strict_json_rejects_unknown_fields_and_invalid_concurrency() {
 }
 
 #[test]
+fn corrupt_manager_state_fails_closed_without_resetting_database_bytes() {
+    let path = TempDir::new("corrupt-manager-state");
+    let manager_dir = path.join("manager");
+    fs::create_dir_all(&manager_dir).unwrap();
+    let database = manager_dir.join("manager.sqlite3");
+    let original = b"not a sqlite database";
+    fs::write(&database, original).unwrap();
+    let config = write_config(&path, "all", "127.0.0.1:0", "");
+
+    let result = failed(&config, None);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !result.status.success(),
+        "corrupt state unexpectedly started"
+    );
+    assert!(stderr.contains("startup_failed"), "{stderr}");
+    assert_eq!(fs::read(database).unwrap(), original);
+}
+
+#[test]
 fn non_loopback_listener_and_occupied_port_fail_before_readiness() {
     let path = TempDir::new("listener-errors");
     let non_loopback = write_config(&path, "all", "0.0.0.0:0", "");
@@ -1953,6 +1973,44 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
     assert_eq!(status, 404, "{body}");
     signal(&restarted, "INT");
     wait_for_exit(&mut restarted);
+}
+
+#[cfg(unix)]
+#[test]
+fn log_storage_symlink_failure_returns_redacted_internal_error() {
+    use std::os::unix::fs::symlink;
+
+    let path = TempDir::new("log-storage-fault");
+    let (mut child, address) = start(&path, "all", None);
+    let job = job_json("log-storage", &["/bin/sh", "-c", "printf safe-output"]);
+    assert_eq!(
+        http(address, "POST", "/v1/jobs", Some("application/json"), &job).0,
+        201
+    );
+    let result = start_and_poll(address, "log-storage");
+    let run_id = result["runId"].as_str().unwrap();
+    let logs_dir = path.join("worker/runs");
+    let log_path = logs_dir.join(format!("{run_id}.stdout"));
+    let target = path.join("secret-target");
+    fs::write(&target, b"must-not-be-read-through-a-link").unwrap();
+    fs::remove_file(&log_path).unwrap();
+    symlink(&target, &log_path).unwrap();
+
+    let (status, body) = http(
+        address,
+        "GET",
+        &format!("/v1/runs/{run_id}/logs?stream=stdout"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 503, "{body}");
+    assert!(body.contains("worker_unavailable"), "{body}");
+    assert!(
+        !body.contains("secret-target"),
+        "storage path leaked: {body}"
+    );
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
 }
 
 #[test]
