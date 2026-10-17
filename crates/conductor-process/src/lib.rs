@@ -107,15 +107,14 @@ impl ExecutionBackend for HostProcessBackend {
 
     fn kill_process_group(&self, group_id: u32) -> io::Result<()> {
         #[cfg(target_os = "linux")]
-        if let Some(cgroup) = &self.cgroup {
-            if let Some(path) = cgroup
+        if let Some(cgroup) = &self.cgroup
+            && let Some(path) = cgroup
                 .groups
                 .lock()
                 .map_err(|_| io::Error::other("cgroup registry is unavailable"))?
                 .get(&group_id)
-            {
-                CgroupV2::kill(path)?;
-            }
+        {
+            CgroupV2::kill(path)?;
         }
         #[cfg(unix)]
         {
@@ -143,45 +142,44 @@ impl ExecutionBackend for HostProcessBackend {
 
     fn cleanup_execution(&self, group_id: u32) -> io::Result<()> {
         #[cfg(target_os = "linux")]
-        if let Some(cgroup) = &self.cgroup {
-            let path = cgroup
+        if let Some(cgroup) = &self.cgroup
+            && let Some(path) = cgroup
                 .groups
                 .lock()
                 .map_err(|_| io::Error::other("cgroup registry is unavailable"))?
                 .get(&group_id)
-                .cloned();
-            if let Some(path) = path {
-                match CgroupV2::kill(&path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        cgroup
-                            .groups
-                            .lock()
-                            .map_err(|_| io::Error::other("cgroup registry is unavailable"))?
-                            .remove(&group_id);
-                        return Ok(());
-                    }
-                    Err(error) => return Err(error),
+                .cloned()
+        {
+            match CgroupV2::kill(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    cgroup
+                        .groups
+                        .lock()
+                        .map_err(|_| io::Error::other("cgroup registry is unavailable"))?
+                        .remove(&group_id);
+                    return Ok(());
                 }
-                match CgroupV2::remove_when_empty(&path) {
-                    Ok(()) => {
-                        cgroup
-                            .groups
-                            .lock()
-                            .map_err(|_| io::Error::other("cgroup registry is unavailable"))?
-                            .remove(&group_id);
-                        return Ok(());
-                    }
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                        cgroup
-                            .groups
-                            .lock()
-                            .map_err(|_| io::Error::other("cgroup registry is unavailable"))?
-                            .remove(&group_id);
-                        return Ok(());
-                    }
-                    Err(error) => return Err(error),
+                Err(error) => return Err(error),
+            }
+            match CgroupV2::remove_when_empty(&path) {
+                Ok(()) => {
+                    cgroup
+                        .groups
+                        .lock()
+                        .map_err(|_| io::Error::other("cgroup registry is unavailable"))?
+                        .remove(&group_id);
+                    return Ok(());
                 }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    cgroup
+                        .groups
+                        .lock()
+                        .map_err(|_| io::Error::other("cgroup registry is unavailable"))?
+                        .remove(&group_id);
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
             }
         }
         let _ = group_id;
