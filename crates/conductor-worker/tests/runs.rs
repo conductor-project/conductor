@@ -191,6 +191,22 @@ fn wait_for_pending_persistence(service: &WorkerService, id: &str) -> conductor_
     }
 }
 
+fn wait_for_pending_count(service: &WorkerService, count: usize) -> conductor_core::WorkerStatus {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = service.status().unwrap();
+        if status.pending_persistence() == count {
+            assert!(service.is_degraded());
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pending persistence did not reach {count} entries"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn worker_acceptance_is_deduplicated_and_terminal_observations_survive_reopen() {
     let directory = TempDir::new();
@@ -466,6 +482,88 @@ fn terminal_persistence_outage_is_bounded_and_recovers_without_relaunch() {
     assert!(status.available());
     assert_eq!(status.used_slots(), 0);
     assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn terminal_retry_backoff_yields_to_other_run_deadlines() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 3, Arc::clone(&backend));
+    let connection = Connection::open(directory.0.join("worker.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_selected_terminal BEFORE UPDATE OF state ON runs
+             WHEN NEW.run_id IN ('pending-a', 'pending-b')
+               AND NEW.state IN ('succeeded', 'failed', 'cancelled', 'timed_out')
+             BEGIN SELECT RAISE(FAIL, 'injected terminal persistence failure'); END;",
+        )
+        .unwrap();
+    for id in ["pending-a", "pending-b"] {
+        service
+            .start(StartRun::new(run(
+                id,
+                job(id, vec!["/bin/sh".into(), "-c".into(), "sleep 0.05".into()]),
+            )))
+            .unwrap();
+    }
+    let deadline_job = JobSpec::new(
+        JobId::new("deadline-job").unwrap(),
+        vec!["/bin/sleep".into(), "30".into()],
+        PathBuf::from("/tmp"),
+        BTreeMap::new(),
+        false,
+        Some(150),
+        50,
+    )
+    .unwrap();
+    service
+        .start(StartRun::new(run("deadline-run", deadline_job)))
+        .unwrap();
+    let terminal = wait_for(&service, "deadline-run");
+    assert_eq!(terminal.state(), RunState::TimedOut);
+    assert_eq!(
+        terminal.termination_reason(),
+        Some(conductor_core::RunTerminationReason::DeadlineExceeded)
+    );
+    let pending = service.status().unwrap();
+    assert_eq!(pending.pending_persistence(), 2);
+    assert_eq!(pending.used_slots(), 2);
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn shutdown_bounds_pending_terminal_retries_and_runtime_teardown() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 1, Arc::clone(&backend));
+    let connection = Connection::open(directory.0.join("worker.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_terminal BEFORE UPDATE OF state ON runs
+             WHEN NEW.state IN ('succeeded', 'failed', 'cancelled', 'timed_out')
+             BEGIN SELECT RAISE(FAIL, 'injected terminal persistence failure'); END;",
+        )
+        .unwrap();
+    service
+        .start(StartRun::new(run(
+            "shutdown-pending",
+            job(
+                "shutdown-pending",
+                vec!["/bin/sh".into(), "-c".into(), "sleep 0.05".into()],
+            ),
+        )))
+        .unwrap();
+    wait_for_pending_count(&service, 1);
+
+    let started = std::time::Instant::now();
+    let result = service.shutdown();
+    drop(service);
+    assert!(started.elapsed() < Duration::from_secs(4));
+    assert_eq!(
+        result.unwrap_err().kind(),
+        io::ErrorKind::TimedOut,
+        "shutdown reports that the terminal result remains unresolved"
+    );
 }
 
 #[test]
