@@ -208,6 +208,73 @@ fn wait_for_pending_count(service: &WorkerService, count: usize) -> conductor_co
 }
 
 #[test]
+fn escaped_pipe_fixture() {
+    let Ok(mode) = std::env::var("CONDUCTOR_PIPE_FIXTURE_MODE") else {
+        return;
+    };
+    let marker = PathBuf::from(std::env::var_os("CONDUCTOR_PIPE_FIXTURE_MARKER").unwrap());
+    if mode == "descendant" {
+        #[cfg(unix)]
+        nix::unistd::setsid().unwrap();
+        fs::write(marker, std::process::id().to_string()).unwrap();
+        thread::sleep(Duration::from_secs(30));
+        return;
+    }
+    let executable = std::env::current_exe().unwrap();
+    let child = Command::new(executable)
+        .args(["--exact", "escaped_pipe_fixture", "--nocapture"])
+        .env("CONDUCTOR_PIPE_FIXTURE_MODE", "descendant")
+        .env("CONDUCTOR_PIPE_FIXTURE_MARKER", &marker)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(marker.exists(), "escaped descendant did not start");
+    // The descendant has detached into its own session and inherited both
+    // output descriptors. Let the direct child exit without waiting for it.
+    drop(child);
+}
+
+#[cfg(unix)]
+struct EscapedChild(i32);
+
+#[cfg(unix)]
+impl Drop for EscapedChild {
+    fn drop(&mut self) {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        let _ = kill(Pid::from_raw(self.0), Signal::SIGKILL);
+    }
+}
+
+#[cfg(unix)]
+fn escaped_pipe_job(id: &str, marker: PathBuf) -> JobSpec {
+    let mut env = BTreeMap::new();
+    env.insert("CONDUCTOR_PIPE_FIXTURE_MODE".into(), "parent".into());
+    env.insert(
+        "CONDUCTOR_PIPE_FIXTURE_MARKER".into(),
+        marker.display().to_string(),
+    );
+    JobSpec::new(
+        JobId::new(id).unwrap(),
+        vec![
+            std::env::current_exe().unwrap().display().to_string(),
+            "--exact".into(),
+            "escaped_pipe_fixture".into(),
+            "--nocapture".into(),
+        ],
+        PathBuf::from("/tmp"),
+        env,
+        false,
+        None,
+        100,
+    )
+    .unwrap()
+}
+
+#[test]
 fn worker_acceptance_is_deduplicated_and_terminal_observations_survive_reopen() {
     let directory = TempDir::new();
     let backend = Arc::new(TestBackend::default());
@@ -565,6 +632,80 @@ fn shutdown_bounds_pending_terminal_retries_and_runtime_teardown() {
         "shutdown reports that the terminal result remains unresolved"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn pending_output_readers_do_not_block_other_run_deadlines() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 3, backend);
+    let mut escaped = Vec::new();
+    for id in ["escaped-a", "escaped-b"] {
+        let marker = directory.0.join(format!("{id}.pid"));
+        service
+            .start(StartRun::new(run(id, escaped_pipe_job(id, marker.clone()))))
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !marker.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(marker.exists(), "escaped pipe holder did not start");
+        escaped.push(EscapedChild(
+            fs::read_to_string(marker).unwrap().parse().unwrap(),
+        ));
+    }
+
+    let deadline_job = JobSpec::new(
+        JobId::new("reader-deadline").unwrap(),
+        vec!["/bin/sleep".into(), "30".into()],
+        PathBuf::from("/tmp"),
+        BTreeMap::new(),
+        false,
+        Some(120),
+        50,
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    service
+        .start(StartRun::new(run("reader-deadline", deadline_job)))
+        .unwrap();
+    let terminal = wait_for(&service, "reader-deadline");
+    assert_eq!(terminal.state(), RunState::TimedOut);
+    assert!(
+        started.elapsed() < OUTPUT_DEADLINE_TEST_LIMIT,
+        "another run's deadline stalled behind output readers"
+    );
+    assert_eq!(wait_for(&service, "escaped-a").state(), RunState::Succeeded);
+    assert_eq!(wait_for(&service, "escaped-b").state(), RunState::Succeeded);
+
+    // Shutdown must account for pending readers and cancel their drain even
+    // though the escaped descendants still hold the output descriptors.
+    service.shutdown().unwrap();
+    // Cleanup is guaranteed even when an assertion above fails.
+    drop(escaped);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let completed: i64 = Connection::open(directory.0.join("worker.sqlite3"))
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM run_logs WHERE run_id IN ('escaped-a', 'escaped-b') AND stdout_closed = 1 AND stderr_closed = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if completed == 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "reader cleanup did not finish"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(unix)]
+const OUTPUT_DEADLINE_TEST_LIMIT: Duration = Duration::from_millis(500);
 
 #[test]
 fn log_persistence_failure_does_not_change_the_process_exit_outcome() {
