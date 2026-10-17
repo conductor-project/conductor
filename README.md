@@ -1,6 +1,6 @@
 # Conductor
 
-Conductor is an early-stage Linux daemon for managing jobs and runs. MVP1 targets one `conductor` binary that combines manager and worker responsibilities behind explicit interfaces. The current runnable milestone validates and manages immutable job definitions over a loopback HTTP API. Job registration does not execute processes; process execution is a later milestone. Job definitions currently live in memory and are lost when the agent restarts.
+Conductor is an early-stage Linux daemon for managing jobs and runs. MVP1 targets one `conductor` binary that combines manager and worker responsibilities behind explicit interfaces. The current runnable milestone validates and manages immutable job definitions over a loopback HTTP API. Job registration does not execute processes; process execution is a later milestone. Job definitions are stored durably in SQLite under the configured manager state directory and survive agent restarts.
 
 The host process backend runs with the daemon user's operating-system permissions and network access. It is not a security sandbox.
 
@@ -45,11 +45,13 @@ curl --fail http://127.0.0.1:8080/v1/jobs/hello
 curl --fail -X DELETE http://127.0.0.1:8080/v1/jobs/hello
 ```
 
-`POST /v1/jobs` returns 201 with the validated immutable definition; duplicate and previously deleted IDs return 409. `GET /v1/jobs` returns `{"jobs":[...]}` ordered by ID. `GET /v1/jobs/{id}` returns 200 or 404, and `DELETE /v1/jobs/{id}` returns 204 or 404. Deletion reserves the ID so it cannot refer to a different definition later. The manager currently accepts up to 1,000 active jobs and reserves up to 10,000 IDs; request bodies are limited to 65,536 bytes. These limits are temporary until pagination and durable storage are implemented.
+`POST /v1/jobs` returns 201 with the validated immutable definition; duplicate and previously deleted IDs return 409. `GET /v1/jobs` returns `{"jobs":[...]}` ordered by ID. `GET /v1/jobs/{id}` returns 200 or 404, and `DELETE /v1/jobs/{id}` returns 204 or 404. Deletion reserves the ID so it cannot refer to a different definition later. The manager currently accepts up to 1,000 active jobs and reserves up to 10,000 IDs; request bodies are limited to 65,536 bytes. These limits are temporary until pagination is implemented.
 
 Definitions require an absolute executable path and absolute working directory. Arguments are passed directly to the executable without an implicit shell. Environment inheritance defaults to false; only the explicit `env` map is added unless `inheritEnv` is set true. Unknown fields and invalid paths, identifiers, environment entries, and duration bounds are rejected with a stable JSON error envelope. Registration only stores the definition; it never launches the command.
 
-Configuration is strict JSON. The listener must bind to IPv4 or IPv6 loopback. Manager and worker state directories must be separate, worker ID must be stable and valid, and concurrency must be positive. `127.0.0.1:0` is supported for integration tests.
+Configuration is strict JSON. The listener must bind to IPv4 or IPv6 loopback. Manager and worker state directories must be separate, worker ID must be stable and valid, and concurrency must be positive. The daemon canonicalizes both state paths and holds OS file locks on them for its lifetime; concurrent processes using either directory, including through a symlink alias, fail startup. Lock files left by a crashed process do not block a later start because the OS releases the lock when the process exits. On Unix, state directories use mode `0700`, and the database and lock files use `0600`.
+
+The manager database is `manager.sqlite3` in `manager_data_dir`. SQLite uses WAL journaling with `synchronous=FULL`; database schema changes run as versioned transactions. Startup fails closed if the database is corrupt, inaccessible, or has a schema version newer than the daemon supports. Back up the manager state directory while the daemon is stopped so the database and WAL state remain consistent. `127.0.0.1:0` is supported for integration tests.
 
 ## Architecture
 
