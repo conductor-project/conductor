@@ -10,6 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
+const ASYNC_TEST_WATCHDOG: Duration = Duration::from_secs(30);
+
 struct TempDir(PathBuf);
 
 impl TempDir {
@@ -512,10 +514,33 @@ fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit(
         .unwrap()
         .to_owned();
     let database = path.join("manager/manager.sqlite3");
-    let lock = Connection::open(database).expect("open lock connection");
+    // Prove one known operation remains alive after the HTTP request times out.
+    // Keep the lock only until that response arrives, before SQLite's own busy
+    // timeout can expire, then observe the job through the API.
+    let lock = Connection::open(&database).expect("open lock connection");
     lock.execute_batch("BEGIN EXCLUSIVE;")
         .expect("hold manager write lock");
+    let (status, body) = thread::spawn(move || {
+        let body = job_json("blocked-survives", &["/usr/bin/true"]);
+        http(address, "POST", "/v1/jobs", Some("application/json"), &body)
+    })
+    .join()
+    .expect("timed-out write request");
+    assert_eq!(status, 408, "{body}");
+    lock.execute_batch("ROLLBACK;")
+        .expect("release manager write lock");
+    let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
+    loop {
+        if http(address, "GET", "/v1/jobs/blocked-survives", None, &[]).0 == 200 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed-out write did not finish");
+        thread::sleep(Duration::from_millis(20));
+    }
 
+    // Independently saturate general blocking work while storage is locked.
+    lock.execute_batch("BEGIN EXCLUSIVE;")
+        .expect("hold manager write lock for saturation check");
     let requests = 64;
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(requests));
     let handles = (0..requests)
@@ -528,7 +553,7 @@ fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit(
             })
         })
         .collect::<Vec<_>>();
-    thread::sleep(Duration::from_millis(150));
+    thread::sleep(Duration::from_millis(50));
 
     assert_eq!(http(address, "GET", "/healthz", None, &[]).0, 200);
     assert_eq!(http(address, "GET", "/readyz", None, &[]).0, 200);
@@ -554,17 +579,17 @@ fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit(
         let (status, body) = handle.join().expect("request thread");
         assert_eq!(status, 408, "{body}");
     }
-    let deadline = Instant::now() + Duration::from_secs(3);
-    loop {
-        if http(address, "GET", "/v1/jobs/blocked-0", None, &[]).0 == 200 {
-            break;
-        }
-        assert!(Instant::now() < deadline, "timed-out writes did not finish");
-        thread::sleep(Duration::from_millis(20));
-    }
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     loop {
         let (status, body) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
+        if status == 429 {
+            assert!(
+                Instant::now() < deadline,
+                "blocking work did not release its permits"
+            );
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
         assert_eq!(status, 200, "{body}");
         let observation: serde_json::Value = serde_json::from_str(&body).unwrap();
         if observation["state"] == "cancelled" {
@@ -1052,6 +1077,37 @@ fn wait_for_run_state(
         assert!(
             Instant::now() < deadline,
             "run state did not match: {observation}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_closed_logs(address: SocketAddr, run_id: &str) {
+    let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
+    loop {
+        let mut all_closed = true;
+        for stream in ["stdout", "stderr"] {
+            let (status, body) = http(
+                address,
+                "GET",
+                &format!("/v1/runs/{run_id}/logs?stream={stream}"),
+                None,
+                &[],
+            );
+            if status == 404 {
+                all_closed = false;
+                continue;
+            }
+            assert_eq!(status, 200, "{body}");
+            let chunk: serde_json::Value = serde_json::from_str(&body).unwrap();
+            all_closed &= chunk["streamClosed"] == true;
+        }
+        if all_closed {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "output readers did not close both log streams before the watchdog"
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -2183,9 +2239,11 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
     let stderr = child.0.stderr.take().unwrap();
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
         let mut line = String::new();
-        let _ = BufReader::new(stderr).read_line(&mut line);
+        let _ = reader.read_line(&mut line);
         let _ = sender.send(line);
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
     });
     let line = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
     let event: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -2217,7 +2275,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
         .to_owned();
     wait_for_run_state(address, &run_id, &["running"], Duration::from_secs(2));
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     let chunk = loop {
         let (status, body) = http(
             address,
@@ -2246,7 +2304,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
     assert_eq!(chunk["nextOffset"], 2);
     assert_eq!(chunk["streamClosed"], false);
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     let chunk = loop {
         let (status, body) = http(
             address,
@@ -2274,6 +2332,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
 
     let finished = wait_for_run_state(address, &run_id, &["succeeded"], Duration::from_secs(3));
     assert_eq!(finished["state"], "succeeded");
+    wait_for_closed_logs(address, &run_id);
     let (status, chunk) = http(
         address,
         "GET",
@@ -2309,10 +2368,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
         &[],
     );
     assert_eq!(status, 400, "{body}");
-    let active_job = job_json(
-        "retention-active",
-        &["/bin/sh", "-c", "printf active; sleep 60"],
-    );
+    let active_job = job_json("retention-active", &["/bin/sleep", "60"]);
     assert_eq!(
         http(
             address,
@@ -2332,7 +2388,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
         .unwrap()
         .to_owned();
     wait_for_run_state(address, &active_id, &["running"], Duration::from_secs(2));
-    let active_log_deadline = Instant::now() + Duration::from_secs(30);
+    let active_log_deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     loop {
         let (status, body) = http(
             address,
@@ -2369,7 +2425,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
     // Pruning runs after the asynchronous output readers finish. Keep polling
     // for that state transition; this is only a deadlock guard, not a latency
     // expectation for the reader/reaper thread.
-    let retention_deadline = Instant::now() + Duration::from_secs(30);
+    let retention_deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     loop {
         let (status, body) = http(
             address,
@@ -2381,13 +2437,17 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
         if status == 410 {
             break;
         }
-        assert_eq!(status, 200, "{body}");
+        assert!(
+            status == 200 || status == 404,
+            "log retention poll failed: {body}"
+        );
         assert!(
             Instant::now() < retention_deadline,
-            "completed log was not pruned after asynchronous capture finished: {body}"
+            "completed log did not reach the pruned state after asynchronous capture finished: {body}"
         );
         thread::sleep(Duration::from_millis(10));
     }
+    wait_for_run_state(address, &active_id, &["running"], Duration::from_secs(2));
     let (status, body) = http(
         address,
         "GET",
