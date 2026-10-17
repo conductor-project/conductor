@@ -38,5 +38,7 @@ jobs:
         run: cargo +1.99.1 test --release --workspace --locked --all-targets --all-features
       - name: Build release
         run: cargo +1.99.1 build --workspace --locked --release
+      - name: Qualify Linux run capacity
+        run: python3 scripts/qualify-linux-capacity.py --binary target/release/conductor --runs 64
       - name: Run release lifecycle demo
         run: python3 scripts/demo-agent.py --binary target/release/conductor --include-crash

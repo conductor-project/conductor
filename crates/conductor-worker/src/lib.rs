@@ -22,6 +22,8 @@ use conductor_core::{
     RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId, WorkerStatus,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use tokio::runtime::Runtime;
+use tokio::sync::Notify;
 
 #[cfg(unix)]
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -80,6 +82,7 @@ struct WorkerState {
 struct ActiveGroup {
     group_id: u32,
     intent: Arc<AtomicU8>,
+    notify: Arc<Notify>,
 }
 
 /// Owns a spawned process until supervision takes responsibility for it.
@@ -228,7 +231,8 @@ pub struct WorkerService {
     backend: Arc<dyn ExecutionBackend>,
     state: Arc<SharedWorkerState>,
     pending: Arc<PendingPersistence>,
-    supervisors: Mutex<Vec<JoinHandle<()>>>,
+    runtime: Runtime,
+    supervisors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     lifecycle: Mutex<bool>,
 }
 
@@ -265,7 +269,7 @@ impl WorkerService {
         if capacity == 0 || capacity > MAX_WORKER_CAPACITY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "worker capacity must be between 1 and 1000",
+                "worker capacity must be between 1 and 64",
             ));
         }
         if log_policy.max_bytes_per_stream == 0
@@ -277,6 +281,10 @@ impl WorkerService {
                 "worker log limits are outside the supported range",
             ));
         }
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_time()
+            .build()?;
         let log_directory = state_directory.join("runs");
         match fs::symlink_metadata(&log_directory) {
             Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -463,6 +471,7 @@ impl WorkerService {
                 observations: Mutex::new(BTreeMap::new()),
                 degraded: AtomicBool::new(false),
             }),
+            runtime,
             supervisors: Mutex::new(Vec::new()),
             lifecycle: Mutex::new(false),
         };
@@ -637,6 +646,7 @@ impl WorkerService {
             let _ = self.abort_startup(spawned, running);
             return Err(WorkerError::StorageUnavailable);
         }
+        let control_notify = Arc::new(Notify::new());
         {
             let mut state = match self.state.0.lock() {
                 Ok(state) => state,
@@ -650,6 +660,7 @@ impl WorkerService {
                 ActiveGroup {
                     group_id,
                     intent: Arc::new(AtomicU8::new(INTENT_NONE)),
+                    notify: Arc::clone(&control_notify),
                 },
             );
         }
@@ -662,11 +673,11 @@ impl WorkerService {
             Ok(state) => state
                 .active_groups
                 .get(spec.id().as_str())
-                .map(|active| Arc::clone(&active.intent))
+                .map(|active| (Arc::clone(&active.intent), Arc::clone(&active.notify)))
                 .ok_or(WorkerError::StorageUnavailable),
             Err(_) => Err(WorkerError::StorageUnavailable),
         };
-        let control = match control {
+        let (control, control_notify) = match control {
             Ok(control) => control,
             Err(_) => {
                 if let Ok(mut state) = self.state.0.lock() {
@@ -681,64 +692,27 @@ impl WorkerService {
         let log_directory = self.state_directory.join("runs");
         let retention_runs = self.log_policy.retention_runs;
         let supervisor_observation = running.clone();
-        let child_slot = Arc::new(Mutex::new(Some(spawned)));
-        let supervisor_child = Arc::clone(&child_slot);
-        let supervisor = thread::Builder::new()
-            .name(format!("conductor-run-{run_id}"))
-            .spawn(move || {
-                let spawned = supervisor_child
-                    .lock()
-                    .ok()
-                    .and_then(|mut spawned| spawned.take());
-                if let Some(spawned) = spawned {
-                    supervise(RunSupervision {
-                        state,
-                        pending,
-                        backend,
-                        run_id,
-                        spawned,
-                        current: supervisor_observation,
-                        control,
-                        launched_at,
-                        timeout,
-                        grace,
-                        log_directory,
-                        retention_runs,
-                    });
-                }
-            });
-        let supervisor = match supervisor {
-            Ok(supervisor) => supervisor,
-            Err(_) => {
-                if let Ok(mut slot) = child_slot.lock()
-                    && let Some(spawned) = slot.take()
-                    && self.abort_startup(spawned, running.clone()).is_err()
-                {
-                    if let Ok(mut state) = self.state.0.lock() {
-                        state.active_groups.remove(spec.id().as_str());
-                    }
-                    return Err(WorkerError::StorageUnavailable);
-                }
-                if let Ok(mut state) = self.state.0.lock() {
-                    state.active_groups.remove(spec.id().as_str());
-                }
-                return Err(WorkerError::StorageUnavailable);
-            }
-        };
+        let supervisor = self.runtime.spawn(supervise(RunSupervision {
+            state,
+            pending,
+            backend,
+            run_id,
+            spawned,
+            current: supervisor_observation,
+            control,
+            control_notify,
+            launched_at,
+            timeout,
+            grace,
+            log_directory,
+            retention_runs,
+        }));
         let mut supervisors = self
             .supervisors
             .lock()
             .map_err(|_| WorkerError::StorageUnavailable)?;
-        let mut unfinished = Vec::with_capacity(supervisors.len() + 1);
-        for old in supervisors.drain(..) {
-            if old.is_finished() {
-                let _ = old.join();
-            } else {
-                unfinished.push(old);
-            }
-        }
-        unfinished.push(supervisor);
-        *supervisors = unfinished;
+        supervisors.retain(|old| !old.is_finished());
+        supervisors.push(supervisor);
         Ok(running)
     }
 
@@ -889,6 +863,7 @@ impl WorkerService {
             Ordering::SeqCst,
             Ordering::SeqCst,
         );
+        active.notify.notify_one();
         Ok(stopping)
     }
 
@@ -1027,6 +1002,7 @@ impl WorkerService {
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 );
+                active.notify.notify_one();
             }
         }
     }
@@ -1102,12 +1078,28 @@ impl WorkerService {
                 "worker shutdown deadline elapsed",
             ));
         }
-        if let Ok(mut supervisors) = self.supervisors.lock() {
-            for supervisor in supervisors.drain(..) {
-                if supervisor.is_finished() && supervisor.join().is_err() {
-                    first_error.get_or_insert(io::Error::other("run supervisor panicked"));
+        let supervisors = self
+            .supervisors
+            .lock()
+            .map_err(|_| io::Error::other("run supervisor lock poisoned"))?
+            .drain(..)
+            .collect::<Vec<_>>();
+        let task_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while supervisors
+            .iter()
+            .any(|supervisor| !supervisor.is_finished())
+            && std::time::Instant::now() < task_deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !supervisors.is_empty() {
+            self.runtime.block_on(async {
+                for supervisor in supervisors {
+                    if supervisor.is_finished() && supervisor.await.is_err() {
+                        first_error.get_or_insert(io::Error::other("run supervisor panicked"));
+                    }
                 }
-            }
+            });
         }
         first_error.map_or(Ok(()), Err)
     }
@@ -1385,40 +1377,59 @@ fn spawn_capture<R: CaptureRead + 'static>(
         let mut written = 0_u64;
         let mut truncated = false;
         let mut was_cancelled = false;
-        let capture_result = (|| {
-            loop {
-                if !source.wait_readable(&cancelled)? {
-                    if cancelled.load(Ordering::SeqCst) {
-                        was_cancelled = true;
-                        break;
-                    }
-                    continue;
-                }
-                let count = source.read(&mut buffer)?;
-                if count == 0 {
+        let mut capture_error = None;
+        let mut logging_disabled = false;
+        loop {
+            match source.wait_readable(&cancelled) {
+                Ok(true) => {}
+                Ok(false) if cancelled.load(Ordering::SeqCst) => {
+                    was_cancelled = true;
                     break;
                 }
-                let keep = (count as u64).min(byte_cap.saturating_sub(written)) as usize;
-                if keep > 0 {
-                    output.write_all(&buffer[..keep])?;
-                    written += keep as u64;
-                }
-                if keep < count && !truncated {
-                    truncated = true;
-                    set_log_truncated(&state, &run_id, stream)?;
+                Ok(false) => continue,
+                Err(error) => {
+                    capture_error.get_or_insert(error);
+                    break;
                 }
             }
-            if !was_cancelled {
-                output.sync_all()?;
+            let count = match source.read(&mut buffer) {
+                Ok(count) => count,
+                Err(error) => {
+                    capture_error.get_or_insert(error);
+                    break;
+                }
+            };
+            if count == 0 {
+                break;
             }
-            Ok(())
-        })();
-        let close_result = if was_cancelled {
-            Ok(())
-        } else {
-            close_log_stream(&state, &run_id, stream)
-        };
-        capture_result.and(close_result)
+            let keep = (count as u64).min(byte_cap.saturating_sub(written)) as usize;
+            if keep > 0 && !logging_disabled {
+                match output.write_all(&buffer[..keep]) {
+                    Ok(()) => written += keep as u64,
+                    Err(error) => {
+                        capture_error.get_or_insert(error);
+                        logging_disabled = true;
+                    }
+                }
+            }
+            if keep < count && !truncated {
+                truncated = true;
+                if let Err(error) = set_log_truncated(&state, &run_id, stream) {
+                    capture_error.get_or_insert(error);
+                    logging_disabled = true;
+                }
+            }
+        }
+        if !was_cancelled
+            && !logging_disabled
+            && let Err(error) = output.sync_all()
+        {
+            capture_error.get_or_insert(error);
+        }
+        if !was_cancelled && let Err(error) = close_log_stream(&state, &run_id, stream) {
+            capture_error.get_or_insert(error);
+        }
+        capture_error.map_or(Ok(()), Err)
     })
 }
 
@@ -1596,6 +1607,7 @@ struct RunSupervision {
     spawned: SpawnGuard,
     current: RunObservation,
     control: Arc<AtomicU8>,
+    control_notify: Arc<Notify>,
     launched_at: std::time::Instant,
     timeout: Option<Duration>,
     grace: Duration,
@@ -1603,7 +1615,7 @@ struct RunSupervision {
     retention_runs: usize,
 }
 
-fn supervise(supervision: RunSupervision) {
+async fn supervise(supervision: RunSupervision) {
     let RunSupervision {
         state,
         pending,
@@ -1612,6 +1624,7 @@ fn supervise(supervision: RunSupervision) {
         mut spawned,
         mut current,
         control: intent,
+        control_notify,
         launched_at,
         timeout,
         grace,
@@ -1619,81 +1632,130 @@ fn supervise(supervision: RunSupervision) {
         retention_runs,
     } = supervision;
     let group_id = spawned.group_id;
+    if spawned.child.is_none() {
+        emit_worker_diagnostic(
+            "supervisor_child_missing",
+            run_id.as_str(),
+            &io::Error::other("supervisor did not receive the child process"),
+        );
+        return;
+    };
+    let timeout_deadline = timeout.map(|limit| tokio::time::Instant::from_std(launched_at + limit));
+    let mut status = None;
     let mut wait_failed = false;
-    let mut termination_deadline = None;
-    let (status, wait_failed) = loop {
-        let Some(child) = spawned.child.as_mut() else {
-            break (None, true);
-        };
-        match child.try_wait() {
-            Ok(Some(exit)) => break (Some(exit), wait_failed),
-            Ok(None) => {}
-            Err(_) => {
-                wait_failed = true;
+    loop {
+        if let Some(child) = spawned.child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(exit)) => {
+                    status = Some(exit);
+                    wait_failed = false;
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    wait_failed = true;
+                    let _ = intent.compare_exchange(
+                        INTENT_NONE,
+                        INTENT_SHUTDOWN,
+                        Ordering::SeqCst,
+                        Ordering::SeqCst,
+                    );
+                }
+            }
+        }
+        if intent.load(Ordering::SeqCst) != INTENT_NONE {
+            break;
+        }
+        tokio::select! {
+            _ = control_notify.notified() => {},
+            _ = tokio::time::sleep(Duration::from_millis(10)) => {},
+            _ = async {
+                match timeout_deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
                 let _ = intent.compare_exchange(
                     INTENT_NONE,
-                    INTENT_SHUTDOWN,
+                    INTENT_TIMEOUT,
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 );
             }
         }
+    }
 
-        let mut requested = intent.load(Ordering::SeqCst);
-        if requested == INTENT_NONE && timeout.is_some_and(|limit| launched_at.elapsed() >= limit) {
-            let _ = intent.compare_exchange(
-                INTENT_NONE,
-                INTENT_TIMEOUT,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            );
-            requested = intent.load(Ordering::SeqCst);
+    if intent.load(Ordering::SeqCst) != INTENT_NONE {
+        let requested = intent.load(Ordering::SeqCst);
+        if let Ok(state) = state.0.lock()
+            && let Ok(json) = state.connection.query_row(
+                "SELECT observation_json FROM runs WHERE run_id = ?1",
+                [&run_id],
+                |row| row.get::<_, String>(0),
+            )
+            && let Ok(latest) = serde_json::from_str::<RunObservation>(&json)
+        {
+            current = latest;
         }
-        if requested != INTENT_NONE && termination_deadline.is_none() {
-            if let Ok(state) = state.0.lock()
-                && let Ok(json) = state.connection.query_row(
-                    "SELECT observation_json FROM runs WHERE run_id = ?1",
-                    [&run_id],
-                    |row| row.get::<_, String>(0),
+        let reason = match requested {
+            INTENT_TIMEOUT => RunTerminationReason::DeadlineExceeded,
+            INTENT_SHUTDOWN => RunTerminationReason::Shutdown,
+            _ => RunTerminationReason::Cancelled,
+        };
+        if !current.state().is_terminal() && current.state() != RunState::Stopping {
+            current = current
+                .next_revision(
+                    RunState::Stopping,
+                    current.started_at_ms(),
+                    None,
+                    None,
+                    None,
+                    None,
                 )
-                && let Ok(latest) = serde_json::from_str::<RunObservation>(&json)
+                .map(|value| value.with_termination_reason(reason))
+                .unwrap_or(current);
+            if let Ok(serialized) = serde_json::to_string(&current)
+                && let Ok(state) = state.0.lock()
             {
-                current = latest;
+                let _ = state.connection.execute(
+                    "UPDATE runs SET observation_json = ?1, revision = ?2, state = ?3 WHERE run_id = ?4 AND revision < ?2 AND state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
+                    params![serialized, current.revision() as i64, current.state().as_str(), current.run_id().as_str()],
+                );
             }
-            let reason = match requested {
-                INTENT_TIMEOUT => RunTerminationReason::DeadlineExceeded,
-                INTENT_SHUTDOWN => RunTerminationReason::Shutdown,
-                _ => RunTerminationReason::Cancelled,
-            };
-            if !current.state().is_terminal() && current.state() != RunState::Stopping {
-                current = current
-                    .next_revision(
-                        RunState::Stopping,
-                        current.started_at_ms(),
-                        None,
-                        None,
-                        None,
-                        None,
-                    )
-                    .map(|value| value.with_termination_reason(reason))
-                    .unwrap_or(current);
-                if let Ok(serialized) = serde_json::to_string(&current)
-                    && let Ok(state) = state.0.lock()
-                {
-                    let _ = state.connection.execute(
-                        "UPDATE runs SET observation_json = ?1, revision = ?2, state = ?3 WHERE run_id = ?4 AND revision < ?2 AND state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
-                        params![serialized, current.revision() as i64, current.state().as_str(), current.run_id().as_str()],
-                    );
+        }
+        let _ = backend.terminate_process_group(group_id);
+        let grace_deadline = tokio::time::Instant::now() + grace;
+        loop {
+            if let Some(child) = spawned.child.as_mut() {
+                match child.try_wait() {
+                    Ok(Some(exit)) => {
+                        status = Some(exit);
+                        wait_failed = false;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(_) => {}
                 }
             }
-            let _ = backend.terminate_process_group(group_id);
-            termination_deadline = Some(std::time::Instant::now() + grace);
+            if tokio::time::Instant::now() >= grace_deadline {
+                let _ = backend.kill_process_group(group_id);
+                if let Some(child) = spawned.child.as_mut() {
+                    let _ = child.kill();
+                    match child.wait() {
+                        Ok(exit) => {
+                            status = Some(exit);
+                            wait_failed = false;
+                        }
+                        Err(_) => wait_failed = true,
+                    }
+                } else {
+                    wait_failed = true;
+                }
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        if termination_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
-            let _ = backend.kill_process_group(group_id);
-        }
-        thread::sleep(Duration::from_millis(10));
-    };
+    }
     let _ = backend.kill_process_group(group_id);
     // A failed log writer must not rewrite the process exit result. Joining
     // readers ensures their resources are reclaimed before the run is released.

@@ -919,9 +919,10 @@ fn wait_for_run_state(
 fn actual_binary_stops_runs_and_enforces_deadlines() {
     let path = TempDir::new("stop-and-deadline");
     let (mut child, address) = start(&path, "all", None);
+    let cooperative_ready = path.join("cooperative-ready");
     let cooperative = serde_json::json!({
         "id":"cooperative-stop",
-        "command":["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do /bin/sleep 1; done"],
+        "command":["/bin/sh", "-c", format!("trap 'exit 0' TERM; : > '{}'; while :; do /bin/sleep 1; done", cooperative_ready.display())],
         "cwd":"/tmp",
         "timeoutMs":null,
         "terminationGraceMs":500,
@@ -942,6 +943,14 @@ fn actual_binary_stops_runs_and_enforces_deadlines() {
     let accepted: serde_json::Value = serde_json::from_str(&accepted).unwrap();
     let run_id = accepted["runId"].as_str().unwrap();
     wait_for_run_state(address, run_id, &["running"], Duration::from_secs(3));
+    let ready_deadline = Instant::now() + Duration::from_secs(3);
+    while !cooperative_ready.exists() {
+        assert!(
+            Instant::now() < ready_deadline,
+            "cooperative process did not initialize"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     let (status, stopping) = http(
         address,
         "POST",
@@ -954,7 +963,7 @@ fn actual_binary_stops_runs_and_enforces_deadlines() {
     assert_eq!(stopping["state"], "stopping");
     let cancelled = wait_for_run_state(address, run_id, &["cancelled"], Duration::from_secs(3));
     assert_eq!(cancelled["terminationReason"], "cancelled");
-    assert_eq!(cancelled["exitCode"], 0);
+    assert_eq!(cancelled["exitCode"], 0, "{cancelled}");
     let (status, repeated) = http(
         address,
         "POST",
@@ -968,9 +977,10 @@ fn actual_binary_stops_runs_and_enforces_deadlines() {
         cancelled
     );
 
+    let stubborn_ready = path.join("stubborn-ready");
     let stubborn = serde_json::json!({
         "id":"stubborn-stop",
-        "command":["/bin/sh", "-c", "trap '' TERM; while :; do /bin/sleep 1; done"],
+        "command":["/bin/sh", "-c", format!("trap '' TERM; : > '{}'; while :; do /bin/sleep 1; done", stubborn_ready.display())],
         "cwd":"/tmp",
         "timeoutMs":null,
         "terminationGraceMs":100,
@@ -991,6 +1001,14 @@ fn actual_binary_stops_runs_and_enforces_deadlines() {
     let accepted: serde_json::Value = serde_json::from_str(&accepted).unwrap();
     let run_id = accepted["runId"].as_str().unwrap();
     wait_for_run_state(address, run_id, &["running"], Duration::from_secs(3));
+    let ready_deadline = Instant::now() + Duration::from_secs(3);
+    while !stubborn_ready.exists() {
+        assert!(
+            Instant::now() < ready_deadline,
+            "stubborn process did not initialize"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     let started = Instant::now();
     assert_eq!(
         http(
