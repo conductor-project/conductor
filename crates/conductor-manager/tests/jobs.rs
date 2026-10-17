@@ -1,13 +1,14 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use conductor_core::{
-    InspectRun, JobId, JobSpec, RunFailureReason, RunObservation, RunState, StartRun,
-    WorkerDescriptor, WorkerId,
+    InspectRun, JobId, JobSpec, LogStream, ReadRunLogs, RunFailureReason, RunLogChunk,
+    RunLogStatus, RunObservation, RunState, StartRun, WorkerDescriptor, WorkerId,
 };
 use conductor_manager::{
     JobRepository, JobService, MAX_JOBS, ManagerError, RepositoryOpenError, RunStoreError,
@@ -17,14 +18,19 @@ use rusqlite::Connection;
 
 struct TempDir(PathBuf);
 
+static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
 impl TempDir {
     fn new() -> Self {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("conductor-manager-{}-{nonce}", std::process::id()));
+        let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "conductor-manager-{}-{nonce}-{sequence}",
+            std::process::id()
+        ));
         fs::create_dir(&path).expect("create temporary manager directory");
         Self(path)
     }
@@ -374,6 +380,13 @@ impl WorkerPort for FullWorker {
     fn stop(&self, _command: conductor_core::StopRun) -> Result<RunObservation, WorkerPortError> {
         Err(WorkerPortError::Unavailable)
     }
+
+    fn read_logs(
+        &self,
+        _command: conductor_core::ReadRunLogs,
+    ) -> Result<conductor_core::RunLogChunk, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
 }
 
 struct UncertainWorker(WorkerId);
@@ -394,6 +407,64 @@ impl WorkerPort for UncertainWorker {
     fn stop(&self, _command: conductor_core::StopRun) -> Result<RunObservation, WorkerPortError> {
         Err(WorkerPortError::Unavailable)
     }
+
+    fn read_logs(
+        &self,
+        _command: conductor_core::ReadRunLogs,
+    ) -> Result<conductor_core::RunLogChunk, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
+}
+
+struct LogOnlyWorker(WorkerId);
+
+impl WorkerPort for LogOnlyWorker {
+    fn descriptor(&self) -> WorkerDescriptor {
+        WorkerDescriptor::new(self.0.clone(), 1, true)
+    }
+
+    fn start(&self, _command: StartRun) -> Result<RunObservation, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
+
+    fn inspect(&self, _command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError> {
+        Ok(None)
+    }
+
+    fn stop(&self, _command: conductor_core::StopRun) -> Result<RunObservation, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
+
+    fn read_logs(&self, command: ReadRunLogs) -> Result<RunLogChunk, WorkerPortError> {
+        Ok(RunLogChunk::new(
+            command.run_id().clone(),
+            command.stream(),
+            command.offset(),
+            command.offset() + 2,
+            vec![0, 255],
+            RunLogStatus::new(false, false, false),
+        ))
+    }
+}
+
+#[test]
+fn manager_reads_logs_only_through_worker_port() {
+    let directory = TempDir::new();
+    let manager = JobService::open_sqlite(directory.database()).unwrap();
+    let worker = LogOnlyWorker(WorkerId::new("worker").unwrap());
+    let command = ReadRunLogs::new(
+        conductor_core::RunId::new("opaque-run").unwrap(),
+        LogStream::Stderr,
+        12,
+        2,
+    );
+
+    let chunk = manager.read_logs(command, &worker).unwrap();
+
+    assert_eq!(chunk.stream(), LogStream::Stderr);
+    assert_eq!(chunk.offset(), 12);
+    assert_eq!(chunk.data(), [0, 255]);
+    assert!(!chunk.stream_closed());
 }
 
 #[test]

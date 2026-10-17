@@ -9,8 +9,8 @@ use std::{fs, io};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use conductor_core::{
-    InspectRun, JobId, JobSpec, RunFailureReason, RunId, RunObservation, RunSpec, RunState,
-    RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId,
+    InspectRun, JobId, JobSpec, ReadRunLogs, RunFailureReason, RunId, RunLogChunk, RunObservation,
+    RunSpec, RunState, RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
@@ -41,6 +41,8 @@ pub enum WorkerPortError {
     CapacityReached,
     RunConflict,
     ShuttingDown,
+    LogsNotFound,
+    LogsPruned,
     Unavailable,
 }
 
@@ -53,6 +55,7 @@ pub trait WorkerPort: Send + Sync {
     fn start(&self, command: StartRun) -> Result<RunObservation, WorkerPortError>;
     fn inspect(&self, command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError>;
     fn stop(&self, command: StopRun) -> Result<RunObservation, WorkerPortError>;
+    fn read_logs(&self, command: ReadRunLogs) -> Result<RunLogChunk, WorkerPortError>;
 }
 
 /// Storage port owned by the manager. Implementations preserve deleted IDs.
@@ -598,6 +601,8 @@ pub enum ManagerError {
     RunNotFound,
     WorkerUnavailable,
     WorkerDraining,
+    LogsNotFound,
+    LogsPruned,
     StorageUnavailable,
 }
 
@@ -677,7 +682,12 @@ impl JobService {
                 self.mark_dispatch_failure(&spec, RunFailureReason::BackendFailure, true)?;
                 return Err(ManagerError::WorkerDraining);
             }
-            Err(WorkerPortError::RunConflict | WorkerPortError::Unavailable) => {
+            Err(
+                WorkerPortError::RunConflict
+                | WorkerPortError::Unavailable
+                | WorkerPortError::LogsNotFound
+                | WorkerPortError::LogsPruned,
+            ) => {
                 self.mark_dispatch_failure(&spec, RunFailureReason::OutcomeUnknown, false)?;
                 return Err(ManagerError::WorkerUnavailable);
             }
@@ -787,6 +797,24 @@ impl JobService {
             return Ok(observation);
         }
         Ok(stopping)
+    }
+
+    pub fn read_logs(
+        &self,
+        command: ReadRunLogs,
+        worker: &dyn WorkerPort,
+    ) -> Result<RunLogChunk, ManagerError> {
+        match worker.read_logs(command) {
+            Ok(chunk) => Ok(chunk),
+            Err(WorkerPortError::LogsNotFound) => Err(ManagerError::LogsNotFound),
+            Err(WorkerPortError::LogsPruned) => Err(ManagerError::LogsPruned),
+            Err(
+                WorkerPortError::Unavailable
+                | WorkerPortError::ShuttingDown
+                | WorkerPortError::CapacityReached
+                | WorkerPortError::RunConflict,
+            ) => Err(ManagerError::WorkerUnavailable),
+        }
     }
 
     fn mark_dispatch_failure(

@@ -65,6 +65,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bitflags"
 version = "2.13.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -149,6 +155,7 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 name = "conductor"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "clap",
  "conductor-api",
  "conductor-core",
@@ -166,6 +173,7 @@ name = "conductor-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "conductor-core",
  "conductor-manager",
  "serde",

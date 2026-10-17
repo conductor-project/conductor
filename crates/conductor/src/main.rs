@@ -10,7 +10,7 @@ use std::sync::{
 };
 
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
-use conductor_core::{InspectRun, MAX_WORKER_CAPACITY, StartRun, StopRun, WorkerId};
+use conductor_core::{InspectRun, MAX_WORKER_CAPACITY, ReadRunLogs, StartRun, StopRun, WorkerId};
 use conductor_manager::{WorkerPort, WorkerPortError};
 use serde::Deserialize;
 use state_lock::StateLocks;
@@ -44,6 +44,18 @@ struct Config {
     worker_data_dir: PathBuf,
     worker_id: String,
     worker_concurrency: usize,
+    #[serde(default = "default_log_max_bytes_per_stream")]
+    log_max_bytes_per_stream: u64,
+    #[serde(default = "default_log_retention_runs")]
+    log_retention_runs: usize,
+}
+
+fn default_log_max_bytes_per_stream() -> u64 {
+    conductor_worker::DEFAULT_LOG_MAX_BYTES_PER_STREAM
+}
+
+fn default_log_retention_runs() -> usize {
+    conductor_worker::DEFAULT_LOG_RETENTION_RUNS
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, ValueEnum)]
@@ -114,10 +126,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.manager_data_dir.join("manager.sqlite3"),
     )?);
     let worker_id = WorkerId::new(config.worker_id.clone())?;
-    let worker = Arc::new(conductor_worker::WorkerService::open(
+    let worker = Arc::new(conductor_worker::WorkerService::open_with_log_policy(
         &config.worker_data_dir,
         worker_id.clone(),
         config.worker_concurrency,
+        conductor_worker::LogPolicy {
+            max_bytes_per_stream: config.log_max_bytes_per_stream,
+            retention_runs: config.log_retention_runs,
+        },
         Arc::new(conductor_process::HostProcessBackend),
     )?);
     let worker_port: Arc<dyn WorkerPort> = Arc::new(LocalWorkerPort(Arc::clone(&worker)));
@@ -173,6 +189,13 @@ impl WorkerPort for LocalWorkerPort {
     fn stop(&self, command: StopRun) -> Result<conductor_core::RunObservation, WorkerPortError> {
         self.0.stop(command).map_err(map_worker_error)
     }
+
+    fn read_logs(
+        &self,
+        command: ReadRunLogs,
+    ) -> Result<conductor_core::RunLogChunk, WorkerPortError> {
+        self.0.read_logs(command).map_err(map_worker_error)
+    }
 }
 
 fn map_worker_error(error: conductor_worker::WorkerError) -> WorkerPortError {
@@ -180,6 +203,8 @@ fn map_worker_error(error: conductor_worker::WorkerError) -> WorkerPortError {
         conductor_worker::WorkerError::CapacityReached => WorkerPortError::CapacityReached,
         conductor_worker::WorkerError::RunConflict => WorkerPortError::RunConflict,
         conductor_worker::WorkerError::ShuttingDown => WorkerPortError::ShuttingDown,
+        conductor_worker::WorkerError::LogsNotFound => WorkerPortError::LogsNotFound,
+        conductor_worker::WorkerError::LogsPruned => WorkerPortError::LogsPruned,
         conductor_worker::WorkerError::WorkerMismatch
         | conductor_worker::WorkerError::StorageUnavailable => WorkerPortError::Unavailable,
     }
