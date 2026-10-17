@@ -10,7 +10,7 @@ const MAX_IDENTIFIER_LENGTH: usize = 128;
 const DEFAULT_TERMINATION_GRACE_MS: u64 = 5_000;
 const MAX_TERMINATION_GRACE_MS: u64 = 300_000;
 const MAX_TIMEOUT_MS: u64 = 604_800_000;
-pub const MAX_WORKER_CAPACITY: usize = 1_000;
+pub const MAX_WORKER_CAPACITY: usize = 64;
 pub const DEFAULT_LOG_CHUNK_BYTES: usize = 4_096;
 pub const MAX_LOG_CHUNK_BYTES: usize = 65_536;
 

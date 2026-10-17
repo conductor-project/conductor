@@ -264,10 +264,10 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         return Err("worker_id must contain 1-128 ASCII letters, digits, '-', '_' or '.'".into());
     }
     if config.worker_concurrency == 0 {
-        return Err("worker_concurrency must be between 1 and 1000".into());
+        return Err("worker_concurrency must be between 1 and 64".into());
     }
     if config.worker_concurrency > MAX_WORKER_CAPACITY {
-        return Err("worker_concurrency must be between 1 and 1000".into());
+        return Err("worker_concurrency must be between 1 and 64".into());
     }
     if !(100..=120_000).contains(&config.request_timeout_ms) {
         return Err("request_timeout_ms must be between 100 and 120000".into());
@@ -306,6 +306,9 @@ mod tests {
     fn configuration_accepts_ipv6_loopback_and_rejects_public_listener_without_binding() {
         assert!(validate(&config("[::1]:8080")).is_ok());
         assert!(validate(&config("192.0.2.1:8080")).is_err());
+        let mut excessive_capacity = config("127.0.0.1:8080");
+        excessive_capacity.worker_concurrency = conductor_core::MAX_WORKER_CAPACITY + 1;
+        assert!(validate(&excessive_capacity).is_err());
     }
 
     #[test]

@@ -10,6 +10,7 @@ conductor-core.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 nix.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true

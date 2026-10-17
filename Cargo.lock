@@ -216,6 +216,7 @@ dependencies = [
  "nix",
  "rusqlite",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
