@@ -346,7 +346,7 @@ def main():
                 "filesystemPolicy": {"grants": ["fixture"], "enabled": False},
             }
             status, _ = request(address, "POST", "/v1/jobs", disabled_job)
-            assert status == 400, "job was allowed to disable mandatory filesystem enforcement"
+            assert status == 422, "job was allowed to disable mandatory filesystem enforcement"
 
             # A path grant must not overlap state, cgroup controls, or a protected ancestor.
             broad_config = dict(config)
@@ -397,3 +397,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
