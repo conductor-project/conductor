@@ -32,6 +32,8 @@ const MAX_REQUEST_HEADER_COUNT: usize = 64;
 const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PENDING_STARTS: usize = 32;
+const MAX_PENDING_BLOCKING_OPERATIONS: usize = 64;
+const MAX_PENDING_CONTROL_OPERATIONS: usize = 8;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -98,6 +100,8 @@ struct ApiState {
     worker_id: WorkerId,
     worker_capacity: usize,
     start_admission: Arc<Semaphore>,
+    blocking_admission: Arc<Semaphore>,
+    control_admission: Arc<Semaphore>,
     recovery_ready: Arc<AtomicBool>,
 }
 
@@ -147,6 +151,8 @@ fn router_with_recovery(
         worker_id: descriptor.worker_id().clone(),
         worker_capacity: descriptor.capacity(),
         start_admission: Arc::new(Semaphore::new(MAX_PENDING_STARTS)),
+        blocking_admission: Arc::new(Semaphore::new(MAX_PENDING_BLOCKING_OPERATIONS)),
+        control_admission: Arc::new(Semaphore::new(MAX_PENDING_CONTROL_OPERATIONS)),
         recovery_ready,
     });
     Router::new()
@@ -168,6 +174,62 @@ fn router_with_recovery(
             request_bounds,
         ))
         .with_state(state)
+}
+
+#[derive(Clone, Copy)]
+enum BlockingClass {
+    General,
+    Control,
+}
+
+enum BlockingError {
+    Saturated,
+    Join,
+}
+
+async fn run_blocking<T, F>(
+    state: &Arc<ApiState>,
+    class: BlockingClass,
+    operation: F,
+) -> Result<T, BlockingError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let admission = match class {
+        BlockingClass::General => Arc::clone(&state.blocking_admission),
+        BlockingClass::Control => Arc::clone(&state.control_admission),
+    };
+    let permit = admission
+        .try_acquire_owned()
+        .map_err(|_| BlockingError::Saturated)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(|_| BlockingError::Join)
+}
+
+fn blocking_error(error_value: BlockingError) -> Response {
+    match error_value {
+        BlockingError::Saturated => {
+            let mut response = error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "blocking_admission_saturated",
+                "too many blocking operations are in progress",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            response
+        }
+        BlockingError::Join => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "the blocking operation stopped unexpectedly",
+        ),
+    }
 }
 
 async fn request_bounds(
@@ -268,9 +330,14 @@ async fn query_worker_status(
 ) -> Result<conductor_core::WorkerStatus, ManagerError> {
     let manager = Arc::clone(&state.manager);
     let worker = Arc::clone(&state.worker);
-    tokio::task::spawn_blocking(move || manager.worker_status(worker.as_ref()))
-        .await
-        .map_err(|_| ManagerError::WorkerUnavailable)?
+    match run_blocking(state, BlockingClass::General, move || {
+        manager.worker_status(worker.as_ref())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ManagerError::WorkerUnavailable),
+    }
 }
 
 async fn create_job(
@@ -281,7 +348,17 @@ async fn create_job(
         Ok(payload) => payload,
         Err(rejection) => return json_rejection(rejection),
     };
-    match state.manager.register(job.clone()) {
+    let result = match run_blocking(&state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        let job = job.clone();
+        move || manager.register(job)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error_value) => return blocking_error(error_value),
+    };
+    match result {
         Ok(()) => (StatusCode::CREATED, Json(job)).into_response(),
         Err(ManagerError::DuplicateJob) => error(
             StatusCode::CONFLICT,
@@ -314,7 +391,17 @@ async fn list_jobs(
     if !(1..=MAX_PAGE_SIZE).contains(&limit) {
         return invalid_page_query();
     }
-    match state.manager.list_page(limit, filters.cursor.as_deref()) {
+    let result = match run_blocking(&state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        let cursor = filters.cursor;
+        move || manager.list_page(limit, cursor.as_deref())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error_value) => return blocking_error(error_value),
+    };
+    match result {
         Ok(page) => (
             StatusCode::OK,
             Json(JobCollection {
@@ -335,7 +422,16 @@ async fn get_job(State(state): State<Arc<ApiState>>, Path(raw_id): Path<String>)
             "the job ID is invalid",
         );
     };
-    match state.manager.get(&id) {
+    let result = match run_blocking(&state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        move || manager.get(&id)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error_value) => return blocking_error(error_value),
+    };
+    match result {
         Ok(Some(job)) => (StatusCode::OK, Json(job)).into_response(),
         Ok(None) => error(
             StatusCode::NOT_FOUND,
@@ -358,7 +454,16 @@ async fn delete_job(State(state): State<Arc<ApiState>>, Path(raw_id): Path<Strin
             "the job ID is invalid",
         );
     };
-    match state.manager.delete(&id) {
+    let result = match run_blocking(&state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        move || manager.delete(&id)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error_value) => return blocking_error(error_value),
+    };
+    match result {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => error(
             StatusCode::NOT_FOUND,
@@ -439,7 +544,7 @@ async fn start_run(
     let worker = Arc::clone(&state.worker);
     let worker_id = state.worker_id.clone();
     let worker_capacity = state.worker_capacity;
-    let result = tokio::task::spawn_blocking(move || {
+    let result = run_blocking(&state, BlockingClass::General, move || {
         let _permit = permit;
         manager.start_run_with_key(
             &job_id,
@@ -453,11 +558,7 @@ async fn start_run(
     match result {
         Ok(Ok(observation)) => accepted_run(observation),
         Ok(Err(error)) => manager_error(error),
-        Err(_) => error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal_error",
-            "the run admission worker stopped unexpectedly",
-        ),
+        Err(error_value) => blocking_error(error_value),
     }
 }
 
@@ -468,9 +569,14 @@ async fn replay_run(
 ) -> Result<Option<conductor_core::RunObservation>, ManagerError> {
     let manager = Arc::clone(&state.manager);
     let worker = Arc::clone(&state.worker);
-    tokio::task::spawn_blocking(move || manager.replay_run(&job_id, &key, worker.as_ref()))
-        .await
-        .map_err(|_| ManagerError::WorkerUnavailable)?
+    match run_blocking(state, BlockingClass::General, move || {
+        manager.replay_run(&job_id, &key, worker.as_ref())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(ManagerError::WorkerUnavailable),
+    }
 }
 
 fn accepted_run(observation: conductor_core::RunObservation) -> Response {
@@ -518,7 +624,17 @@ async fn get_run(State(state): State<Arc<ApiState>>, Path(raw_id): Path<String>)
             "the run ID is invalid",
         );
     };
-    match state.manager.get_run(&run_id, state.worker.as_ref()) {
+    let result = match run_blocking(&state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        let worker = Arc::clone(&state.worker);
+        move || manager.get_run(&run_id, worker.as_ref())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error_value) => return blocking_error(error_value),
+    };
+    match result {
         Ok(Some(observation)) => (StatusCode::OK, Json(observation)).into_response(),
         Ok(None) => error(
             StatusCode::NOT_FOUND,
@@ -537,7 +653,17 @@ async fn stop_run(State(state): State<Arc<ApiState>>, Path(raw_id): Path<String>
             "the run ID is invalid",
         );
     };
-    match state.manager.stop_run(&run_id, state.worker.as_ref()) {
+    let result = match run_blocking(&state, BlockingClass::Control, {
+        let manager = Arc::clone(&state.manager);
+        let worker = Arc::clone(&state.worker);
+        move || manager.stop_run(&run_id, worker.as_ref())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error_value) => return blocking_error(error_value),
+    };
+    match result {
         Ok(observation) => {
             let status = if observation.state().is_terminal() {
                 StatusCode::OK
@@ -576,10 +702,18 @@ async fn resolve_run(
             "resolution must be 'abandon' with a non-empty reason of at most 512 bytes",
         );
     }
-    match state
-        .manager
-        .resolve_unknown_run(&run_id, &payload.reason, state.worker.as_ref())
+    let result = match run_blocking(&state, BlockingClass::Control, {
+        let manager = Arc::clone(&state.manager);
+        let worker = Arc::clone(&state.worker);
+        let reason = payload.reason;
+        move || manager.resolve_unknown_run(&run_id, &reason, worker.as_ref())
+    })
+    .await
     {
+        Ok(result) => result,
+        Err(error_value) => return blocking_error(error_value),
+    };
+    match result {
         Ok(observation) => (StatusCode::OK, Json(observation)).into_response(),
         Err(ManagerError::ResolutionConflict) => error(
             StatusCode::CONFLICT,
@@ -622,7 +756,17 @@ async fn get_run_logs(
         );
     }
     let command = ReadRunLogs::new(run_id, filters.stream, offset, limit);
-    match state.manager.read_logs(command, state.worker.as_ref()) {
+    let result = match run_blocking(&state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        let worker = Arc::clone(&state.worker);
+        move || manager.read_logs(command, worker.as_ref())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error_value) => return blocking_error(error_value),
+    };
+    match result {
         Ok(chunk) => (
             StatusCode::OK,
             Json(RunLogsResponse {
@@ -686,16 +830,32 @@ async fn list_runs(
     if !(1..=MAX_PAGE_SIZE).contains(&limit) {
         return invalid_page_query();
     }
-    match state.manager.list_runs_page(
-        job_id.as_ref(),
-        filters.state,
-        limit,
-        filters.cursor.as_deref(),
-    ) {
+    let page = match run_blocking(&state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        let cursor = filters.cursor;
+        move || manager.list_runs_page(job_id.as_ref(), filters.state, limit, cursor.as_deref())
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error_value) => return blocking_error(error_value),
+    };
+    match page {
         Ok(page) => {
             let mut refreshed = Vec::with_capacity(page.items.len());
             for run in page.items {
-                match state.manager.get_run(run.run_id(), state.worker.as_ref()) {
+                let current = match run_blocking(&state, BlockingClass::General, {
+                    let manager = Arc::clone(&state.manager);
+                    let worker = Arc::clone(&state.worker);
+                    let run_id = run.run_id().clone();
+                    move || manager.get_run(&run_id, worker.as_ref())
+                })
+                .await
+                {
+                    Ok(current) => current,
+                    Err(error_value) => return blocking_error(error_value),
+                };
+                match current {
                     Ok(Some(current)) => refreshed.push(current),
                     Ok(None) => {}
                     Err(error) => return manager_error(error),

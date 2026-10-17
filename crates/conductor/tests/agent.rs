@@ -125,6 +125,20 @@ fn start_with_capacity(
             );
         fs::write(&config, content).expect("write worker capacity");
     }
+    start_config(config, role_override)
+}
+
+fn start_with_request_timeout(path: &Path, timeout_ms: u64) -> (Agent, SocketAddr) {
+    let config = write_config(
+        path,
+        "all",
+        "127.0.0.1:0",
+        &format!(",\"request_timeout_ms\":{timeout_ms}"),
+    );
+    start_config(config, None)
+}
+
+fn start_config(config: PathBuf, role_override: Option<&str>) -> (Agent, SocketAddr) {
     let child = command(&config, role_override)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -451,6 +465,146 @@ fn request_header_and_processing_time_bounds_are_enforced() {
         .expect("read timed request response");
     assert!(response.starts_with("HTTP/1.1 408"), "{response}");
     assert_eq!(http(address, "GET", "/healthz", None, &[]).0, 200);
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
+}
+
+#[test]
+fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit() {
+    let path = TempDir::new("blocking-storage");
+    let (mut child, address) = start_with_request_timeout(&path, 100);
+    let job = job_json("stop-me", &["/bin/sh", "-c", "exec /bin/sleep 60"]);
+    assert_eq!(
+        http(address, "POST", "/v1/jobs", Some("application/json"), &job).0,
+        201
+    );
+    let (status, accepted) = http(address, "POST", "/v1/jobs/stop-me/runs", None, &[]);
+    assert_eq!(status, 202, "{accepted}");
+    let run_id = serde_json::from_str::<serde_json::Value>(&accepted).unwrap()["runId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let database = path.join("manager/manager.sqlite3");
+    let lock = Connection::open(database).expect("open lock connection");
+    lock.execute_batch("BEGIN EXCLUSIVE;")
+        .expect("hold manager write lock");
+
+    let requests = 64;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(requests));
+    let handles = (0..requests)
+        .map(|index| {
+            let barrier = std::sync::Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let body = job_json(&format!("blocked-{index}"), &["/usr/bin/true"]);
+                http(address, "POST", "/v1/jobs", Some("application/json"), &body)
+            })
+        })
+        .collect::<Vec<_>>();
+    thread::sleep(Duration::from_millis(150));
+
+    assert_eq!(http(address, "GET", "/healthz", None, &[]).0, 200);
+    assert_eq!(http(address, "GET", "/readyz", None, &[]).0, 200);
+    let body = job_json("saturated", &["/usr/bin/true"]);
+    let (status, response) = http(address, "POST", "/v1/jobs", Some("application/json"), &body);
+    assert_eq!(status, 429, "{response}");
+    assert!(response.contains("blocking_admission_saturated"));
+    let (status, response) = http(
+        address,
+        "POST",
+        &format!("/v1/runs/{run_id}/stop"),
+        None,
+        &[],
+    );
+    assert_eq!(
+        status, 408,
+        "reserved control operation was rejected: {response}"
+    );
+
+    lock.execute_batch("ROLLBACK;")
+        .expect("release manager write lock");
+    for handle in handles {
+        let (status, body) = handle.join().expect("request thread");
+        assert_eq!(status, 408, "{body}");
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if http(address, "GET", "/v1/jobs/blocked-0", None, &[]).0 == 200 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed-out writes did not finish");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let (status, body) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
+        assert_eq!(status, 200, "{body}");
+        let observation: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if observation["state"] == "cancelled" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "stop operation did not finish");
+        thread::sleep(Duration::from_millis(20));
+    }
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
+}
+
+#[test]
+fn timed_out_start_can_be_retried_with_the_same_idempotency_key() {
+    let path = TempDir::new("timed-out-idempotent-start");
+    let (mut child, address) = start_with_request_timeout(&path, 100);
+    let marker = path.join("started-once");
+    let command = [
+        "/bin/sh",
+        "-c",
+        &format!("printf x >> '{}'", marker.display()),
+    ];
+    let job = job_json("timeout-start", &command);
+    assert_eq!(
+        http(address, "POST", "/v1/jobs", Some("application/json"), &job).0,
+        201
+    );
+
+    let lock = Connection::open(path.join("manager/manager.sqlite3")).unwrap();
+    lock.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+    let headers = [("Idempotency-Key", "timeout-start-once")];
+    let (status, _, _) = http_with_custom_headers(
+        address,
+        "POST",
+        "/v1/jobs/timeout-start/runs",
+        None,
+        &headers,
+        &[],
+    );
+    assert_eq!(status, 408);
+    lock.execute_batch("ROLLBACK;").unwrap();
+
+    let (status, _, response) = http_with_custom_headers(
+        address,
+        "POST",
+        "/v1/jobs/timeout-start/runs",
+        None,
+        &headers,
+        &[],
+    );
+    assert_eq!(status, 202, "{response}");
+    let run_id = serde_json::from_str::<serde_json::Value>(&response).unwrap()["runId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let (status, body) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
+        assert_eq!(status, 200, "{body}");
+        let observation: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if observation["state"] == "succeeded" {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed-out start did not finish");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(fs::read_to_string(marker).unwrap(), "x");
     signal(&child, "INT");
     wait_for_exit(&mut child);
 }
