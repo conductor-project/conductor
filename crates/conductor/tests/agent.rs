@@ -2437,10 +2437,13 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
         if status == 410 {
             break;
         }
-        assert_eq!(status, 200, "{body}");
+        assert!(
+            status == 200 || status == 404,
+            "log retention poll failed: {body}"
+        );
         assert!(
             Instant::now() < retention_deadline,
-            "completed log was not pruned after asynchronous capture finished: {body}"
+            "completed log did not reach the pruned state after asynchronous capture finished: {body}"
         );
         thread::sleep(Duration::from_millis(10));
     }

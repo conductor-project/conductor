@@ -664,13 +664,19 @@ fn pending_output_readers_do_not_block_other_run_deadlines() {
             .start(StartRun::new(run(id, escaped_pipe_job(id, marker.clone()))))
             .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while !marker.exists() && std::time::Instant::now() < deadline {
+        let pid = loop {
+            if let Ok(value) = fs::read_to_string(&marker)
+                && let Ok(pid) = value.trim().parse()
+            {
+                break pid;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "escaped pipe holder did not write its process id"
+            );
             thread::sleep(Duration::from_millis(5));
-        }
-        assert!(marker.exists(), "escaped pipe holder did not start");
-        escaped.push(EscapedChild(
-            fs::read_to_string(marker).unwrap().parse().unwrap(),
-        ));
+        };
+        escaped.push(EscapedChild(pid));
     }
 
     let deadline_job = JobSpec::new(
