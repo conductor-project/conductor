@@ -2,12 +2,17 @@
 
 #[cfg(target_os = "linux")]
 mod cgroup;
+#[cfg(target_os = "linux")]
+mod landlock;
 
 use std::io;
 use std::process::{Child, Command, Stdio};
 
 use conductor_core::{JobSpec, ResourceLimits};
 use conductor_worker::ExecutionBackend;
+
+#[cfg(target_os = "linux")]
+pub use landlock::{LandlockGrantConfig, LandlockMode};
 
 #[cfg(target_os = "linux")]
 use std::collections::BTreeMap;
@@ -23,13 +28,16 @@ use cgroup::CgroupV2;
 pub struct HostProcessBackend {
     #[cfg(target_os = "linux")]
     cgroup: Option<CgroupBackend>,
+    #[cfg(target_os = "linux")]
+    landlock: Option<landlock::LandlockBackend>,
+    #[cfg(target_os = "linux")]
+    launcher: Option<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
 #[derive(Clone, Debug)]
 struct CgroupBackend {
     manager: CgroupV2,
-    launcher: PathBuf,
     groups: Arc<Mutex<BTreeMap<u32, PathBuf>>>,
 }
 
@@ -45,10 +53,29 @@ impl HostProcessBackend {
         Ok(Self {
             cgroup: Some(CgroupBackend {
                 manager: CgroupV2::open(root, worker_id, maximums)?,
-                launcher,
                 groups: Arc::new(Mutex::new(BTreeMap::new())),
             }),
+            landlock: None,
+            launcher: Some(launcher),
         })
+    }
+
+    /// Configure administrator-approved Landlock grants and launch enforcement mode.
+    #[cfg(target_os = "linux")]
+    pub fn with_landlock(
+        mut self,
+        mode: LandlockMode,
+        grants: Vec<LandlockGrantConfig>,
+        protected_paths: &[PathBuf],
+        launcher: PathBuf,
+    ) -> io::Result<Self> {
+        self.landlock = Some(landlock::LandlockBackend::open(
+            mode,
+            grants,
+            protected_paths,
+        )?);
+        self.launcher = Some(launcher);
+        Ok(self)
     }
 
     /// Cgroup enforcement is available only on Linux.
@@ -68,11 +95,43 @@ impl HostProcessBackend {
 
 impl ExecutionBackend for HostProcessBackend {
     fn spawn(&self, run_id: &str, job: &JobSpec) -> io::Result<Child> {
-        #[cfg(not(target_os = "linux"))]
-        let _ = run_id;
         #[cfg(target_os = "linux")]
-        if let Some(cgroup) = &self.cgroup {
-            return spawn_in_cgroup(cgroup, run_id, job);
+        {
+            let landlock_grants = self
+                .landlock
+                .as_ref()
+                .map(|policy| policy.launcher_grants(job.filesystem_policy()))
+                .transpose()?
+                .flatten();
+            if self.cgroup.is_some() || landlock_grants.is_some() {
+                if self.cgroup.is_none() && !job.resource_limits().is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "job resource limits require enabled cgroup v2 enforcement",
+                    ));
+                }
+                let launcher = self
+                    .launcher
+                    .as_deref()
+                    .ok_or_else(|| io::Error::other("internal launcher is not configured"))?;
+                return spawn_sandboxed(
+                    self.cgroup.as_ref(),
+                    landlock_grants,
+                    launcher,
+                    run_id,
+                    job,
+                );
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = run_id;
+            if job.filesystem_policy().is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "filesystem policy requires Landlock on Linux",
+                ));
+            }
         }
         if !job.resource_limits().is_empty() {
             return Err(io::Error::new(
@@ -214,17 +273,29 @@ fn spawn_host_process(job: &JobSpec) -> io::Result<Child> {
 }
 
 #[cfg(target_os = "linux")]
-fn spawn_in_cgroup(cgroup: &CgroupBackend, run_id: &str, job: &JobSpec) -> io::Result<Child> {
+fn spawn_sandboxed(
+    cgroup: Option<&CgroupBackend>,
+    landlock_grants: Option<Vec<landlock::LauncherGrant>>,
+    launcher: &Path,
+    run_id: &str,
+    job: &JobSpec,
+) -> io::Result<Child> {
     use std::io::Read;
     use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     static NEXT_SOCKET: AtomicU64 = AtomicU64::new(1);
-    trace_cgroup_launch(run_id, "create_run_cgroup");
-    let path = cgroup.manager.create(run_id, job.resource_limits())?;
-    trace_cgroup_launch(run_id, "run_cgroup_created");
+    let path = if let Some(cgroup) = cgroup {
+        trace_cgroup_launch(run_id, "create_run_cgroup");
+        let path = cgroup.manager.create(run_id, job.resource_limits())?;
+        trace_cgroup_launch(run_id, "run_cgroup_created");
+        Some(path)
+    } else {
+        None
+    };
     let private_directory = std::env::temp_dir().join(format!(
         "conductor-launch-{}-{}-{}",
         std::process::id(),
@@ -237,23 +308,42 @@ fn spawn_in_cgroup(cgroup: &CgroupBackend, run_id: &str, job: &JobSpec) -> io::R
     let mut directory_builder = std::fs::DirBuilder::new();
     directory_builder.mode(0o700);
     if let Err(error) = directory_builder.create(&private_directory) {
-        let _ = CgroupV2::kill(&path);
-        let _ = CgroupV2::remove_when_empty(&path);
+        if let Some(path) = &path {
+            let _ = CgroupV2::kill(path);
+            let _ = CgroupV2::remove_when_empty(path);
+        }
         return Err(error);
     }
     let socket_path = private_directory.join("ready.sock");
+    let policy_path = private_directory.join("landlock.json");
     let mut spawned: Option<Child> = None;
     let result = (|| {
+        if let Some(grants) = &landlock_grants {
+            let manifest = serde_json::to_vec(grants)
+                .map_err(|_| io::Error::other("failed to encode Landlock grant manifest"))?;
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&policy_path)?;
+            use std::io::Write;
+            file.write_all(&manifest)?;
+        }
         trace_cgroup_launch(run_id, "bind_handshake_socket");
         let listener = UnixListener::bind(&socket_path)?;
         listener.set_nonblocking(true)?;
-        let mut command = Command::new(&cgroup.launcher);
+        let mut command = Command::new(launcher);
         command
             .arg("__internal-launch")
-            .arg("--cgroup-path")
-            .arg(&path)
             .arg("--ready-socket")
-            .arg(&socket_path)
+            .arg(&socket_path);
+        if let Some(path) = &path {
+            command.arg("--cgroup-path").arg(path);
+        }
+        if landlock_grants.is_some() {
+            command.arg("--landlock-policy-file").arg(&policy_path);
+        }
+        command
             .arg("--")
             .args(job.command())
             .current_dir(job.cwd())
@@ -292,20 +382,22 @@ fn spawn_in_cgroup(cgroup: &CgroupBackend, run_id: &str, job: &JobSpec) -> io::R
                         ));
                     }
                     let _ = std::fs::remove_file(&socket_path);
-                    cgroup
-                        .groups
-                        .lock()
-                        .map_err(|_| io::Error::other("cgroup registry is unavailable"))?
-                        .insert(
-                            spawned
-                                .as_ref()
-                                .ok_or_else(|| {
-                                    io::Error::other("cgroup launcher child is missing")
-                                })?
-                                .id(),
-                            path.clone(),
-                        );
-                    trace_cgroup_launch(run_id, "run_cgroup_registered");
+                    if let (Some(cgroup), Some(path)) = (cgroup, &path) {
+                        cgroup
+                            .groups
+                            .lock()
+                            .map_err(|_| io::Error::other("cgroup registry is unavailable"))?
+                            .insert(
+                                spawned
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        io::Error::other("cgroup launcher child is missing")
+                                    })?
+                                    .id(),
+                                path.clone(),
+                            );
+                        trace_cgroup_launch(run_id, "run_cgroup_registered");
+                    }
                     return spawned
                         .take()
                         .ok_or_else(|| io::Error::other("cgroup launcher child is missing"));
@@ -333,14 +425,17 @@ fn spawn_in_cgroup(cgroup: &CgroupBackend, run_id: &str, job: &JobSpec) -> io::R
         }
     })();
     let _ = std::fs::remove_file(&socket_path);
+    let _ = std::fs::remove_file(&policy_path);
     let _ = std::fs::remove_dir(&private_directory);
     if result.is_err() {
         if let Some(mut child) = spawned.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        let _ = CgroupV2::kill(&path);
-        let _ = CgroupV2::remove_when_empty(&path);
+        if let Some(path) = &path {
+            let _ = CgroupV2::kill(path);
+            let _ = CgroupV2::remove_when_empty(path);
+        }
     }
     result
 }
@@ -356,23 +451,42 @@ fn trace_cgroup_launch(run_id: &str, phase: &str) {
 
 /// Entered only by a fresh internal launcher before it executes user code.
 #[cfg(target_os = "linux")]
-pub fn internal_launch(cgroup_path: &Path, ready_socket: &Path, command: &[String]) -> i32 {
+pub fn internal_launch(
+    cgroup_path: Option<&Path>,
+    ready_socket: &Path,
+    landlock_policy_file: Option<&Path>,
+    command: &[String],
+) -> i32 {
     use std::io::Write;
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt;
 
-    let setup = CgroupV2::move_launcher(cgroup_path);
+    let grants = match landlock_policy_file
+        .map(landlock::read_launcher_policy)
+        .transpose()
+    {
+        Ok(grants) => grants,
+        Err(_) => return 125,
+    };
     let mut stream = match UnixStream::connect(ready_socket) {
         Ok(stream) => stream,
         Err(_) => return 125,
     };
-    if setup.is_err() {
+    if cgroup_path.is_some_and(|path| CgroupV2::move_launcher(path).is_err()) {
+        let _ = stream.write_all(b"ERROR\n");
+        return 125;
+    }
+    if grants
+        .as_deref()
+        .is_some_and(|grants| landlock::apply_launcher_policy(grants).is_err())
+    {
         let _ = stream.write_all(b"ERROR\n");
         return 125;
     }
     if stream.write_all(b"READY\n").is_err() {
         return 125;
     }
+    drop(stream);
     if command.is_empty() {
         return 125;
     }
@@ -383,8 +497,9 @@ pub fn internal_launch(cgroup_path: &Path, ready_socket: &Path, command: &[Strin
 
 #[cfg(not(target_os = "linux"))]
 pub fn internal_launch(
-    _cgroup_path: &std::path::Path,
+    _cgroup_path: Option<&std::path::Path>,
     _ready_socket: &std::path::Path,
+    _landlock_policy_file: Option<&std::path::Path>,
     _command: &[String],
 ) -> i32 {
     125

@@ -1,0 +1,17 @@
+{
+  "role": "all",
+  "listen": "127.0.0.1:8080",
+  "manager_data_dir": "./state/manager",
+  "worker_data_dir": "./state/worker",
+  "worker_id": "landlock-worker",
+  "worker_concurrency": 2,
+  "landlock": {
+    "mode": "required",
+    "protectedPaths": ["/opt/conductor/credentials"],
+    "grants": [
+      {"id": "printf", "path": "/usr/bin/printf", "execute": true},
+      {"id": "libc", "path": "/lib/x86_64-linux-gnu/libc.so.6", "read": true},
+      {"id": "loader", "path": "/lib64/ld-linux-x86-64.so.2", "read": true, "execute": true}
+    ]
+  }
+}

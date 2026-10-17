@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use conductor_core::{
-    JobId, JobSpec, ResourceLimits, RunFailureReason, RunId, RunSpec, RunState, WorkerId,
+    FilesystemPolicy, JobId, JobSpec, ResourceLimits, RunFailureReason, RunId, RunSpec, RunState,
+    WorkerId,
 };
 
 #[test]
@@ -140,6 +141,42 @@ fn job_resource_limits_validate_and_round_trip_without_changing_legacy_json() {
         assert!(serde_json::from_str::<JobSpec>(&input).is_err(), "{input}");
     }
     assert!(ResourceLimits::new(Some(1_000), Some(100_000), None, None, Some(1)).is_ok());
+}
+
+#[test]
+fn job_filesystem_policy_is_immutable_strict_and_backward_compatible() {
+    let base = r#"{"id":"job","command":["/usr/bin/true"],"cwd":"/tmp"}"#;
+    let legacy: JobSpec = serde_json::from_str(base).unwrap();
+    assert_eq!(legacy.filesystem_policy(), None);
+    assert_eq!(
+        serde_json::to_string(&legacy).unwrap(),
+        base.replace(
+            "}",
+            ",\"env\":{},\"inheritEnv\":false,\"timeoutMs\":null,\"terminationGraceMs\":5000}"
+        )
+    );
+
+    let input = r#"{"id":"job","command":["/usr/bin/true"],"cwd":"/tmp","filesystemPolicy":{"grants":["input.data","bin"]}}"#;
+    let job: JobSpec = serde_json::from_str(input).unwrap();
+    assert_eq!(
+        job.filesystem_policy().unwrap().grants(),
+        ["input.data", "bin"]
+    );
+    let decoded: JobSpec = serde_json::from_str(&serde_json::to_string(&job).unwrap()).unwrap();
+    assert_eq!(decoded, job);
+
+    for policy in [
+        r#"{"grants":["same","same"]}"#,
+        r#"{"grants":["has space"]}"#,
+        r#"{"grants":["bad/path"]}"#,
+        r#"{"grants":["x"],"unknown":true}"#,
+    ] {
+        let input = format!(
+            r#"{{"id":"job","command":["/usr/bin/true"],"cwd":"/tmp","filesystemPolicy":{policy}}}"#
+        );
+        assert!(serde_json::from_str::<JobSpec>(&input).is_err(), "{input}");
+    }
+    assert!(FilesystemPolicy::new(vec!["x".to_owned(); 65]).is_err());
 }
 
 #[test]
