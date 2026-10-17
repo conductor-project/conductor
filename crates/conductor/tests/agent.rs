@@ -49,11 +49,30 @@ impl Drop for Agent {
 }
 
 fn write_config(path: &Path, role: &str, listen: &str, extra: &str) -> PathBuf {
+    write_config_dirs(
+        path,
+        role,
+        listen,
+        &path.join("manager"),
+        &path.join("worker"),
+        extra,
+    )
+}
+
+fn write_config_dirs(
+    path: &Path,
+    role: &str,
+    listen: &str,
+    manager_dir: &Path,
+    worker_dir: &Path,
+    extra: &str,
+) -> PathBuf {
+    fs::create_dir_all(path).expect("create config directory");
     let config_path = path.join("agent.json");
     let content = format!(
         r#"{{"role":"{role}","listen":"{listen}","manager_data_dir":"{}","worker_data_dir":"{}","worker_id":"test-worker","worker_concurrency":1{extra}}}"#,
-        path.join("manager").display(),
-        path.join("worker").display(),
+        manager_dir.display(),
+        worker_dir.display(),
     );
     fs::write(&config_path, content).expect("write config");
     config_path
@@ -455,5 +474,174 @@ fn actual_binary_rejects_invalid_jobs_bodies_and_media_types_without_poisoning_s
     assert_eq!(status, 404, "{unknown}");
 
     signal(&child, "TERM");
+    wait_for_exit(&mut child);
+}
+
+#[test]
+fn actual_binary_preserves_jobs_after_normal_and_abrupt_restart() {
+    let path = TempDir::new("durable-restart");
+    let (mut child, address) = start(&path, "all", None);
+    let durable = job_json("durable", &["/usr/bin/true"]);
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &durable
+        )
+        .0,
+        201
+    );
+    let deleted = job_json("deleted", &["/usr/bin/true"]);
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &deleted
+        )
+        .0,
+        201
+    );
+    assert_eq!(
+        http(address, "DELETE", "/v1/jobs/deleted", None, &[]).0,
+        204
+    );
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
+
+    let (mut child, address) = start(&path, "all", None);
+    let (status, body) = http(address, "GET", "/v1/jobs/durable", None, &[]);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &deleted
+        )
+        .0,
+        409
+    );
+    signal(&child, "KILL");
+    let status = child.0.wait().expect("wait for killed agent");
+    assert!(!status.success());
+
+    let (mut child, address) = start(&path, "all", None);
+    let (status, body) = http(address, "GET", "/v1/jobs/durable", None, &[]);
+    assert_eq!(status, 200, "{body}");
+    signal(&child, "TERM");
+    wait_for_exit(&mut child);
+}
+
+#[test]
+fn actual_binary_rejects_duplicate_manager_and_worker_state_ownership() {
+    let path = TempDir::new("state-ownership");
+    let manager = path.join("shared-manager");
+    let worker_a = path.join("worker-a");
+    let worker_b = path.join("worker-b");
+    let config_a = write_config_dirs(
+        &path.join("a"),
+        "all",
+        "127.0.0.1:0",
+        &manager,
+        &worker_a,
+        "",
+    );
+    let mut owner = Agent(
+        command(&config_a, None)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start owner"),
+    );
+    let stderr = owner.0.stderr.take().expect("stderr");
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stderr).read_line(&mut line);
+        let _ = sender.send(line);
+    });
+    let line = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("owner readiness");
+    let event: serde_json::Value = serde_json::from_str(&line).expect("owner startup event");
+    assert_eq!(event["event"], "agent_started", "{line}");
+    let address: SocketAddr = event["address"].as_str().unwrap().parse().unwrap();
+
+    let config_manager_conflict = write_config_dirs(
+        &path.join("b"),
+        "all",
+        "127.0.0.1:0",
+        &manager,
+        &worker_b,
+        "",
+    );
+    let result = failed(&config_manager_conflict, None);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("already in use"));
+
+    let config_worker_conflict = write_config_dirs(
+        &path.join("c"),
+        "all",
+        "127.0.0.1:0",
+        &path.join("manager-c"),
+        &worker_a,
+        "",
+    );
+    let result = failed(&config_worker_conflict, None);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("already in use"));
+    assert_eq!(http(address, "GET", "/healthz", None, &[]).0, 200);
+    signal(&owner, "INT");
+    let mut owner = owner;
+    wait_for_exit(&mut owner);
+}
+
+#[cfg(unix)]
+#[test]
+fn actual_binary_rejects_aliased_state_directories_and_sets_private_permissions() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let path = TempDir::new("state-paths");
+    let manager = path.join("manager");
+    fs::create_dir_all(&manager).unwrap();
+    symlink(&manager, path.join("manager-alias")).expect("create manager alias");
+    let config = write_config_dirs(
+        &path.join("alias"),
+        "all",
+        "127.0.0.1:0",
+        &manager,
+        &path.join("manager-alias"),
+        "",
+    );
+    let result = failed(&config, None);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("same directory"));
+
+    let (mut child, _) = start(&path, "all", None);
+    for directory in [&path.join("manager"), &path.join("worker")] {
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        assert_eq!(
+            fs::metadata(directory.join(".conductor.lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+    }
+    let database = path.join("manager/manager.sqlite3");
+    assert_eq!(
+        fs::metadata(database).unwrap().permissions().mode() & 0o077,
+        0
+    );
+    signal(&child, "INT");
     wait_for_exit(&mut child);
 }

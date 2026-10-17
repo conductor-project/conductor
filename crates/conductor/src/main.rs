@@ -1,3 +1,5 @@
+mod state_lock;
+
 use std::fs;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
@@ -9,6 +11,7 @@ use std::sync::{
 
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use serde::Deserialize;
+use state_lock::StateLocks;
 
 #[derive(Debug, Parser)]
 #[command(name = "conductor", version, about = "Conductor job and run agent")]
@@ -104,6 +107,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    let _state_locks = StateLocks::acquire(&config.manager_data_dir, &config.worker_data_dir)?;
+    let manager = Arc::new(conductor_manager::JobService::open_sqlite(
+        config.manager_data_dir.join("manager.sqlite3"),
+    )?);
     let listener = TcpListener::bind(config.listen)?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
@@ -119,12 +126,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener)?;
-        conductor_api::serve(
-            listener,
-            shutdown,
-            Arc::new(conductor_manager::JobService::in_memory()),
-        )
-        .await
+        conductor_api::serve(listener, shutdown, manager).await
     })?;
     Ok(())
 }
@@ -149,9 +151,6 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         || config.worker_data_dir.as_os_str().is_empty()
     {
         return Err("data directories must not be empty".into());
-    }
-    if config.manager_data_dir == config.worker_data_dir {
-        return Err("manager_data_dir and worker_data_dir must be separate".into());
     }
     Ok(())
 }
