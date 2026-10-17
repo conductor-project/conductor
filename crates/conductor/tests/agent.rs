@@ -4,6 +4,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -76,9 +77,16 @@ fn start(path: &Path, config_role: &str, role_override: Option<&str>) -> (Agent,
         .expect("start agent");
     let mut child = Agent(child);
     let stderr = child.0.stderr.take().expect("stderr");
-    let mut reader = BufReader::new(stderr);
-    let mut line = String::new();
-    reader.read_line(&mut line).expect("startup event");
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        let _ = sender.send(line);
+    });
+    let line = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("startup event before readiness deadline");
     let event: serde_json::Value = serde_json::from_str(&line).expect("structured startup event");
     assert_eq!(event["event"], "agent_started", "{line}");
     let address: SocketAddr = event["address"]
@@ -86,7 +94,6 @@ fn start(path: &Path, config_role: &str, role_override: Option<&str>) -> (Agent,
         .expect("address")
         .parse()
         .expect("socket address");
-    drop(reader);
     (child, address)
 }
 
@@ -220,4 +227,233 @@ fn clap_help_and_invalid_role_are_clear() {
     let result = failed(&config, Some("invalid"));
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("possible values"));
+}
+
+fn http(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> (u16, String) {
+    let mut stream = TcpStream::connect(address).expect("connect to agent");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .expect("set bounded read timeout");
+    stream
+        .set_write_timeout(Some(Duration::from_secs(3)))
+        .expect("set bounded write timeout");
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    )
+    .expect("write request headers");
+    if let Some(content_type) = content_type {
+        write!(stream, "Content-Type: {content_type}\r\n").expect("write content type");
+    }
+    stream.write_all(b"\r\n").expect("finish request headers");
+    stream.write_all(body).expect("write request body");
+
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+    let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response");
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_ascii_whitespace().nth(1))
+        .expect("HTTP status")
+        .parse()
+        .expect("numeric status");
+    (status, body.to_owned())
+}
+
+fn job_json(id: &str, command: &[&str]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "id": id,
+        "command": command,
+        "cwd": "/tmp",
+    }))
+    .expect("encode job")
+}
+
+#[test]
+fn actual_binary_registers_lists_reads_and_deletes_immutable_jobs() {
+    let path = TempDir::new("jobs");
+    let (mut child, address) = start(&path, "all", None);
+    let marker = path.join("must-not-be-created");
+    let marker_arg = marker.to_str().expect("UTF-8 temp path");
+    let zeta = job_json("zeta", &["/usr/bin/touch", marker_arg]);
+    let alpha = job_json("alpha", &["/usr/bin/touch", marker_arg]);
+
+    let (status, created) = http(address, "POST", "/v1/jobs", Some("application/json"), &zeta);
+    assert_eq!(status, 201, "{created}");
+    let created: serde_json::Value = serde_json::from_str(&created).expect("job response JSON");
+    assert_eq!(created["id"], "zeta");
+    assert_eq!(created["inheritEnv"], false);
+    assert_eq!(created["env"], serde_json::json!({}));
+    assert_eq!(created["terminationGraceMs"], 5_000);
+    assert_eq!(created["timeoutMs"], serde_json::Value::Null);
+
+    let (status, _) = http(
+        address,
+        "POST",
+        "/v1/jobs",
+        Some("application/json"),
+        &alpha,
+    );
+    assert_eq!(status, 201);
+    let (status, fetched) = http(address, "GET", "/v1/jobs/zeta", None, &[]);
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&fetched).unwrap(),
+        created
+    );
+    let (status, listed) = http(address, "GET", "/v1/jobs", None, &[]);
+    assert_eq!(status, 200);
+    let listed: serde_json::Value = serde_json::from_str(&listed).expect("collection JSON");
+    assert_eq!(listed["jobs"][0]["id"], "alpha");
+    assert_eq!(listed["jobs"][1]["id"], "zeta");
+
+    let (status, duplicate) = http(address, "POST", "/v1/jobs", Some("application/json"), &zeta);
+    assert_eq!(status, 409, "{duplicate}");
+    assert!(duplicate.contains("duplicate_job"));
+    assert!(!marker.exists(), "registering a job must not execute it");
+
+    let (status, _) = http(address, "DELETE", "/v1/jobs/zeta", None, &[]);
+    assert_eq!(status, 204);
+    let (status, missing) = http(address, "GET", "/v1/jobs/zeta", None, &[]);
+    assert_eq!(status, 404, "{missing}");
+    assert!(missing.contains("job_not_found"));
+    let (status, missing_delete) = http(address, "DELETE", "/v1/jobs/zeta", None, &[]);
+    assert_eq!(status, 404, "{missing_delete}");
+    let (status, reused) = http(address, "POST", "/v1/jobs", Some("application/json"), &zeta);
+    assert_eq!(status, 409, "{reused}");
+
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
+}
+
+#[test]
+fn actual_binary_rejects_invalid_jobs_bodies_and_media_types_without_poisoning_service() {
+    let path = TempDir::new("invalid-jobs");
+    let (mut child, address) = start(&path, "all", None);
+    let base = r#"{"id":"valid","command":["/usr/bin/true"],"cwd":"/tmp"}"#;
+    let invalid = [
+        ("{ invalid", 400, "invalid_json"),
+        (
+            r#"{"id":"valid","command":["/usr/bin/true"],"cwd":"/tmp","unexpected":1}"#,
+            422,
+            "invalid_job",
+        ),
+        (r#"{"id":"valid","cwd":"/tmp"}"#, 422, "invalid_job"),
+        (
+            r#"{"id":"valid","command":[],"cwd":"/tmp"}"#,
+            422,
+            "invalid_job",
+        ),
+        (
+            r#"{"id":"valid","command":["true"],"cwd":"/tmp"}"#,
+            422,
+            "invalid_job",
+        ),
+        (
+            r#"{"id":"valid","command":["/usr/bin/true"],"cwd":"relative"}"#,
+            422,
+            "invalid_job",
+        ),
+        (
+            r#"{"id":"bad id","command":["/usr/bin/true"],"cwd":"/tmp"}"#,
+            422,
+            "invalid_job",
+        ),
+        (
+            r#"{"id":"valid","command":["/usr/bin/true","x\u0000y"],"cwd":"/tmp"}"#,
+            422,
+            "invalid_job",
+        ),
+        (
+            r#"{"id":"valid","command":["/usr/bin/true"],"cwd":"/tmp","env":{"BAD-NAME":"SECRET_VALUE"}}"#,
+            422,
+            "invalid_job",
+        ),
+        (
+            r#"{"id":"valid","command":["/usr/bin/true"],"cwd":"/tmp","env":{"GOOD":"bad\u0000value"}}"#,
+            422,
+            "invalid_job",
+        ),
+        (
+            r#"{"id":"valid","command":["/usr/bin/true"],"cwd":"/tmp","timeoutMs":0}"#,
+            422,
+            "invalid_job",
+        ),
+        (
+            r#"{"id":"valid","command":["/usr/bin/true"],"cwd":"/tmp","timeoutMs":604800001}"#,
+            422,
+            "invalid_job",
+        ),
+        (
+            r#"{"id":"valid","command":["/usr/bin/true"],"cwd":"/tmp","terminationGraceMs":300001}"#,
+            422,
+            "invalid_job",
+        ),
+    ];
+    for (body, expected_status, expected_code) in invalid {
+        let (status, response) = http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            body.as_bytes(),
+        );
+        assert_eq!(status, expected_status, "{body}: {response}");
+        assert!(response.contains(expected_code), "{body}: {response}");
+        assert!(
+            !response.contains("SECRET_VALUE"),
+            "sensitive input echoed: {response}"
+        );
+    }
+
+    let (status, unsupported) = http(
+        address,
+        "POST",
+        "/v1/jobs",
+        Some("text/plain"),
+        base.as_bytes(),
+    );
+    assert_eq!(status, 415, "{unsupported}");
+    assert!(unsupported.contains("unsupported_media_type"));
+
+    let oversized = vec![b'x'; 65_537];
+    let (status, too_large) = http(
+        address,
+        "POST",
+        "/v1/jobs",
+        Some("application/json"),
+        &oversized,
+    );
+    assert_eq!(status, 413, "{too_large}");
+    assert!(too_large.contains("body_too_large"));
+
+    let (status, _) = http(
+        address,
+        "POST",
+        "/v1/jobs",
+        Some("application/json"),
+        base.as_bytes(),
+    );
+    assert_eq!(status, 201);
+    let (status, health) = http(address, "GET", "/healthz", None, &[]);
+    assert_eq!(status, 200, "{health}");
+    let (status, unknown) = http(
+        address,
+        "POST",
+        "/v1/unknown",
+        Some("application/json"),
+        base.as_bytes(),
+    );
+    assert_eq!(status, 404, "{unknown}");
+
+    signal(&child, "TERM");
+    wait_for_exit(&mut child);
 }

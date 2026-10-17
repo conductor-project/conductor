@@ -154,12 +154,19 @@ name = "conductor-api"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "conductor-core",
+ "conductor-manager",
+ "serde",
  "tokio",
 ]
 
 [[package]]
 name = "conductor-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "conductor-manager"

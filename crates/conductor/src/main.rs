@@ -119,7 +119,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener)?;
-        conductor_api::serve(listener, shutdown).await
+        conductor_api::serve(
+            listener,
+            shutdown,
+            Arc::new(conductor_manager::JobService::in_memory()),
+        )
+        .await
     })?;
     Ok(())
 }
