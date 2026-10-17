@@ -254,7 +254,9 @@ async fn get_worker(State(state): State<Arc<ApiState>>, Path(raw_id): Path<Strin
     }
 }
 
-async fn query_worker_status(state: &Arc<ApiState>) -> Result<conductor_core::WorkerStatus, ManagerError> {
+async fn query_worker_status(
+    state: &Arc<ApiState>,
+) -> Result<conductor_core::WorkerStatus, ManagerError> {
     let manager = Arc::clone(&state.manager);
     let worker = Arc::clone(&state.worker);
     tokio::task::spawn_blocking(move || manager.worker_status(worker.as_ref()))
