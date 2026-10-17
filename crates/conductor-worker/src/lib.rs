@@ -2148,6 +2148,9 @@ async fn supervise(supervision: RunSupervision) {
     if let Ok(mut state) = state.0.lock() {
         state.active_groups.remove(&run_id);
     }
+    if let Some(reader_task) = reader_task {
+        let _ = reader_task.await;
+    }
     if let Err(error) = run_bounded_blocking(&persistence_admission, {
         let state = Arc::clone(&state);
         move || prune_completed_logs_shared(&state, &log_directory, retention_runs)
@@ -2155,9 +2158,6 @@ async fn supervise(supervision: RunSupervision) {
     .await
     {
         emit_worker_diagnostic("log_retention_failed", run_id.as_str(), &error);
-    }
-    if let Some(reader_task) = reader_task {
-        let _ = reader_task.await;
     }
 }
 
