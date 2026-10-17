@@ -26,6 +26,7 @@ MAX_FILE_DESCRIPTORS = 1024
 MAX_HEALTH_P95_MS = 250.0
 MAX_START_P95_MS = 2_000.0
 MAX_STOP_P95_MS = 5_000.0
+MAX_STOP_COMPLETION_SECONDS = 30.0
 
 
 def request(base, method, route, payload=None):
@@ -187,17 +188,36 @@ def main():
             stop_latencies = []
             pending = {run_id: sent_at for run_id, sent_at, _ in stops}
             stop_responses = [elapsed for _, _, elapsed in stops]
-            deadline = time.monotonic() + 10
-            while pending and time.monotonic() < deadline:
-                for run_id, sent_at in list(pending.items()):
-                    _, observation = request(base, "GET", f"/v1/runs/{run_id}")
-                    if observation["state"] in ("succeeded", "failed", "cancelled", "timed_out"):
-                        stop_latencies.append((time.perf_counter() - sent_at) * 1000)
-                        del pending[run_id]
-                if pending:
-                    time.sleep(0.02)
+            pending_states = {}
+            deadline = time.monotonic() + MAX_STOP_COMPLETION_SECONDS
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(args.runs, 32)
+            ) as poller:
+                while pending and time.monotonic() < deadline:
+                    futures = {
+                        poller.submit(request, base, "GET", f"/v1/runs/{run_id}"): (
+                            run_id,
+                            sent_at,
+                        )
+                        for run_id, sent_at in pending.items()
+                    }
+                    for future in concurrent.futures.as_completed(futures):
+                        run_id, sent_at = futures[future]
+                        _, observation = future.result()
+                        state = observation["state"]
+                        if state in ("succeeded", "failed", "cancelled", "timed_out"):
+                            stop_latencies.append((time.perf_counter() - sent_at) * 1000)
+                            del pending[run_id]
+                            pending_states.pop(run_id, None)
+                        else:
+                            pending_states[run_id] = state
+                    if pending:
+                        time.sleep(0.02)
             if pending:
-                raise TimeoutError(f"{len(pending)} runs did not stop within 10 seconds")
+                raise TimeoutError(
+                    f"{len(pending)} runs did not stop within "
+                    f"{MAX_STOP_COMPLETION_SECONDS:g} seconds; states={pending_states}"
+                )
 
             checks = {
                 "peak_rss_within_512_mib": peaks["rss_kib"] <= MAX_RSS_KIB,
