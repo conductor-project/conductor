@@ -212,6 +212,7 @@ name = "conductor-worker"
 version = "0.1.0"
 dependencies = [
  "conductor-core",
+ "nix",
  "rusqlite",
  "serde_json",
 ]
