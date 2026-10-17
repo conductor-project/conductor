@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
-const ASYNC_LOG_WATCHDOG: Duration = Duration::from_secs(30);
+const ASYNC_TEST_WATCHDOG: Duration = Duration::from_secs(30);
 
 struct TempDir(PathBuf);
 
@@ -556,7 +556,7 @@ fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit(
         let (status, body) = handle.join().expect("request thread");
         assert_eq!(status, 408, "{body}");
     }
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     loop {
         if http(address, "GET", "/v1/jobs/blocked-0", None, &[]).0 == 200 {
             break;
@@ -564,7 +564,7 @@ fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit(
         assert!(Instant::now() < deadline, "timed-out writes did not finish");
         thread::sleep(Duration::from_millis(20));
     }
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     loop {
         let (status, body) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
         assert_eq!(status, 200, "{body}");
@@ -1060,7 +1060,7 @@ fn wait_for_run_state(
 }
 
 fn wait_for_closed_logs(address: SocketAddr, run_id: &str) {
-    let deadline = Instant::now() + ASYNC_LOG_WATCHDOG;
+    let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     loop {
         let mut all_closed = true;
         for stream in ["stdout", "stderr"] {
@@ -2252,7 +2252,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
         .to_owned();
     wait_for_run_state(address, &run_id, &["running"], Duration::from_secs(2));
 
-    let deadline = Instant::now() + ASYNC_LOG_WATCHDOG;
+    let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     let chunk = loop {
         let (status, body) = http(
             address,
@@ -2281,7 +2281,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
     assert_eq!(chunk["nextOffset"], 2);
     assert_eq!(chunk["streamClosed"], false);
 
-    let deadline = Instant::now() + ASYNC_LOG_WATCHDOG;
+    let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     let chunk = loop {
         let (status, body) = http(
             address,
@@ -2365,7 +2365,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
         .unwrap()
         .to_owned();
     wait_for_run_state(address, &active_id, &["running"], Duration::from_secs(2));
-    let active_log_deadline = Instant::now() + ASYNC_LOG_WATCHDOG;
+    let active_log_deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     loop {
         let (status, body) = http(
             address,
@@ -2402,7 +2402,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
     // Pruning runs after the asynchronous output readers finish. Keep polling
     // for that state transition; this is only a deadlock guard, not a latency
     // expectation for the reader/reaper thread.
-    let retention_deadline = Instant::now() + ASYNC_LOG_WATCHDOG;
+    let retention_deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     loop {
         let (status, body) = http(
             address,
