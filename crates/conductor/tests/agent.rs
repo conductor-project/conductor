@@ -142,6 +142,9 @@ fn start_with_capacity(
         .expect("startup event before readiness deadline");
     let event: serde_json::Value = serde_json::from_str(&line).expect("structured startup event");
     assert_eq!(event["event"], "agent_started", "{line}");
+    assert_eq!(event["severity"], "info", "{line}");
+    assert_eq!(event["component"], "agent", "{line}");
+    assert!(event["timestampMs"].as_u64().is_some(), "{line}");
     let address: SocketAddr = event["address"]
         .as_str()
         .expect("address")
@@ -212,7 +215,11 @@ fn actual_binary_serves_health_and_shuts_down_on_sigint() {
     let mut response = String::new();
     stream.read_to_string(&mut response).expect("response");
     assert!(response.starts_with("HTTP/1.1 200 OK"));
-    assert!(response.ends_with(r#"{"status":"ok"}"#));
+    let (_, body) = response.split_once("\r\n\r\n").expect("HTTP body");
+    let health: serde_json::Value = serde_json::from_str(body).expect("health response JSON");
+    assert_eq!(health["status"], "ok");
+    assert_eq!(health["role"], "all");
+    assert_eq!(health["capabilities"][0], "local_process_execution");
     let mut run_ids = Vec::new();
     let mut pid_files = Vec::new();
     let mut process_guards = Vec::new();
@@ -265,6 +272,185 @@ fn actual_binary_serves_health_and_shuts_down_on_sigint() {
         TcpStream::connect(address).is_err(),
         "listener remained bound"
     );
+}
+
+#[test]
+fn worker_diagnostics_report_capacity_identity_and_restart_incarnation() {
+    let path = TempDir::new("worker-status");
+    let (mut child, address) = start_with_capacity(&path, "all", None, 2);
+    assert_eq!(http(address, "GET", "/healthz", None, &[]).0, 200);
+    assert_eq!(http(address, "GET", "/readyz", None, &[]).0, 200);
+    let (status, body) = http(address, "GET", "/v1/workers", None, &[]);
+    assert_eq!(status, 200, "{body}");
+    let workers: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let initial = &workers[0];
+    assert_eq!(initial["workerId"], "test-worker");
+    assert_eq!(initial["capacity"], 2);
+    assert_eq!(initial["processExecution"], true);
+    assert_eq!(initial["usedSlots"], 0);
+    assert_eq!(initial["availableSlots"], 2);
+    assert_eq!(initial["unknownRuns"], 0);
+    assert_eq!(initial["available"], true);
+    assert_eq!(initial["draining"], false);
+    assert!(initial["observedAtMs"].as_i64().unwrap() > 0);
+    let first_incarnation = initial["incarnation"].as_u64().unwrap();
+    let (status, single) = http(address, "GET", "/v1/workers/test-worker", None, &[]);
+    assert_eq!(status, 200, "{single}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&single).unwrap()["incarnation"],
+        first_incarnation
+    );
+    assert_eq!(
+        http(address, "GET", "/v1/workers/missing", None, &[]).0,
+        404
+    );
+
+    let job = job_json("status-probe", &["/bin/sh", "-c", "exec /bin/sleep 60"]);
+    assert_eq!(
+        http(address, "POST", "/v1/jobs", Some("application/json"), &job).0,
+        201
+    );
+    let (status, accepted) = http(address, "POST", "/v1/jobs/status-probe/runs", None, &[]);
+    assert_eq!(status, 202, "{accepted}");
+    let run_id = serde_json::from_str::<serde_json::Value>(&accepted).unwrap()["runId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let second_job = job_json(
+        "status-probe-second",
+        &["/bin/sh", "-c", "exec /bin/sleep 60"],
+    );
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &second_job
+        )
+        .0,
+        201
+    );
+    let (status, second_accepted) = http(
+        address,
+        "POST",
+        "/v1/jobs/status-probe-second/runs",
+        None,
+        &[],
+    );
+    assert_eq!(status, 202, "{second_accepted}");
+    let second_run_id =
+        serde_json::from_str::<serde_json::Value>(&second_accepted).unwrap()["runId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let active = loop {
+        let (status, body) = http(address, "GET", "/v1/workers/test-worker", None, &[]);
+        assert_eq!(status, 200, "{body}");
+        let status: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if status["usedSlots"] == 2 {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker slot use was not reported: {status}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(active["availableSlots"], 0);
+    assert_eq!(active["incarnation"], first_incarnation);
+    assert_eq!(http(address, "GET", "/readyz", None, &[]).0, 200);
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            &format!("/v1/runs/{run_id}/stop"),
+            None,
+            &[]
+        )
+        .0,
+        202
+    );
+    wait_for_run_state(address, &run_id, &["cancelled"], Duration::from_secs(3));
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            &format!("/v1/runs/{second_run_id}/stop"),
+            None,
+            &[]
+        )
+        .0,
+        202
+    );
+    wait_for_run_state(
+        address,
+        &second_run_id,
+        &["cancelled"],
+        Duration::from_secs(3),
+    );
+    let (status, body) = http(address, "GET", "/v1/workers/test-worker", None, &[]);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["usedSlots"],
+        0
+    );
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
+
+    let (mut restarted, address) = start(&path, "all", None);
+    let (status, body) = http(address, "GET", "/v1/workers/test-worker", None, &[]);
+    assert_eq!(status, 200, "{body}");
+    let next = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+    assert!(next["incarnation"].as_u64().unwrap() > first_incarnation);
+    signal(&restarted, "INT");
+    wait_for_exit(&mut restarted);
+}
+
+#[test]
+fn request_header_and_processing_time_bounds_are_enforced() {
+    let path = TempDir::new("request-bounds");
+    let config = write_config(&path, "all", "127.0.0.1:0", ",\"request_timeout_ms\":100");
+    let child = command(&config, None)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start agent");
+    let mut child = Agent(child);
+    let stderr = child.0.stderr.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stderr).read_line(&mut line);
+        let _ = sender.send(line);
+    });
+    let line = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("startup event");
+    let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let address: SocketAddr = event["address"].as_str().unwrap().parse().unwrap();
+    wait_for_ready(address);
+
+    let headers = vec![("X-Filler", "x"); 65];
+    assert_eq!(
+        http_with_custom_headers(address, "GET", "/healthz", None, &headers, &[]).0,
+        431
+    );
+
+    let mut stream = TcpStream::connect(address).expect("connect for bounded body request");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    stream.write_all(b"POST /v1/jobs HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{\"id\":").unwrap();
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .expect("read timed request response");
+    assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+    assert_eq!(http(address, "GET", "/healthz", None, &[]).0, 200);
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
 }
 
 #[test]
@@ -337,6 +523,11 @@ fn strict_json_rejects_unknown_fields_and_invalid_concurrency() {
     let result = failed(&zero_concurrency, None);
     assert!(!result.status.success());
     assert!(String::from_utf8_lossy(&result.stderr).contains("worker_concurrency"));
+
+    let invalid_timeout = write_config(&path, "all", "127.0.0.1:0", ",\"request_timeout_ms\":99");
+    let result = failed(&invalid_timeout, None);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("request_timeout_ms"));
 
     let config = path.join("malformed.json");
     fs::write(&config, b"{ this is not JSON").expect("write malformed JSON");
@@ -1317,6 +1508,13 @@ fn actual_binary_turns_interrupted_runs_unknown_without_replaying_them() {
     assert_eq!(observation["state"], "unknown");
     assert!(observation["workerIncarnation"].as_u64().unwrap() > initial_incarnation);
     assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    let (status, status_body) = http(address, "GET", "/v1/workers/test-worker", None, &[]);
+    assert_eq!(status, 200, "{status_body}");
+    let worker_status: serde_json::Value = serde_json::from_str(&status_body).unwrap();
+    assert_eq!(worker_status["usedSlots"], 1);
+    assert_eq!(worker_status["availableSlots"], 0);
+    assert_eq!(worker_status["unknownRuns"], 1);
+    assert_eq!(http(address, "GET", "/readyz", None, &[]).0, 200);
     assert_eq!(
         http(address, "POST", "/v1/jobs/ambiguous/runs", None, &[]).0,
         409

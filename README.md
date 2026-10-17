@@ -37,7 +37,7 @@ The agent prints a structured startup event with its bound address to stderr. `/
 
 ## Job definition API
 
-The API listens only on loopback. Register a job using the checked-in [JSON example](examples/job.json):
+The API listens only on loopback. `/healthz` is liveness and `/readyz` is readiness; startup recovery and shutdown return 503 from `/readyz`. `GET /v1/workers` returns one bounded snapshot for the local worker, and `GET /v1/workers/{id}` returns that worker or 404. Snapshots include stable worker ID, incarnation, process capability, configured/used/available slots, unknown-run reservations, availability/draining state, and observation time. These are local operational readings, not distributed heartbeats or leases. A full worker can still be ready; run admission enforces capacity separately. Register a job using the checked-in [JSON example](examples/job.json):
 
 ```sh
 curl --fail-with-body -H 'Content-Type: application/json' \
@@ -47,7 +47,7 @@ curl --fail http://127.0.0.1:8080/v1/jobs/hello
 curl --fail -X DELETE http://127.0.0.1:8080/v1/jobs/hello
 ```
 
-`POST /v1/jobs` returns 201 with the validated immutable definition; duplicate and previously deleted IDs return 409. `GET /v1/jobs` returns `{"jobs":[...],"nextCursor":...}` in ascending ID order. `GET /v1/jobs/{id}` returns 200 or 404, and `DELETE /v1/jobs/{id}` returns 204 or 404. Deletion reserves the ID so it cannot refer to a different definition later. The manager accepts up to 1,000 active jobs; deleted-ID reservations remain durable. Request bodies are limited to 65,536 bytes.
+`POST /v1/jobs` returns 201 with the validated immutable definition; duplicate and previously deleted IDs return 409. `GET /v1/jobs` returns `{"jobs":[...],"nextCursor":...}` in ascending ID order. `GET /v1/jobs/{id}` returns 200 or 404, and `DELETE /v1/jobs/{id}` returns 204 or 404. Deletion reserves the ID so it cannot refer to a different definition later. The manager accepts up to 1,000 active jobs; deleted-ID reservations remain durable. Request bodies are limited to 65,536 bytes. Requests with more than 64 header fields or over 16,384 aggregate header-name/value bytes receive 431. HTTP header reads use Hyper's bounded parser defaults; the handler processing deadline is configurable with `request_timeout_ms` (100–120,000 ms, default 10,000). Execution deadlines are independent. A timed-out start may already have been accepted; retry it with the same `Idempotency-Key` to recover its run identity.
 
 Start and inspect a run using the checked-in [success example](examples/job.json), [failure example](examples/job-failure.json), [cancellable example](examples/job-cancellable.json), and [deadline example](examples/job-timeout.json):
 
@@ -106,6 +106,18 @@ curl --fail-with-body "http://127.0.0.1:8080/v1/runs/$run_id/logs?stream=stdout&
 Definitions require an absolute executable path and absolute working directory. Arguments are passed directly to the executable without an implicit shell. Environment inheritance defaults to false; only the explicit `env` map is added unless `inheritEnv` is set true. Unknown fields and invalid paths, identifiers, environment entries, and duration bounds are rejected with a stable JSON error envelope. Registration only stores the definition; it never launches the command.
 
 Configuration is strict JSON. The listener must bind to IPv4 or IPv6 loopback. Manager and worker state directories must be separate, worker ID must be stable and valid, and concurrency must be between 1 and 1,000. `log_max_bytes_per_stream` sets the per-run stdout and stderr cap (1 byte to 1 GiB); `log_retention_runs` sets the number of newest completed runs whose logs are retained (0 to 10,000). The daemon canonicalizes both state paths and holds OS file locks on them for its lifetime; concurrent processes using either directory, including through a symlink alias, fail startup. Lock files left by a crashed process do not block a later start because the OS releases the lock when the process exits. On Unix, state directories use mode `0700`, and the database and lock files use `0600`.
+
+### systemd operation
+
+The checked-in [systemd unit example](examples/conductor.service) runs as the dedicated `conductor` user, uses an explicit working directory, and sets `Restart=no`. Install the binary at `/usr/local/bin/conductor`, install a loopback-only config at `/etc/conductor/agent.json`, create `/var/lib/conductor` owned by `conductor`, and adjust the config's manager/worker paths to separate directories beneath it. Then install the unit under `/etc/systemd/system/`, run `systemctl daemon-reload`, enable and start `conductor.service`, and inspect logs with `journalctl -u conductor.service`.
+
+The example sets `KillMode=control-group`: systemd also cleans up processes remaining in the unit's cgroup when stopping the service, beyond Conductor's own process-group supervision. Running the binary directly has no cgroup cleanup, so a crash can leave an externally owned workload whose outcome becomes `unknown`. Conductor never automatically restarts after a daemon failure in this unit; operators must inspect and clean up uncertain workloads before resolving them.
+
+### Local release probe
+
+Build the release binary, then run `python3 scripts/benchmark-agent.py --iterations 100`. The harness uses isolated temporary state, loopback on an ephemeral port, 100 `/healthz`, worker-status, run-start, and terminal-run inspection samples by default, and `/bin/true` jobs. It reports p50/p95/p99 latency and process RSS before/after, along with the CPU architecture/count, Rust compiler, platform, and binary SHA-256. Increase iterations only up to 500. Results describe that machine, OS, filesystem, and build; they are not service-level targets or portable performance claims. This probe is separate from correctness tests and has no timing pass/fail threshold.
+
+One recorded probe on macOS 27.0.1 arm64 (8 logical CPUs), Rust 1.99.1, 100 iterations, and the repository release profile (optimization level 3, fat LTO, one codegen unit, overflow checks and debug assertions enabled) measured RSS from 9,328 to 10,016 KiB. p50/p95/p99 were 0.224/0.257/0.619 ms for `/healthz`, 0.247/0.294/0.326 ms for worker inspection, 1.120/1.451/1.731 ms for run start, and 0.242/0.283/0.308 ms for terminal-run inspection. This measurement is from a macOS development host and does not qualify Linux deployment performance.
 
 The manager database is `manager.sqlite3` in `manager_data_dir`. SQLite uses WAL journaling with `synchronous=FULL`; database schema changes run as versioned transactions. Startup fails closed if the database is corrupt, inaccessible, or has a schema version newer than the daemon supports. Back up the manager state directory while the daemon is stopped so the database and WAL state remain consistent. `127.0.0.1:0` is supported for integration tests.
 

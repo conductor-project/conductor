@@ -520,6 +520,10 @@ impl WorkerPort for UncertainWorker {
     ) -> Result<conductor_core::RunLogChunk, WorkerPortError> {
         Err(WorkerPortError::Unavailable)
     }
+
+    fn status(&self) -> Result<conductor_core::WorkerStatus, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
 }
 
 struct LogOnlyWorker(WorkerId);
@@ -680,6 +684,17 @@ fn manager_reads_logs_only_through_worker_port() {
     assert_eq!(chunk.offset(), 12);
     assert_eq!(chunk.data(), [0, 255]);
     assert!(!chunk.stream_closed());
+}
+
+#[test]
+fn manager_reports_unavailable_worker_status_without_opening_worker_storage() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let worker = UncertainWorker(WorkerId::new("local").unwrap());
+    assert_eq!(
+        manager.worker_status(&worker),
+        Err(ManagerError::WorkerUnavailable)
+    );
 }
 
 #[test]

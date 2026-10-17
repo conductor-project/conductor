@@ -8,6 +8,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use conductor_core::{
@@ -50,6 +51,8 @@ struct Config {
     log_max_bytes_per_stream: u64,
     #[serde(default = "default_log_retention_runs")]
     log_retention_runs: usize,
+    #[serde(default = "default_request_timeout_ms")]
+    request_timeout_ms: u64,
 }
 
 fn default_log_max_bytes_per_stream() -> u64 {
@@ -58,6 +61,10 @@ fn default_log_max_bytes_per_stream() -> u64 {
 
 fn default_log_retention_runs() -> usize {
     conductor_worker::DEFAULT_LOG_RETENTION_RUNS
+}
+
+fn default_request_timeout_ms() -> u64 {
+    conductor_api::DEFAULT_REQUEST_TIMEOUT.as_millis() as u64
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, ValueEnum)]
@@ -83,7 +90,8 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!(
-                "{{\"event\":\"startup_failed\",\"error\":{}}}",
+                "{{\"timestampMs\":{},\"severity\":\"error\",\"component\":\"agent\",\"event\":\"startup_failed\",\"message\":{}}}",
+                timestamp_ms(),
                 serde_json::to_string(&error.to_string())
                     .unwrap_or_else(|_| "\"unknown error\"".into())
             );
@@ -150,7 +158,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         signal_shutdown.store(true, Ordering::SeqCst);
     })?;
     eprintln!(
-        "{{\"event\":\"agent_started\",\"role\":\"all\",\"address\":{}}}",
+        "{{\"timestampMs\":{},\"severity\":\"info\",\"component\":\"agent\",\"event\":\"agent_started\",\"role\":\"all\",\"address\":{}}}",
+        timestamp_ms(),
         serde_json::to_string(&address.to_string())?
     );
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -158,12 +167,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
     let serve_result = runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener)?;
-        conductor_api::serve(listener, shutdown, manager, worker_port).await
+        conductor_api::serve(
+            listener,
+            shutdown,
+            manager,
+            worker_port,
+            Duration::from_millis(config.request_timeout_ms),
+        )
+        .await
     });
     let shutdown_result = worker.shutdown();
     serve_result?;
     shutdown_result?;
     Ok(())
+}
+
+fn timestamp_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default()
 }
 
 struct LocalWorkerPort(Arc<conductor_worker::WorkerService>);
@@ -197,6 +220,10 @@ impl WorkerPort for LocalWorkerPort {
         command: ResolveRun,
     ) -> Result<conductor_core::RunObservation, WorkerPortError> {
         self.0.resolve_unknown(command).map_err(map_worker_error)
+    }
+
+    fn status(&self) -> Result<conductor_core::WorkerStatus, WorkerPortError> {
+        self.0.status().map_err(map_worker_error)
     }
 
     fn read_logs(
@@ -238,6 +265,9 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     if config.worker_concurrency > MAX_WORKER_CAPACITY {
         return Err("worker_concurrency must be between 1 and 1000".into());
     }
+    if !(100..=120_000).contains(&config.request_timeout_ms) {
+        return Err("request_timeout_ms must be between 100 and 120000".into());
+    }
     if config.manager_data_dir.as_os_str().is_empty()
         || config.worker_data_dir.as_os_str().is_empty()
     {
@@ -248,7 +278,31 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
     use std::panic::catch_unwind;
+    use std::path::PathBuf;
+
+    use super::{Config, Role, default_request_timeout_ms, validate};
+
+    fn config(listen: &str) -> Config {
+        Config {
+            role: Role::All,
+            listen: listen.parse::<SocketAddr>().unwrap(),
+            manager_data_dir: PathBuf::from("manager"),
+            worker_data_dir: PathBuf::from("worker"),
+            worker_id: "test-worker".to_owned(),
+            worker_concurrency: 1,
+            log_max_bytes_per_stream: conductor_worker::DEFAULT_LOG_MAX_BYTES_PER_STREAM,
+            log_retention_runs: conductor_worker::DEFAULT_LOG_RETENTION_RUNS,
+            request_timeout_ms: default_request_timeout_ms(),
+        }
+    }
+
+    #[test]
+    fn configuration_accepts_ipv6_loopback_and_rejects_public_listener_without_binding() {
+        assert!(validate(&config("[::1]:8080")).is_ok());
+        assert!(validate(&config("192.0.2.1:8080")).is_err());
+    }
 
     #[test]
     fn release_profile_keeps_overflow_and_debug_assertions() {

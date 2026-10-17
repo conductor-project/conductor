@@ -127,6 +127,79 @@ impl WorkerDescriptor {
     }
 }
 
+/// Bounded operational snapshot for one locally registered worker.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerStatus {
+    worker_id: WorkerId,
+    incarnation: u64,
+    process_execution: bool,
+    capacity: usize,
+    used_slots: usize,
+    unknown_runs: usize,
+    available_slots: usize,
+    available: bool,
+    draining: bool,
+    observed_at_ms: i64,
+}
+
+impl WorkerStatus {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        descriptor: WorkerDescriptor,
+        used_slots: usize,
+        unknown_runs: usize,
+        available: bool,
+        draining: bool,
+        observed_at_ms: i64,
+    ) -> Self {
+        let capacity = descriptor.capacity();
+        Self {
+            worker_id: descriptor.worker_id().clone(),
+            incarnation: descriptor.incarnation(),
+            process_execution: descriptor.supports_process_execution(),
+            capacity,
+            used_slots: used_slots.min(capacity),
+            unknown_runs: unknown_runs.min(used_slots),
+            available_slots: capacity.saturating_sub(used_slots),
+            available,
+            draining,
+            observed_at_ms,
+        }
+    }
+
+    pub fn worker_id(&self) -> &WorkerId {
+        &self.worker_id
+    }
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
+    pub fn supports_process_execution(&self) -> bool {
+        self.process_execution
+    }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    pub fn used_slots(&self) -> usize {
+        self.used_slots
+    }
+    pub fn unknown_runs(&self) -> usize {
+        self.unknown_runs
+    }
+    pub fn available_slots(&self) -> usize {
+        self.available_slots
+    }
+    pub fn available(&self) -> bool {
+        self.available
+    }
+    pub fn draining(&self) -> bool {
+        self.draining
+    }
+    pub fn observed_at_ms(&self) -> i64 {
+        self.observed_at_ms
+    }
+}
+
 /// A fixed job-definition snapshot assigned to one worker execution attempt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

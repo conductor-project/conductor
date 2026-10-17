@@ -12,7 +12,7 @@ use base64::Engine;
 use conductor_core::{
     InspectRun, JobId, JobSpec, MAX_WORKER_CAPACITY, ReadRunLogs, ResolveRun, RunFailureReason,
     RunId, RunLogChunk, RunObservation, RunSpec, RunState, RunTerminationReason, StartRun, StopRun,
-    WorkerDescriptor, WorkerId,
+    WorkerDescriptor, WorkerId, WorkerStatus,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
@@ -88,6 +88,17 @@ pub trait WorkerPort: Send + Sync {
     fn stop(&self, command: StopRun) -> Result<RunObservation, WorkerPortError>;
     fn resolve(&self, _command: ResolveRun) -> Result<RunObservation, WorkerPortError> {
         Err(WorkerPortError::Unavailable)
+    }
+    fn status(&self) -> Result<WorkerStatus, WorkerPortError> {
+        let draining = self.is_draining();
+        Ok(WorkerStatus::new(
+            self.descriptor(),
+            0,
+            0,
+            !draining,
+            draining,
+            0,
+        ))
     }
     fn read_logs(&self, command: ReadRunLogs) -> Result<RunLogChunk, WorkerPortError>;
 }
@@ -942,6 +953,11 @@ impl JobService {
 
     pub fn get(&self, id: &JobId) -> Result<Option<JobSpec>, ManagerError> {
         self.repository.get(id).map_err(map_store_error)
+    }
+
+    /// Read bounded worker operational state through its owner port.
+    pub fn worker_status(&self, worker: &dyn WorkerPort) -> Result<WorkerStatus, ManagerError> {
+        worker.status().map_err(|_| ManagerError::WorkerUnavailable)
     }
 
     pub fn list_page(
