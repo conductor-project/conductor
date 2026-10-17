@@ -80,12 +80,20 @@ struct RunLogFilters {
     limit: Option<usize>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResolveRunRequest {
+    resolution: String,
+    reason: String,
+}
+
 struct ApiState {
     manager: Arc<JobService>,
     worker: Arc<dyn WorkerPort>,
     worker_id: WorkerId,
     worker_capacity: usize,
     start_admission: Arc<Semaphore>,
+    recovery_ready: Arc<AtomicBool>,
 }
 
 #[derive(Serialize)]
@@ -113,6 +121,14 @@ fn error(status: StatusCode, code: &'static str, message: &'static str) -> Respo
 
 /// Build the HTTP application served by the combined agent.
 pub fn router(manager: Arc<JobService>, worker: Arc<dyn WorkerPort>) -> Router {
+    router_with_recovery(manager, worker, Arc::new(AtomicBool::new(true)))
+}
+
+fn router_with_recovery(
+    manager: Arc<JobService>,
+    worker: Arc<dyn WorkerPort>,
+    recovery_ready: Arc<AtomicBool>,
+) -> Router {
     let descriptor = worker.descriptor();
     let state = Arc::new(ApiState {
         manager,
@@ -120,9 +136,11 @@ pub fn router(manager: Arc<JobService>, worker: Arc<dyn WorkerPort>) -> Router {
         worker_id: descriptor.worker_id().clone(),
         worker_capacity: descriptor.capacity(),
         start_admission: Arc::new(Semaphore::new(MAX_PENDING_STARTS)),
+        recovery_ready,
     });
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/v1/jobs", post(create_job).get(list_jobs))
         .route("/v1/jobs/{id}", get(get_job).delete(delete_job))
         .route("/v1/jobs/{id}/runs", post(start_run))
@@ -130,6 +148,7 @@ pub fn router(manager: Arc<JobService>, worker: Arc<dyn WorkerPort>) -> Router {
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/logs", get(get_run_logs))
         .route("/v1/runs/{id}/stop", post(stop_run))
+        .route("/v1/runs/{id}/resolve", post(resolve_run))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
@@ -143,6 +162,17 @@ async fn healthz() -> impl IntoResponse {
         )],
         r#"{"status":"ok"}"#,
     )
+}
+
+async fn readyz(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    if state.recovery_ready.load(Ordering::SeqCst) {
+        (StatusCode::OK, r#"{"status":"ready"}"#)
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"status":"recovering"}"#,
+        )
+    }
 }
 
 async fn create_job(
@@ -255,6 +285,13 @@ async fn start_run(
     Path(raw_job_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
+    if !state.recovery_ready.load(Ordering::SeqCst) {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "recovery_in_progress",
+            "run admission is unavailable until durable state reconciliation completes",
+        );
+    }
     let Ok(job_id) = JobId::new(raw_job_id) else {
         return error(
             StatusCode::BAD_REQUEST,
@@ -411,6 +448,46 @@ async fn stop_run(State(state): State<Arc<ApiState>>, Path(raw_id): Path<String>
             };
             (status, Json(observation)).into_response()
         }
+        Err(error) => manager_error(error),
+    }
+}
+
+async fn resolve_run(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+    payload: Result<Json<ResolveRunRequest>, JsonRejection>,
+) -> Response {
+    let Ok(run_id) = RunId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_run_id",
+            "the run ID is invalid",
+        );
+    };
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return json_rejection(rejection),
+    };
+    if payload.resolution != "abandon"
+        || payload.reason.trim().is_empty()
+        || payload.reason.len() > 512
+    {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_resolution",
+            "resolution must be 'abandon' with a non-empty reason of at most 512 bytes",
+        );
+    }
+    match state
+        .manager
+        .resolve_unknown_run(&run_id, &payload.reason, state.worker.as_ref())
+    {
+        Ok(observation) => (StatusCode::OK, Json(observation)).into_response(),
+        Err(ManagerError::ResolutionConflict) => error(
+            StatusCode::CONFLICT,
+            "resolution_conflict",
+            "only unknown runs may be abandoned, and the same reason must be used for retries",
+        ),
         Err(error) => manager_error(error),
     }
 }
@@ -579,6 +656,11 @@ fn manager_error(error_value: ManagerError) -> Response {
             "idempotency_key_conflict",
             "the Idempotency-Key was already used for a different request",
         ),
+        ManagerError::ResolutionConflict => error(
+            StatusCode::CONFLICT,
+            "resolution_conflict",
+            "only unknown runs may be abandoned, and the same reason must be used for retries",
+        ),
         ManagerError::CapacityReached => {
             let mut response = error(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -659,12 +741,35 @@ pub async fn serve(
     manager: Arc<JobService>,
     worker: Arc<dyn WorkerPort>,
 ) -> io::Result<()> {
-    let server =
-        axum::serve(listener, router(manager, worker)).with_graceful_shutdown(async move {
-            while !shutdown.load(Ordering::SeqCst) {
-                tokio::time::sleep(Duration::from_millis(20)).await;
+    let recovery_ready = Arc::new(AtomicBool::new(false));
+    let ready_for_recovery = Arc::clone(&recovery_ready);
+    let recovery_manager = Arc::clone(&manager);
+    let recovery_worker = Arc::clone(&worker);
+    tokio::spawn(async move {
+        for attempt in 0..4 {
+            let manager = Arc::clone(&recovery_manager);
+            let worker = Arc::clone(&recovery_worker);
+            let result =
+                tokio::task::spawn_blocking(move || manager.reconcile(worker.as_ref())).await;
+            if matches!(result, Ok(Ok(()))) {
+                ready_for_recovery.store(true, Ordering::SeqCst);
+                return;
             }
-        });
+            if attempt < 3 {
+                tokio::time::sleep(Duration::from_millis(50 << attempt)).await;
+            }
+        }
+        eprintln!("{{\"event\":\"reconciliation_failed\"}}");
+    });
+    let server = axum::serve(
+        listener,
+        router_with_recovery(manager, worker, recovery_ready),
+    )
+    .with_graceful_shutdown(async move {
+        while !shutdown.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
     match tokio::time::timeout(Duration::from_secs(5), server).await {
         Ok(result) => result,
         Err(_) => {

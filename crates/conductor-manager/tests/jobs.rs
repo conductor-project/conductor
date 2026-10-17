@@ -553,6 +553,115 @@ impl WorkerPort for LogOnlyWorker {
     }
 }
 
+struct RecoveryWorker {
+    worker_id: WorkerId,
+    incarnation: u64,
+    observation: Option<RunObservation>,
+}
+
+impl WorkerPort for RecoveryWorker {
+    fn descriptor(&self) -> WorkerDescriptor {
+        WorkerDescriptor::new(self.worker_id.clone(), 1, true).with_incarnation(self.incarnation)
+    }
+
+    fn start(&self, command: StartRun) -> Result<RunObservation, WorkerPortError> {
+        Ok(RunObservation::requested(command.spec(), 10))
+    }
+
+    fn inspect(&self, _command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError> {
+        Ok(self.observation.clone())
+    }
+
+    fn stop(&self, _command: conductor_core::StopRun) -> Result<RunObservation, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
+
+    fn read_logs(&self, _command: ReadRunLogs) -> Result<RunLogChunk, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
+}
+
+#[test]
+fn startup_reconciliation_repairs_terminal_state_and_marks_missing_worker_runs_unknown() {
+    for worker_has_run in [true, false] {
+        let directory = TempDir::new();
+        let manager = service(&directory);
+        manager.register(job("recover-me")).unwrap();
+        let worker_id = WorkerId::new("local").unwrap();
+        let admission_worker = RecoveryWorker {
+            worker_id: worker_id.clone(),
+            incarnation: 0,
+            observation: None,
+        };
+        let requested = manager
+            .start_run(
+                &JobId::new("recover-me").unwrap(),
+                &worker_id,
+                1,
+                &admission_worker,
+            )
+            .unwrap();
+        let terminal = requested
+            .next_revision(RunState::Succeeded, Some(11), Some(12), Some(0), None, None)
+            .unwrap();
+        let recovery_worker = RecoveryWorker {
+            worker_id: worker_id.clone(),
+            incarnation: 0,
+            observation: worker_has_run.then_some(terminal),
+        };
+
+        manager.reconcile(&recovery_worker).unwrap();
+        let recovered = manager
+            .get_run(requested.run_id(), &recovery_worker)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recovered.state(),
+            if worker_has_run {
+                RunState::Succeeded
+            } else {
+                RunState::Unknown
+            }
+        );
+    }
+
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    manager.register(job("stale-worker")).unwrap();
+    let worker_id = WorkerId::new("local").unwrap();
+    let original = RecoveryWorker {
+        worker_id: worker_id.clone(),
+        incarnation: 0,
+        observation: None,
+    };
+    let requested = manager
+        .start_run(
+            &JobId::new("stale-worker").unwrap(),
+            &worker_id,
+            1,
+            &original,
+        )
+        .unwrap();
+    let stale_running = requested
+        .next_revision(RunState::Running, Some(11), None, None, None, None)
+        .unwrap()
+        .with_worker_incarnation(1);
+    let restarted = RecoveryWorker {
+        worker_id,
+        incarnation: 2,
+        observation: Some(stale_running),
+    };
+    manager.reconcile(&restarted).unwrap();
+    assert_eq!(
+        manager
+            .get_run(requested.run_id(), &restarted)
+            .unwrap()
+            .unwrap()
+            .state(),
+        RunState::Unknown
+    );
+}
+
 #[test]
 fn manager_reads_logs_only_through_worker_port() {
     let directory = TempDir::new();

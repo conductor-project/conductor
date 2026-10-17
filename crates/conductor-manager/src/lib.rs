@@ -10,8 +10,9 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use base64::Engine;
 use conductor_core::{
-    InspectRun, JobId, JobSpec, ReadRunLogs, RunFailureReason, RunId, RunLogChunk, RunObservation,
-    RunSpec, RunState, RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId,
+    InspectRun, JobId, JobSpec, MAX_WORKER_CAPACITY, ReadRunLogs, ResolveRun, RunFailureReason,
+    RunId, RunLogChunk, RunObservation, RunSpec, RunState, RunTerminationReason, StartRun, StopRun,
+    WorkerDescriptor, WorkerId,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
@@ -85,6 +86,9 @@ pub trait WorkerPort: Send + Sync {
     fn start(&self, command: StartRun) -> Result<RunObservation, WorkerPortError>;
     fn inspect(&self, command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError>;
     fn stop(&self, command: StopRun) -> Result<RunObservation, WorkerPortError>;
+    fn resolve(&self, _command: ResolveRun) -> Result<RunObservation, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
     fn read_logs(&self, command: ReadRunLogs) -> Result<RunLogChunk, WorkerPortError>;
 }
 
@@ -904,6 +908,7 @@ pub enum ManagerError {
     RunNotFound,
     WorkerUnavailable,
     WorkerDraining,
+    ResolutionConflict,
     LogsNotFound,
     LogsPruned,
     StorageUnavailable,
@@ -1035,6 +1040,12 @@ impl JobService {
             self.mark_dispatch_failure(&spec, RunFailureReason::OutcomeUnknown, false)?;
             return Err(ManagerError::WorkerUnavailable);
         }
+        if !observation.state().is_terminal()
+            && observation.worker_incarnation() != worker.descriptor().incarnation()
+        {
+            self.mark_dispatch_failure(&spec, RunFailureReason::OutcomeUnknown, false)?;
+            return Err(ManagerError::WorkerUnavailable);
+        }
         self.repository
             .record_observation(&observation)
             .map_err(|_| ManagerError::StorageUnavailable)?;
@@ -1078,12 +1089,72 @@ impl JobService {
             && observation.worker_id() == stored.worker_id()
             && observation.revision() > stored.revision()
         {
+            if !observation.state().is_terminal()
+                && observation.worker_incarnation() != worker.descriptor().incarnation()
+            {
+                self.mark_unknown(&stored)?;
+                return self
+                    .repository
+                    .get_run(id)
+                    .map_err(|_| ManagerError::StorageUnavailable);
+            }
             self.repository
                 .record_observation(&observation)
                 .map_err(|_| ManagerError::StorageUnavailable)?;
             return Ok(Some(observation));
         }
         Ok(Some(stored))
+    }
+
+    /// Converge persisted manager reservations with the selected worker before reopening admission.
+    pub fn reconcile(&self, worker: &dyn WorkerPort) -> Result<(), ManagerError> {
+        let descriptor = worker.descriptor();
+        let active = self
+            .repository
+            .list_active_runs(descriptor.worker_id(), MAX_WORKER_CAPACITY)
+            .map_err(|_| ManagerError::StorageUnavailable)?;
+        for stored in active {
+            match worker.inspect(InspectRun::new(stored.run_id().clone())) {
+                Ok(Some(observed))
+                    if observed.run_id() == stored.run_id()
+                        && observed.job_id() == stored.job_id()
+                        && observed.worker_id() == stored.worker_id()
+                        && observed.revision() > stored.revision() =>
+                {
+                    if !observed.state().is_terminal()
+                        && observed.worker_incarnation() != descriptor.incarnation()
+                    {
+                        self.mark_unknown(&stored)?;
+                    } else {
+                        self.repository
+                            .record_observation(&observed)
+                            .map_err(|_| ManagerError::StorageUnavailable)?;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    self.mark_unknown(&stored)?;
+                }
+                Err(_) => return Err(ManagerError::WorkerUnavailable),
+            }
+        }
+        Ok(())
+    }
+
+    fn mark_unknown(&self, stored: &RunObservation) -> Result<(), ManagerError> {
+        let unknown = stored
+            .next_revision(
+                RunState::Unknown,
+                stored.started_at_ms(),
+                None,
+                None,
+                None,
+                Some(RunFailureReason::OutcomeUnknown),
+            )
+            .ok_or(ManagerError::StorageUnavailable)?;
+        self.repository
+            .record_observation(&unknown)
+            .map_err(|_| ManagerError::StorageUnavailable)
     }
 
     /// Persist the stop decision before attempting delivery to the worker.
@@ -1125,6 +1196,11 @@ impl JobService {
             && observation.job_id() == stopping.job_id()
             && observation.worker_id() == stopping.worker_id()
         {
+            if !observation.state().is_terminal()
+                && observation.worker_incarnation() != worker.descriptor().incarnation()
+            {
+                return Ok(stopping);
+            }
             let observation = if observation.state().is_terminal()
                 && observation.revision() <= stopping.revision()
             {
@@ -1152,6 +1228,49 @@ impl JobService {
             return Ok(observation);
         }
         Ok(stopping)
+    }
+
+    pub fn resolve_unknown_run(
+        &self,
+        id: &RunId,
+        reason: &str,
+        worker: &dyn WorkerPort,
+    ) -> Result<RunObservation, ManagerError> {
+        if reason.trim().is_empty() || reason.len() > 512 {
+            return Err(ManagerError::ResolutionConflict);
+        }
+        let Some(current) = self
+            .repository
+            .get_run(id)
+            .map_err(|_| ManagerError::StorageUnavailable)?
+        else {
+            return Err(ManagerError::RunNotFound);
+        };
+        if current.state() == RunState::Abandoned {
+            return if current.resolution_reason() == Some(reason) {
+                Ok(current)
+            } else {
+                Err(ManagerError::ResolutionConflict)
+            };
+        }
+        if current.state() != RunState::Unknown {
+            return Err(ManagerError::ResolutionConflict);
+        }
+        let resolved = match worker.resolve(ResolveRun::new(id.clone(), reason.to_owned())) {
+            Ok(resolved) => resolved,
+            Err(WorkerPortError::RunConflict) => return Err(ManagerError::ResolutionConflict),
+            Err(_) => return Err(ManagerError::WorkerUnavailable),
+        };
+        if resolved.run_id() != id
+            || resolved.state() != RunState::Abandoned
+            || resolved.resolution_reason() != Some(reason)
+        {
+            return Err(ManagerError::WorkerUnavailable);
+        }
+        self.repository
+            .record_observation(&resolved)
+            .map_err(|_| ManagerError::StorageUnavailable)?;
+        Ok(resolved)
     }
 
     pub fn read_logs(

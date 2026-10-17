@@ -15,15 +15,20 @@ use conductor_worker::{ExecutionBackend, WorkerError, WorkerService};
 
 struct TempDir(PathBuf);
 
+static TEMP_DIR_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
 impl TempDir {
     fn new() -> Self {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path =
-            std::env::temp_dir().join(format!("conductor-worker-{}-{nonce}", std::process::id()));
-        fs::create_dir_all(&path).unwrap();
+        let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "conductor-worker-{}-{nonce}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&path).unwrap();
         Self(path)
     }
 }
@@ -116,6 +121,7 @@ fn worker_acceptance_is_deduplicated_and_terminal_observations_survive_reopen() 
     let directory = TempDir::new();
     let backend = Arc::new(TestBackend::default());
     let service = open_worker(&directory, 2, Arc::clone(&backend));
+    let first_incarnation = service.descriptor().incarnation();
     let marker = directory.0.join("launch-count");
     let spec = run(
         "once",
@@ -144,11 +150,13 @@ fn worker_acceptance_is_deduplicated_and_terminal_observations_survive_reopen() 
     );
     drop(service);
     let reopened = open_worker(&directory, 2, backend);
+    assert!(reopened.descriptor().incarnation() > first_incarnation);
     let persisted = reopened
         .inspect(conductor_core::InspectRun::new(RunId::new("once").unwrap()))
         .unwrap()
         .unwrap();
     assert_eq!(persisted, terminal);
+    assert_eq!(persisted.worker_incarnation(), first_incarnation);
     assert_eq!(persisted.revision(), 4);
 }
 
