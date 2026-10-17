@@ -38,3 +38,5 @@ jobs:
         run: cargo +1.99.1 test --release --workspace --locked --all-targets --all-features
       - name: Build release
         run: cargo +1.99.1 build --workspace --locked --release
+      - name: Run release lifecycle demo
+        run: python3 scripts/demo-agent.py --binary target/release/conductor --include-crash
