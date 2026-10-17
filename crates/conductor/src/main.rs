@@ -37,7 +37,7 @@ enum Commands {
         role: Option<Role>,
     },
     /// Internal launcher used only to enter a configured cgroup before exec.
-    #[command(hide = true)]
+    #[command(name = "__internal-launch", hide = true)]
     InternalLaunch {
         #[arg(long)]
         cgroup_path: PathBuf,
