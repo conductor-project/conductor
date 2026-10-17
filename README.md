@@ -1,6 +1,6 @@
 # Conductor
 
-Conductor is an early-stage Linux daemon for managing jobs and runs. MVP1 targets one `conductor` binary that combines manager and worker responsibilities behind explicit interfaces. The current runnable milestone validates and manages immutable job definitions over a loopback HTTP API. Job registration does not execute processes; process execution is a later milestone. Job definitions are stored durably in SQLite under the configured manager state directory and survive agent restarts.
+Conductor is an early-stage Linux daemon for managing and running jobs. MVP1 targets one `conductor` binary that combines manager and worker responsibilities behind explicit interfaces. It validates and stores immutable job definitions, starts local host processes, and records run observations through a loopback HTTP API. Job definitions and run history survive agent restarts; a process whose outcome becomes ambiguous across a crash is marked `unknown` and is not automatically replayed.
 
 The host process backend runs with the daemon user's operating-system permissions and network access. It is not a security sandbox. Each process starts in a dedicated process group; ordinary group members are force-cleaned after the leader exits and during daemon shutdown. A process can deliberately leave its group, so this mechanism is not containment.
 
@@ -8,6 +8,7 @@ The host process backend runs with the daemon user's operating-system permission
 
 - Linux for the supported daemon deployment.
 - Rust 1.99.1 with `rustfmt` and `clippy` (installed by `rust-toolchain.toml`).
+- `curl` and `jq` for the HTTP walkthrough.
 
 ## Build and check
 
@@ -47,7 +48,7 @@ curl --fail -X DELETE http://127.0.0.1:8080/v1/jobs/hello
 
 `POST /v1/jobs` returns 201 with the validated immutable definition; duplicate and previously deleted IDs return 409. `GET /v1/jobs` returns `{"jobs":[...]}` ordered by ID. `GET /v1/jobs/{id}` returns 200 or 404, and `DELETE /v1/jobs/{id}` returns 204 or 404. Deletion reserves the ID so it cannot refer to a different definition later. The manager currently accepts up to 1,000 active jobs and reserves up to 10,000 IDs; request bodies are limited to 65,536 bytes. These limits are temporary until pagination is implemented.
 
-Start and inspect a run using the checked-in [success example](examples/job.json) and [failure example](examples/job-failure.json):
+Start and inspect a run using the checked-in [success example](examples/job.json), [failure example](examples/job-failure.json), [cancellable example](examples/job-cancellable.json), and [deadline example](examples/job-timeout.json):
 
 ```sh
 curl --fail-with-body -H 'Content-Type: application/json' \
@@ -56,10 +57,21 @@ curl --fail-with-body -X POST -D - http://127.0.0.1:8080/v1/jobs/hello/runs
 curl --fail-with-body -H 'Content-Type: application/json' \
   --data-binary @examples/job-failure.json http://127.0.0.1:8080/v1/jobs
 curl --fail-with-body -X POST -D - http://127.0.0.1:8080/v1/jobs/failure/runs
+curl --fail-with-body -H 'Content-Type: application/json' \
+  --data-binary @examples/job-cancellable.json http://127.0.0.1:8080/v1/jobs
+run_id=$(curl --fail-with-body -X POST http://127.0.0.1:8080/v1/jobs/cancellable/runs | jq -r .runId)
+curl --fail-with-body -X POST "http://127.0.0.1:8080/v1/runs/$run_id/stop"
+curl --fail-with-body -H 'Content-Type: application/json' \
+  --data-binary @examples/job-timeout.json http://127.0.0.1:8080/v1/jobs
+curl --fail-with-body -X POST http://127.0.0.1:8080/v1/jobs/deadline/runs
 curl --fail http://127.0.0.1:8080/v1/runs
 ```
 
-Run start returns 202 and a relative `Location: /v1/runs/{runId}` header. Poll that URL for `requested`, `starting`, `running`, then `succeeded` or `failed`. `GET /v1/runs` accepts `jobId`, `state`, and `limit`; responses are capped at 100 observations. Results include requested/start/finish timestamps, exit code or termination signal, and a structured `failureReason`: `spawn_failed`, `non_zero_exit`, `signal_terminated`, `backend_failure`, or `outcome_unknown`. Run IDs are not process IDs. Starting a job that already has an active or unresolved run, or deleting it while that run is held, returns 409. A full local worker returns 429. Non-null job timeouts are rejected until deadline enforcement is implemented. `stopping`, `cancelled`, `timed_out`, `unknown`, and `abandoned` are reserved for later lifecycle slices; `unknown` is used when launch or outcome becomes ambiguous after restart.
+Run start returns 202 and a relative `Location: /v1/runs/{runId}` header. Poll that URL for `requested`, `starting`, `running`, then a terminal state. `GET /v1/runs` accepts `jobId`, `state`, and `limit`; responses are capped at 100 observations. Results include requested/start/finish timestamps, exit code or termination signal, a structured `failureReason`, and an optional `terminationReason`. Run IDs are not process IDs. Starting a job that already has an active or unresolved run, or deleting it while that run is held, returns 409. A full local worker returns 429. Job `timeoutMs` starts when the process is launched and is measured with a monotonic clock; queue/admission time does not count.
+
+Stop a run with `POST /v1/runs/{runId}/stop`. The manager records `stopping` before dispatch, and the endpoint returns 202 while cleanup is in progress. Repeating the request is safe; stopping an already terminal run returns its unchanged result with 200. The worker sends SIGTERM to the owned process group, waits the job's `terminationGraceMs`, then sends SIGKILL to remaining ordinary group members. A natural exit wins if the supervisor observes it before a stop/deadline request; after termination intent is recorded, the terminal state is `cancelled` or `timed_out`, with the actual exit code/signal preserved. `terminationReason` is `cancelled`, `deadline_exceeded`, or `shutdown`. Cancellation does not roll back external side effects.
+
+On SIGINT/SIGTERM, the worker immediately stops admission and requests graceful termination for all active runs concurrently. After five seconds it force-kills remaining owned groups and allows up to one additional second for reaping and output flush. Existing API connections receive Axum graceful shutdown during a five-second server window. These windows bound shutdown to at most eleven seconds under ordinary local process behavior; a workload that escapes its process group is outside this cleanup guarantee. `unknown` and `abandoned` remain reserved for recovery/operator-resolution work; `unknown` is used when launch or outcome becomes ambiguous after restart.
 
 Runs are committed to manager storage before dispatch. The worker has its own SQLite database under `worker_data_dir`; accepted run specifications and observations are committed before a process launches. Repeating the same worker `StartRun` command returns the existing observation, while reusing its run ID with a different specification is a conflict. After a daemon restart, any worker run that was not known terminal becomes `unknown` and keeps its job and capacity reservation. It is not automatically replayed; this avoids claiming exactly-once execution when a crash leaves process launch ambiguous. `unknown` and `abandoned` states reserve their future lifecycle semantics. Standard output and error are continuously drained using fixed-size buffers into private per-run files in the worker state directory; public log retrieval is not implemented yet.
 

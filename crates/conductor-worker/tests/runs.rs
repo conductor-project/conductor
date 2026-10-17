@@ -59,6 +59,10 @@ impl ExecutionBackend for TestBackend {
     fn kill_process_group(&self, _group_id: u32) -> io::Result<()> {
         Ok(())
     }
+
+    fn terminate_process_group(&self, _group_id: u32) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn job(id: &str, command: Vec<String>) -> JobSpec {

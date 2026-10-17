@@ -104,7 +104,25 @@ fn command(config: &Path, role: Option<&str>) -> Command {
 }
 
 fn start(path: &Path, config_role: &str, role_override: Option<&str>) -> (Agent, SocketAddr) {
+    start_with_capacity(path, config_role, role_override, 1)
+}
+
+fn start_with_capacity(
+    path: &Path,
+    config_role: &str,
+    role_override: Option<&str>,
+    capacity: usize,
+) -> (Agent, SocketAddr) {
     let config = write_config(path, config_role, "127.0.0.1:0", "");
+    if capacity != 1 {
+        let content = fs::read_to_string(&config)
+            .expect("read generated config")
+            .replace(
+                "\"worker_concurrency\":1",
+                &format!("\"worker_concurrency\":{capacity}"),
+            );
+        fs::write(&config, content).expect("write worker capacity");
+    }
     let child = command(&config, role_override)
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -164,7 +182,7 @@ fn failed(config: &Path, role: Option<&str>) -> Output {
 #[test]
 fn actual_binary_serves_health_and_shuts_down_on_sigint() {
     let path = TempDir::new("sigint");
-    let (mut child, address) = start(&path, "all", None);
+    let (mut child, address) = start_with_capacity(&path, "all", None, 2);
     let mut stream = TcpStream::connect(address).expect("connect to agent");
     stream
         .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -173,8 +191,54 @@ fn actual_binary_serves_health_and_shuts_down_on_sigint() {
     stream.read_to_string(&mut response).expect("response");
     assert!(response.starts_with("HTTP/1.1 200 OK"));
     assert!(response.ends_with(r#"{"status":"ok"}"#));
+    let mut run_ids = Vec::new();
+    let mut pid_files = Vec::new();
+    let mut process_guards = Vec::new();
+    for id in ["shutdown-a", "shutdown-b"] {
+        let pid_file = path.join(format!("{id}.pid"));
+        process_guards.push(ProcessGuard(pid_file.clone()));
+        let job = serde_json::json!({
+            "id":id,
+            "command":["/bin/sh", "-c", format!("echo $$ > {}; exec /bin/sleep 60", pid_file.display())],
+            "cwd":"/tmp",
+            "terminationGraceMs":200,
+        });
+        assert_eq!(
+            http(
+                address,
+                "POST",
+                "/v1/jobs",
+                Some("application/json"),
+                &serde_json::to_vec(&job).unwrap()
+            )
+            .0,
+            201
+        );
+        let (status, accepted) = http(address, "POST", &format!("/v1/jobs/{id}/runs"), None, &[]);
+        assert_eq!(status, 202, "{accepted}");
+        let accepted: serde_json::Value = serde_json::from_str(&accepted).unwrap();
+        run_ids.push(accepted["runId"].as_str().unwrap().to_owned());
+        pid_files.push(pid_file);
+    }
+    for pid_file in &pid_files {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !pid_file.exists() {
+            assert!(Instant::now() < deadline, "workload did not start");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
     signal(&child, "INT");
     wait_for_exit(&mut child);
+    let (mut restarted, address) = start_with_capacity(&path, "all", None, 2);
+    for run_id in run_ids {
+        let (status, result) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
+        assert_eq!(status, 200, "{result}");
+        let result: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(result["state"], "cancelled");
+        assert_eq!(result["terminationReason"], "shutdown");
+    }
+    signal(&restarted, "INT");
+    wait_for_exit(&mut restarted);
     assert!(
         TcpStream::connect(address).is_err(),
         "listener remained bound"
@@ -184,13 +248,40 @@ fn actual_binary_serves_health_and_shuts_down_on_sigint() {
 #[test]
 fn actual_binary_shuts_down_on_sigterm() {
     let path = TempDir::new("sigterm");
-    let (mut child, address) = start(&path, "all", None);
+    let (mut child, address) = start_with_capacity(&path, "all", None, 2);
+    let mut run_ids = Vec::new();
+    for id in ["term-a", "term-b"] {
+        let job = job_json(id, &["/bin/sh", "-c", "exec /bin/sleep 60"]);
+        assert_eq!(
+            http(address, "POST", "/v1/jobs", Some("application/json"), &job).0,
+            201
+        );
+        let (status, accepted) = http(address, "POST", &format!("/v1/jobs/{id}/runs"), None, &[]);
+        assert_eq!(status, 202, "{accepted}");
+        run_ids.push(
+            serde_json::from_str::<serde_json::Value>(&accepted).unwrap()["runId"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+    }
     signal(&child, "TERM");
     wait_for_exit(&mut child);
     assert!(
         TcpStream::connect(address).is_err(),
         "listener remained bound"
     );
+    let (mut restarted, address) = start_with_capacity(&path, "all", None, 2);
+    for run_id in run_ids {
+        let (status, result) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
+        assert_eq!(status, 200, "{result}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result).unwrap()["terminationReason"],
+            "shutdown"
+        );
+    }
+    signal(&restarted, "INT");
+    wait_for_exit(&mut restarted);
 }
 
 #[test]
@@ -355,7 +446,9 @@ fn start_and_poll(address: SocketAddr, job_id: &str) -> serde_json::Value {
         let (status, body) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
         assert_eq!(status, 200, "{body}");
         let observation: serde_json::Value = serde_json::from_str(&body).expect("run observation");
-        if ["succeeded", "failed"].contains(&observation["state"].as_str().unwrap_or("")) {
+        if ["succeeded", "failed", "cancelled", "timed_out"]
+            .contains(&observation["state"].as_str().unwrap_or(""))
+        {
             assert!(observation["finishedAtMs"].is_number());
             assert!(observation.get("pid").is_none());
             return observation;
@@ -366,6 +459,150 @@ fn start_and_poll(address: SocketAddr, job_id: &str) -> serde_json::Value {
         );
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn wait_for_run_state(
+    address: SocketAddr,
+    run_id: &str,
+    expected: &[&str],
+    timeout: Duration,
+) -> serde_json::Value {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let (status, body) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
+        assert_eq!(status, 200, "{body}");
+        let observation: serde_json::Value = serde_json::from_str(&body).expect("run observation");
+        if expected.contains(&observation["state"].as_str().unwrap_or("")) {
+            return observation;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run state did not match: {observation}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn actual_binary_stops_runs_and_enforces_deadlines() {
+    let path = TempDir::new("stop-and-deadline");
+    let (mut child, address) = start(&path, "all", None);
+    let cooperative = serde_json::json!({
+        "id":"cooperative-stop",
+        "command":["/bin/sh", "-c", "trap 'exit 0' TERM; while :; do /bin/sleep 1; done"],
+        "cwd":"/tmp",
+        "timeoutMs":null,
+        "terminationGraceMs":500,
+    });
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &serde_json::to_vec(&cooperative).unwrap()
+        )
+        .0,
+        201
+    );
+    let (status, accepted) = http(address, "POST", "/v1/jobs/cooperative-stop/runs", None, &[]);
+    assert_eq!(status, 202, "{accepted}");
+    let accepted: serde_json::Value = serde_json::from_str(&accepted).unwrap();
+    let run_id = accepted["runId"].as_str().unwrap();
+    wait_for_run_state(address, run_id, &["running"], Duration::from_secs(3));
+    let (status, stopping) = http(
+        address,
+        "POST",
+        &format!("/v1/runs/{run_id}/stop"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 202, "{stopping}");
+    let stopping: serde_json::Value = serde_json::from_str(&stopping).unwrap();
+    assert_eq!(stopping["state"], "stopping");
+    let cancelled = wait_for_run_state(address, run_id, &["cancelled"], Duration::from_secs(3));
+    assert_eq!(cancelled["terminationReason"], "cancelled");
+    assert_eq!(cancelled["exitCode"], 0);
+    let (status, repeated) = http(
+        address,
+        "POST",
+        &format!("/v1/runs/{run_id}/stop"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "{repeated}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&repeated).unwrap(),
+        cancelled
+    );
+
+    let stubborn = serde_json::json!({
+        "id":"stubborn-stop",
+        "command":["/bin/sh", "-c", "trap '' TERM; while :; do /bin/sleep 1; done"],
+        "cwd":"/tmp",
+        "timeoutMs":null,
+        "terminationGraceMs":100,
+    });
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &serde_json::to_vec(&stubborn).unwrap()
+        )
+        .0,
+        201
+    );
+    let (status, accepted) = http(address, "POST", "/v1/jobs/stubborn-stop/runs", None, &[]);
+    assert_eq!(status, 202, "{accepted}");
+    let accepted: serde_json::Value = serde_json::from_str(&accepted).unwrap();
+    let run_id = accepted["runId"].as_str().unwrap();
+    wait_for_run_state(address, run_id, &["running"], Duration::from_secs(3));
+    let started = Instant::now();
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            &format!("/v1/runs/{run_id}/stop"),
+            None,
+            &[]
+        )
+        .0,
+        202
+    );
+    let stopped = wait_for_run_state(address, run_id, &["cancelled"], Duration::from_secs(3));
+    assert!(started.elapsed() >= Duration::from_millis(80));
+    assert_eq!(stopped["terminationReason"], "cancelled");
+    assert!(stopped["terminationSignal"].is_number());
+
+    let deadline_job = serde_json::json!({
+        "id":"deadline",
+        "command":["/bin/sh", "-c", "exec /bin/sleep 60"],
+        "cwd":"/tmp",
+        "timeoutMs":100,
+        "terminationGraceMs":0,
+    });
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &serde_json::to_vec(&deadline_job).unwrap()
+        )
+        .0,
+        201
+    );
+    let (status, accepted) = http(address, "POST", "/v1/jobs/deadline/runs", None, &[]);
+    assert_eq!(status, 202, "{accepted}");
+    let accepted: serde_json::Value = serde_json::from_str(&accepted).unwrap();
+    let run_id = accepted["runId"].as_str().unwrap();
+    let timed_out = wait_for_run_state(address, run_id, &["timed_out"], Duration::from_secs(3));
+    assert_eq!(timed_out["terminationReason"], "deadline_exceeded");
+    assert!(timed_out["terminationSignal"].is_number());
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
 }
 
 #[test]

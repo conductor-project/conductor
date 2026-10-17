@@ -197,6 +197,15 @@ pub enum RunFailureReason {
     OutcomeUnknown,
 }
 
+/// Why the worker initiated process termination, independent of the final exit status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunTerminationReason {
+    Cancelled,
+    DeadlineExceeded,
+    Shutdown,
+}
+
 /// Serializable worker observation. Process IDs are deliberately not part of the contract.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -212,6 +221,8 @@ pub struct RunObservation {
     exit_code: Option<i32>,
     termination_signal: Option<i32>,
     failure_reason: Option<RunFailureReason>,
+    #[serde(default)]
+    termination_reason: Option<RunTerminationReason>,
 }
 
 impl RunObservation {
@@ -228,6 +239,7 @@ impl RunObservation {
             exit_code: None,
             termination_signal: None,
             failure_reason: None,
+            termination_reason: None,
         }
     }
 
@@ -264,6 +276,21 @@ impl RunObservation {
     pub fn failure_reason(&self) -> Option<RunFailureReason> {
         self.failure_reason
     }
+    pub fn termination_reason(&self) -> Option<RunTerminationReason> {
+        self.termination_reason
+    }
+
+    pub fn with_termination_reason(mut self, reason: RunTerminationReason) -> Self {
+        self.termination_reason = Some(reason);
+        self
+    }
+    pub fn with_optional_termination_reason(
+        mut self,
+        reason: Option<RunTerminationReason>,
+    ) -> Self {
+        self.termination_reason = reason;
+        self
+    }
 
     pub fn next_revision(
         &self,
@@ -286,6 +313,7 @@ impl RunObservation {
             exit_code,
             termination_signal,
             failure_reason,
+            termination_reason: self.termination_reason,
         })
     }
 
@@ -301,6 +329,22 @@ impl RunObservation {
         }
         *self = newer;
         true
+    }
+}
+
+/// Idempotent request to stop one accepted run.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StopRun {
+    run_id: RunId,
+}
+
+impl StopRun {
+    pub fn new(run_id: RunId) -> Self {
+        Self { run_id }
+    }
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
     }
 }
 

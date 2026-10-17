@@ -10,7 +10,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use conductor_core::{
     InspectRun, JobId, JobSpec, RunFailureReason, RunId, RunObservation, RunSpec, RunState,
-    StartRun, WorkerDescriptor, WorkerId,
+    RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
@@ -33,7 +33,6 @@ pub enum RunStoreError {
     JobNotFound,
     JobConflict,
     CapacityReached,
-    TimeoutUnsupported,
     StorageUnavailable,
 }
 
@@ -41,14 +40,19 @@ pub enum RunStoreError {
 pub enum WorkerPortError {
     CapacityReached,
     RunConflict,
+    ShuttingDown,
     Unavailable,
 }
 
 /// Manager-owned seam for dispatch and observation reads from the selected worker.
 pub trait WorkerPort: Send + Sync {
     fn descriptor(&self) -> WorkerDescriptor;
+    fn is_draining(&self) -> bool {
+        false
+    }
     fn start(&self, command: StartRun) -> Result<RunObservation, WorkerPortError>;
     fn inspect(&self, command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError>;
+    fn stop(&self, command: StopRun) -> Result<RunObservation, WorkerPortError>;
 }
 
 /// Storage port owned by the manager. Implementations preserve deleted IDs.
@@ -443,9 +447,6 @@ impl JobRepository for SqliteJobRepository {
             .ok_or(RunStoreError::JobNotFound)?;
         let job: JobSpec =
             serde_json::from_str(&job_json).map_err(|_| RunStoreError::StorageUnavailable)?;
-        if job.timeout_ms().is_some() {
-            return Err(RunStoreError::TimeoutUnsupported);
-        }
         let existing_for_job: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM runs WHERE job_id = ?1 AND state IN ('requested', 'starting', 'running', 'stopping', 'unknown'))",
             [job_id.as_str()],
@@ -594,8 +595,9 @@ pub enum ManagerError {
     JobNotFound,
     JobConflict,
     CapacityReached,
-    TimeoutUnsupported,
+    RunNotFound,
     WorkerUnavailable,
+    WorkerDraining,
     StorageUnavailable,
 }
 
@@ -644,6 +646,9 @@ impl JobService {
         worker_capacity: usize,
         worker: &dyn WorkerPort,
     ) -> Result<RunObservation, ManagerError> {
+        if worker.is_draining() {
+            return Err(ManagerError::WorkerDraining);
+        }
         let active = self
             .repository
             .list_active_runs(worker_id, worker_capacity)
@@ -667,6 +672,10 @@ impl JobService {
             Err(WorkerPortError::CapacityReached) => {
                 self.mark_dispatch_failure(&spec, RunFailureReason::CapacityRejected, true)?;
                 return Err(ManagerError::CapacityReached);
+            }
+            Err(WorkerPortError::ShuttingDown) => {
+                self.mark_dispatch_failure(&spec, RunFailureReason::BackendFailure, true)?;
+                return Err(ManagerError::WorkerDraining);
             }
             Err(WorkerPortError::RunConflict | WorkerPortError::Unavailable) => {
                 self.mark_dispatch_failure(&spec, RunFailureReason::OutcomeUnknown, false)?;
@@ -710,6 +719,74 @@ impl JobService {
             return Ok(Some(observation));
         }
         Ok(Some(stored))
+    }
+
+    /// Persist the stop decision before attempting delivery to the worker.
+    pub fn stop_run(
+        &self,
+        id: &RunId,
+        worker: &dyn WorkerPort,
+    ) -> Result<RunObservation, ManagerError> {
+        let Some(current) = self
+            .repository
+            .get_run(id)
+            .map_err(|_| ManagerError::StorageUnavailable)?
+        else {
+            return Err(ManagerError::RunNotFound);
+        };
+        if current.state().is_terminal() {
+            return Ok(current);
+        }
+        let stopping = if current.state() == RunState::Stopping {
+            current
+        } else {
+            current
+                .next_revision(
+                    RunState::Stopping,
+                    current.started_at_ms(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .ok_or(ManagerError::StorageUnavailable)?
+                .with_termination_reason(RunTerminationReason::Cancelled)
+        };
+        self.repository
+            .record_observation(&stopping)
+            .map_err(|_| ManagerError::StorageUnavailable)?;
+        if let Ok(observation) = worker.stop(StopRun::new(id.clone()))
+            && observation.run_id() == id
+            && observation.job_id() == stopping.job_id()
+            && observation.worker_id() == stopping.worker_id()
+        {
+            let observation = if observation.state().is_terminal()
+                && observation.revision() <= stopping.revision()
+            {
+                stopping
+                    .next_revision(
+                        observation.state(),
+                        observation.started_at_ms(),
+                        observation.finished_at_ms(),
+                        observation.exit_code(),
+                        observation.termination_signal(),
+                        observation.failure_reason(),
+                    )
+                    .map(|value| {
+                        value.with_optional_termination_reason(observation.termination_reason())
+                    })
+                    .ok_or(ManagerError::StorageUnavailable)?
+            } else if observation.revision() > stopping.revision() {
+                observation
+            } else {
+                return Ok(stopping);
+            };
+            self.repository
+                .record_observation(&observation)
+                .map_err(|_| ManagerError::StorageUnavailable)?;
+            return Ok(observation);
+        }
+        Ok(stopping)
     }
 
     fn mark_dispatch_failure(
@@ -771,7 +848,6 @@ fn map_run_error(error: RunStoreError) -> ManagerError {
         RunStoreError::JobNotFound => ManagerError::JobNotFound,
         RunStoreError::JobConflict => ManagerError::JobConflict,
         RunStoreError::CapacityReached => ManagerError::CapacityReached,
-        RunStoreError::TimeoutUnsupported => ManagerError::TimeoutUnsupported,
         RunStoreError::StorageUnavailable => ManagerError::StorageUnavailable,
     }
 }

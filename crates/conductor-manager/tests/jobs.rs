@@ -309,7 +309,7 @@ fn manager_admission_reserves_job_and_worker_capacity_transactionally() {
 }
 
 #[test]
-fn version_one_manager_database_migrates_runs_and_unsupported_timeouts_fail_before_dispatch() {
+fn version_one_manager_database_migrates_runs_and_accepts_timeout_specs() {
     let directory = TempDir::new();
     let connection = Connection::open(directory.database()).unwrap();
     connection
@@ -338,12 +338,16 @@ fn version_one_manager_database_migrates_runs_and_unsupported_timeouts_fail_befo
     .unwrap();
     repository.insert(timed).unwrap();
     assert_eq!(
-        repository.create_run(
-            &JobId::new("timed").unwrap(),
-            &WorkerId::new("worker").unwrap(),
-            1
-        ),
-        Err(RunStoreError::TimeoutUnsupported)
+        repository
+            .create_run(
+                &JobId::new("timed").unwrap(),
+                &WorkerId::new("worker").unwrap(),
+                1
+            )
+            .unwrap()
+            .job()
+            .timeout_ms(),
+        Some(1_000)
     );
     let connection = Connection::open(directory.database()).unwrap();
     let version: i64 = connection
@@ -366,6 +370,10 @@ impl WorkerPort for FullWorker {
     fn inspect(&self, _command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError> {
         Ok(None)
     }
+
+    fn stop(&self, _command: conductor_core::StopRun) -> Result<RunObservation, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
 }
 
 struct UncertainWorker(WorkerId);
@@ -381,6 +389,10 @@ impl WorkerPort for UncertainWorker {
 
     fn inspect(&self, _command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError> {
         Ok(None)
+    }
+
+    fn stop(&self, _command: conductor_core::StopRun) -> Result<RunObservation, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
     }
 }
 
@@ -434,4 +446,43 @@ fn ambiguous_worker_dispatch_is_marked_unknown_and_keeps_its_reservation() {
         manager.start_run(&JobId::new("ambiguous").unwrap(), &worker_id, 1, &worker),
         Err(ManagerError::JobConflict)
     );
+}
+
+#[test]
+fn stop_intent_is_durable_and_terminal_runs_are_unchanged() {
+    let directory = TempDir::new();
+    let repository = Arc::new(SqliteJobRepository::open(directory.database()).unwrap());
+    repository.insert(job("stoppable")).unwrap();
+    let worker_id = WorkerId::new("worker").unwrap();
+    let spec = repository
+        .create_run(&JobId::new("stoppable").unwrap(), &worker_id, 1)
+        .unwrap();
+    let manager = JobService::new(repository.clone());
+    let worker = UncertainWorker(worker_id);
+
+    let stopping = manager.stop_run(spec.id(), &worker).unwrap();
+    assert_eq!(stopping.state(), RunState::Stopping);
+    assert_eq!(
+        stopping.termination_reason(),
+        Some(conductor_core::RunTerminationReason::Cancelled)
+    );
+    assert_eq!(
+        repository.get_run(spec.id()).unwrap(),
+        Some(stopping.clone())
+    );
+    assert_eq!(manager.stop_run(spec.id(), &worker).unwrap(), stopping);
+
+    let terminal = stopping
+        .next_revision(
+            RunState::Cancelled,
+            stopping.started_at_ms(),
+            Some(stopping.requested_at_ms() + 10),
+            None,
+            Some(15),
+            None,
+        )
+        .unwrap()
+        .with_termination_reason(conductor_core::RunTerminationReason::Cancelled);
+    repository.record_observation(&terminal).unwrap();
+    assert_eq!(manager.stop_run(spec.id(), &worker).unwrap(), terminal);
 }
