@@ -5,10 +5,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::fd::AsFd;
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -19,6 +22,9 @@ use conductor_core::{
     RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId, WorkerStatus,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+
+#[cfg(unix)]
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -84,6 +90,7 @@ struct SpawnGuard {
     group_id: u32,
     child: Option<Child>,
     readers: Vec<JoinHandle<io::Result<()>>>,
+    cancel_readers: Arc<AtomicBool>,
     cleaned: bool,
 }
 
@@ -92,6 +99,7 @@ impl SpawnGuard {
         if self.cleaned {
             return Ok(());
         }
+        self.cancel_readers.store(true, Ordering::SeqCst);
         let mut first_error = self.backend.kill_process_group(self.group_id).err();
         if let Some(child) = &mut self.child {
             if let Err(error) = child.kill()
@@ -135,6 +143,32 @@ impl SpawnGuard {
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+}
+
+trait CaptureRead: Read + Send {
+    fn wait_readable(&self, cancelled: &AtomicBool) -> io::Result<bool>;
+}
+
+#[cfg(unix)]
+impl<T: Read + Send + AsFd> CaptureRead for T {
+    fn wait_readable(&self, cancelled: &AtomicBool) -> io::Result<bool> {
+        if cancelled.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
+        let mut descriptors = [PollFd::new(
+            self.as_fd(),
+            PollFlags::POLLIN | PollFlags::POLLHUP | PollFlags::POLLERR,
+        )];
+        let ready = poll(&mut descriptors, PollTimeout::from(50_u16)).map_err(io::Error::from)?;
+        Ok(ready > 0 && !cancelled.load(Ordering::SeqCst))
+    }
+}
+
+#[cfg(not(unix))]
+impl<T: Read + Send> CaptureRead for T {
+    fn wait_readable(&self, cancelled: &AtomicBool) -> io::Result<bool> {
+        Ok(!cancelled.load(Ordering::SeqCst))
     }
 }
 
@@ -511,6 +545,7 @@ impl WorkerService {
             group_id,
             child: Some(child),
             readers: Vec::with_capacity(2),
+            cancel_readers: Arc::new(AtomicBool::new(false)),
             cleaned: false,
         };
         let Some(stdout) = spawned.child.as_mut().and_then(|child| child.stdout.take()) else {
@@ -526,6 +561,7 @@ impl WorkerService {
             Arc::clone(&self.state),
             spec.id().to_string(),
             LogStream::Stdout,
+            Arc::clone(&spawned.cancel_readers),
         ) {
             Ok(reader) => reader,
             Err(_) => return self.abort_startup(spawned, starting),
@@ -538,6 +574,7 @@ impl WorkerService {
             Arc::clone(&self.state),
             spec.id().to_string(),
             LogStream::Stderr,
+            Arc::clone(&spawned.cancel_readers),
         ) {
             Ok(reader) => reader,
             Err(_) => return self.abort_startup(spawned, starting),
@@ -1266,20 +1303,29 @@ fn prepare_log_file(path: &Path) -> io::Result<File> {
     options.open(path)
 }
 
-fn spawn_capture<R: Read + Send + 'static>(
+fn spawn_capture<R: CaptureRead + 'static>(
     mut source: R,
     mut output: File,
     byte_cap: u64,
     state: Arc<SharedWorkerState>,
     run_id: String,
     stream: LogStream,
+    cancelled: Arc<AtomicBool>,
 ) -> io::Result<JoinHandle<io::Result<()>>> {
     thread::Builder::new().spawn(move || {
         let mut buffer = [0_u8; 8192];
         let mut written = 0_u64;
         let mut truncated = false;
+        let mut was_cancelled = false;
         let capture_result = (|| {
             loop {
+                if !source.wait_readable(&cancelled)? {
+                    if cancelled.load(Ordering::SeqCst) {
+                        was_cancelled = true;
+                        break;
+                    }
+                    continue;
+                }
                 let count = source.read(&mut buffer)?;
                 if count == 0 {
                     break;
@@ -1294,10 +1340,16 @@ fn spawn_capture<R: Read + Send + 'static>(
                     set_log_truncated(&state, &run_id, stream)?;
                 }
             }
-            output.sync_all()?;
+            if !was_cancelled {
+                output.sync_all()?;
+            }
             Ok(())
         })();
-        let close_result = close_log_stream(&state, &run_id, stream);
+        let close_result = if was_cancelled {
+            Ok(())
+        } else {
+            close_log_stream(&state, &run_id, stream)
+        };
         capture_result.and(close_result)
     })
 }

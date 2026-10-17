@@ -9,8 +9,6 @@ license.workspace = true
 conductor-core.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
-
-[dev-dependencies]
 nix.workspace = true
 
 [lints]
