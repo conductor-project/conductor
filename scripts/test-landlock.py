@@ -350,6 +350,9 @@ def main():
 
             # A path grant must not overlap state, cgroup controls, or a protected ancestor.
             broad_config = dict(config)
+            broad_config["manager_data_dir"] = str(root / "broad-manager")
+            broad_config["worker_data_dir"] = str(root / "broad-worker")
+            broad_config["cgroup_v2"] = {"enabled": False}
             broad_config["landlock"] = {
                 "mode": "required",
                 "grants": [{"id": "broad", "path": str(root), "read": True}],
@@ -364,7 +367,7 @@ def main():
                 timeout=5,
             )
             assert rejected_agent.returncode != 0, "broad protected ancestor grant was accepted"
-            assert "overlap Conductor state or control paths" in rejected_agent.stderr
+            assert "overlap Conductor state or control paths" in rejected_agent.stderr, rejected_agent.stderr
 
             nested = output_dir / "nested"
             nested.mkdir()
