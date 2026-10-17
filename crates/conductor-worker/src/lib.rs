@@ -15,8 +15,8 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use conductor_core::{
     InspectRun, JobSpec, LogStream, MAX_LOG_CHUNK_BYTES, MAX_WORKER_CAPACITY, ReadRunLogs,
-    RunFailureReason, RunLogChunk, RunLogStatus, RunObservation, RunState, RunTerminationReason,
-    StartRun, StopRun, WorkerDescriptor, WorkerId,
+    ResolveRun, RunFailureReason, RunLogChunk, RunLogStatus, RunObservation, RunState,
+    RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
@@ -86,6 +86,7 @@ struct SharedWorkerState(Mutex<WorkerState>);
 pub struct WorkerService {
     worker_id: WorkerId,
     capacity: usize,
+    incarnation: u64,
     state_directory: PathBuf,
     log_policy: LogPolicy,
     backend: Arc<dyn ExecutionBackend>,
@@ -208,7 +209,7 @@ impl WorkerService {
         let schema_version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(storage_error)?;
-        if !(0..=2).contains(&schema_version) {
+        if !(0..=3).contains(&schema_version) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "worker database schema is newer than supported",
@@ -285,9 +286,35 @@ impl WorkerService {
             .pragma_update(None, "synchronous", "FULL")
             .map_err(storage_error)?;
 
+        let incarnation = {
+            let transaction = connection.unchecked_transaction().map_err(storage_error)?;
+            transaction
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS worker_meta (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    incarnation INTEGER NOT NULL CHECK (incarnation >= 0)
+                );
+                INSERT OR IGNORE INTO worker_meta (id, incarnation) VALUES (1, 0);
+                UPDATE worker_meta SET incarnation = incarnation + 1 WHERE id = 1;
+                PRAGMA user_version = 3;",
+                )
+                .map_err(storage_error)?;
+            let generation = transaction
+                .query_row(
+                    "SELECT incarnation FROM worker_meta WHERE id = 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(storage_error)?;
+            transaction.commit().map_err(storage_error)?;
+            u64::try_from(generation)
+                .map_err(|_| io::Error::other("worker incarnation is invalid"))?
+        };
+
         let service = Self {
             worker_id,
             capacity,
+            incarnation,
             state_directory,
             log_policy,
             backend,
@@ -350,7 +377,8 @@ impl WorkerService {
             if active_count >= self.capacity as i64 {
                 return Err(WorkerError::CapacityReached);
             }
-            let observation = RunObservation::requested(spec, now);
+            let observation =
+                RunObservation::requested(spec, now).with_worker_incarnation(self.incarnation);
             let observation_json =
                 serde_json::to_string(&observation).map_err(|_| WorkerError::StorageUnavailable)?;
             transaction.execute(
@@ -685,8 +713,78 @@ impl WorkerService {
         Ok(stopping)
     }
 
+    /// Resolve an ambiguous run after the operator has verified external cleanup.
+    pub fn resolve_unknown(&self, command: ResolveRun) -> Result<RunObservation, WorkerError> {
+        let id = command.run_id();
+        let mut state = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let raw = transaction
+            .query_row(
+                "SELECT observation_json FROM runs WHERE run_id = ?1",
+                [id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| WorkerError::StorageUnavailable)?
+            .ok_or(WorkerError::RunConflict)?;
+        let current: RunObservation =
+            serde_json::from_str(&raw).map_err(|_| WorkerError::StorageUnavailable)?;
+        if current.state() == RunState::Abandoned {
+            if current.resolution_reason() == Some(command.reason()) {
+                transaction
+                    .commit()
+                    .map_err(|_| WorkerError::StorageUnavailable)?;
+                return Ok(current);
+            }
+            return Err(WorkerError::RunConflict);
+        }
+        if current.state() != RunState::Unknown
+            || command.reason().trim().is_empty()
+            || command.reason().len() > 512
+        {
+            return Err(WorkerError::RunConflict);
+        }
+        let finished = now_ms().map_err(|_| WorkerError::StorageUnavailable)?;
+        let resolved = current
+            .next_revision(
+                RunState::Abandoned,
+                current.started_at_ms(),
+                Some(finished),
+                None,
+                None,
+                None,
+            )
+            .ok_or(WorkerError::StorageUnavailable)?
+            .with_resolution_reason(command.reason().to_owned());
+        let json = serde_json::to_string(&resolved).map_err(|_| WorkerError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "UPDATE runs SET observation_json = ?1, state = ?2, revision = ?3 WHERE run_id = ?4 AND revision = ?5",
+                params![json, resolved.state().as_str(), resolved.revision() as i64, id.as_str(), current.revision() as i64],
+            )
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "UPDATE run_logs SET stdout_closed = 1, stderr_closed = 1, completed_at_ms = ?1 WHERE run_id = ?2",
+                params![finished, id.as_str()],
+            )
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        Ok(resolved)
+    }
+
     pub fn descriptor(&self) -> WorkerDescriptor {
         WorkerDescriptor::new(self.worker_id.clone(), self.capacity, true)
+            .with_incarnation(self.incarnation)
     }
 
     pub fn is_draining(&self) -> bool {
@@ -818,7 +916,8 @@ impl WorkerService {
                     None,
                     Some(RunFailureReason::OutcomeUnknown),
                 )
-                .ok_or_else(|| io::Error::other("observation revision exhausted"))?;
+                .ok_or_else(|| io::Error::other("observation revision exhausted"))?
+                .with_worker_incarnation(self.incarnation);
             let serialized = serde_json::to_string(&unknown).map_err(storage_error)?;
             transaction.execute(
                 "UPDATE runs SET observation_json = ?1, revision = ?2, state = ?3 WHERE run_id = ?4 AND revision = ?5",

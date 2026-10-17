@@ -96,6 +96,8 @@ pub struct WorkerDescriptor {
     worker_id: WorkerId,
     capacity: usize,
     process_execution: bool,
+    #[serde(default)]
+    incarnation: u64,
 }
 
 impl WorkerDescriptor {
@@ -104,7 +106,12 @@ impl WorkerDescriptor {
             worker_id,
             capacity,
             process_execution,
+            incarnation: 0,
         }
+    }
+    pub fn with_incarnation(mut self, incarnation: u64) -> Self {
+        self.incarnation = incarnation;
+        self
     }
     pub fn worker_id(&self) -> &WorkerId {
         &self.worker_id
@@ -114,6 +121,9 @@ impl WorkerDescriptor {
     }
     pub fn supports_process_execution(&self) -> bool {
         self.process_execution
+    }
+    pub fn incarnation(&self) -> u64 {
+        self.incarnation
     }
 }
 
@@ -225,6 +235,10 @@ pub struct RunObservation {
     failure_reason: Option<RunFailureReason>,
     #[serde(default)]
     termination_reason: Option<RunTerminationReason>,
+    #[serde(default)]
+    resolution_reason: Option<String>,
+    #[serde(default)]
+    worker_incarnation: u64,
 }
 
 impl RunObservation {
@@ -242,6 +256,8 @@ impl RunObservation {
             termination_signal: None,
             failure_reason: None,
             termination_reason: None,
+            resolution_reason: None,
+            worker_incarnation: 0,
         }
     }
 
@@ -281,6 +297,21 @@ impl RunObservation {
     pub fn termination_reason(&self) -> Option<RunTerminationReason> {
         self.termination_reason
     }
+    pub fn resolution_reason(&self) -> Option<&str> {
+        self.resolution_reason.as_deref()
+    }
+
+    pub fn with_resolution_reason(mut self, reason: String) -> Self {
+        self.resolution_reason = Some(reason);
+        self
+    }
+    pub fn with_worker_incarnation(mut self, incarnation: u64) -> Self {
+        self.worker_incarnation = incarnation;
+        self
+    }
+    pub fn worker_incarnation(&self) -> u64 {
+        self.worker_incarnation
+    }
 
     pub fn with_termination_reason(mut self, reason: RunTerminationReason) -> Self {
         self.termination_reason = Some(reason);
@@ -316,6 +347,8 @@ impl RunObservation {
             termination_signal,
             failure_reason,
             termination_reason: self.termination_reason,
+            resolution_reason: self.resolution_reason.clone(),
+            worker_incarnation: self.worker_incarnation,
         })
     }
 
@@ -339,6 +372,27 @@ impl RunObservation {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StopRun {
     run_id: RunId,
+}
+
+/// Operator-authorized resolution of an ambiguous run after external cleanup.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResolveRun {
+    run_id: RunId,
+    reason: String,
+}
+
+impl ResolveRun {
+    pub fn new(run_id: RunId, reason: String) -> Self {
+        Self { run_id, reason }
+    }
+
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
 }
 
 /// One worker-owned output stream for a run.

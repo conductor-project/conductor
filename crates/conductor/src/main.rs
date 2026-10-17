@@ -10,7 +10,9 @@ use std::sync::{
 };
 
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
-use conductor_core::{InspectRun, MAX_WORKER_CAPACITY, ReadRunLogs, StartRun, StopRun, WorkerId};
+use conductor_core::{
+    InspectRun, MAX_WORKER_CAPACITY, ReadRunLogs, ResolveRun, StartRun, StopRun, WorkerId,
+};
 use conductor_manager::{WorkerPort, WorkerPortError};
 use serde::Deserialize;
 use state_lock::StateLocks;
@@ -188,6 +190,13 @@ impl WorkerPort for LocalWorkerPort {
 
     fn stop(&self, command: StopRun) -> Result<conductor_core::RunObservation, WorkerPortError> {
         self.0.stop(command).map_err(map_worker_error)
+    }
+
+    fn resolve(
+        &self,
+        command: ResolveRun,
+    ) -> Result<conductor_core::RunObservation, WorkerPortError> {
+        self.0.resolve_unknown(command).map_err(map_worker_error)
     }
 
     fn read_logs(

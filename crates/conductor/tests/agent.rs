@@ -147,7 +147,29 @@ fn start_with_capacity(
         .expect("address")
         .parse()
         .expect("socket address");
+    wait_for_ready(address);
     (child, address)
+}
+
+fn wait_for_ready(address: SocketAddr) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(mut stream) = TcpStream::connect(address) {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+            let _ = stream
+                .write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let mut response = String::new();
+            if stream.read_to_string(&mut response).is_ok() && response.starts_with("HTTP/1.1 200")
+            {
+                return;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agent did not become ready before deadline"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn wait_for_exit(child: &mut Agent) {
@@ -905,6 +927,7 @@ fn actual_binary_rejects_duplicate_manager_and_worker_state_ownership() {
     let event: serde_json::Value = serde_json::from_str(&line).expect("owner startup event");
     assert_eq!(event["event"], "agent_started", "{line}");
     let address: SocketAddr = event["address"].as_str().unwrap().parse().unwrap();
+    wait_for_ready(address);
 
     let config_manager_conflict = write_config_dirs(
         &path.join("b"),
@@ -1164,6 +1187,7 @@ fn actual_binary_inherits_environment_only_when_job_opts_in() {
     let event: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(event["event"], "agent_started", "{line}");
     let address: SocketAddr = event["address"].as_str().unwrap().parse().unwrap();
+    wait_for_ready(address);
     let payload = serde_json::to_vec(&serde_json::json!({
         "id":"inherit-environment",
         "command":["/usr/bin/env"],
@@ -1261,6 +1285,7 @@ fn actual_binary_turns_interrupted_runs_unknown_without_replaying_them() {
         .expect("agent readiness");
     let event: serde_json::Value = serde_json::from_str(&line).unwrap();
     let address: SocketAddr = event["address"].as_str().unwrap().parse().unwrap();
+    wait_for_ready(address);
     assert_eq!(
         http(
             address,
@@ -1275,6 +1300,7 @@ fn actual_binary_turns_interrupted_runs_unknown_without_replaying_them() {
     let (status, accepted) = http(address, "POST", "/v1/jobs/ambiguous/runs", None, &[]);
     assert_eq!(status, 202, "{accepted}");
     let run: serde_json::Value = serde_json::from_str(&accepted).unwrap();
+    let initial_incarnation = run["workerIncarnation"].as_u64().unwrap();
     let run_id = run["runId"].as_str().unwrap().to_owned();
     let deadline = Instant::now() + Duration::from_secs(5);
     while !pid_file.exists() {
@@ -1289,6 +1315,7 @@ fn actual_binary_turns_interrupted_runs_unknown_without_replaying_them() {
     assert_eq!(status, 200, "{body}");
     let observation: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(observation["state"], "unknown");
+    assert!(observation["workerIncarnation"].as_u64().unwrap() > initial_incarnation);
     assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
     assert_eq!(
         http(address, "POST", "/v1/jobs/ambiguous/runs", None, &[]).0,
@@ -1304,8 +1331,62 @@ fn actual_binary_turns_interrupted_runs_unknown_without_replaying_them() {
         .status()
         .unwrap();
     assert!(status.success());
+    let resolution = br#"{"resolution":"abandon","reason":"Externally verified workload cleanup"}"#;
+    let (status, body) = http(
+        address,
+        "POST",
+        &format!("/v1/runs/{run_id}/resolve"),
+        Some("application/json"),
+        resolution,
+    );
+    assert_eq!(status, 200, "{body}");
+    let abandoned: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(abandoned["state"], "abandoned");
+    assert_eq!(
+        abandoned["resolutionReason"],
+        "Externally verified workload cleanup"
+    );
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            &format!("/v1/runs/{run_id}/resolve"),
+            Some("application/json"),
+            resolution
+        )
+        .0,
+        200,
+        "same resolution is idempotent",
+    );
+    let conflicting = br#"{"resolution":"abandon","reason":"different decision"}"#;
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            &format!("/v1/runs/{run_id}/resolve"),
+            Some("application/json"),
+            conflicting
+        )
+        .0,
+        409,
+    );
     signal(&restarted, "INT");
     wait_for_exit(&mut restarted);
+
+    let (mut recovered, address) = start(&path, "all", None);
+    let (status, body) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["state"],
+        "abandoned"
+    );
+    let (status, accepted) = http(address, "POST", "/v1/jobs/ambiguous/runs", None, &[]);
+    assert_eq!(
+        status, 202,
+        "resolution releases the worker slot: {accepted}"
+    );
+    signal(&recovered, "INT");
+    wait_for_exit(&mut recovered);
 }
 
 #[test]
@@ -1451,6 +1532,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
     let event: serde_json::Value = serde_json::from_str(&line).unwrap();
     assert_eq!(event["event"], "agent_started", "{line}");
     let address: SocketAddr = event["address"].as_str().unwrap().parse().unwrap();
+    wait_for_ready(address);
 
     let job = serde_json::json!({
         "id":"binary-logs",
@@ -1505,15 +1587,26 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
     assert_eq!(chunk["nextOffset"], 2);
     assert_eq!(chunk["streamClosed"], false);
 
-    let (status, chunk) = http(
-        address,
-        "GET",
-        &format!("/v1/runs/{run_id}/logs?stream=stdout&offset=2&limit=2"),
-        None,
-        &[],
-    );
-    assert_eq!(status, 200, "{chunk}");
-    let chunk: serde_json::Value = serde_json::from_str(&chunk).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let chunk = loop {
+        let (status, body) = http(
+            address,
+            "GET",
+            &format!("/v1/runs/{run_id}/logs?stream=stdout&offset=2&limit=2"),
+            None,
+            &[],
+        );
+        assert_eq!(status, 200, "{body}");
+        let chunk: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if chunk["truncated"] == true {
+            break chunk;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker did not report capped output: {chunk}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
     assert_eq!(
         decode_log_chunk(chunk["data"].as_str().unwrap())[..2],
         [195, 169]
