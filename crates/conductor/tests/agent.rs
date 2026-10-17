@@ -10,6 +10,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
+const ASYNC_LOG_WATCHDOG: Duration = Duration::from_secs(30);
+
 struct TempDir(PathBuf);
 
 impl TempDir {
@@ -1052,6 +1054,37 @@ fn wait_for_run_state(
         assert!(
             Instant::now() < deadline,
             "run state did not match: {observation}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_closed_logs(address: SocketAddr, run_id: &str) {
+    let deadline = Instant::now() + ASYNC_LOG_WATCHDOG;
+    loop {
+        let mut all_closed = true;
+        for stream in ["stdout", "stderr"] {
+            let (status, body) = http(
+                address,
+                "GET",
+                &format!("/v1/runs/{run_id}/logs?stream={stream}"),
+                None,
+                &[],
+            );
+            if status == 404 {
+                all_closed = false;
+                continue;
+            }
+            assert_eq!(status, 200, "{body}");
+            let chunk: serde_json::Value = serde_json::from_str(&body).unwrap();
+            all_closed &= chunk["streamClosed"] == true;
+        }
+        if all_closed {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "output readers did not close both log streams before the watchdog"
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -2183,9 +2216,11 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
     let stderr = child.0.stderr.take().unwrap();
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
         let mut line = String::new();
-        let _ = BufReader::new(stderr).read_line(&mut line);
+        let _ = reader.read_line(&mut line);
         let _ = sender.send(line);
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
     });
     let line = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
     let event: serde_json::Value = serde_json::from_str(&line).unwrap();
@@ -2217,7 +2252,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
         .to_owned();
     wait_for_run_state(address, &run_id, &["running"], Duration::from_secs(2));
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + ASYNC_LOG_WATCHDOG;
     let chunk = loop {
         let (status, body) = http(
             address,
@@ -2246,7 +2281,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
     assert_eq!(chunk["nextOffset"], 2);
     assert_eq!(chunk["streamClosed"], false);
 
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + ASYNC_LOG_WATCHDOG;
     let chunk = loop {
         let (status, body) = http(
             address,
@@ -2274,6 +2309,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
 
     let finished = wait_for_run_state(address, &run_id, &["succeeded"], Duration::from_secs(3));
     assert_eq!(finished["state"], "succeeded");
+    wait_for_closed_logs(address, &run_id);
     let (status, chunk) = http(
         address,
         "GET",
@@ -2309,10 +2345,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
         &[],
     );
     assert_eq!(status, 400, "{body}");
-    let active_job = job_json(
-        "retention-active",
-        &["/bin/sh", "-c", "printf active; sleep 60"],
-    );
+    let active_job = job_json("retention-active", &["/bin/sleep", "60"]);
     assert_eq!(
         http(
             address,
@@ -2332,7 +2365,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
         .unwrap()
         .to_owned();
     wait_for_run_state(address, &active_id, &["running"], Duration::from_secs(2));
-    let active_log_deadline = Instant::now() + Duration::from_secs(30);
+    let active_log_deadline = Instant::now() + ASYNC_LOG_WATCHDOG;
     loop {
         let (status, body) = http(
             address,
@@ -2369,7 +2402,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
     // Pruning runs after the asynchronous output readers finish. Keep polling
     // for that state transition; this is only a deadlock guard, not a latency
     // expectation for the reader/reaper thread.
-    let retention_deadline = Instant::now() + Duration::from_secs(30);
+    let retention_deadline = Instant::now() + ASYNC_LOG_WATCHDOG;
     loop {
         let (status, body) = http(
             address,
@@ -2388,6 +2421,7 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
         );
         thread::sleep(Duration::from_millis(10));
     }
+    wait_for_run_state(address, &active_id, &["running"], Duration::from_secs(2));
     let (status, body) = http(
         address,
         "GET",
