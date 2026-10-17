@@ -107,14 +107,16 @@ impl ExecutionBackend for HostProcessBackend {
 
     fn kill_process_group(&self, group_id: u32) -> io::Result<()> {
         #[cfg(target_os = "linux")]
-        if let Some(cgroup) = &self.cgroup
-            && let Some(path) = cgroup
+        if let Some(cgroup) = &self.cgroup {
+            let path = cgroup
                 .groups
                 .lock()
                 .map_err(|_| io::Error::other("cgroup registry is unavailable"))?
                 .get(&group_id)
-        {
-            CgroupV2::kill(path)?;
+                .cloned();
+            if let Some(path) = path {
+                CgroupV2::kill(&path)?;
+            }
         }
         #[cfg(unix)]
         {
