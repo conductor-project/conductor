@@ -1,12 +1,14 @@
 //! Worker-owned process supervision, persistence, deadlines, and captured output.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
+#[cfg(test)]
+use std::sync::Condvar;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::mpsc::{SyncSender, sync_channel};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,7 +26,7 @@ use conductor_core::{
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use tokio::runtime::Runtime;
-use tokio::sync::{Notify, Semaphore, oneshot, watch};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
 #[cfg(unix)]
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -93,12 +95,16 @@ struct ReaderReapRequest {
     child: Option<Child>,
     readers: Vec<JoinHandle<io::Result<()>>>,
     completion: Option<oneshot::Sender<io::Result<()>>>,
+    cleanup_permit: OwnedSemaphorePermit,
 }
 
 #[derive(Clone)]
 struct ReaderReaper {
     sender: SyncSender<ReaderReapRequest>,
     pending: Arc<AtomicUsize>,
+    overflow: Arc<Mutex<VecDeque<ReaderReapRequest>>>,
+    #[cfg(test)]
+    gate: Arc<(Mutex<bool>, Condvar)>,
 }
 
 impl ReaderReaper {
@@ -106,24 +112,57 @@ impl ReaderReaper {
         let (sender, receiver) = sync_channel::<ReaderReapRequest>(MAX_WORKER_CAPACITY);
         let pending = Arc::new(AtomicUsize::new(0));
         let reaper_pending = Arc::clone(&pending);
+        let overflow = Arc::new(Mutex::new(VecDeque::new()));
+        let reaper_overflow = Arc::clone(&overflow);
+        #[cfg(test)]
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        #[cfg(test)]
+        let reaper_gate = Arc::clone(&gate);
         thread::Builder::new()
             .name("conductor-reader-reaper".to_owned())
             .spawn(move || {
-                while let Ok(request) = receiver.recv() {
-                    let result = reap_child_and_readers(request.child, request.readers);
-                    reaper_pending.fetch_sub(1, Ordering::SeqCst);
-                    if let Some(completion) = request.completion {
-                        let _ = completion.send(result);
+                loop {
+                    let queued = reaper_overflow
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .pop_front();
+                    let request = match queued {
+                        Some(request) => request,
+                        None => match receiver.recv() {
+                            Ok(request) => request,
+                            Err(_) => break,
+                        },
+                    };
+                    #[cfg(test)]
+                    {
+                        let (paused, changed) = &*reaper_gate;
+                        let mut paused = paused
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        while *paused {
+                            paused = changed
+                                .wait(paused)
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        }
+                        drop(paused);
                     }
+                    finish_reap_request(request, &reaper_pending);
                 }
             })?;
-        Ok(Self { sender, pending })
+        Ok(Self {
+            sender,
+            pending,
+            overflow,
+            #[cfg(test)]
+            gate,
+        })
     }
 
     fn enqueue(
         &self,
         child: Option<Child>,
         readers: Vec<JoinHandle<io::Result<()>>>,
+        cleanup_permit: OwnedSemaphorePermit,
     ) -> io::Result<oneshot::Receiver<io::Result<()>>> {
         let (completion, receiver) = oneshot::channel();
         if readers.is_empty() && child.is_none() {
@@ -131,45 +170,126 @@ impl ReaderReaper {
             return Ok(receiver);
         }
         self.pending.fetch_add(1, Ordering::SeqCst);
-        if self
-            .sender
-            .send(ReaderReapRequest {
-                child,
-                readers,
-                completion: Some(completion),
-            })
-            .is_err()
-        {
-            self.pending.fetch_sub(1, Ordering::SeqCst);
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "output reader reaper is unavailable",
-            ));
+        match self.sender.try_send(ReaderReapRequest {
+            child,
+            readers,
+            completion: Some(completion),
+            cleanup_permit,
+        }) {
+            Ok(()) => {}
+            Err(TrySendError::Full(request)) => {
+                self.overflow
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push_back(request);
+            }
+            Err(TrySendError::Disconnected(request)) => {
+                enqueue_detached_fallback(request, Arc::clone(&self.pending), &self.overflow)?;
+            }
         }
         Ok(receiver)
     }
 
-    fn enqueue_detached(&self, child: Option<Child>, readers: Vec<JoinHandle<io::Result<()>>>) {
+    fn enqueue_detached(
+        &self,
+        child: Option<Child>,
+        readers: Vec<JoinHandle<io::Result<()>>>,
+        cleanup_permit: OwnedSemaphorePermit,
+    ) {
         if readers.is_empty() && child.is_none() {
             return;
         }
         self.pending.fetch_add(1, Ordering::SeqCst);
-        if self
-            .sender
-            .send(ReaderReapRequest {
-                child,
-                readers,
-                completion: None,
-            })
-            .is_err()
-        {
-            self.pending.fetch_sub(1, Ordering::SeqCst);
+        let request = ReaderReapRequest {
+            child,
+            readers,
+            completion: None,
+            cleanup_permit,
+        };
+        match self.sender.try_send(request) {
+            Ok(()) => {}
+            Err(TrySendError::Full(request)) => {
+                self.overflow
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push_back(request);
+            }
+            Err(TrySendError::Disconnected(request)) => {
+                if let Err(error) =
+                    enqueue_detached_fallback(request, Arc::clone(&self.pending), &self.overflow)
+                {
+                    emit_worker_diagnostic("reader_reaper_unavailable", "", &error);
+                }
+            }
         }
     }
 
     fn pending(&self) -> usize {
         self.pending.load(Ordering::SeqCst)
     }
+
+    #[cfg(test)]
+    fn pause_for_test(&self) {
+        *self
+            .gate
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+    }
+
+    #[cfg(test)]
+    fn resume_for_test(&self) {
+        *self
+            .gate
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = false;
+        self.gate.1.notify_all();
+    }
+}
+
+fn finish_reap_request(request: ReaderReapRequest, pending: &AtomicUsize) {
+    let ReaderReapRequest {
+        child,
+        readers,
+        completion,
+        cleanup_permit: _cleanup_permit,
+    } = request;
+    let result = reap_child_and_readers(child, readers);
+    pending.fetch_sub(1, Ordering::SeqCst);
+    if let Some(completion) = completion {
+        let _ = completion.send(result);
+    }
+}
+
+fn enqueue_detached_fallback(
+    request: ReaderReapRequest,
+    pending: Arc<AtomicUsize>,
+    overflow: &Mutex<VecDeque<ReaderReapRequest>>,
+) -> io::Result<()> {
+    let request = Arc::new(Mutex::new(Some(request)));
+    let thread_request = Arc::clone(&request);
+    let spawn = thread::Builder::new()
+        .name("conductor-reader-reaper-fallback".to_owned())
+        .spawn(move || {
+            if let Ok(mut request) = thread_request.lock()
+                && let Some(request) = request.take()
+            {
+                finish_reap_request(request, &pending);
+            }
+        });
+    if let Err(error) = spawn {
+        if let Ok(mut request) = request.lock()
+            && let Some(request) = request.take()
+        {
+            overflow
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_back(request);
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn join_readers(readers: Vec<JoinHandle<io::Result<()>>>) -> io::Result<()> {
@@ -208,6 +328,7 @@ struct SpawnGuard {
     group_id: u32,
     child: Option<Child>,
     readers: Vec<JoinHandle<io::Result<()>>>,
+    cleanup_permit: Option<OwnedSemaphorePermit>,
     cancel_readers: Arc<AtomicBool>,
     cleaned: bool,
 }
@@ -240,8 +361,15 @@ impl SpawnGuard {
     }
 
     fn enqueue_readers(&mut self) -> io::Result<oneshot::Receiver<io::Result<()>>> {
-        self.reader_reaper
-            .enqueue(self.child.take(), std::mem::take(&mut self.readers))
+        let cleanup_permit = self
+            .cleanup_permit
+            .take()
+            .ok_or_else(|| io::Error::other("cleanup reservation is missing"))?;
+        self.reader_reaper.enqueue(
+            self.child.take(),
+            std::mem::take(&mut self.readers),
+            cleanup_permit,
+        )
     }
 }
 
@@ -281,8 +409,13 @@ impl Drop for SpawnGuard {
         if let Some(child) = &mut self.child {
             let _ = child.kill();
         }
-        self.reader_reaper
-            .enqueue_detached(self.child.take(), std::mem::take(&mut self.readers));
+        if let Some(cleanup_permit) = self.cleanup_permit.take() {
+            self.reader_reaper.enqueue_detached(
+                self.child.take(),
+                std::mem::take(&mut self.readers),
+                cleanup_permit,
+            );
+        }
     }
 }
 
@@ -364,6 +497,7 @@ pub struct WorkerService {
     persistence_admission: Arc<Semaphore>,
     shutdown_signal: watch::Sender<bool>,
     reader_reaper: ReaderReaper,
+    cleanup_admission: Arc<Semaphore>,
     runtime: Runtime,
     supervisors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     lifecycle: Mutex<()>,
@@ -375,6 +509,10 @@ impl Drop for WorkerService {
         let _ = self.shutdown();
     }
 }
+
+#[cfg(test)]
+#[path = "reader_reaper_tests.rs"]
+mod reader_reaper_tests;
 
 impl WorkerService {
     pub fn open(
@@ -609,6 +747,7 @@ impl WorkerService {
             persistence_admission: Arc::new(Semaphore::new(PERSISTENCE_BLOCKING_CAPACITY)),
             shutdown_signal: watch::channel(false).0,
             reader_reaper: ReaderReaper::new()?,
+            cleanup_admission: Arc::new(Semaphore::new(capacity)),
             runtime,
             supervisors: Mutex::new(Vec::new()),
             lifecycle: Mutex::new(()),
@@ -633,7 +772,7 @@ impl WorkerService {
         }
         let spec_json = serde_json::to_string(spec).map_err(|_| WorkerError::StorageUnavailable)?;
         let now = now_ms().map_err(|_| WorkerError::StorageUnavailable)?;
-        let observation = {
+        let (observation, cleanup_permit) = {
             let mut state = self
                 .state
                 .0
@@ -658,6 +797,9 @@ impl WorkerService {
                 return serde_json::from_str(&stored_observation)
                     .map_err(|_| WorkerError::StorageUnavailable);
             }
+            let cleanup_permit = Arc::clone(&self.cleanup_admission)
+                .try_acquire_owned()
+                .map_err(|_| WorkerError::CapacityReached)?;
             if self.is_degraded() {
                 return Err(WorkerError::StorageUnavailable);
             }
@@ -686,7 +828,7 @@ impl WorkerService {
             transaction
                 .commit()
                 .map_err(|_| WorkerError::StorageUnavailable)?;
-            observation
+            (observation, cleanup_permit)
         };
 
         let starting = observation
@@ -736,6 +878,7 @@ impl WorkerService {
             group_id,
             child: Some(child),
             readers: Vec::with_capacity(2),
+            cleanup_permit: Some(cleanup_permit),
             cancel_readers: Arc::new(AtomicBool::new(false)),
             cleaned: false,
         };
@@ -1109,11 +1252,12 @@ impl WorkerService {
             .len()
             .map_err(|_| WorkerError::StorageUnavailable)?;
         let degraded = self.is_degraded();
+        let cleanup_available = self.cleanup_admission.available_permits() > 0;
         Ok(WorkerStatus::new(
             self.descriptor(),
             used,
             unknown,
-            !draining && !degraded,
+            !draining && !degraded && cleanup_available,
             draining,
             observed_at,
         )
