@@ -48,7 +48,7 @@ struct TestBackend {
 }
 
 impl ExecutionBackend for TestBackend {
-    fn spawn(&self, job: &JobSpec) -> io::Result<Child> {
+    fn spawn(&self, _run_id: &str, job: &JobSpec) -> io::Result<Child> {
         self.spawns.fetch_add(1, Ordering::SeqCst);
         let mut command = Command::new(&job.command()[0]);
         command

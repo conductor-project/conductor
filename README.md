@@ -2,7 +2,7 @@
 
 Conductor is an early-stage Linux daemon for managing and running jobs. MVP1 targets one `conductor` binary that combines manager and worker responsibilities behind explicit interfaces. It validates and stores immutable job definitions, starts local host processes, and records run observations through a loopback HTTP API. Job definitions and run history survive agent restarts; a process whose outcome becomes ambiguous across a crash is marked `unknown` and is not automatically replayed.
 
-The host process backend runs with the daemon user's operating-system permissions and network access. It is not a security sandbox. Each process starts in a dedicated process group; ordinary group members are force-cleaned after the leader exits and during daemon shutdown. A process can deliberately leave its group, so this mechanism is not containment.
+The host process backend runs with the daemon user's operating-system permissions and network access. It is not a security sandbox. Each process starts in a dedicated process group; ordinary group members are force-cleaned after the leader exits and during daemon shutdown. A process can deliberately leave its group, so process groups alone are not containment. Optional Linux cgroup v2 enforcement places the launcher in a per-run cgroup before it executes the job, applies CPU, memory, swap, and process-count limits, and cleans up descendants that leave the process group. It does not provide filesystem or network isolation, and workloads sharing the daemon UID may interfere with cgroup files if the administrator has not protected the delegated hierarchy.
 
 ## Requirements
 
@@ -129,6 +129,28 @@ curl --fail-with-body "http://127.0.0.1:8080/v1/runs/$run_id/logs?stream=stdout&
 Definitions require an absolute executable path and absolute working directory. Arguments are passed directly to the executable without an implicit shell. Environment inheritance defaults to false; only the explicit `env` map is added unless `inheritEnv` is set true. Unknown fields and invalid paths, identifiers, environment entries, and duration bounds are rejected with a stable JSON error envelope. Registration only stores the definition; it never launches the command.
 
 Configuration is strict JSON. The listener must bind to IPv4 or IPv6 loopback. Manager and worker state directories must be separate, worker ID must be stable and valid, and concurrency must be between 1 and 64. `log_max_bytes_per_stream` sets the per-run stdout and stderr cap (1 byte to 1 GiB); `log_retention_runs` sets the number of newest completed runs whose logs are retained (0 to 10,000). The daemon canonicalizes both state paths and holds OS file locks on them for its lifetime; concurrent processes using either directory, including through a symlink alias, fail startup. Lock files left by a crashed process do not block a later start because the OS releases the lock when the process exits. On Unix, state directories use mode `0700`, and the database and lock files use `0600`.
+
+`cgroup_v2.enabled` defaults to `false` for compatibility. When enabled, `delegated_root` must identify an administrator-delegated, non-root cgroup v2 directory with the `cpu`, `memory`, and `pids` controllers enabled for child groups. Conductor creates an exclusive `conductor-<worker-id-hash>` subtree there; reserve it for this worker because startup removes only stale `run-*` groups inside that subtree. The daemon never configures systemd delegation or changes controllers on ancestors. The checked-in systemd unit requests `Delegate=cpu memory pids`; after enabling delegation, set `delegated_root` to that unit's cgroup directory. Startup fails if required controls or permissions are missing.
+
+The optional job field `resourceLimits` accepts `cpuQuotaUs` with `cpuPeriodUs` (quota and period in microseconds), `memoryMaxBytes`, `memorySwapMaxBytes`, and `pidsMax`. Swap is separately limited; `memorySwapMaxBytes: 0` disables swap for the run. Omitted per-job values inherit the matching administrator `cgroup_v2.maximums` value. Job requests above an administrator maximum are rejected before workload execution. For example:
+
+```json
+{
+  "cgroup_v2": {
+    "enabled": true,
+    "delegatedRoot": "/sys/fs/cgroup/system.slice/conductor.service",
+    "maximums": {
+      "cpuQuotaUs": 200000,
+      "cpuPeriodUs": 100000,
+      "memoryMaxBytes": 536870912,
+      "memorySwapMaxBytes": 0,
+      "pidsMax": 128
+    }
+  }
+}
+```
+
+Keep the workload UID from writing cgroup control files or migrating itself outside the delegated subtree. A delegated root owned by the same UID as the workload is not itself a security boundary. Cgroups provide resource limits and descendant cleanup only; they do not hide host metadata, restrict files or network, or prevent all same-user interference. When cgroup enforcement is disabled, jobs that request resource limits fail before their executable is launched.
 
 ### systemd operation
 
