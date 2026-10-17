@@ -520,15 +520,12 @@ fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit(
     let lock = Connection::open(&database).expect("open lock connection");
     lock.execute_batch("BEGIN EXCLUSIVE;")
         .expect("hold manager write lock");
-    let (status, body) = {
-        let address = address;
-        thread::spawn(move || {
-            let body = job_json("blocked-survives", &["/usr/bin/true"]);
-            http(address, "POST", "/v1/jobs", Some("application/json"), &body)
-        })
-        .join()
-        .expect("timed-out write request")
-    };
+    let (status, body) = thread::spawn(move || {
+        let body = job_json("blocked-survives", &["/usr/bin/true"]);
+        http(address, "POST", "/v1/jobs", Some("application/json"), &body)
+    })
+    .join()
+    .expect("timed-out write request");
     assert_eq!(status, 408, "{body}");
     lock.execute_batch("ROLLBACK;")
         .expect("release manager write lock");
