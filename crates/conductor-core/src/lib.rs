@@ -10,6 +10,7 @@ const MAX_IDENTIFIER_LENGTH: usize = 128;
 const DEFAULT_TERMINATION_GRACE_MS: u64 = 5_000;
 const MAX_TERMINATION_GRACE_MS: u64 = 300_000;
 const MAX_TIMEOUT_MS: u64 = 604_800_000;
+pub const MAX_WORKER_CAPACITY: usize = 1_000;
 
 /// An identifier failed the stable ASCII identifier format.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +86,253 @@ macro_rules! stable_id {
 stable_id!(JobId);
 stable_id!(RunId);
 stable_id!(WorkerId);
+
+/// Local worker registration advertised through the manager-worker contract.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerDescriptor {
+    worker_id: WorkerId,
+    capacity: usize,
+    process_execution: bool,
+}
+
+impl WorkerDescriptor {
+    pub fn new(worker_id: WorkerId, capacity: usize, process_execution: bool) -> Self {
+        Self {
+            worker_id,
+            capacity,
+            process_execution,
+        }
+    }
+    pub fn worker_id(&self) -> &WorkerId {
+        &self.worker_id
+    }
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+    pub fn supports_process_execution(&self) -> bool {
+        self.process_execution
+    }
+}
+
+/// A fixed job-definition snapshot assigned to one worker execution attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunSpec {
+    id: RunId,
+    worker_id: WorkerId,
+    job: JobSpec,
+}
+
+impl RunSpec {
+    pub fn new(id: RunId, worker_id: WorkerId, job: JobSpec) -> Self {
+        Self { id, worker_id, job }
+    }
+
+    pub fn id(&self) -> &RunId {
+        &self.id
+    }
+
+    pub fn worker_id(&self) -> &WorkerId {
+        &self.worker_id
+    }
+
+    pub fn job(&self) -> &JobSpec {
+        &self.job
+    }
+}
+
+/// The manager's durable view of a run, updated only by increasing revisions.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunState {
+    Requested,
+    Starting,
+    Running,
+    Succeeded,
+    Failed,
+    Stopping,
+    Cancelled,
+    TimedOut,
+    Unknown,
+    Abandoned,
+}
+
+impl RunState {
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::Failed | Self::Cancelled | Self::TimedOut | Self::Abandoned
+        )
+    }
+
+    pub fn is_active_or_unresolved(self) -> bool {
+        !self.is_terminal()
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Requested => "requested",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Stopping => "stopping",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+            Self::Unknown => "unknown",
+            Self::Abandoned => "abandoned",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunFailureReason {
+    SpawnFailed,
+    NonZeroExit,
+    SignalTerminated,
+    CapacityRejected,
+    BackendFailure,
+    OutcomeUnknown,
+}
+
+/// Serializable worker observation. Process IDs are deliberately not part of the contract.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RunObservation {
+    run_id: RunId,
+    job_id: JobId,
+    worker_id: WorkerId,
+    revision: u64,
+    state: RunState,
+    requested_at_ms: i64,
+    started_at_ms: Option<i64>,
+    finished_at_ms: Option<i64>,
+    exit_code: Option<i32>,
+    termination_signal: Option<i32>,
+    failure_reason: Option<RunFailureReason>,
+}
+
+impl RunObservation {
+    pub fn requested(spec: &RunSpec, requested_at_ms: i64) -> Self {
+        Self {
+            run_id: spec.id.clone(),
+            job_id: spec.job.id.clone(),
+            worker_id: spec.worker_id.clone(),
+            revision: 1,
+            state: RunState::Requested,
+            requested_at_ms,
+            started_at_ms: None,
+            finished_at_ms: None,
+            exit_code: None,
+            termination_signal: None,
+            failure_reason: None,
+        }
+    }
+
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+    pub fn job_id(&self) -> &JobId {
+        &self.job_id
+    }
+    pub fn worker_id(&self) -> &WorkerId {
+        &self.worker_id
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn state(&self) -> RunState {
+        self.state
+    }
+    pub fn requested_at_ms(&self) -> i64 {
+        self.requested_at_ms
+    }
+    pub fn started_at_ms(&self) -> Option<i64> {
+        self.started_at_ms
+    }
+    pub fn finished_at_ms(&self) -> Option<i64> {
+        self.finished_at_ms
+    }
+    pub fn exit_code(&self) -> Option<i32> {
+        self.exit_code
+    }
+    pub fn termination_signal(&self) -> Option<i32> {
+        self.termination_signal
+    }
+    pub fn failure_reason(&self) -> Option<RunFailureReason> {
+        self.failure_reason
+    }
+
+    pub fn next_revision(
+        &self,
+        state: RunState,
+        started_at_ms: Option<i64>,
+        finished_at_ms: Option<i64>,
+        exit_code: Option<i32>,
+        termination_signal: Option<i32>,
+        failure_reason: Option<RunFailureReason>,
+    ) -> Option<Self> {
+        Some(Self {
+            run_id: self.run_id.clone(),
+            job_id: self.job_id.clone(),
+            worker_id: self.worker_id.clone(),
+            revision: self.revision.checked_add(1)?,
+            state,
+            requested_at_ms: self.requested_at_ms,
+            started_at_ms,
+            finished_at_ms,
+            exit_code,
+            termination_signal,
+            failure_reason,
+        })
+    }
+
+    /// Apply an observation only if it is newer than the currently accepted revision.
+    pub fn apply_newer(&mut self, newer: Self) -> bool {
+        if self.state.is_terminal()
+            || newer.run_id != self.run_id
+            || newer.job_id != self.job_id
+            || newer.worker_id != self.worker_id
+            || newer.revision <= self.revision
+        {
+            return false;
+        }
+        *self = newer;
+        true
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct StartRun {
+    spec: RunSpec,
+}
+
+impl StartRun {
+    pub fn new(spec: RunSpec) -> Self {
+        Self { spec }
+    }
+    pub fn spec(&self) -> &RunSpec {
+        &self.spec
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InspectRun {
+    run_id: RunId,
+}
+
+impl InspectRun {
+    pub fn new(run_id: RunId) -> Self {
+        Self { run_id }
+    }
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+}
 
 /// Invalid process/job specification input. Messages never include submitted values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -2,7 +2,7 @@
 
 Conductor is an early-stage Linux daemon for managing jobs and runs. MVP1 targets one `conductor` binary that combines manager and worker responsibilities behind explicit interfaces. The current runnable milestone validates and manages immutable job definitions over a loopback HTTP API. Job registration does not execute processes; process execution is a later milestone. Job definitions are stored durably in SQLite under the configured manager state directory and survive agent restarts.
 
-The host process backend runs with the daemon user's operating-system permissions and network access. It is not a security sandbox.
+The host process backend runs with the daemon user's operating-system permissions and network access. It is not a security sandbox. Each process starts in a dedicated process group; ordinary group members are force-cleaned after the leader exits and during daemon shutdown. A process can deliberately leave its group, so this mechanism is not containment.
 
 ## Requirements
 
@@ -47,9 +47,25 @@ curl --fail -X DELETE http://127.0.0.1:8080/v1/jobs/hello
 
 `POST /v1/jobs` returns 201 with the validated immutable definition; duplicate and previously deleted IDs return 409. `GET /v1/jobs` returns `{"jobs":[...]}` ordered by ID. `GET /v1/jobs/{id}` returns 200 or 404, and `DELETE /v1/jobs/{id}` returns 204 or 404. Deletion reserves the ID so it cannot refer to a different definition later. The manager currently accepts up to 1,000 active jobs and reserves up to 10,000 IDs; request bodies are limited to 65,536 bytes. These limits are temporary until pagination is implemented.
 
+Start and inspect a run using the checked-in [success example](examples/job.json) and [failure example](examples/job-failure.json):
+
+```sh
+curl --fail-with-body -H 'Content-Type: application/json' \
+  --data-binary @examples/job.json http://127.0.0.1:8080/v1/jobs
+curl --fail-with-body -X POST -D - http://127.0.0.1:8080/v1/jobs/hello/runs
+curl --fail-with-body -H 'Content-Type: application/json' \
+  --data-binary @examples/job-failure.json http://127.0.0.1:8080/v1/jobs
+curl --fail-with-body -X POST -D - http://127.0.0.1:8080/v1/jobs/failure/runs
+curl --fail http://127.0.0.1:8080/v1/runs
+```
+
+Run start returns 202 and a relative `Location: /v1/runs/{runId}` header. Poll that URL for `requested`, `starting`, `running`, then `succeeded` or `failed`. `GET /v1/runs` accepts `jobId`, `state`, and `limit`; responses are capped at 100 observations. Results include requested/start/finish timestamps, exit code or termination signal, and a structured `failureReason`: `spawn_failed`, `non_zero_exit`, `signal_terminated`, `backend_failure`, or `outcome_unknown`. Run IDs are not process IDs. Starting a job that already has an active or unresolved run, or deleting it while that run is held, returns 409. A full local worker returns 429. Non-null job timeouts are rejected until deadline enforcement is implemented. `stopping`, `cancelled`, `timed_out`, `unknown`, and `abandoned` are reserved for later lifecycle slices; `unknown` is used when launch or outcome becomes ambiguous after restart.
+
+Runs are committed to manager storage before dispatch. The worker has its own SQLite database under `worker_data_dir`; accepted run specifications and observations are committed before a process launches. Repeating the same worker `StartRun` command returns the existing observation, while reusing its run ID with a different specification is a conflict. After a daemon restart, any worker run that was not known terminal becomes `unknown` and keeps its job and capacity reservation. It is not automatically replayed; this avoids claiming exactly-once execution when a crash leaves process launch ambiguous. `unknown` and `abandoned` states reserve their future lifecycle semantics. Standard output and error are continuously drained using fixed-size buffers into private per-run files in the worker state directory; public log retrieval is not implemented yet.
+
 Definitions require an absolute executable path and absolute working directory. Arguments are passed directly to the executable without an implicit shell. Environment inheritance defaults to false; only the explicit `env` map is added unless `inheritEnv` is set true. Unknown fields and invalid paths, identifiers, environment entries, and duration bounds are rejected with a stable JSON error envelope. Registration only stores the definition; it never launches the command.
 
-Configuration is strict JSON. The listener must bind to IPv4 or IPv6 loopback. Manager and worker state directories must be separate, worker ID must be stable and valid, and concurrency must be positive. The daemon canonicalizes both state paths and holds OS file locks on them for its lifetime; concurrent processes using either directory, including through a symlink alias, fail startup. Lock files left by a crashed process do not block a later start because the OS releases the lock when the process exits. On Unix, state directories use mode `0700`, and the database and lock files use `0600`.
+Configuration is strict JSON. The listener must bind to IPv4 or IPv6 loopback. Manager and worker state directories must be separate, worker ID must be stable and valid, and concurrency must be between 1 and 1,000. The daemon canonicalizes both state paths and holds OS file locks on them for its lifetime; concurrent processes using either directory, including through a symlink alias, fail startup. Lock files left by a crashed process do not block a later start because the OS releases the lock when the process exits. On Unix, state directories use mode `0700`, and the database and lock files use `0600`.
 
 The manager database is `manager.sqlite3` in `manager_data_dir`. SQLite uses WAL journaling with `synchronous=FULL`; database schema changes run as versioned transactions. Startup fails closed if the database is corrupt, inaccessible, or has a schema version newer than the daemon supports. Back up the manager state directory while the daemon is stopped so the database and WAL state remain consistent. `127.0.0.1:0` is supported for integration tests.
 

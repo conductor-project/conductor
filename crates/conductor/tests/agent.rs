@@ -48,6 +48,22 @@ impl Drop for Agent {
     }
 }
 
+struct ProcessGuard(PathBuf);
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        if let Ok(pid) = fs::read_to_string(&self.0)
+            && let Ok(pid) = pid.trim().parse::<u32>()
+        {
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
 fn write_config(path: &Path, role: &str, listen: &str, extra: &str) -> PathBuf {
     write_config_dirs(
         path,
@@ -255,6 +271,17 @@ fn http(
     content_type: Option<&str>,
     body: &[u8],
 ) -> (u16, String) {
+    let (status, _, body) = http_with_headers(address, method, path, content_type, body);
+    (status, body)
+}
+
+fn http_with_headers(
+    address: SocketAddr,
+    method: &str,
+    path: &str,
+    content_type: Option<&str>,
+    body: &[u8],
+) -> (u16, String, String) {
     let mut stream = TcpStream::connect(address).expect("connect to agent");
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
@@ -284,7 +311,7 @@ fn http(
         .expect("HTTP status")
         .parse()
         .expect("numeric status");
-    (status, body.to_owned())
+    (status, headers.to_owned(), body.to_owned())
 }
 
 fn job_json(id: &str, command: &[&str]) -> Vec<u8> {
@@ -294,6 +321,51 @@ fn job_json(id: &str, command: &[&str]) -> Vec<u8> {
         "cwd": "/tmp",
     }))
     .expect("encode job")
+}
+
+fn job_with(id: &str, command: &[String], cwd: &str, env: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "id": id,
+        "command": command,
+        "cwd": cwd,
+        "env": env,
+    }))
+    .expect("encode job")
+}
+
+fn start_and_poll(address: SocketAddr, job_id: &str) -> serde_json::Value {
+    let (status, headers, body) = http_with_headers(
+        address,
+        "POST",
+        &format!("/v1/jobs/{job_id}/runs"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 202, "{body}");
+    let run: serde_json::Value = serde_json::from_str(&body).expect("accepted run JSON");
+    let run_id = run["runId"].as_str().expect("run ID");
+    assert!(
+        headers
+            .lines()
+            .any(|line| line.eq_ignore_ascii_case(&format!("Location: /v1/runs/{run_id}"))),
+        "missing Location header: {headers}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, body) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
+        assert_eq!(status, 200, "{body}");
+        let observation: serde_json::Value = serde_json::from_str(&body).expect("run observation");
+        if ["succeeded", "failed"].contains(&observation["state"].as_str().unwrap_or("")) {
+            assert!(observation["finishedAtMs"].is_number());
+            assert!(observation.get("pid").is_none());
+            return observation;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run did not reach terminal state: {observation}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]
@@ -644,4 +716,444 @@ fn actual_binary_rejects_aliased_state_directories_and_sets_private_permissions(
     );
     signal(&child, "INT");
     wait_for_exit(&mut child);
+}
+
+#[test]
+fn actual_binary_executes_jobs_and_reports_distinct_process_outcomes() {
+    let path = TempDir::new("run-outcomes");
+    let (mut child, address) = start(&path, "all", None);
+    let cases = [
+        (
+            "success",
+            vec!["/usr/bin/true".to_owned()],
+            "/tmp",
+            serde_json::json!({}),
+            "succeeded",
+            None,
+            None,
+        ),
+        (
+            "nonzero",
+            vec!["/bin/sh".into(), "-c".into(), "exit 17".into()],
+            "/tmp",
+            serde_json::json!({}),
+            "failed",
+            Some(17),
+            Some("non_zero_exit"),
+        ),
+        (
+            "launch",
+            vec!["/missing/conductor-run-executable".into()],
+            "/tmp",
+            serde_json::json!({}),
+            "failed",
+            None,
+            Some("spawn_failed"),
+        ),
+        (
+            "cwd",
+            vec!["/usr/bin/true".into()],
+            "/tmp/no-such-conductor-cwd",
+            serde_json::json!({}),
+            "failed",
+            None,
+            Some("spawn_failed"),
+        ),
+        (
+            "signal",
+            vec!["/bin/sh".into(), "-c".into(), "kill -TERM $$".into()],
+            "/tmp",
+            serde_json::json!({}),
+            "failed",
+            None,
+            Some("signal_terminated"),
+        ),
+    ];
+    for (id, command, cwd, env, state, exit_code, failure) in cases {
+        let payload = job_with(id, &command, cwd, env);
+        let (status, created) = http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &payload,
+        );
+        assert_eq!(status, 201, "{created}");
+        let observation = start_and_poll(address, id);
+        assert_eq!(observation["state"], state);
+        if let Some(code) = exit_code {
+            assert_eq!(observation["exitCode"], code);
+        }
+        if let Some(reason) = failure {
+            assert_eq!(observation["failureReason"], reason);
+        }
+        if id == "signal" {
+            assert!(observation["terminationSignal"].is_number());
+        }
+    }
+
+    let marker = path.join("must-not-expand");
+    let literal = format!("argument with spaces; $(touch {})", marker.display());
+    let command = vec!["/usr/bin/printf".into(), "%s".into(), literal.clone()];
+    let payload = job_with("arguments", &command, "/tmp", serde_json::json!({}));
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &payload
+        )
+        .0,
+        201
+    );
+    let observation = start_and_poll(address, "arguments");
+    let run_id = observation["runId"].as_str().unwrap();
+    assert_eq!(
+        fs::read_to_string(path.join("worker/runs").join(format!("{run_id}.stdout"))).unwrap(),
+        literal
+    );
+    assert!(!marker.exists(), "shell metacharacters must remain literal");
+
+    let env_payload = job_with(
+        "environment",
+        &["/usr/bin/env".into()],
+        "/tmp",
+        serde_json::json!({"CONDUCTOR_TEST_VALUE":"expected"}),
+    );
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &env_payload
+        )
+        .0,
+        201
+    );
+    let observation = start_and_poll(address, "environment");
+    let run_id = observation["runId"].as_str().unwrap();
+    let env_output =
+        fs::read_to_string(path.join("worker/runs").join(format!("{run_id}.stdout"))).unwrap();
+    assert_eq!(env_output.trim(), "CONDUCTOR_TEST_VALUE=expected");
+
+    let canonical_cwd = fs::canonicalize(&*path).unwrap();
+    let cwd = canonical_cwd.to_str().unwrap();
+    let cwd_payload = job_with(
+        "working-directory",
+        &["/bin/pwd".into()],
+        cwd,
+        serde_json::json!({}),
+    );
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &cwd_payload
+        )
+        .0,
+        201
+    );
+    let observation = start_and_poll(address, "working-directory");
+    let run_id = observation["runId"].as_str().unwrap();
+    let output =
+        fs::read_to_string(path.join("worker/runs").join(format!("{run_id}.stdout"))).unwrap();
+    assert_eq!(output.trim(), cwd);
+
+    let (status, collection) = http(
+        address,
+        "GET",
+        "/v1/runs?jobId=nonzero&state=failed&limit=1",
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "{collection}");
+    let collection: serde_json::Value = serde_json::from_str(&collection).unwrap();
+    assert_eq!(collection["runs"].as_array().unwrap().len(), 1);
+    signal(&child, "TERM");
+    wait_for_exit(&mut child);
+}
+
+#[test]
+fn actual_binary_inherits_environment_only_when_job_opts_in() {
+    let path = TempDir::new("inherit-environment");
+    let config = write_config(&path, "all", "127.0.0.1:0", "");
+    let mut child = Agent(
+        command(&config, None)
+            .env("CONDUCTOR_PARENT_TEST_VALUE", "controlled-value")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start agent with controlled environment"),
+    );
+    let stderr = child.0.stderr.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stderr).read_line(&mut line);
+        let _ = sender.send(line);
+    });
+    let line = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("agent readiness");
+    let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let address: SocketAddr = event["address"].as_str().unwrap().parse().unwrap();
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "id":"inherit-environment",
+        "command":["/usr/bin/env"],
+        "cwd":"/tmp",
+        "inheritEnv":true,
+    }))
+    .unwrap();
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &payload
+        )
+        .0,
+        201
+    );
+    let observation = start_and_poll(address, "inherit-environment");
+    let run_id = observation["runId"].as_str().unwrap();
+    let output =
+        fs::read_to_string(path.join("worker/runs").join(format!("{run_id}.stdout"))).unwrap();
+    assert!(
+        output
+            .lines()
+            .any(|line| line == "CONDUCTOR_PARENT_TEST_VALUE=controlled-value")
+    );
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
+}
+
+#[test]
+fn actual_binary_enforces_one_run_per_job_and_worker_capacity() {
+    let path = TempDir::new("run-capacity");
+    let (mut child, address) = start(&path, "all", None);
+    for id in ["active", "other"] {
+        let payload = job_json(id, &["/bin/sh", "-c", "sleep 5"]);
+        assert_eq!(
+            http(
+                address,
+                "POST",
+                "/v1/jobs",
+                Some("application/json"),
+                &payload
+            )
+            .0,
+            201
+        );
+    }
+    let (status, accepted) = http(address, "POST", "/v1/jobs/active/runs", None, &[]);
+    assert_eq!(status, 202, "{accepted}");
+    let (status, conflict) = http(address, "POST", "/v1/jobs/active/runs", None, &[]);
+    assert_eq!(status, 409, "{conflict}");
+    assert!(conflict.contains("job_conflict"));
+    let (status, conflict) = http(address, "DELETE", "/v1/jobs/active", None, &[]);
+    assert_eq!(status, 409, "{conflict}");
+    let (status, full) = http(address, "POST", "/v1/jobs/other/runs", None, &[]);
+    assert_eq!(status, 429, "{full}");
+    signal(&child, "TERM");
+    wait_for_exit(&mut child);
+}
+
+#[test]
+fn actual_binary_turns_interrupted_runs_unknown_without_replaying_them() {
+    let path = TempDir::new("run-crash");
+    let pid_file = path.join("workload.pid");
+    let marker = path.join("workload-started");
+    let job_command = vec![
+        "/bin/sh".to_owned(),
+        "-c".to_owned(),
+        format!(
+            "echo $$ > {}; echo started >> {}; exec sleep 60",
+            pid_file.display(),
+            marker.display()
+        ),
+    ];
+    let payload = job_with("ambiguous", &job_command, "/tmp", serde_json::json!({}));
+    let config = write_config(&path, "all", "127.0.0.1:0", "");
+    let mut child = Agent(
+        command(&config, None)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start agent"),
+    );
+    let stderr = child.0.stderr.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stderr).read_line(&mut line);
+        let _ = sender.send(line);
+    });
+    let line = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("agent readiness");
+    let event: serde_json::Value = serde_json::from_str(&line).unwrap();
+    let address: SocketAddr = event["address"].as_str().unwrap().parse().unwrap();
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &payload
+        )
+        .0,
+        201
+    );
+    let (status, accepted) = http(address, "POST", "/v1/jobs/ambiguous/runs", None, &[]);
+    assert_eq!(status, 202, "{accepted}");
+    let run: serde_json::Value = serde_json::from_str(&accepted).unwrap();
+    let run_id = run["runId"].as_str().unwrap().to_owned();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !pid_file.exists() {
+        assert!(Instant::now() < deadline, "workload did not start");
+        thread::sleep(Duration::from_millis(10));
+    }
+    signal(&child, "KILL");
+    let _ = child.0.wait().expect("wait for killed agent");
+
+    let (mut restarted, address) = start(&path, "all", None);
+    let (status, body) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
+    assert_eq!(status, 200, "{body}");
+    let observation: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(observation["state"], "unknown");
+    assert_eq!(fs::read_to_string(&marker).unwrap().lines().count(), 1);
+    assert_eq!(
+        http(address, "POST", "/v1/jobs/ambiguous/runs", None, &[]).0,
+        409
+    );
+    let pid: u32 = fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let status = Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    signal(&restarted, "INT");
+    wait_for_exit(&mut restarted);
+}
+
+#[test]
+fn actual_binary_cleans_process_group_members_and_keeps_terminal_history() {
+    let path = TempDir::new("process-group");
+    let orphan_pid_file = path.join("orphan.pid");
+    let _orphan_guard = ProcessGuard(orphan_pid_file.clone());
+    let (mut child, address) = start(&path, "all", None);
+
+    let leader_exits = job_with(
+        "leader-exits",
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("sleep 60 & echo $! > {}; exit 0", orphan_pid_file.display()),
+        ],
+        "/tmp",
+        serde_json::json!({}),
+    );
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &leader_exits
+        )
+        .0,
+        201
+    );
+    let terminal = start_and_poll(address, "leader-exits");
+    assert_eq!(terminal["state"], "succeeded");
+    let orphan_pid = fs::read_to_string(&orphan_pid_file)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let status = Command::new("ps")
+            .args(["-o", "stat=", "-p", &orphan_pid])
+            .output()
+            .unwrap();
+        let process_state = String::from_utf8_lossy(&status.stdout);
+        if process_state.trim().is_empty() || process_state.trim_start().starts_with('Z') {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "remaining process group member is alive: {process_state}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let (mut restarted, address) = {
+        signal(&child, "INT");
+        wait_for_exit(&mut child);
+        start(&path, "all", None)
+    };
+    let run_id = terminal["runId"].as_str().unwrap();
+    let (status, persisted) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
+    assert_eq!(status, 200, "{persisted}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&persisted).unwrap(),
+        terminal
+    );
+
+    let active_pid_file = path.join("active.pid");
+    let _active_guard = ProcessGuard(active_pid_file.clone());
+    let active = job_with(
+        "shutdown-active",
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("echo $$ > {}; exec sleep 60", active_pid_file.display()),
+        ],
+        "/tmp",
+        serde_json::json!({}),
+    );
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            "/v1/jobs",
+            Some("application/json"),
+            &active
+        )
+        .0,
+        201
+    );
+    assert_eq!(
+        http(address, "POST", "/v1/jobs/shutdown-active/runs", None, &[]).0,
+        202
+    );
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !active_pid_file.exists() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let active_pid = fs::read_to_string(&active_pid_file)
+        .unwrap()
+        .trim()
+        .to_owned();
+    signal(&restarted, "TERM");
+    wait_for_exit(&mut restarted);
+    let status = Command::new("ps")
+        .args(["-o", "stat=", "-p", &active_pid])
+        .output()
+        .unwrap();
+    let process_state = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        process_state.trim().is_empty() || process_state.trim_start().starts_with('Z'),
+        "workload remained alive after shutdown: {process_state}"
+    );
 }
