@@ -173,7 +173,7 @@ impl ReaderReaper {
         cleanup: Option<Box<dyn FnMut() -> io::Result<()> + Send>>,
     ) -> io::Result<oneshot::Receiver<io::Result<()>>> {
         let (completion, receiver) = oneshot::channel();
-        if readers.is_empty() && child.is_none() {
+        if readers.is_empty() && child.is_none() && cleanup.is_none() {
             let _ = completion.send(Ok(()));
             return Ok(receiver);
         }
@@ -206,7 +206,7 @@ impl ReaderReaper {
         cleanup_permit: OwnedSemaphorePermit,
         cleanup: Option<Box<dyn FnMut() -> io::Result<()> + Send>>,
     ) {
-        if readers.is_empty() && child.is_none() {
+        if readers.is_empty() && child.is_none() && cleanup.is_none() {
             return;
         }
         self.pending.fetch_add(1, Ordering::SeqCst);

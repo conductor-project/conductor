@@ -260,3 +260,46 @@ fn spawn_guard_drop_enqueues_cleanup_without_waiting_for_reaper() {
         thread::sleep(Duration::from_millis(5));
     }
 }
+
+#[test]
+fn reaper_runs_backend_cleanup_when_child_and_readers_are_already_gone() {
+    let directory = TestDirectory::new();
+    let backend: Arc<dyn ExecutionBackend> = Arc::new(TestBackend::default());
+    let service = WorkerService::open(
+        &directory.0,
+        WorkerId::new("worker-test").unwrap(),
+        1,
+        backend,
+    )
+    .unwrap();
+    service.reader_reaper.pause_for_test();
+    let permit = Arc::clone(&service.cleanup_admission)
+        .try_acquire_owned()
+        .expect("reserve cleanup capacity");
+    let cleaned = Arc::new(AtomicUsize::new(0));
+    let callback_state = Arc::clone(&cleaned);
+    service
+        .reader_reaper
+        .enqueue(
+            None,
+            Vec::new(),
+            permit,
+            Some(Box::new(move || {
+                callback_state.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })),
+        )
+        .expect("enqueue backend cleanup");
+
+    assert_eq!(service.reader_reaper.pending(), 1);
+    service.reader_reaper.resume_for_test();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while service.reader_reaper.pending() != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "reaper did not run cleanup"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+}
