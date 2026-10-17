@@ -165,6 +165,32 @@ fn wait_for(service: &WorkerService, id: &str) -> conductor_core::RunObservation
     }
 }
 
+fn wait_for_pending_persistence(service: &WorkerService, id: &str) -> conductor_core::WorkerStatus {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = service.status().unwrap();
+        if status.pending_persistence() == 1 {
+            assert!(service.is_degraded());
+            assert!(!status.available());
+            assert_eq!(status.used_slots(), 1);
+            assert!(
+                service
+                    .inspect(conductor_core::InspectRun::new(RunId::new(id).unwrap()))
+                    .unwrap()
+                    .unwrap()
+                    .state()
+                    .is_active_or_unresolved()
+            );
+            return status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "terminal persistence did not become pending"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn worker_acceptance_is_deduplicated_and_terminal_observations_survive_reopen() {
     let directory = TempDir::new();
@@ -378,4 +404,98 @@ fn uncertain_process_group_cleanup_keeps_run_unknown_and_cancels_readers() {
     );
     assert_eq!(service.start(StartRun::new(spec)), Ok(observed));
     assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn terminal_persistence_outage_is_bounded_and_recovers_without_relaunch() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 1, Arc::clone(&backend));
+    let connection = Connection::open(directory.0.join("worker.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_terminal BEFORE UPDATE OF state ON runs
+             WHEN NEW.state IN ('succeeded', 'failed', 'cancelled', 'timed_out')
+             BEGIN SELECT RAISE(FAIL, 'injected terminal persistence failure'); END;",
+        )
+        .unwrap();
+    let spec = run(
+        "terminal-retry",
+        job(
+            "terminal-retry",
+            vec!["/bin/sh".into(), "-c".into(), "sleep 0.05; exit 17".into()],
+        ),
+    );
+    assert_eq!(
+        service.start(StartRun::new(spec.clone())).unwrap().state(),
+        RunState::Running
+    );
+
+    let pending_status = wait_for_pending_persistence(&service, "terminal-retry");
+    assert_eq!(pending_status.pending_persistence(), 1);
+    assert!(pending_status.degraded());
+    assert_eq!(pending_status.available_slots(), 0);
+    thread::sleep(Duration::from_millis(450));
+    let pending_status = service.status().unwrap();
+    assert_eq!(pending_status.pending_persistence(), 1);
+    assert_eq!(pending_status.used_slots(), 1);
+    assert_eq!(pending_status.live_processes(), 0);
+    assert!(pending_status.degraded());
+    assert_eq!(
+        service.start(StartRun::new(run(
+            "blocked-during-persistence",
+            job("blocked-during-persistence", vec!["/bin/true".into()]),
+        ))),
+        Err(WorkerError::StorageUnavailable)
+    );
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
+
+    connection
+        .execute_batch("DROP TRIGGER reject_terminal;")
+        .unwrap();
+    let terminal = wait_for(&service, "terminal-retry");
+    assert_eq!(terminal.state(), RunState::Failed);
+    assert_eq!(terminal.exit_code(), Some(17));
+    assert_eq!(
+        terminal.failure_reason(),
+        Some(RunFailureReason::NonZeroExit)
+    );
+    let status = service.status().unwrap();
+    assert_eq!(status.pending_persistence(), 0);
+    assert!(!status.degraded());
+    assert!(status.available());
+    assert_eq!(status.used_slots(), 0);
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn log_persistence_failure_does_not_change_the_process_exit_outcome() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 1, backend);
+    let connection = Connection::open(directory.0.join("worker.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_log_close BEFORE UPDATE OF stdout_closed ON run_logs
+             BEGIN SELECT RAISE(FAIL, 'injected log persistence failure'); END;",
+        )
+        .unwrap();
+    drop(connection);
+    let observation = service
+        .start(StartRun::new(run(
+            "log-failure",
+            job(
+                "log-failure",
+                vec!["/bin/sh".into(), "-c".into(), "exit 17".into()],
+            ),
+        )))
+        .unwrap();
+    assert_eq!(observation.state(), RunState::Running);
+    let terminal = wait_for(&service, "log-failure");
+    assert_eq!(terminal.state(), RunState::Failed);
+    assert_eq!(terminal.exit_code(), Some(17));
+    assert_eq!(
+        terminal.failure_reason(),
+        Some(RunFailureReason::NonZeroExit)
+    );
 }

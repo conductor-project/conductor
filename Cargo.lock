@@ -163,6 +163,7 @@ dependencies = [
  "conductor-process",
  "conductor-worker",
  "ctrlc",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",
