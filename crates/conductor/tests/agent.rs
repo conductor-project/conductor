@@ -152,6 +152,9 @@ fn start_config(config: PathBuf, role_override: Option<&str>) -> (Agent, SocketA
         let mut line = String::new();
         let _ = reader.read_line(&mut line);
         let _ = sender.send(line);
+        // Keep draining diagnostics after the startup event. Closing this
+        // pipe early can make later eprintln! calls panic in the child.
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
     });
     let line = receiver
         .recv_timeout(Duration::from_secs(5))
@@ -460,8 +463,10 @@ fn request_header_and_processing_time_bounds_are_enforced() {
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
         let mut line = String::new();
-        let _ = BufReader::new(stderr).read_line(&mut line);
+        let mut reader = BufReader::new(stderr);
+        let _ = reader.read_line(&mut line);
         let _ = sender.send(line);
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
     });
     let line = receiver
         .recv_timeout(Duration::from_secs(5))
@@ -2001,10 +2006,9 @@ fn actual_binary_recovers_pending_terminal_persistence_as_unknown_without_replay
         let (status, body) = http(address, "GET", "/v1/workers/test-worker", None, &[]);
         assert_eq!(status, 200, "{body}");
         let worker_status: serde_json::Value = serde_json::from_str(&body).unwrap();
-        if worker_status["pendingPersistence"] == 1 {
+        if worker_status["pendingPersistence"] == 1 && worker_status["liveProcesses"] == 0 {
             assert_eq!(worker_status["degraded"], true);
             assert_eq!(worker_status["usedSlots"], 1);
-            assert_eq!(worker_status["liveProcesses"], 0);
             assert_eq!(worker_status["available"], false);
             break;
         }
@@ -2341,7 +2345,10 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
         201
     );
     start_and_poll(address, "retention-followup");
-    let retention_deadline = Instant::now() + Duration::from_secs(2);
+    // Pruning runs after the asynchronous output readers finish. Keep polling
+    // for that state transition; this is only a deadlock guard, not a latency
+    // expectation for the reader/reaper thread.
+    let retention_deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let (status, body) = http(
             address,
