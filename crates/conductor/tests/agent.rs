@@ -192,7 +192,11 @@ fn wait_for_ready(address: SocketAddr) {
 }
 
 fn wait_for_exit(child: &mut Agent) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    wait_for_exit_with_timeout(child, Duration::from_secs(5));
+}
+
+fn wait_for_exit_with_timeout(child: &mut Agent, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.0.try_wait().expect("poll child") {
             assert!(status.success(), "agent exited with {status}");
@@ -648,7 +652,10 @@ fn actual_binary_shuts_down_on_sigterm() {
         );
     }
     signal(&child, "TERM");
-    wait_for_exit(&mut child);
+    // Server graceful shutdown and worker process cleanup each have an
+    // independent bounded window; keep the test limit aligned with that
+    // documented combined ceiling under a busy test runner.
+    wait_for_exit_with_timeout(&mut child, Duration::from_secs(12));
     assert!(
         TcpStream::connect(address).is_err(),
         "listener remained bound"
@@ -662,6 +669,76 @@ fn actual_binary_shuts_down_on_sigterm() {
             "shutdown"
         );
     }
+    signal(&restarted, "INT");
+    wait_for_exit(&mut restarted);
+}
+
+#[test]
+fn readiness_and_sigterm_remain_responsive_during_stalled_worker_startup() {
+    let path = TempDir::new("worker-start-stall");
+    let (mut child, address) = start_with_request_timeout(&path, 100);
+    let job = job_json("startup-stall", &["/bin/sleep", "30"]);
+    assert_eq!(
+        http(address, "POST", "/v1/jobs", Some("application/json"), &job).0,
+        201
+    );
+
+    // Hold the worker database write lock so start owns its lifecycle gate
+    // while waiting in the worker's bounded SQLite busy timeout.
+    let worker_lock = Connection::open(path.join("worker/worker.sqlite3")).unwrap();
+    worker_lock.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let run_address = address;
+    let run_request = thread::spawn(move || {
+        let response = http(
+            run_address,
+            "POST",
+            "/v1/jobs/startup-stall/runs",
+            None,
+            &[],
+        );
+        sender.send(response).unwrap();
+    });
+    thread::sleep(Duration::from_millis(30));
+
+    let ready_started = Instant::now();
+    let (ready_status, ready_body) = http(address, "GET", "/readyz", None, &[]);
+    assert_eq!(ready_status, 200, "{ready_body}");
+    assert!(ready_started.elapsed() < Duration::from_millis(100));
+    let health_started = Instant::now();
+    let (health_status, health_body) = http(address, "GET", "/healthz", None, &[]);
+    assert_eq!(health_status, 200, "{health_body}");
+    assert!(health_started.elapsed() < Duration::from_millis(100));
+
+    // Status uses bounded blocking storage work; its configured request
+    // deadline must still be serviced by the HTTP executor.
+    let workers_started = Instant::now();
+    let (workers_status, workers_body) = http(address, "GET", "/v1/workers", None, &[]);
+    assert_eq!(workers_status, 408, "{workers_body}");
+    assert!(workers_started.elapsed() < Duration::from_millis(500));
+    let (start_status, start_body) = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+    assert_eq!(start_status, 408, "{start_body}");
+
+    signal(&child, "TERM");
+    worker_lock.execute_batch("ROLLBACK;").unwrap();
+    run_request.join().unwrap();
+    let manager = Connection::open(path.join("manager/manager.sqlite3")).unwrap();
+    let run_id = manager
+        .query_row(
+            "SELECT run_id FROM runs WHERE job_id = 'startup-stall'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    wait_for_exit(&mut child);
+
+    let (mut restarted, address) = start_with_capacity(&path, "all", None, 1);
+    let (status, observation) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
+    assert_eq!(status, 200, "{observation}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&observation).unwrap()["terminationReason"],
+        "shutdown"
+    );
     signal(&restarted, "INT");
     wait_for_exit(&mut restarted);
 }
@@ -2264,14 +2341,25 @@ fn actual_binary_serves_bounded_binary_logs_with_offsets_and_retention_metadata(
         201
     );
     start_and_poll(address, "retention-followup");
-    let (status, body) = http(
-        address,
-        "GET",
-        &format!("/v1/runs/{run_id}/logs?stream=stdout"),
-        None,
-        &[],
-    );
-    assert_eq!(status, 410, "{body}");
+    let retention_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let (status, body) = http(
+            address,
+            "GET",
+            &format!("/v1/runs/{run_id}/logs?stream=stdout"),
+            None,
+            &[],
+        );
+        if status == 410 {
+            break;
+        }
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            Instant::now() < retention_deadline,
+            "completed log was not pruned after asynchronous capture finished: {body}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     let (status, body) = http(
         address,
         "GET",
