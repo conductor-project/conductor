@@ -43,6 +43,8 @@ jobs:
           sudo sh -c 'printf "+cpu +memory +pids" > /sys/fs/cgroup/cgroup.subtree_control'
           sudo mkdir /sys/fs/cgroup/conductor-ci
           sudo chown "$(id -un):$(id -gn)" /sys/fs/cgroup/conductor-ci
+          sudo sh -c 'printf "+cpu +memory +pids" > /sys/fs/cgroup/conductor-ci/cgroup.subtree_control'
+          sudo chown "$(id -u):$(id -g)" /sys/fs/cgroup/conductor-ci/cgroup.procs /sys/fs/cgroup/conductor-ci/cgroup.subtree_control
           printf 'CONDUCTOR_CGROUP_ROOT=/sys/fs/cgroup/conductor-ci\n' >> "$GITHUB_ENV"
       - name: Test real cgroup v2 enforcement and recovery
         run: python3 scripts/test-cgroup-v2.py --binary target/release/conductor --delegated-root "$CONDUCTOR_CGROUP_ROOT"
