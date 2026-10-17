@@ -17,7 +17,8 @@ from pathlib import Path
 
 def request(address, method, route, payload=None):
     body = None if payload is None else json.dumps(payload, separators=(",", ":"))
-    connection = http.client.HTTPConnection(*address, timeout=3)
+    # The cgroup launcher has a bounded five-second placement handshake.
+    connection = http.client.HTTPConnection(*address, timeout=10)
     try:
         headers = {} if body is None else {"Content-Type": "application/json"}
         connection.request(method, route, body=body, headers=headers)
