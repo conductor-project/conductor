@@ -514,10 +514,36 @@ fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit(
         .unwrap()
         .to_owned();
     let database = path.join("manager/manager.sqlite3");
-    let lock = Connection::open(database).expect("open lock connection");
+    // Prove one known operation remains alive after the HTTP request times out.
+    // Keep the lock only until that response arrives, before SQLite's own busy
+    // timeout can expire, then observe the job through the API.
+    let lock = Connection::open(&database).expect("open lock connection");
     lock.execute_batch("BEGIN EXCLUSIVE;")
         .expect("hold manager write lock");
+    let (status, body) = {
+        let address = address;
+        thread::spawn(move || {
+            let body = job_json("blocked-survives", &["/usr/bin/true"]);
+            http(address, "POST", "/v1/jobs", Some("application/json"), &body)
+        })
+        .join()
+        .expect("timed-out write request")
+    };
+    assert_eq!(status, 408, "{body}");
+    lock.execute_batch("ROLLBACK;")
+        .expect("release manager write lock");
+    let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
+    loop {
+        if http(address, "GET", "/v1/jobs/blocked-survives", None, &[]).0 == 200 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "timed-out write did not finish");
+        thread::sleep(Duration::from_millis(20));
+    }
 
+    // Independently saturate general blocking work while storage is locked.
+    lock.execute_batch("BEGIN EXCLUSIVE;")
+        .expect("hold manager write lock for saturation check");
     let requests = 64;
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(requests));
     let handles = (0..requests)
@@ -530,7 +556,7 @@ fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit(
             })
         })
         .collect::<Vec<_>>();
-    thread::sleep(Duration::from_millis(150));
+    thread::sleep(Duration::from_millis(50));
 
     assert_eq!(http(address, "GET", "/healthz", None, &[]).0, 200);
     assert_eq!(http(address, "GET", "/readyz", None, &[]).0, 200);
@@ -558,15 +584,15 @@ fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit(
     }
     let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     loop {
-        if http(address, "GET", "/v1/jobs/blocked-0", None, &[]).0 == 200 {
-            break;
-        }
-        assert!(Instant::now() < deadline, "timed-out writes did not finish");
-        thread::sleep(Duration::from_millis(20));
-    }
-    let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
-    loop {
         let (status, body) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
+        if status == 429 {
+            assert!(
+                Instant::now() < deadline,
+                "blocking work did not release its permits"
+            );
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
         assert_eq!(status, 200, "{body}");
         let observation: serde_json::Value = serde_json::from_str(&body).unwrap();
         if observation["state"] == "cancelled" {
