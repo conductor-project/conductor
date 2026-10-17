@@ -5,7 +5,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,7 +24,7 @@ use conductor_core::{
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use tokio::runtime::Runtime;
-use tokio::sync::{Notify, Semaphore, watch};
+use tokio::sync::{Notify, Semaphore, oneshot, watch};
 
 #[cfg(unix)]
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -32,6 +33,7 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_PERSISTENCE_BUDGET: Duration = Duration::from_secs(2);
 const PERSISTENCE_BLOCKING_CAPACITY: usize = 2;
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 pub const DEFAULT_LOG_MAX_BYTES_PER_STREAM: u64 = 8 * 1024 * 1024;
 pub const DEFAULT_LOG_RETENTION_RUNS: usize = 100;
 pub const MAX_LOG_MAX_BYTES_PER_STREAM: u64 = 1024 * 1024 * 1024;
@@ -87,11 +89,122 @@ struct ActiveGroup {
     notify: Arc<Notify>,
 }
 
+struct ReaderReapRequest {
+    child: Option<Child>,
+    readers: Vec<JoinHandle<io::Result<()>>>,
+    completion: Option<oneshot::Sender<io::Result<()>>>,
+}
+
+#[derive(Clone)]
+struct ReaderReaper {
+    sender: SyncSender<ReaderReapRequest>,
+    pending: Arc<AtomicUsize>,
+}
+
+impl ReaderReaper {
+    fn new() -> io::Result<Self> {
+        let (sender, receiver) = sync_channel::<ReaderReapRequest>(MAX_WORKER_CAPACITY);
+        let pending = Arc::new(AtomicUsize::new(0));
+        let reaper_pending = Arc::clone(&pending);
+        thread::Builder::new()
+            .name("conductor-reader-reaper".to_owned())
+            .spawn(move || {
+                while let Ok(request) = receiver.recv() {
+                    let result = reap_child_and_readers(request.child, request.readers);
+                    reaper_pending.fetch_sub(1, Ordering::SeqCst);
+                    if let Some(completion) = request.completion {
+                        let _ = completion.send(result);
+                    }
+                }
+            })?;
+        Ok(Self { sender, pending })
+    }
+
+    fn enqueue(
+        &self,
+        child: Option<Child>,
+        readers: Vec<JoinHandle<io::Result<()>>>,
+    ) -> io::Result<oneshot::Receiver<io::Result<()>>> {
+        let (completion, receiver) = oneshot::channel();
+        if readers.is_empty() && child.is_none() {
+            let _ = completion.send(Ok(()));
+            return Ok(receiver);
+        }
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        if self
+            .sender
+            .send(ReaderReapRequest {
+                child,
+                readers,
+                completion: Some(completion),
+            })
+            .is_err()
+        {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "output reader reaper is unavailable",
+            ));
+        }
+        Ok(receiver)
+    }
+
+    fn enqueue_detached(&self, child: Option<Child>, readers: Vec<JoinHandle<io::Result<()>>>) {
+        if readers.is_empty() && child.is_none() {
+            return;
+        }
+        self.pending.fetch_add(1, Ordering::SeqCst);
+        if self
+            .sender
+            .send(ReaderReapRequest {
+                child,
+                readers,
+                completion: None,
+            })
+            .is_err()
+        {
+            self.pending.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn pending(&self) -> usize {
+        self.pending.load(Ordering::SeqCst)
+    }
+}
+
+fn join_readers(readers: Vec<JoinHandle<io::Result<()>>>) -> io::Result<()> {
+    let mut first_error = None;
+    for reader in readers {
+        match reader.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                first_error.get_or_insert(error);
+            }
+            Err(_) => {
+                first_error.get_or_insert(io::Error::other("output reader panicked"));
+            }
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+fn reap_child_and_readers(
+    child: Option<Child>,
+    readers: Vec<JoinHandle<io::Result<()>>>,
+) -> io::Result<()> {
+    let mut first_error = child.and_then(|mut child| child.wait().err());
+    if let Err(error) = join_readers(readers) {
+        first_error.get_or_insert(error);
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 /// Owns a spawned process until supervision takes responsibility for it.
 /// Dropping the guard is a last-resort cleanup path; callers should use
 /// `cleanup` when they need to observe cleanup failures.
 struct SpawnGuard {
     backend: Arc<dyn ExecutionBackend>,
+    reader_reaper: ReaderReaper,
     group_id: u32,
     child: Option<Child>,
     readers: Vec<JoinHandle<io::Result<()>>>,
@@ -117,16 +230,8 @@ impl SpawnGuard {
             }
             self.child.take();
         }
-        for reader in self.readers.drain(..) {
-            match reader.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    first_error.get_or_insert(error);
-                }
-                Err(_) => {
-                    first_error.get_or_insert(io::Error::other("output reader panicked"));
-                }
-            }
+        if let Err(error) = join_readers(std::mem::take(&mut self.readers)) {
+            first_error.get_or_insert(error);
         }
         if first_error.is_none() {
             self.cleaned = true;
@@ -134,20 +239,9 @@ impl SpawnGuard {
         first_error.map_or(Ok(()), Err)
     }
 
-    fn finish_readers(&mut self) -> io::Result<()> {
-        let mut first_error = None;
-        for reader in self.readers.drain(..) {
-            match reader.join() {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    first_error.get_or_insert(error);
-                }
-                Err(_) => {
-                    first_error.get_or_insert(io::Error::other("output reader panicked"));
-                }
-            }
-        }
-        first_error.map_or(Ok(()), Err)
+    fn enqueue_readers(&mut self) -> io::Result<oneshot::Receiver<io::Result<()>>> {
+        self.reader_reaper
+            .enqueue(self.child.take(), std::mem::take(&mut self.readers))
     }
 }
 
@@ -179,7 +273,16 @@ impl<T: Read + Send> CaptureRead for T {
 
 impl Drop for SpawnGuard {
     fn drop(&mut self) {
-        let _ = self.cleanup();
+        if self.cleaned {
+            return;
+        }
+        self.cancel_readers.store(true, Ordering::SeqCst);
+        let _ = self.backend.kill_process_group(self.group_id);
+        if let Some(child) = &mut self.child {
+            let _ = child.kill();
+        }
+        self.reader_reaper
+            .enqueue_detached(self.child.take(), std::mem::take(&mut self.readers));
     }
 }
 
@@ -260,6 +363,7 @@ pub struct WorkerService {
     pending: Arc<PendingPersistence>,
     persistence_admission: Arc<Semaphore>,
     shutdown_signal: watch::Sender<bool>,
+    reader_reaper: ReaderReaper,
     runtime: Runtime,
     supervisors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     lifecycle: Mutex<bool>,
@@ -503,6 +607,7 @@ impl WorkerService {
             }),
             persistence_admission: Arc::new(Semaphore::new(PERSISTENCE_BLOCKING_CAPACITY)),
             shutdown_signal: watch::channel(false).0,
+            reader_reaper: ReaderReaper::new()?,
             runtime,
             supervisors: Mutex::new(Vec::new()),
             lifecycle: Mutex::new(false),
@@ -625,6 +730,7 @@ impl WorkerService {
         let group_id = child.id();
         let mut spawned = SpawnGuard {
             backend: Arc::clone(&self.backend),
+            reader_reaper: self.reader_reaper.clone(),
             group_id,
             child: Some(child),
             readers: Vec::with_capacity(2),
@@ -1063,7 +1169,8 @@ impl WorkerService {
                 .pending
                 .all_shutdown_retries_exhausted()
                 .map_err(|_| io::Error::other("pending shutdown set lock poisoned"))?;
-            if (active == 0 && (pending == 0 || retries_exhausted))
+            let pending_readers = self.reader_reaper.pending();
+            if (active == 0 && (pending == 0 || retries_exhausted) && pending_readers == 0)
                 || std::time::Instant::now() >= deadline
             {
                 break;
@@ -1102,7 +1209,8 @@ impl WorkerService {
                 .pending
                 .all_shutdown_retries_exhausted()
                 .map_err(|_| io::Error::other("pending shutdown set lock poisoned"))?;
-            if active == 0 && (pending == 0 || retries_exhausted) {
+            let pending_readers = self.reader_reaper.pending();
+            if active == 0 && (pending == 0 || retries_exhausted) && pending_readers == 0 {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
@@ -1119,6 +1227,7 @@ impl WorkerService {
                 .len()
                 .map_err(|_| io::Error::other("pending persistence lock poisoned"))?
                 > 0
+            || self.reader_reaper.pending() > 0
         {
             first_error.get_or_insert(io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -1821,12 +1930,22 @@ async fn supervise(supervision: RunSupervision) {
                 let _ = backend.kill_process_group(group_id);
                 if let Some(child) = spawned.child.as_mut() {
                     let _ = child.kill();
-                    match child.wait() {
-                        Ok(exit) => {
-                            status = Some(exit);
-                            wait_failed = false;
+                    let reap_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(exit)) => {
+                                status = Some(exit);
+                                wait_failed = false;
+                                break;
+                            }
+                            Ok(None) if tokio::time::Instant::now() < reap_deadline => {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                            Ok(None) | Err(_) => {
+                                wait_failed = true;
+                                break;
+                            }
                         }
-                        Err(_) => wait_failed = true,
                     }
                 } else {
                     wait_failed = true;
@@ -1837,12 +1956,72 @@ async fn supervise(supervision: RunSupervision) {
         }
     }
     let _ = backend.kill_process_group(group_id);
-    // A failed log writer must not rewrite the process exit result. Joining
-    // readers ensures their resources are reclaimed before the run is released.
-    if let Err(error) = spawned.finish_readers() {
-        emit_worker_diagnostic("log_capture_failed", run_id.as_str(), &error);
-    }
-    spawned.child.take();
+    // Reaping and output drain happen off the Tokio executor. Terminal process
+    // state is persisted independently from log capture completion.
+    let reader_completion = match spawned.enqueue_readers() {
+        Ok(completion) => Some(completion),
+        Err(error) => {
+            emit_worker_diagnostic("log_capture_failed", run_id.as_str(), &error);
+            None
+        }
+    };
+    let cancel_readers = Arc::clone(&spawned.cancel_readers);
+    let reader_state = Arc::clone(&state);
+    let reader_run_id = run_id.clone();
+    let reader_admission = Arc::clone(&persistence_admission);
+    let reader_task = reader_completion.map(|completion| {
+        tokio::spawn(async move {
+            let mut incomplete = false;
+            let mut completion = completion;
+            match tokio::time::timeout(OUTPUT_DRAIN_GRACE, &mut completion).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    emit_worker_diagnostic("log_capture_failed", &reader_run_id, &error);
+                }
+                Ok(Err(_)) => {
+                    emit_worker_diagnostic(
+                        "log_capture_failed",
+                        &reader_run_id,
+                        &io::Error::new(io::ErrorKind::BrokenPipe, "reader reaper stopped"),
+                    );
+                }
+                Err(_) => {
+                    incomplete = true;
+                    cancel_readers.store(true, Ordering::SeqCst);
+                    emit_worker_diagnostic(
+                        "log_capture_incomplete",
+                        &reader_run_id,
+                        &io::Error::new(io::ErrorKind::TimedOut, "output drain grace elapsed"),
+                    );
+                    match completion.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            emit_worker_diagnostic("log_capture_failed", &reader_run_id, &error)
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            let close_run_id = reader_run_id.clone();
+            let close_result = run_bounded_blocking(&reader_admission, move || {
+                let stdout = close_log_stream(&reader_state, &close_run_id, LogStream::Stdout);
+                let stderr = close_log_stream(&reader_state, &close_run_id, LogStream::Stderr);
+                stdout.and(stderr)
+            })
+            .await;
+            if let Err(error) = close_result {
+                emit_worker_diagnostic(
+                    if incomplete {
+                        "log_capture_close_failed"
+                    } else {
+                        "log_capture_failed"
+                    },
+                    &reader_run_id,
+                    &error,
+                );
+            }
+        })
+    });
     let finished = now_ms().unwrap_or(current.requested_at_ms());
     let (run_state, exit_code, signal, failure) = match status {
         Some(status) if !wait_failed => status_observation(status),
@@ -1968,6 +2147,9 @@ async fn supervise(supervision: RunSupervision) {
     }
     if let Ok(mut state) = state.0.lock() {
         state.active_groups.remove(&run_id);
+    }
+    if let Some(reader_task) = reader_task {
+        let _ = reader_task.await;
     }
     if let Err(error) = run_bounded_blocking(&persistence_admission, {
         let state = Arc::clone(&state);
