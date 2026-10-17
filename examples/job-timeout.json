@@ -1,0 +1,9 @@
+{
+  "id": "deadline",
+  "command": ["/bin/sleep", "60"],
+  "cwd": "/tmp",
+  "env": {},
+  "inheritEnv": false,
+  "timeoutMs": 1000,
+  "terminationGraceMs": 5000
+}

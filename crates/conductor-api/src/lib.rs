@@ -83,6 +83,7 @@ pub fn router(manager: Arc<JobService>, worker: Arc<dyn WorkerPort>) -> Router {
         .route("/v1/jobs/{id}/runs", post(start_run))
         .route("/v1/runs", get(list_runs))
         .route("/v1/runs/{id}", get(get_run))
+        .route("/v1/runs/{id}/stop", post(stop_run))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state)
 }
@@ -190,6 +191,13 @@ async fn delete_job(State(state): State<Arc<ApiState>>, Path(raw_id): Path<Strin
 }
 
 async fn start_run(State(state): State<Arc<ApiState>>, Path(raw_job_id): Path<String>) -> Response {
+    if state.worker.is_draining() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "worker_draining",
+            "the local worker is shutting down and no longer accepts runs",
+        );
+    }
     if !state.process_execution {
         return error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -248,6 +256,27 @@ async fn get_run(State(state): State<Arc<ApiState>>, Path(raw_id): Path<String>)
     }
 }
 
+async fn stop_run(State(state): State<Arc<ApiState>>, Path(raw_id): Path<String>) -> Response {
+    let Ok(run_id) = RunId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_run_id",
+            "the run ID is invalid",
+        );
+    };
+    match state.manager.stop_run(&run_id, state.worker.as_ref()) {
+        Ok(observation) => {
+            let status = if observation.state().is_terminal() {
+                StatusCode::OK
+            } else {
+                StatusCode::ACCEPTED
+            };
+            (status, Json(observation)).into_response()
+        }
+        Err(error) => manager_error(error),
+    }
+}
+
 async fn list_runs(
     State(state): State<Arc<ApiState>>,
     Query(filters): Query<RunFilters>,
@@ -301,15 +330,20 @@ fn manager_error(error_value: ManagerError) -> Response {
             "worker_capacity_reached",
             "the local worker has no available capacity",
         ),
-        ManagerError::TimeoutUnsupported => error(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "timeout_unsupported",
-            "job timeouts are not supported by this worker yet",
+        ManagerError::RunNotFound => error(
+            StatusCode::NOT_FOUND,
+            "run_not_found",
+            "the run does not exist",
         ),
         ManagerError::WorkerUnavailable => error(
             StatusCode::SERVICE_UNAVAILABLE,
             "worker_unavailable",
             "the local worker could not confirm run acceptance",
+        ),
+        ManagerError::WorkerDraining => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "worker_draining",
+            "the local worker is shutting down and no longer accepts runs",
         ),
         ManagerError::StorageUnavailable => error(
             StatusCode::INTERNAL_SERVER_ERROR,

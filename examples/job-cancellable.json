@@ -1,0 +1,9 @@
+{
+  "id": "cancellable",
+  "command": ["/bin/sleep", "60"],
+  "cwd": "/tmp",
+  "env": {},
+  "inheritEnv": false,
+  "timeoutMs": null,
+  "terminationGraceMs": 5000
+}

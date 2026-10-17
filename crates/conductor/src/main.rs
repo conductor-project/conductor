@@ -10,7 +10,7 @@ use std::sync::{
 };
 
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
-use conductor_core::{InspectRun, MAX_WORKER_CAPACITY, StartRun, WorkerId};
+use conductor_core::{InspectRun, MAX_WORKER_CAPACITY, StartRun, StopRun, WorkerId};
 use conductor_manager::{WorkerPort, WorkerPortError};
 use serde::Deserialize;
 use state_lock::StateLocks;
@@ -126,7 +126,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let address = listener.local_addr()?;
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal_shutdown = Arc::clone(&shutdown);
-    ctrlc::set_handler(move || signal_shutdown.store(true, Ordering::SeqCst))?;
+    let signal_worker = Arc::clone(&worker);
+    ctrlc::set_handler(move || {
+        signal_worker.begin_shutdown();
+        signal_shutdown.store(true, Ordering::SeqCst);
+    })?;
     eprintln!(
         "{{\"event\":\"agent_started\",\"role\":\"all\",\"address\":{}}}",
         serde_json::to_string(&address.to_string())?
@@ -151,6 +155,10 @@ impl WorkerPort for LocalWorkerPort {
         self.0.descriptor()
     }
 
+    fn is_draining(&self) -> bool {
+        self.0.is_draining()
+    }
+
     fn start(&self, command: StartRun) -> Result<conductor_core::RunObservation, WorkerPortError> {
         self.0.start(command).map_err(map_worker_error)
     }
@@ -161,14 +169,18 @@ impl WorkerPort for LocalWorkerPort {
     ) -> Result<Option<conductor_core::RunObservation>, WorkerPortError> {
         self.0.inspect(command).map_err(map_worker_error)
     }
+
+    fn stop(&self, command: StopRun) -> Result<conductor_core::RunObservation, WorkerPortError> {
+        self.0.stop(command).map_err(map_worker_error)
+    }
 }
 
 fn map_worker_error(error: conductor_worker::WorkerError) -> WorkerPortError {
     match error {
         conductor_worker::WorkerError::CapacityReached => WorkerPortError::CapacityReached,
         conductor_worker::WorkerError::RunConflict => WorkerPortError::RunConflict,
+        conductor_worker::WorkerError::ShuttingDown => WorkerPortError::ShuttingDown,
         conductor_worker::WorkerError::WorkerMismatch
-        | conductor_worker::WorkerError::ShuttingDown
         | conductor_worker::WorkerError::StorageUnavailable => WorkerPortError::Unavailable,
     }
 }

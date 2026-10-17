@@ -30,6 +30,28 @@ impl ExecutionBackend for HostProcessBackend {
         command.spawn()
     }
 
+    fn terminate_process_group(&self, group_id: u32) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use nix::sys::signal::{Signal, killpg};
+            use nix::unistd::Pid;
+
+            match killpg(Pid::from_raw(group_id as i32), Signal::SIGTERM) {
+                Ok(()) => Ok(()),
+                Err(nix::errno::Errno::ESRCH) => Ok(()),
+                Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = group_id;
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "process groups are not supported on this platform",
+            ))
+        }
+    }
+
     fn kill_process_group(&self, group_id: u32) -> io::Result<()> {
         #[cfg(unix)]
         {

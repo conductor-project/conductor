@@ -5,6 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitStatus};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,8 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::OpenOptionsExt;
 
 use conductor_core::{
-    InspectRun, JobSpec, MAX_WORKER_CAPACITY, RunFailureReason, RunObservation, RunState, StartRun,
-    WorkerDescriptor, WorkerId,
+    InspectRun, JobSpec, MAX_WORKER_CAPACITY, RunFailureReason, RunObservation, RunState,
+    RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
@@ -25,6 +26,9 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 pub trait ExecutionBackend: Send + Sync {
     /// Spawn one job in a dedicated process group with stdin closed and output piped.
     fn spawn(&self, job: &JobSpec) -> io::Result<Child>;
+
+    /// Request graceful termination of every process in the execution group.
+    fn terminate_process_group(&self, group_id: u32) -> io::Result<()>;
 
     /// Force-kill every process still in the execution's process group.
     fn kill_process_group(&self, group_id: u32) -> io::Result<()>;
@@ -41,8 +45,19 @@ pub enum WorkerError {
 
 struct WorkerState {
     connection: Connection,
-    active_groups: BTreeMap<String, u32>,
+    active_groups: BTreeMap<String, ActiveGroup>,
 }
+
+#[derive(Clone)]
+struct ActiveGroup {
+    group_id: u32,
+    intent: Arc<AtomicU8>,
+}
+
+const INTENT_NONE: u8 = 0;
+const INTENT_CANCEL: u8 = 1;
+const INTENT_TIMEOUT: u8 = 2;
+const INTENT_SHUTDOWN: u8 = 3;
 
 struct SharedWorkerState(Mutex<WorkerState>);
 
@@ -282,6 +297,7 @@ impl WorkerService {
                 return self.finish_spawn_failure(starting);
             }
         };
+        let launched_at = std::time::Instant::now();
         let group_id = child.id();
         let Some(stdout) = child.stdout.take() else {
             return self.abort_spawned_child(child, group_id, starting);
@@ -316,12 +332,29 @@ impl WorkerService {
                 .0
                 .lock()
                 .map_err(|_| WorkerError::StorageUnavailable)?;
-            state.active_groups.insert(spec.id().to_string(), group_id);
+            state.active_groups.insert(
+                spec.id().to_string(),
+                ActiveGroup {
+                    group_id,
+                    intent: Arc::new(AtomicU8::new(INTENT_NONE)),
+                },
+            );
         }
 
         let state = Arc::clone(&self.state);
         let backend = Arc::clone(&self.backend);
         let run_id = spec.id().to_string();
+        let control = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| WorkerError::StorageUnavailable)?
+            .active_groups
+            .get(spec.id().as_str())
+            .map(|active| Arc::clone(&active.intent))
+            .ok_or(WorkerError::StorageUnavailable)?;
+        let timeout = spec.job().timeout_ms().map(Duration::from_millis);
+        let grace = Duration::from_millis(spec.job().termination_grace_ms());
         let supervisor_observation = running.clone();
         let child_slot = Arc::new(Mutex::new(Some(child)));
         let supervisor_child = Arc::clone(&child_slot);
@@ -333,15 +366,19 @@ impl WorkerService {
                     .ok()
                     .and_then(|mut child| child.take());
                 if let Some(child) = child {
-                    supervise(
+                    supervise(RunSupervision {
                         state,
                         backend,
                         run_id,
                         child,
                         stdout_reader,
                         stderr_reader,
-                        supervisor_observation,
-                    );
+                        current: supervisor_observation,
+                        control,
+                        launched_at,
+                        timeout,
+                        grace,
+                    });
                 }
             });
         let supervisor = match supervisor {
@@ -396,35 +433,96 @@ impl WorkerService {
             .transpose()
     }
 
+    pub fn stop(&self, command: StopRun) -> Result<RunObservation, WorkerError> {
+        let id = command.run_id();
+        let current = self
+            .inspect(InspectRun::new(id.clone()))?
+            .ok_or(WorkerError::RunConflict)?;
+        if current.state().is_terminal() {
+            return Ok(current);
+        }
+        let active = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| WorkerError::StorageUnavailable)?
+            .active_groups
+            .get(id.as_str())
+            .cloned();
+        let Some(active) = active else {
+            // No persisted PID/group is authority after recovery. Keep the run unresolved.
+            return Ok(current);
+        };
+        let stopping = if current.state() == RunState::Stopping {
+            current
+        } else {
+            current
+                .next_revision(
+                    RunState::Stopping,
+                    current.started_at_ms(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .ok_or(WorkerError::StorageUnavailable)?
+                .with_termination_reason(RunTerminationReason::Cancelled)
+        };
+        let stopping = match self.persist(&stopping) {
+            Ok(()) => stopping,
+            Err(error) => match self.inspect(InspectRun::new(id.clone()))? {
+                Some(latest)
+                    if latest.state() == RunState::Stopping || latest.state().is_terminal() =>
+                {
+                    latest
+                }
+                _ => return Err(error),
+            },
+        };
+        if stopping.state().is_terminal() {
+            return Ok(stopping);
+        }
+        let _ = active.intent.compare_exchange(
+            INTENT_NONE,
+            INTENT_CANCEL,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        Ok(stopping)
+    }
+
     pub fn descriptor(&self) -> WorkerDescriptor {
         WorkerDescriptor::new(self.worker_id.clone(), self.capacity, true)
     }
 
-    pub fn shutdown(&self) -> io::Result<()> {
-        {
-            let mut lifecycle = self
-                .lifecycle
-                .lock()
-                .map_err(|_| io::Error::other("worker lifecycle lock poisoned"))?;
-            if *lifecycle {
-                return Ok(());
-            }
+    pub fn is_draining(&self) -> bool {
+        self.lifecycle
+            .lock()
+            .map(|draining| *draining)
+            .unwrap_or(true)
+    }
+
+    /// Stop admission immediately and notify every live supervisor to begin cleanup.
+    pub fn begin_shutdown(&self) {
+        if let Ok(mut lifecycle) = self.lifecycle.lock() {
             *lifecycle = true;
+        } else {
+            return;
         }
-        let groups = {
-            let state = self
-                .state
-                .0
-                .lock()
-                .map_err(|_| io::Error::other("worker state lock poisoned"))?;
-            state.active_groups.values().copied().collect::<Vec<_>>()
-        };
-        let mut first_error = None;
-        for group in groups {
-            if let Err(error) = self.backend.kill_process_group(group) {
-                first_error.get_or_insert(error);
+        if let Ok(state) = self.state.0.lock() {
+            for active in state.active_groups.values() {
+                let _ = active.intent.compare_exchange(
+                    INTENT_NONE,
+                    INTENT_SHUTDOWN,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
             }
         }
+    }
+
+    pub fn shutdown(&self) -> io::Result<()> {
+        self.begin_shutdown();
         let deadline = std::time::Instant::now() + SHUTDOWN_TIMEOUT;
         loop {
             let active = self
@@ -435,6 +533,35 @@ impl WorkerService {
                 .active_groups
                 .len();
             if active == 0 || std::time::Instant::now() >= deadline {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let groups = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| io::Error::other("worker state lock poisoned"))?
+            .active_groups
+            .values()
+            .map(|active| active.group_id)
+            .collect::<Vec<_>>();
+        let mut first_error = None;
+        for group in groups {
+            if let Err(error) = self.backend.kill_process_group(group) {
+                first_error.get_or_insert(error);
+            }
+        }
+        let reap_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while std::time::Instant::now() < reap_deadline {
+            let active = self
+                .state
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("worker state lock poisoned"))?
+                .active_groups
+                .len();
+            if active == 0 {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
@@ -596,22 +723,106 @@ fn spawn_capture<R: Read + Send + 'static>(
     })
 }
 
-fn supervise(
+struct RunSupervision {
     state: Arc<SharedWorkerState>,
     backend: Arc<dyn ExecutionBackend>,
     run_id: String,
-    mut child: Child,
+    child: Child,
     stdout_reader: JoinHandle<io::Result<()>>,
     stderr_reader: JoinHandle<io::Result<()>>,
     current: RunObservation,
-) {
+    control: Arc<AtomicU8>,
+    launched_at: std::time::Instant,
+    timeout: Option<Duration>,
+    grace: Duration,
+}
+
+fn supervise(supervision: RunSupervision) {
+    let RunSupervision {
+        state,
+        backend,
+        run_id,
+        mut child,
+        stdout_reader,
+        stderr_reader,
+        mut current,
+        control: intent,
+        launched_at,
+        timeout,
+        grace,
+    } = supervision;
     let group_id = child.id();
-    let (status, wait_failed) = match child.wait() {
-        Ok(status) => (Some(status), false),
-        Err(_) => {
-            let _ = backend.kill_process_group(group_id);
-            (child.wait().ok(), true)
+    let mut wait_failed = false;
+    let mut termination_deadline = None;
+    let (status, wait_failed) = loop {
+        match child.try_wait() {
+            Ok(Some(exit)) => break (Some(exit), wait_failed),
+            Ok(None) => {}
+            Err(_) => {
+                wait_failed = true;
+                let _ = intent.compare_exchange(
+                    INTENT_NONE,
+                    INTENT_SHUTDOWN,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+            }
         }
+
+        let mut requested = intent.load(Ordering::SeqCst);
+        if requested == INTENT_NONE && timeout.is_some_and(|limit| launched_at.elapsed() >= limit) {
+            let _ = intent.compare_exchange(
+                INTENT_NONE,
+                INTENT_TIMEOUT,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            );
+            requested = intent.load(Ordering::SeqCst);
+        }
+        if requested != INTENT_NONE && termination_deadline.is_none() {
+            if let Ok(state) = state.0.lock()
+                && let Ok(json) = state.connection.query_row(
+                    "SELECT observation_json FROM runs WHERE run_id = ?1",
+                    [&run_id],
+                    |row| row.get::<_, String>(0),
+                )
+                && let Ok(latest) = serde_json::from_str::<RunObservation>(&json)
+            {
+                current = latest;
+            }
+            let reason = match requested {
+                INTENT_TIMEOUT => RunTerminationReason::DeadlineExceeded,
+                INTENT_SHUTDOWN => RunTerminationReason::Shutdown,
+                _ => RunTerminationReason::Cancelled,
+            };
+            if !current.state().is_terminal() && current.state() != RunState::Stopping {
+                current = current
+                    .next_revision(
+                        RunState::Stopping,
+                        current.started_at_ms(),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .map(|value| value.with_termination_reason(reason))
+                    .unwrap_or(current);
+                if let Ok(serialized) = serde_json::to_string(&current)
+                    && let Ok(state) = state.0.lock()
+                {
+                    let _ = state.connection.execute(
+                        "UPDATE runs SET observation_json = ?1, revision = ?2, state = ?3 WHERE run_id = ?4 AND revision < ?2 AND state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
+                        params![serialized, current.revision() as i64, current.state().as_str(), current.run_id().as_str()],
+                    );
+                }
+            }
+            let _ = backend.terminate_process_group(group_id);
+            termination_deadline = Some(std::time::Instant::now() + grace);
+        }
+        if termination_deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            let _ = backend.kill_process_group(group_id);
+        }
+        thread::sleep(Duration::from_millis(10));
     };
     let _ = backend.kill_process_group(group_id);
     let output_failed = stdout_reader.join().map_or(true, |result| result.is_err())
@@ -626,14 +837,32 @@ fn supervise(
             Some(RunFailureReason::BackendFailure),
         ),
     };
-    let terminal = current.next_revision(
-        run_state,
-        current.started_at_ms(),
-        Some(finished),
-        exit_code,
-        signal,
-        failure,
-    );
+    let termination = match intent.load(Ordering::SeqCst) {
+        INTENT_TIMEOUT => Some(RunTerminationReason::DeadlineExceeded),
+        INTENT_CANCEL => Some(RunTerminationReason::Cancelled),
+        INTENT_SHUTDOWN => Some(RunTerminationReason::Shutdown),
+        _ => None,
+    };
+    let final_state = match termination {
+        Some(RunTerminationReason::DeadlineExceeded) => RunState::TimedOut,
+        Some(RunTerminationReason::Cancelled | RunTerminationReason::Shutdown) => {
+            RunState::Cancelled
+        }
+        None => run_state,
+    };
+    let terminal = current
+        .next_revision(
+            final_state,
+            current.started_at_ms(),
+            Some(finished),
+            exit_code,
+            signal,
+            if termination.is_some() { None } else { failure },
+        )
+        .map(|value| match termination {
+            Some(reason) => value.with_termination_reason(reason),
+            None => value,
+        });
     if let Some(terminal) = terminal
         && let Ok(serialized) = serde_json::to_string(&terminal)
         && let Ok(state) = state.0.lock()
