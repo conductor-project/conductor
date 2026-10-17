@@ -1,6 +1,6 @@
 //! Worker-owned process supervision, persistence, deadlines, and captured output.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -23,13 +23,15 @@ use conductor_core::{
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use tokio::runtime::Runtime;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore, watch};
 
 #[cfg(unix)]
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_PERSISTENCE_BUDGET: Duration = Duration::from_secs(2);
+const PERSISTENCE_BLOCKING_CAPACITY: usize = 2;
 pub const DEFAULT_LOG_MAX_BYTES_PER_STREAM: u64 = 8 * 1024 * 1024;
 pub const DEFAULT_LOG_RETENTION_RUNS: usize = 100;
 pub const MAX_LOG_MAX_BYTES_PER_STREAM: u64 = 1024 * 1024 * 1024;
@@ -190,6 +192,7 @@ struct SharedWorkerState(Mutex<WorkerState>);
 
 struct PendingPersistence {
     observations: Mutex<BTreeMap<String, RunObservation>>,
+    shutdown_exhausted: Mutex<BTreeSet<String>>,
     degraded: AtomicBool,
 }
 
@@ -209,9 +212,33 @@ impl PendingPersistence {
             .lock()
             .map_err(|_| io::Error::other("pending persistence lock poisoned"))?;
         observations.remove(run_id);
+        self.shutdown_exhausted
+            .lock()
+            .map_err(|_| io::Error::other("pending shutdown set lock poisoned"))?
+            .remove(run_id);
         self.degraded
             .store(!observations.is_empty(), Ordering::SeqCst);
         Ok(())
+    }
+
+    fn mark_shutdown_exhausted(&self, run_id: &str) -> io::Result<()> {
+        self.shutdown_exhausted
+            .lock()
+            .map_err(|_| io::Error::other("pending shutdown set lock poisoned"))?
+            .insert(run_id.to_owned());
+        Ok(())
+    }
+
+    fn all_shutdown_retries_exhausted(&self) -> io::Result<bool> {
+        let observations = self
+            .observations
+            .lock()
+            .map_err(|_| io::Error::other("pending persistence lock poisoned"))?;
+        let exhausted = self
+            .shutdown_exhausted
+            .lock()
+            .map_err(|_| io::Error::other("pending shutdown set lock poisoned"))?;
+        Ok(observations.keys().all(|run_id| exhausted.contains(run_id)))
     }
 
     fn len(&self) -> io::Result<usize> {
@@ -231,6 +258,8 @@ pub struct WorkerService {
     backend: Arc<dyn ExecutionBackend>,
     state: Arc<SharedWorkerState>,
     pending: Arc<PendingPersistence>,
+    persistence_admission: Arc<Semaphore>,
+    shutdown_signal: watch::Sender<bool>,
     runtime: Runtime,
     supervisors: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     lifecycle: Mutex<bool>,
@@ -469,8 +498,11 @@ impl WorkerService {
             }))),
             pending: Arc::new(PendingPersistence {
                 observations: Mutex::new(BTreeMap::new()),
+                shutdown_exhausted: Mutex::new(BTreeSet::new()),
                 degraded: AtomicBool::new(false),
             }),
+            persistence_admission: Arc::new(Semaphore::new(PERSISTENCE_BLOCKING_CAPACITY)),
+            shutdown_signal: watch::channel(false).0,
             runtime,
             supervisors: Mutex::new(Vec::new()),
             lifecycle: Mutex::new(false),
@@ -667,6 +699,8 @@ impl WorkerService {
 
         let state = Arc::clone(&self.state);
         let pending = Arc::clone(&self.pending);
+        let persistence_admission = Arc::clone(&self.persistence_admission);
+        let shutdown_signal = self.shutdown_signal.subscribe();
         let backend = Arc::clone(&self.backend);
         let run_id = spec.id().to_string();
         let control = match self.state.0.lock() {
@@ -695,6 +729,8 @@ impl WorkerService {
         let supervisor = self.runtime.spawn(supervise(RunSupervision {
             state,
             pending,
+            persistence_admission,
+            shutdown_signal,
             backend,
             run_id,
             spawned,
@@ -989,6 +1025,7 @@ impl WorkerService {
 
     /// Stop admission immediately and notify every live supervisor to begin cleanup.
     pub fn begin_shutdown(&self) {
+        self.shutdown_signal.send_replace(true);
         if let Ok(mut lifecycle) = self.lifecycle.lock() {
             *lifecycle = true;
         } else {
@@ -1022,7 +1059,13 @@ impl WorkerService {
                 .pending
                 .len()
                 .map_err(|_| io::Error::other("pending persistence lock poisoned"))?;
-            if (active == 0 && pending == 0) || std::time::Instant::now() >= deadline {
+            let retries_exhausted = self
+                .pending
+                .all_shutdown_retries_exhausted()
+                .map_err(|_| io::Error::other("pending shutdown set lock poisoned"))?;
+            if (active == 0 && (pending == 0 || retries_exhausted))
+                || std::time::Instant::now() >= deadline
+            {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
@@ -1055,7 +1098,11 @@ impl WorkerService {
                 .pending
                 .len()
                 .map_err(|_| io::Error::other("pending persistence lock poisoned"))?;
-            if active == 0 && pending == 0 {
+            let retries_exhausted = self
+                .pending
+                .all_shutdown_retries_exhausted()
+                .map_err(|_| io::Error::other("pending shutdown set lock poisoned"))?;
+            if active == 0 && (pending == 0 || retries_exhausted) {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
@@ -1602,6 +1649,8 @@ fn emit_worker_event(event: &str, run_id: &str) {
 struct RunSupervision {
     state: Arc<SharedWorkerState>,
     pending: Arc<PendingPersistence>,
+    persistence_admission: Arc<Semaphore>,
+    shutdown_signal: watch::Receiver<bool>,
     backend: Arc<dyn ExecutionBackend>,
     run_id: String,
     spawned: SpawnGuard,
@@ -1615,10 +1664,28 @@ struct RunSupervision {
     retention_runs: usize,
 }
 
+async fn run_bounded_blocking<T, F>(admission: &Arc<Semaphore>, operation: F) -> io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> io::Result<T> + Send + 'static,
+{
+    let permit = Arc::clone(admission)
+        .try_acquire_owned()
+        .map_err(|_| io::Error::other("bounded persistence executor is saturated"))?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
 async fn supervise(supervision: RunSupervision) {
     let RunSupervision {
         state,
         pending,
+        persistence_admission,
+        mut shutdown_signal,
         backend,
         run_id,
         mut spawned,
@@ -1687,41 +1754,54 @@ async fn supervise(supervision: RunSupervision) {
 
     if intent.load(Ordering::SeqCst) != INTENT_NONE {
         let requested = intent.load(Ordering::SeqCst);
-        if let Ok(state) = state.0.lock()
-            && let Ok(json) = state.connection.query_row(
-                "SELECT observation_json FROM runs WHERE run_id = ?1",
-                [&run_id],
-                |row| row.get::<_, String>(0),
-            )
-            && let Ok(latest) = serde_json::from_str::<RunObservation>(&json)
-        {
-            current = latest;
-        }
-        let reason = match requested {
-            INTENT_TIMEOUT => RunTerminationReason::DeadlineExceeded,
-            INTENT_SHUTDOWN => RunTerminationReason::Shutdown,
-            _ => RunTerminationReason::Cancelled,
-        };
-        if !current.state().is_terminal() && current.state() != RunState::Stopping {
-            current = current
-                .next_revision(
-                    RunState::Stopping,
-                    current.started_at_ms(),
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .map(|value| value.with_termination_reason(reason))
-                .unwrap_or(current);
-            if let Ok(serialized) = serde_json::to_string(&current)
-                && let Ok(state) = state.0.lock()
-            {
-                let _ = state.connection.execute(
-                    "UPDATE runs SET observation_json = ?1, revision = ?2, state = ?3 WHERE run_id = ?4 AND revision < ?2 AND state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
-                    params![serialized, current.revision() as i64, current.state().as_str(), current.run_id().as_str()],
-                );
+        match run_bounded_blocking(&persistence_admission, {
+            let state = Arc::clone(&state);
+            let run_id = run_id.clone();
+            let mut current = current.clone();
+            move || {
+                if let Ok(state) = state.0.lock()
+                    && let Ok(json) = state.connection.query_row(
+                        "SELECT observation_json FROM runs WHERE run_id = ?1",
+                        [&run_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    && let Ok(latest) = serde_json::from_str::<RunObservation>(&json)
+                {
+                    current = latest;
+                }
+                let reason = match requested {
+                    INTENT_TIMEOUT => RunTerminationReason::DeadlineExceeded,
+                    INTENT_SHUTDOWN => RunTerminationReason::Shutdown,
+                    _ => RunTerminationReason::Cancelled,
+                };
+                if !current.state().is_terminal() && current.state() != RunState::Stopping {
+                    current = current
+                        .next_revision(
+                            RunState::Stopping,
+                            current.started_at_ms(),
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .map(|value| value.with_termination_reason(reason))
+                        .unwrap_or(current);
+                    if let Ok(serialized) = serde_json::to_string(&current)
+                        && let Ok(state) = state.0.lock()
+                    {
+                        let _ = state.connection.execute(
+                            "UPDATE runs SET observation_json = ?1, revision = ?2, state = ?3 WHERE run_id = ?4 AND revision < ?2 AND state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
+                            params![serialized, current.revision() as i64, current.state().as_str(), current.run_id().as_str()],
+                        );
+                    }
+                }
+                Ok(current)
             }
+        })
+        .await
+        {
+            Ok(updated) => current = updated,
+            Err(error) => emit_worker_diagnostic("stopping_observation_failed", run_id.as_str(), &error),
         }
         let _ = backend.terminate_process_group(group_id);
         let grace_deadline = tokio::time::Instant::now() + grace;
@@ -1800,7 +1880,12 @@ async fn supervise(supervision: RunSupervision) {
             None => value,
         });
     if let Some(terminal) = terminal
-        && let Err(error) = persist_terminal_observation(&state, &terminal)
+        && let Err(error) = run_bounded_blocking(&persistence_admission, {
+            let state = Arc::clone(&state);
+            let terminal = terminal.clone();
+            move || persist_terminal_observation(&state, &terminal)
+        })
+        .await
     {
         pending.degraded.store(true, Ordering::SeqCst);
         let _ = pending.insert(terminal.clone());
@@ -1809,11 +1894,67 @@ async fn supervise(supervision: RunSupervision) {
         }
         emit_worker_diagnostic("terminal_persistence_pending", run_id.as_str(), &error);
         let mut retry_delay = Duration::from_millis(50);
+        let mut shutdown_deadline = (*shutdown_signal.borrow())
+            .then(|| tokio::time::Instant::now() + SHUTDOWN_PERSISTENCE_BUDGET);
+        let mut persisted = false;
         loop {
-            thread::sleep(retry_delay);
-            match persist_terminal_observation(&state, &terminal) {
+            if shutdown_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                let _ = pending.mark_shutdown_exhausted(run_id.as_str());
+                emit_worker_diagnostic(
+                    "terminal_persistence_shutdown_budget_elapsed",
+                    run_id.as_str(),
+                    &io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "shutdown persistence budget elapsed",
+                    ),
+                );
+                break;
+            }
+            if let Some(deadline) = shutdown_deadline {
+                tokio::select! {
+                    _ = tokio::time::sleep(retry_delay) => {},
+                    _ = tokio::time::sleep_until(deadline) => {
+                        let _ = pending.mark_shutdown_exhausted(run_id.as_str());
+                        emit_worker_diagnostic(
+                            "terminal_persistence_shutdown_budget_elapsed",
+                            run_id.as_str(),
+                            &io::Error::new(io::ErrorKind::TimedOut, "shutdown persistence budget elapsed"),
+                        );
+                        break;
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = tokio::time::sleep(retry_delay) => {},
+                    changed = shutdown_signal.changed() => {
+                        if changed.is_ok() && *shutdown_signal.borrow() {
+                            shutdown_deadline = Some(tokio::time::Instant::now() + SHUTDOWN_PERSISTENCE_BUDGET);
+                        }
+                    }
+                }
+            }
+            if shutdown_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                let _ = pending.mark_shutdown_exhausted(run_id.as_str());
+                emit_worker_diagnostic(
+                    "terminal_persistence_shutdown_budget_elapsed",
+                    run_id.as_str(),
+                    &io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "shutdown persistence budget elapsed",
+                    ),
+                );
+                break;
+            }
+            match run_bounded_blocking(&persistence_admission, {
+                let state = Arc::clone(&state);
+                let terminal = terminal.clone();
+                move || persist_terminal_observation(&state, &terminal)
+            })
+            .await
+            {
                 Ok(()) => {
                     let _ = pending.remove(run_id.as_str());
+                    persisted = true;
                     break;
                 }
                 Err(_) => {
@@ -1821,12 +1962,19 @@ async fn supervise(supervision: RunSupervision) {
                 }
             }
         }
-        emit_worker_event("terminal_persistence_recovered", run_id.as_str());
+        if persisted {
+            emit_worker_event("terminal_persistence_recovered", run_id.as_str());
+        }
     }
     if let Ok(mut state) = state.0.lock() {
         state.active_groups.remove(&run_id);
     }
-    if let Err(error) = prune_completed_logs_shared(&state, &log_directory, retention_runs) {
+    if let Err(error) = run_bounded_blocking(&persistence_admission, {
+        let state = Arc::clone(&state);
+        move || prune_completed_logs_shared(&state, &log_directory, retention_runs)
+    })
+    .await
+    {
         emit_worker_diagnostic("log_retention_failed", run_id.as_str(), &error);
     }
 }

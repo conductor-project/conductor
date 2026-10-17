@@ -26,7 +26,7 @@ serde_json = { version = "1.0", default-features = false, features = ["std"] }
 ctrlc = { version = "3.4", default-features = false, features = ["termination"] }
 clap = { version = "4.5", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
-tokio = { version = "1", default-features = false, features = ["net", "rt", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", default-features = false, features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }
 nix = { version = "0.31.3", default-features = false, features = ["poll", "process", "signal"] }
 base64 = { version = "0.22.1", default-features = false }

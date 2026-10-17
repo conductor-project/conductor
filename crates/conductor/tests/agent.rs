@@ -206,6 +206,24 @@ fn wait_for_exit(child: &mut Agent) {
     }
 }
 
+fn wait_for_failure_exit(child: &mut Agent, timeout: Duration) -> std::process::ExitStatus {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.0.try_wait().expect("poll child") {
+            assert!(
+                !status.success(),
+                "agent unexpectedly reported clean shutdown"
+            );
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "agent did not exit before deadline"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
 fn signal(child: &Agent, name: &str) {
     let status = Command::new("kill")
         .args([format!("-{name}"), child.0.id().to_string()])
@@ -646,6 +664,48 @@ fn actual_binary_shuts_down_on_sigterm() {
     }
     signal(&restarted, "INT");
     wait_for_exit(&mut restarted);
+}
+
+#[test]
+fn actual_binary_bounds_sigterm_shutdown_when_terminal_writes_fail() {
+    let path = TempDir::new("sigterm-persistence-outage");
+    let (mut child, address) = start(&path, "all", None);
+    let body = job_json("shutdown-outage", &["/bin/sleep", "30"]);
+    assert_eq!(
+        http(address, "POST", "/v1/jobs", Some("application/json"), &body).0,
+        201
+    );
+    let (status, response) = http(address, "POST", "/v1/jobs/shutdown-outage/runs", None, &[]);
+    assert_eq!(status, 202, "{response}");
+    let run_id = serde_json::from_str::<serde_json::Value>(&response).unwrap()["runId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let database = Connection::open(path.join("worker/worker.sqlite3")).unwrap();
+    database
+        .execute_batch(
+            "CREATE TRIGGER reject_terminal BEFORE UPDATE OF state ON runs
+             WHEN NEW.state IN ('succeeded', 'failed', 'cancelled', 'timed_out')
+             BEGIN SELECT RAISE(FAIL, 'injected terminal persistence failure'); END;",
+        )
+        .unwrap();
+    drop(database);
+
+    let started = Instant::now();
+    signal(&child, "TERM");
+    let status = wait_for_failure_exit(&mut child, Duration::from_secs(11));
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert!(started.elapsed() < Duration::from_secs(11));
+    let persisted = Connection::open(path.join("worker/worker.sqlite3"))
+        .unwrap()
+        .query_row(
+            "SELECT state FROM runs WHERE run_id = ?1",
+            [run_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap();
+    assert!(matches!(persisted.as_str(), "running" | "stopping"));
+    assert!(!status.success());
 }
 
 #[test]
