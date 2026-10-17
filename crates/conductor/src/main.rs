@@ -10,6 +10,8 @@ use std::sync::{
 };
 
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
+use conductor_core::{InspectRun, MAX_WORKER_CAPACITY, StartRun, WorkerId};
+use conductor_manager::{WorkerPort, WorkerPortError};
 use serde::Deserialize;
 use state_lock::StateLocks;
 
@@ -111,6 +113,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let manager = Arc::new(conductor_manager::JobService::open_sqlite(
         config.manager_data_dir.join("manager.sqlite3"),
     )?);
+    let worker_id = WorkerId::new(config.worker_id.clone())?;
+    let worker = Arc::new(conductor_worker::WorkerService::open(
+        &config.worker_data_dir,
+        worker_id.clone(),
+        config.worker_concurrency,
+        Arc::new(conductor_process::HostProcessBackend),
+    )?);
+    let worker_port: Arc<dyn WorkerPort> = Arc::new(LocalWorkerPort(Arc::clone(&worker)));
     let listener = TcpListener::bind(config.listen)?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
@@ -124,11 +134,43 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(async move {
+    let serve_result = runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener)?;
-        conductor_api::serve(listener, shutdown, manager).await
-    })?;
+        conductor_api::serve(listener, shutdown, manager, worker_port).await
+    });
+    let shutdown_result = worker.shutdown();
+    serve_result?;
+    shutdown_result?;
     Ok(())
+}
+
+struct LocalWorkerPort(Arc<conductor_worker::WorkerService>);
+
+impl WorkerPort for LocalWorkerPort {
+    fn descriptor(&self) -> conductor_core::WorkerDescriptor {
+        self.0.descriptor()
+    }
+
+    fn start(&self, command: StartRun) -> Result<conductor_core::RunObservation, WorkerPortError> {
+        self.0.start(command).map_err(map_worker_error)
+    }
+
+    fn inspect(
+        &self,
+        command: InspectRun,
+    ) -> Result<Option<conductor_core::RunObservation>, WorkerPortError> {
+        self.0.inspect(command).map_err(map_worker_error)
+    }
+}
+
+fn map_worker_error(error: conductor_worker::WorkerError) -> WorkerPortError {
+    match error {
+        conductor_worker::WorkerError::CapacityReached => WorkerPortError::CapacityReached,
+        conductor_worker::WorkerError::RunConflict => WorkerPortError::RunConflict,
+        conductor_worker::WorkerError::WorkerMismatch
+        | conductor_worker::WorkerError::ShuttingDown
+        | conductor_worker::WorkerError::StorageUnavailable => WorkerPortError::Unavailable,
+    }
 }
 
 fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -145,7 +187,10 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         return Err("worker_id must contain 1-128 ASCII letters, digits, '-', '_' or '.'".into());
     }
     if config.worker_concurrency == 0 {
-        return Err("worker_concurrency must be greater than zero".into());
+        return Err("worker_concurrency must be between 1 and 1000".into());
+    }
+    if config.worker_concurrency > MAX_WORKER_CAPACITY {
+        return Err("worker_concurrency must be between 1 and 1000".into());
     }
     if config.manager_data_dir.as_os_str().is_empty()
         || config.worker_data_dir.as_os_str().is_empty()

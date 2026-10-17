@@ -8,20 +8,47 @@ use std::{fs, io};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-use conductor_core::{JobId, JobSpec};
+use conductor_core::{
+    InspectRun, JobId, JobSpec, RunFailureReason, RunId, RunObservation, RunSpec, RunState,
+    StartRun, WorkerDescriptor, WorkerId,
+};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 /// Temporary limit for active jobs. Pagination is a later milestone.
 pub const MAX_JOBS: usize = 1_000;
 const MAX_RESERVED_JOB_IDS: usize = 10_000;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JobStoreError {
     DuplicateId,
     LimitExceeded,
+    ActiveRunConflict,
     StorageUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunStoreError {
+    JobNotFound,
+    JobConflict,
+    CapacityReached,
+    TimeoutUnsupported,
+    StorageUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerPortError {
+    CapacityReached,
+    RunConflict,
+    Unavailable,
+}
+
+/// Manager-owned seam for dispatch and observation reads from the selected worker.
+pub trait WorkerPort: Send + Sync {
+    fn descriptor(&self) -> WorkerDescriptor;
+    fn start(&self, command: StartRun) -> Result<RunObservation, WorkerPortError>;
+    fn inspect(&self, command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError>;
 }
 
 /// Storage port owned by the manager. Implementations preserve deleted IDs.
@@ -30,6 +57,25 @@ pub trait JobRepository: Send + Sync {
     fn get(&self, id: &JobId) -> Result<Option<JobSpec>, JobStoreError>;
     fn list(&self) -> Result<Vec<JobSpec>, JobStoreError>;
     fn delete(&self, id: &JobId) -> Result<bool, JobStoreError>;
+    fn create_run(
+        &self,
+        job_id: &JobId,
+        worker_id: &WorkerId,
+        worker_capacity: usize,
+    ) -> Result<RunSpec, RunStoreError>;
+    fn get_run(&self, id: &RunId) -> Result<Option<RunObservation>, RunStoreError>;
+    fn list_active_runs(
+        &self,
+        worker_id: &WorkerId,
+        limit: usize,
+    ) -> Result<Vec<RunObservation>, RunStoreError>;
+    fn list_runs(
+        &self,
+        job_id: Option<&JobId>,
+        state: Option<RunState>,
+        limit: usize,
+    ) -> Result<Vec<RunObservation>, RunStoreError>;
+    fn record_observation(&self, observation: &RunObservation) -> Result<(), RunStoreError>;
 }
 
 #[derive(Debug)]
@@ -164,65 +210,86 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(MigrationError::Sqlite)?;
+    if !(0..=SCHEMA_VERSION).contains(&version) {
+        return Err(MigrationError::Sqlite(rusqlite::Error::InvalidQuery));
+    }
     if version == SCHEMA_VERSION {
-        // Force a schema read so a falsely versioned/corrupt DB fails at startup.
         connection
             .prepare("SELECT id, spec_json, created_at_ms, deleted_at_ms FROM jobs LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare("SELECT run_id, job_id, worker_id, job_spec_json, observation_json, revision, state FROM runs LIMIT 0")
+            .map_err(MigrationError::Sqlite)?;
         return Ok(());
-    }
-    if version != 0 {
-        return Err(MigrationError::Sqlite(rusqlite::Error::InvalidQuery));
     }
 
     let transaction = connection
         .unchecked_transaction()
         .map_err(MigrationError::Sqlite)?;
-    let table_exists: bool = transaction
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(MigrationError::Sqlite)?;
-    if !table_exists {
-        let unexpected_tables: bool = transaction
+    if version == 0 {
+        let table_exists: bool = transaction
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%')",
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'jobs')",
                 [],
                 |row| row.get(0),
             )
             .map_err(MigrationError::Sqlite)?;
-        if unexpected_tables {
-            return Err(MigrationError::InvalidLegacySchema);
-        }
-        transaction
-            .execute_batch(
-                "CREATE TABLE jobs (
-                    id TEXT PRIMARY KEY NOT NULL,
-                    spec_json TEXT NOT NULL,
-                    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
-                    deleted_at_ms INTEGER CHECK (deleted_at_ms IS NULL OR deleted_at_ms >= 0)
-                );",
-            )
-            .map_err(MigrationError::Sqlite)?;
-    } else {
-        let columns = table_columns(&transaction).map_err(MigrationError::Sqlite)?;
-        if !columns.iter().any(|column| column == "id")
-            || !columns.iter().any(|column| column == "spec_json")
-            || !columns.iter().any(|column| column == "created_at_ms")
-        {
-            return Err(MigrationError::InvalidLegacySchema);
-        }
-        if !columns.iter().any(|column| column == "deleted_at_ms") {
-            transaction
-                .execute(
-                    "ALTER TABLE jobs ADD COLUMN deleted_at_ms INTEGER CHECK (deleted_at_ms IS NULL OR deleted_at_ms >= 0)",
+        if !table_exists {
+            let unexpected_tables: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%')",
                     [],
+                    |row| row.get(0),
                 )
                 .map_err(MigrationError::Sqlite)?;
+            if unexpected_tables {
+                return Err(MigrationError::InvalidLegacySchema);
+            }
+            transaction
+                .execute_batch(
+                    "CREATE TABLE jobs (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        spec_json TEXT NOT NULL,
+                        created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                        deleted_at_ms INTEGER CHECK (deleted_at_ms IS NULL OR deleted_at_ms >= 0)
+                    );",
+                )
+                .map_err(MigrationError::Sqlite)?;
+        } else {
+            let columns = table_columns(&transaction).map_err(MigrationError::Sqlite)?;
+            if !columns.iter().any(|column| column == "id")
+                || !columns.iter().any(|column| column == "spec_json")
+                || !columns.iter().any(|column| column == "created_at_ms")
+            {
+                return Err(MigrationError::InvalidLegacySchema);
+            }
+            if !columns.iter().any(|column| column == "deleted_at_ms") {
+                transaction
+                    .execute(
+                        "ALTER TABLE jobs ADD COLUMN deleted_at_ms INTEGER CHECK (deleted_at_ms IS NULL OR deleted_at_ms >= 0)",
+                        [],
+                    )
+                    .map_err(MigrationError::Sqlite)?;
+            }
         }
     }
+    transaction
+        .execute_batch(
+            "CREATE TABLE runs (
+            run_id TEXT PRIMARY KEY NOT NULL,
+            job_id TEXT NOT NULL,
+            worker_id TEXT NOT NULL,
+            job_spec_json TEXT NOT NULL,
+            observation_json TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK (revision > 0),
+            state TEXT NOT NULL
+        );
+        CREATE INDEX runs_by_state_worker ON runs(state, worker_id);
+        CREATE INDEX runs_by_job_created ON runs(job_id, run_id);
+        CREATE TABLE run_sequence (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL);
+        INSERT INTO run_sequence (id, value) VALUES (1, 0);",
+        )
+        .map_err(MigrationError::Sqlite)?;
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(MigrationError::Sqlite)?;
@@ -329,6 +396,16 @@ impl JobRepository for SqliteJobRepository {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| JobStoreError::StorageUnavailable)?;
+        let active_run: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM runs WHERE job_id = ?1 AND state IN ('requested', 'starting', 'running', 'stopping', 'unknown'))",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| JobStoreError::StorageUnavailable)?;
+        if active_run {
+            return Err(JobStoreError::ActiveRunConflict);
+        }
         let deleted_at_ms = now_ms().map_err(|_| JobStoreError::StorageUnavailable)?;
         let changed = transaction
             .execute(
@@ -340,6 +417,165 @@ impl JobRepository for SqliteJobRepository {
             .commit()
             .map_err(|_| JobStoreError::StorageUnavailable)?;
         Ok(changed == 1)
+    }
+
+    fn create_run(
+        &self,
+        job_id: &JobId,
+        worker_id: &WorkerId,
+        worker_capacity: usize,
+    ) -> Result<RunSpec, RunStoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let job_json = transaction
+            .query_row(
+                "SELECT spec_json FROM jobs WHERE id = ?1 AND deleted_at_ms IS NULL",
+                [job_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| RunStoreError::StorageUnavailable)?
+            .ok_or(RunStoreError::JobNotFound)?;
+        let job: JobSpec =
+            serde_json::from_str(&job_json).map_err(|_| RunStoreError::StorageUnavailable)?;
+        if job.timeout_ms().is_some() {
+            return Err(RunStoreError::TimeoutUnsupported);
+        }
+        let existing_for_job: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM runs WHERE job_id = ?1 AND state IN ('requested', 'starting', 'running', 'stopping', 'unknown'))",
+            [job_id.as_str()],
+            |row| row.get(0),
+        ).map_err(|_| RunStoreError::StorageUnavailable)?;
+        if existing_for_job {
+            return Err(RunStoreError::JobConflict);
+        }
+        let active_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM runs WHERE worker_id = ?1 AND state IN ('requested', 'starting', 'running', 'stopping', 'unknown')",
+            [worker_id.as_str()],
+            |row| row.get(0),
+        ).map_err(|_| RunStoreError::StorageUnavailable)?;
+        if active_count >= worker_capacity as i64 {
+            return Err(RunStoreError::CapacityReached);
+        }
+        transaction
+            .execute("UPDATE run_sequence SET value = value + 1 WHERE id = 1", [])
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let sequence: i64 = transaction
+            .query_row("SELECT value FROM run_sequence WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let run_id =
+            RunId::new(format!("run-{sequence}")).map_err(|_| RunStoreError::StorageUnavailable)?;
+        let spec = RunSpec::new(run_id, worker_id.clone(), job);
+        let observation = RunObservation::requested(
+            &spec,
+            now_ms().map_err(|_| RunStoreError::StorageUnavailable)?,
+        );
+        let spec_json =
+            serde_json::to_string(&spec).map_err(|_| RunStoreError::StorageUnavailable)?;
+        let observation_json =
+            serde_json::to_string(&observation).map_err(|_| RunStoreError::StorageUnavailable)?;
+        transaction.execute(
+            "INSERT INTO runs (run_id, job_id, worker_id, job_spec_json, observation_json, revision, state) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![spec.id().as_str(), job_id.as_str(), worker_id.as_str(), spec_json, observation_json, observation.revision() as i64, observation.state().as_str()],
+        ).map_err(|_| RunStoreError::StorageUnavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        Ok(spec)
+    }
+
+    fn get_run(&self, id: &RunId) -> Result<Option<RunObservation>, RunStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let json = connection
+            .query_row(
+                "SELECT observation_json FROM runs WHERE run_id = ?1",
+                [id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        json.map(|value| {
+            serde_json::from_str(&value).map_err(|_| RunStoreError::StorageUnavailable)
+        })
+        .transpose()
+    }
+
+    fn list_active_runs(
+        &self,
+        worker_id: &WorkerId,
+        limit: usize,
+    ) -> Result<Vec<RunObservation>, RunStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let mut statement = connection.prepare(
+            "SELECT observation_json FROM runs WHERE worker_id = ?1 AND state IN ('requested', 'starting', 'running', 'stopping', 'unknown') ORDER BY rowid DESC LIMIT ?2",
+        ).map_err(|_| RunStoreError::StorageUnavailable)?;
+        let rows = statement
+            .query_map(params![worker_id.as_str(), limit as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(|_| RunStoreError::StorageUnavailable)?)
+                .map_err(|_| RunStoreError::StorageUnavailable)
+        })
+        .collect()
+    }
+
+    fn list_runs(
+        &self,
+        job_id: Option<&JobId>,
+        state_filter: Option<RunState>,
+        limit: usize,
+    ) -> Result<Vec<RunObservation>, RunStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let mut statement = connection.prepare(
+            "SELECT observation_json FROM runs WHERE (?1 IS NULL OR job_id = ?1) AND (?2 IS NULL OR state = ?2) ORDER BY rowid DESC LIMIT ?3",
+        ).map_err(|_| RunStoreError::StorageUnavailable)?;
+        let rows = statement
+            .query_map(
+                params![
+                    job_id.map(JobId::as_str),
+                    state_filter.map(RunState::as_str),
+                    limit as i64
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(|_| RunStoreError::StorageUnavailable)?)
+                .map_err(|_| RunStoreError::StorageUnavailable)
+        })
+        .collect()
+    }
+
+    fn record_observation(&self, observation: &RunObservation) -> Result<(), RunStoreError> {
+        let serialized =
+            serde_json::to_string(observation).map_err(|_| RunStoreError::StorageUnavailable)?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        connection.execute(
+            "UPDATE runs SET observation_json = ?1, revision = ?2, state = ?3 WHERE run_id = ?4 AND revision < ?2 AND state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
+            params![serialized, observation.revision() as i64, observation.state().as_str(), observation.run_id().as_str()],
+        ).map_err(|_| RunStoreError::StorageUnavailable)?;
+        Ok(())
     }
 }
 
@@ -355,8 +591,15 @@ fn now_ms() -> Result<i64, RepositoryOpenError> {
 pub enum ManagerError {
     DuplicateJob,
     JobLimitReached,
+    JobNotFound,
+    JobConflict,
+    CapacityReached,
+    TimeoutUnsupported,
+    WorkerUnavailable,
     StorageUnavailable,
 }
+
+pub const MAX_RUNS_RESPONSE: usize = 100;
 
 /// Manager application service for immutable job definitions.
 pub struct JobService {
@@ -377,6 +620,7 @@ impl JobService {
             Ok(()) => Ok(()),
             Err(JobStoreError::DuplicateId) => Err(ManagerError::DuplicateJob),
             Err(JobStoreError::LimitExceeded) => Err(ManagerError::JobLimitReached),
+            Err(JobStoreError::ActiveRunConflict) => Err(ManagerError::JobConflict),
             Err(JobStoreError::StorageUnavailable) => Err(ManagerError::StorageUnavailable),
         }
     }
@@ -392,12 +636,142 @@ impl JobService {
     pub fn delete(&self, id: &JobId) -> Result<bool, ManagerError> {
         self.repository.delete(id).map_err(map_store_error)
     }
+
+    pub fn start_run(
+        &self,
+        job_id: &JobId,
+        worker_id: &WorkerId,
+        worker_capacity: usize,
+        worker: &dyn WorkerPort,
+    ) -> Result<RunObservation, ManagerError> {
+        let active = self
+            .repository
+            .list_active_runs(worker_id, worker_capacity)
+            .map_err(|_| ManagerError::StorageUnavailable)?;
+        for stored in active {
+            if let Ok(Some(newer)) = worker.inspect(InspectRun::new(stored.run_id().clone()))
+                && newer.run_id() == stored.run_id()
+                && newer.revision() > stored.revision()
+            {
+                self.repository
+                    .record_observation(&newer)
+                    .map_err(|_| ManagerError::StorageUnavailable)?;
+            }
+        }
+        let spec = self
+            .repository
+            .create_run(job_id, worker_id, worker_capacity)
+            .map_err(map_run_error)?;
+        let observation = match worker.start(StartRun::new(spec.clone())) {
+            Ok(observation) => observation,
+            Err(WorkerPortError::CapacityReached) => {
+                self.mark_dispatch_failure(&spec, RunFailureReason::CapacityRejected, true)?;
+                return Err(ManagerError::CapacityReached);
+            }
+            Err(WorkerPortError::RunConflict | WorkerPortError::Unavailable) => {
+                self.mark_dispatch_failure(&spec, RunFailureReason::OutcomeUnknown, false)?;
+                return Err(ManagerError::WorkerUnavailable);
+            }
+        };
+        if observation.run_id() != spec.id()
+            || observation.job_id() != spec.job().id()
+            || observation.worker_id() != spec.worker_id()
+        {
+            self.mark_dispatch_failure(&spec, RunFailureReason::OutcomeUnknown, false)?;
+            return Err(ManagerError::WorkerUnavailable);
+        }
+        self.repository
+            .record_observation(&observation)
+            .map_err(|_| ManagerError::StorageUnavailable)?;
+        Ok(observation)
+    }
+
+    pub fn get_run(
+        &self,
+        id: &RunId,
+        worker: &dyn WorkerPort,
+    ) -> Result<Option<RunObservation>, ManagerError> {
+        let Some(stored) = self
+            .repository
+            .get_run(id)
+            .map_err(|_| ManagerError::StorageUnavailable)?
+        else {
+            return Ok(None);
+        };
+        if let Ok(Some(observation)) = worker.inspect(InspectRun::new(id.clone()))
+            && observation.run_id() == id
+            && observation.job_id() == stored.job_id()
+            && observation.worker_id() == stored.worker_id()
+            && observation.revision() > stored.revision()
+        {
+            self.repository
+                .record_observation(&observation)
+                .map_err(|_| ManagerError::StorageUnavailable)?;
+            return Ok(Some(observation));
+        }
+        Ok(Some(stored))
+    }
+
+    fn mark_dispatch_failure(
+        &self,
+        spec: &RunSpec,
+        reason: conductor_core::RunFailureReason,
+        rejected: bool,
+    ) -> Result<(), ManagerError> {
+        let Some(current) = self
+            .repository
+            .get_run(spec.id())
+            .map_err(|_| ManagerError::StorageUnavailable)?
+        else {
+            return Err(ManagerError::StorageUnavailable);
+        };
+        let finished = now_ms().map_err(|_| ManagerError::StorageUnavailable)?;
+        let next = current
+            .next_revision(
+                if rejected {
+                    RunState::Failed
+                } else {
+                    RunState::Unknown
+                },
+                None,
+                if rejected { Some(finished) } else { None },
+                None,
+                None,
+                Some(reason),
+            )
+            .ok_or(ManagerError::StorageUnavailable)?;
+        self.repository
+            .record_observation(&next)
+            .map_err(|_| ManagerError::StorageUnavailable)
+    }
+
+    pub fn list_runs(
+        &self,
+        job_id: Option<&JobId>,
+        state: Option<RunState>,
+        limit: usize,
+    ) -> Result<Vec<RunObservation>, ManagerError> {
+        self.repository
+            .list_runs(job_id, state, limit.min(MAX_RUNS_RESPONSE))
+            .map_err(|_| ManagerError::StorageUnavailable)
+    }
 }
 
 fn map_store_error(error: JobStoreError) -> ManagerError {
     match error {
         JobStoreError::DuplicateId => ManagerError::DuplicateJob,
         JobStoreError::LimitExceeded => ManagerError::JobLimitReached,
+        JobStoreError::ActiveRunConflict => ManagerError::JobConflict,
         JobStoreError::StorageUnavailable => ManagerError::StorageUnavailable,
+    }
+}
+
+fn map_run_error(error: RunStoreError) -> ManagerError {
+    match error {
+        RunStoreError::JobNotFound => ManagerError::JobNotFound,
+        RunStoreError::JobConflict => ManagerError::JobConflict,
+        RunStoreError::CapacityReached => ManagerError::CapacityReached,
+        RunStoreError::TimeoutUnsupported => ManagerError::TimeoutUnsupported,
+        RunStoreError::StorageUnavailable => ManagerError::StorageUnavailable,
     }
 }
