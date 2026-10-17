@@ -262,9 +262,17 @@ fn spawn_in_cgroup(cgroup: &CgroupBackend, run_id: &str, job: &JobSpec) -> io::R
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
-                    let mut response = [0; 128];
-                    let length = stream.read(&mut response)?;
-                    if &response[..length] != b"READY\n" {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "cgroup launcher setup exceeded its deadline",
+                        ));
+                    }
+                    stream.set_read_timeout(Some(remaining))?;
+                    let mut response = [0; 6];
+                    stream.read_exact(&mut response)?;
+                    if &response != b"READY\n" {
                         return Err(io::Error::new(
                             io::ErrorKind::PermissionDenied,
                             "cgroup launcher setup failed before workload execution",
