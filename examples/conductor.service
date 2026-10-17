@@ -1,0 +1,18 @@
+[Unit]
+Description=Conductor local job agent
+After=network.target
+
+[Service]
+Type=simple
+User=conductor
+Group=conductor
+WorkingDirectory=/var/lib/conductor
+ExecStart=/usr/local/bin/conductor agent --config /etc/conductor/agent.json
+Restart=no
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

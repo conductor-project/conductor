@@ -3,7 +3,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::Router;
@@ -12,6 +12,7 @@ use axum::extract::{
     rejection::{JsonRejection, QueryRejection},
 };
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine;
@@ -26,6 +27,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+const MAX_REQUEST_HEADER_COUNT: usize = 64;
+const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PENDING_STARTS: usize = 32;
 
 #[derive(Serialize)]
@@ -121,13 +125,19 @@ fn error(status: StatusCode, code: &'static str, message: &'static str) -> Respo
 
 /// Build the HTTP application served by the combined agent.
 pub fn router(manager: Arc<JobService>, worker: Arc<dyn WorkerPort>) -> Router {
-    router_with_recovery(manager, worker, Arc::new(AtomicBool::new(true)))
+    router_with_recovery(
+        manager,
+        worker,
+        Arc::new(AtomicBool::new(true)),
+        DEFAULT_REQUEST_TIMEOUT,
+    )
 }
 
 fn router_with_recovery(
     manager: Arc<JobService>,
     worker: Arc<dyn WorkerPort>,
     recovery_ready: Arc<AtomicBool>,
+    request_timeout: Duration,
 ) -> Router {
     let descriptor = worker.descriptor();
     let state = Arc::new(ApiState {
@@ -144,13 +154,46 @@ fn router_with_recovery(
         .route("/v1/jobs", post(create_job).get(list_jobs))
         .route("/v1/jobs/{id}", get(get_job).delete(delete_job))
         .route("/v1/jobs/{id}/runs", post(start_run))
+        .route("/v1/workers", get(list_workers))
+        .route("/v1/workers/{id}", get(get_worker))
         .route("/v1/runs", get(list_runs))
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/logs", get(get_run_logs))
         .route("/v1/runs/{id}/stop", post(stop_run))
         .route("/v1/runs/{id}/resolve", post(resolve_run))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        .layer(middleware::from_fn_with_state(
+            request_timeout,
+            request_bounds,
+        ))
         .with_state(state)
+}
+
+async fn request_bounds(
+    axum::extract::State(timeout): axum::extract::State<Duration>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    let headers = request.headers();
+    let header_bytes = headers.iter().fold(0usize, |size, (name, value)| {
+        size.saturating_add(name.as_str().len())
+            .saturating_add(value.as_bytes().len())
+    });
+    if headers.len() > MAX_REQUEST_HEADER_COUNT || header_bytes > MAX_REQUEST_HEADER_BYTES {
+        return error(
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            "request_headers_too_large",
+            "request headers exceed the configured count or byte limit",
+        );
+    }
+    match tokio::time::timeout(timeout, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => error(
+            StatusCode::REQUEST_TIMEOUT,
+            "request_timeout",
+            "the request exceeded the configured processing deadline",
+        ),
+    }
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -160,19 +203,63 @@ async fn healthz() -> impl IntoResponse {
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         )],
-        r#"{"status":"ok"}"#,
+        r#"{"status":"ok","role":"all","capabilities":["local_process_execution"]}"#,
     )
 }
 
 async fn readyz(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
-    if state.recovery_ready.load(Ordering::SeqCst) {
-        (StatusCode::OK, r#"{"status":"ready"}"#)
+    if state.recovery_ready.load(Ordering::SeqCst) && !state.worker.is_draining() {
+        (
+            StatusCode::OK,
+            r#"{"status":"ready","role":"all","capabilities":["local_process_execution"]}"#,
+        )
+    } else if state.worker.is_draining() {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            r#"{"status":"draining","role":"all","capabilities":["local_process_execution"]}"#,
+        )
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"status":"recovering"}"#,
+            r#"{"status":"recovering","role":"all","capabilities":["local_process_execution"]}"#,
         )
     }
+}
+
+async fn list_workers(State(state): State<Arc<ApiState>>) -> Response {
+    match query_worker_status(&state).await {
+        Ok(status) => (StatusCode::OK, Json(vec![status])).into_response(),
+        Err(error) => manager_error(error),
+    }
+}
+
+async fn get_worker(State(state): State<Arc<ApiState>>, Path(raw_id): Path<String>) -> Response {
+    let Ok(id) = WorkerId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_worker_id",
+            "the worker ID is invalid",
+        );
+    };
+    if id != state.worker_id {
+        return error(
+            StatusCode::NOT_FOUND,
+            "worker_not_found",
+            "the worker does not exist",
+        );
+    }
+    match query_worker_status(&state).await {
+        Ok(status) => (StatusCode::OK, Json(status)).into_response(),
+        Err(error) => manager_error(error),
+    }
+}
+
+async fn query_worker_status(state: &Arc<ApiState>) -> Result<conductor_core::WorkerStatus, ManagerError> {
+    let manager = Arc::clone(&state.manager);
+    let worker = Arc::clone(&state.worker);
+    tokio::task::spawn_blocking(move || manager.worker_status(worker.as_ref()))
+        .await
+        .map_err(|_| ManagerError::WorkerUnavailable)?
 }
 
 async fn create_job(
@@ -740,6 +827,7 @@ pub async fn serve(
     shutdown: Arc<AtomicBool>,
     manager: Arc<JobService>,
     worker: Arc<dyn WorkerPort>,
+    request_timeout: Duration,
 ) -> io::Result<()> {
     let recovery_ready = Arc::new(AtomicBool::new(false));
     let ready_for_recovery = Arc::clone(&recovery_ready);
@@ -759,11 +847,14 @@ pub async fn serve(
                 tokio::time::sleep(Duration::from_millis(50 << attempt)).await;
             }
         }
-        eprintln!("{{\"event\":\"reconciliation_failed\"}}");
+        eprintln!(
+            "{{\"timestampMs\":{},\"severity\":\"error\",\"component\":\"manager\",\"event\":\"reconciliation_failed\"}}",
+            timestamp_ms()
+        );
     });
     let server = axum::serve(
         listener,
-        router_with_recovery(manager, worker, recovery_ready),
+        router_with_recovery(manager, worker, recovery_ready, request_timeout),
     )
     .with_graceful_shutdown(async move {
         while !shutdown.load(Ordering::SeqCst) {
@@ -773,8 +864,18 @@ pub async fn serve(
     match tokio::time::timeout(Duration::from_secs(5), server).await {
         Ok(result) => result,
         Err(_) => {
-            eprintln!("{{\"event\":\"shutdown_deadline_elapsed\",\"timeout_seconds\":5}}");
+            eprintln!(
+                "{{\"timestampMs\":{},\"severity\":\"warn\",\"component\":\"api\",\"event\":\"shutdown_deadline_elapsed\",\"timeout_seconds\":5}}",
+                timestamp_ms()
+            );
             Ok(())
         }
     }
+}
+
+fn timestamp_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default()
 }

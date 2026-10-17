@@ -16,7 +16,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use conductor_core::{
     InspectRun, JobSpec, LogStream, MAX_LOG_CHUNK_BYTES, MAX_WORKER_CAPACITY, ReadRunLogs,
     ResolveRun, RunFailureReason, RunLogChunk, RunLogStatus, RunObservation, RunState,
-    RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId,
+    RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId, WorkerStatus,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
@@ -785,6 +785,34 @@ impl WorkerService {
     pub fn descriptor(&self) -> WorkerDescriptor {
         WorkerDescriptor::new(self.worker_id.clone(), self.capacity, true)
             .with_incarnation(self.incarnation)
+    }
+
+    pub fn status(&self) -> Result<WorkerStatus, WorkerError> {
+        let draining = self.is_draining();
+        let state = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let (used, unknown): (i64, i64) = state
+            .connection
+            .query_row(
+                "SELECT COUNT(*), SUM(CASE WHEN state = 'unknown' THEN 1 ELSE 0 END) FROM runs WHERE state IN ('requested', 'starting', 'running', 'stopping', 'unknown')",
+                [],
+                |row| Ok((row.get(0)?, row.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+            )
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let used = usize::try_from(used).map_err(|_| WorkerError::StorageUnavailable)?;
+        let unknown = usize::try_from(unknown).map_err(|_| WorkerError::StorageUnavailable)?;
+        let observed_at = now_ms().map_err(|_| WorkerError::StorageUnavailable)?;
+        Ok(WorkerStatus::new(
+            self.descriptor(),
+            used,
+            unknown,
+            !draining,
+            draining,
+            observed_at,
+        ))
     }
 
     pub fn is_draining(&self) -> bool {
