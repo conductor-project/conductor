@@ -60,6 +60,20 @@ def wait_run(address, run_id, expected, timeout=10):
     raise TimeoutError(f"run {run_id} did not reach {sorted(expected)}: {last}")
 
 
+def wait_worker_slot(address, timeout=10):
+    deadline = time.monotonic() + timeout
+    latest = None
+    while time.monotonic() < deadline:
+        status, workers = request(address, "GET", "/v1/workers")
+        if status != 200 or len(workers) != 1:
+            raise RuntimeError(f"worker status returned HTTP {status}: {workers}")
+        latest = workers[0]
+        if latest["availableSlots"] > 0 and latest["available"]:
+            return latest
+        time.sleep(0.02)
+    raise TimeoutError(f"worker did not release an execution slot: {latest}")
+
+
 def logs(address, run_id):
     status, body = request(address, "GET", f"/v1/runs/{run_id}/logs?stream=stdout&limit=65536")
     if status != 200:
@@ -222,6 +236,7 @@ def main():
             assert not marker.exists(), "workload ran despite administrator limit rejection"
 
             # A daemon crash leaves an ambiguous run; restart kills only the owned subtree.
+            wait_worker_slot(address)
             crash_job = {
                 "id": "crash-cleanup",
                 "command": [
@@ -236,7 +251,7 @@ def main():
             status, _ = request(address, "POST", "/v1/jobs", crash_job)
             assert status == 201
             status, accepted = request(address, "POST", "/v1/jobs/crash-cleanup/runs")
-            assert status == 202
+            assert status == 202, f"crash-cleanup run start returned HTTP {status}: {accepted}"
             crash_run = accepted["runId"]
             run_ids.append(crash_run)
             wait_run(address, crash_run, {"running"})
