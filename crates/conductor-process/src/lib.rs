@@ -216,7 +216,9 @@ fn spawn_in_cgroup(cgroup: &CgroupBackend, run_id: &str, job: &JobSpec) -> io::R
     use std::time::{Duration, Instant};
 
     static NEXT_SOCKET: AtomicU64 = AtomicU64::new(1);
+    trace_cgroup_launch(run_id, "create_run_cgroup");
     let path = cgroup.manager.create(run_id, job.resource_limits())?;
+    trace_cgroup_launch(run_id, "run_cgroup_created");
     let private_directory = std::env::temp_dir().join(format!(
         "conductor-launch-{}-{}-{}",
         std::process::id(),
@@ -236,6 +238,7 @@ fn spawn_in_cgroup(cgroup: &CgroupBackend, run_id: &str, job: &JobSpec) -> io::R
     let socket_path = private_directory.join("ready.sock");
     let mut spawned: Option<Child> = None;
     let result = (|| {
+        trace_cgroup_launch(run_id, "bind_handshake_socket");
         let listener = UnixListener::bind(&socket_path)?;
         listener.set_nonblocking(true)?;
         let mut command = Command::new(&cgroup.launcher);
@@ -257,11 +260,14 @@ fn spawn_in_cgroup(cgroup: &CgroupBackend, run_id: &str, job: &JobSpec) -> io::R
         command.envs(job.env());
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+        trace_cgroup_launch(run_id, "spawn_internal_launcher");
         spawned = Some(command.spawn()?);
+        trace_cgroup_launch(run_id, "internal_launcher_spawned");
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match listener.accept() {
                 Ok((mut stream, _)) => {
+                    trace_cgroup_launch(run_id, "launcher_connected");
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         return Err(io::Error::new(
@@ -272,6 +278,7 @@ fn spawn_in_cgroup(cgroup: &CgroupBackend, run_id: &str, job: &JobSpec) -> io::R
                     stream.set_read_timeout(Some(remaining))?;
                     let mut response = [0; 6];
                     stream.read_exact(&mut response)?;
+                    trace_cgroup_launch(run_id, "launcher_handshake_received");
                     if &response != b"READY\n" {
                         return Err(io::Error::new(
                             io::ErrorKind::PermissionDenied,
@@ -292,6 +299,7 @@ fn spawn_in_cgroup(cgroup: &CgroupBackend, run_id: &str, job: &JobSpec) -> io::R
                                 .id(),
                             path.clone(),
                         );
+                    trace_cgroup_launch(run_id, "run_cgroup_registered");
                     return spawned
                         .take()
                         .ok_or_else(|| io::Error::other("cgroup launcher child is missing"));
@@ -329,6 +337,15 @@ fn spawn_in_cgroup(cgroup: &CgroupBackend, run_id: &str, job: &JobSpec) -> io::R
         let _ = CgroupV2::remove_when_empty(&path);
     }
     result
+}
+
+#[cfg(target_os = "linux")]
+fn trace_cgroup_launch(run_id: &str, phase: &str) {
+    if std::env::var_os("CONDUCTOR_CGROUP_TRACE").is_some() {
+        eprintln!(
+            "{{\"severity\":\"info\",\"component\":\"process\",\"event\":\"cgroup_launch_phase\",\"runId\":\"{run_id}\",\"phase\":\"{phase}\"}}"
+        );
+    }
 }
 
 /// Entered only by a fresh internal launcher before it executes user code.
