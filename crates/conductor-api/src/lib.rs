@@ -1191,6 +1191,14 @@ async fn authenticate_and_audit(
 ) -> Response {
     let principal = if let Some(authenticator) = &state.operator_authenticator {
         if !authenticator.authenticate(request.headers()) {
+            let (_, body) = request.into_parts();
+            if to_bytes(body, MAX_REQUEST_BODY_BYTES).await.is_err() {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request_body_too_large",
+                    "the request body exceeds the configured byte limit",
+                );
+            }
             let mut response = error(
                 StatusCode::UNAUTHORIZED,
                 "operator_authentication_required",
