@@ -175,4 +175,8 @@ from prior incarnations are replayed before the worker polls for new commands.
 `JobSpec.executableDigest` is an optional, operator-provisioned SHA-256 digest.
 The worker streams the executable through a fixed-size buffer immediately
 before launch. A mismatch produces a failed observation without calling the
-execution backend. When the digest is absent, legacy MVP1 behavior remains.
+execution backend. Before any launch, the worker also checks that a native
+executable uses the host OS format and architecture; universal Mach-O files
+must include the current worker architecture. Interpreter scripts use their
+shebang interpreter. Incompatible binaries fail without calling the execution
+backend. When the digest is absent, digest verification is skipped.

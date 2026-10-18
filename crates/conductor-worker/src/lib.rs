@@ -20,11 +20,13 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 
 use conductor_core::{
-    CommandEnvelope, CommandId, InspectRun, JobSpec, LogStream, MAX_LOG_CHUNK_BYTES,
-    MAX_WORKER_CAPACITY, ReadRunLogs, ResolveRun, RunFailureReason, RunLogChunk, RunLogStatus,
-    RunObservation, RunState, RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId,
-    WorkerStatus,
+    Architecture as WorkerArchitecture, CommandEnvelope, CommandId, InspectRun, JobSpec, LogStream,
+    MAX_LOG_CHUNK_BYTES, MAX_WORKER_CAPACITY, OperatingSystem, ReadRunLogs, ResolveRun,
+    RunFailureReason, RunLogChunk, RunLogStatus, RunObservation, RunState, RunTerminationReason,
+    StartRun, StopRun, WorkerDescriptor, WorkerId, WorkerStatus,
 };
+use object::read::{FileKind, Object, ReadCache, macho::FatArch};
+use object::{Architecture as ObjectArchitecture, BinaryFormat};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
@@ -972,6 +974,24 @@ impl WorkerService {
                     self.mark_log_closed(spec.id().as_str(), LogStream::Stderr);
                     return self.finish_backend_failure(starting);
                 }
+            }
+        }
+
+        match executable_is_compatible(Path::new(&spec.job().command()[0])) {
+            Ok(true) => {}
+            Ok(false) => {
+                drop(stdout_file);
+                drop(stderr_file);
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stdout);
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stderr);
+                return self.finish_failure(starting, RunFailureReason::IncompatibleExecutable);
+            }
+            Err(_) => {
+                drop(stdout_file);
+                drop(stderr_file);
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stdout);
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stderr);
+                return self.finish_backend_failure(starting);
             }
         }
 
@@ -2138,6 +2158,147 @@ fn executable_digest_matches(path: &Path, expected: &str) -> io::Result<bool> {
     Ok(expected.as_bytes() == encoded)
 }
 
+/// Check native executable format and architecture before the backend can launch it.
+/// Interpreter scripts are delegated to their shebang interpreter, whose own
+/// native executable is checked by the operating system when the script starts.
+fn executable_is_compatible(path: &Path) -> io::Result<bool> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        // Preserve the backend's normal SpawnFailed result for missing commands.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Ok(false);
+    }
+
+    let mut prefix = [0_u8; 2];
+    let prefix_length = file.read(&mut prefix)?;
+    if prefix_length == prefix.len() && prefix == *b"#!" {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::Start(0))?;
+
+    let cache = ReadCache::new(file);
+    let kind = match FileKind::parse(&cache) {
+        Ok(kind) => kind,
+        Err(_) => return Ok(false),
+    };
+    let target_os = target_operating_system();
+    let target_architecture = target_architecture();
+    let Some((target_os, target_architecture)) = target_os.zip(target_architecture) else {
+        return Ok(false);
+    };
+
+    match kind {
+        FileKind::Elf32 | FileKind::Elf64 => {
+            let Ok(file) = object::File::parse(&cache) else {
+                return Ok(false);
+            };
+            Ok(binary_is_compatible(
+                BinaryFormat::Elf,
+                file.architecture(),
+                target_os,
+                target_architecture,
+            ))
+        }
+        FileKind::MachO32 | FileKind::MachO64 => {
+            let Ok(file) = object::File::parse(&cache) else {
+                return Ok(false);
+            };
+            Ok(binary_is_compatible(
+                BinaryFormat::MachO,
+                file.architecture(),
+                target_os,
+                target_architecture,
+            ))
+        }
+        FileKind::MachOFat32 => {
+            let Ok(file) = object::read::macho::MachOFatFile32::parse(&cache) else {
+                return Ok(false);
+            };
+            Ok(fat_binary_is_compatible(
+                file.arches().iter().map(FatArch::architecture),
+                target_os,
+                target_architecture,
+            ))
+        }
+        FileKind::MachOFat64 => {
+            let Ok(file) = object::read::macho::MachOFatFile64::parse(&cache) else {
+                return Ok(false);
+            };
+            Ok(fat_binary_is_compatible(
+                file.arches().iter().map(FatArch::architecture),
+                target_os,
+                target_architecture,
+            ))
+        }
+        _ => Ok(false),
+    }
+}
+
+fn fat_binary_is_compatible(
+    architectures: impl Iterator<Item = ObjectArchitecture>,
+    target_os: OperatingSystem,
+    target_architecture: WorkerArchitecture,
+) -> bool {
+    architectures.into_iter().any(|architecture| {
+        binary_is_compatible(
+            BinaryFormat::MachO,
+            architecture,
+            target_os,
+            target_architecture,
+        )
+    })
+}
+
+fn binary_is_compatible(
+    format: BinaryFormat,
+    architecture: ObjectArchitecture,
+    target_os: OperatingSystem,
+    target_architecture: WorkerArchitecture,
+) -> bool {
+    let expected_format = match target_os {
+        OperatingSystem::Linux => BinaryFormat::Elf,
+        OperatingSystem::Macos => BinaryFormat::MachO,
+    };
+    let expected_architecture = match target_architecture {
+        WorkerArchitecture::Aarch64 => ObjectArchitecture::Aarch64,
+        WorkerArchitecture::X86_64 => ObjectArchitecture::X86_64,
+    };
+    format == expected_format && architecture == expected_architecture
+}
+
+const fn target_operating_system() -> Option<OperatingSystem> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(OperatingSystem::Linux)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(OperatingSystem::Macos)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+const fn target_architecture() -> Option<WorkerArchitecture> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        Some(WorkerArchitecture::Aarch64)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        Some(WorkerArchitecture::X86_64)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        None
+    }
+}
+
 fn spawn_capture<R: CaptureRead + 'static>(
     mut source: R,
     mut output: File,
@@ -2857,4 +3018,47 @@ fn now_ms() -> io::Result<i64> {
 
 fn storage_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
+}
+
+#[cfg(test)]
+mod executable_compatibility_tests {
+    use super::{binary_is_compatible, fat_binary_is_compatible};
+    use conductor_core::{Architecture, OperatingSystem};
+    use object::{Architecture as ObjectArchitecture, BinaryFormat};
+
+    #[test]
+    fn native_format_and_architecture_must_both_match() {
+        assert!(binary_is_compatible(
+            BinaryFormat::MachO,
+            ObjectArchitecture::Aarch64,
+            OperatingSystem::Macos,
+            Architecture::Aarch64,
+        ));
+        assert!(!binary_is_compatible(
+            BinaryFormat::Elf,
+            ObjectArchitecture::Aarch64,
+            OperatingSystem::Macos,
+            Architecture::Aarch64,
+        ));
+        assert!(!binary_is_compatible(
+            BinaryFormat::MachO,
+            ObjectArchitecture::X86_64,
+            OperatingSystem::Macos,
+            Architecture::Aarch64,
+        ));
+    }
+
+    #[test]
+    fn universal_macho_requires_a_matching_worker_slice() {
+        assert!(fat_binary_is_compatible(
+            [ObjectArchitecture::X86_64, ObjectArchitecture::Aarch64].into_iter(),
+            OperatingSystem::Macos,
+            Architecture::Aarch64,
+        ));
+        assert!(!fat_binary_is_compatible(
+            [ObjectArchitecture::X86_64].into_iter(),
+            OperatingSystem::Macos,
+            Architecture::Aarch64,
+        ));
+    }
 }

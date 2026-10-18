@@ -352,6 +352,7 @@ pub enum RunFailureReason {
     CapacityRejected,
     BackendFailure,
     ExecutableDigestMismatch,
+    IncompatibleExecutable,
     OutcomeUnknown,
 }
 

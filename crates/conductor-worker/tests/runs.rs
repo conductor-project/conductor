@@ -603,6 +603,32 @@ fn executable_digest_mismatch_fails_without_spawning_the_workload() {
 }
 
 #[test]
+fn incompatible_executable_format_fails_before_backend_spawn() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 1, Arc::clone(&backend));
+    let executable = directory.0.join("wrong-format");
+    fs::write(&executable, b"not a native executable").unwrap();
+
+    let observation = service
+        .start(StartRun::new(run(
+            "wrong-format",
+            job(
+                "wrong-format",
+                vec![executable.to_string_lossy().into_owned()],
+            ),
+        )))
+        .unwrap();
+
+    assert_eq!(observation.state(), RunState::Failed);
+    assert_eq!(
+        observation.failure_reason(),
+        Some(RunFailureReason::IncompatibleExecutable)
+    );
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn worker_reports_spawn_exit_signal_and_capacity_outcomes() {
     let directory = TempDir::new();
     let backend = Arc::new(TestBackend::default());
