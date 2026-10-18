@@ -32,7 +32,7 @@ those Linux kernel guarantees.
 | Landlock filesystem policy | Optional, when the kernel and administrator configuration meet the requirements | Unavailable |
 | Resource requests and reservations | Scheduling metadata; only configured cgroup limits are kernel enforcement | Scheduling metadata only; no kernel resource enforcement |
 | Filesystem-policy request | Enforced by Landlock or rejected before launch, depending on policy mode | Rejected before launch |
-| Executable architecture and digest | Architecture is represented in worker capability contracts; digest verification before execution is tracked separately in issue #63 | Same contract behavior; the native loader rejects incompatible binaries, while digest verification is tracked separately in issue #63 |
+| Executable architecture and digest | The worker checks ELF format and worker architecture before launch, and verifies an optional operator-provisioned SHA-256 digest | The worker checks Mach-O format and worker architecture before launch, and verifies an optional operator-provisioned SHA-256 digest |
 
 Conductor does not silently replace a requested Linux protection with a weaker
 macOS behavior. A macOS worker cannot advertise cgroup or Landlock enforcement,
@@ -44,9 +44,19 @@ qualify independent-host failure isolation or cross-host networking; those
 require the separate MVP2 multi-host qualification in issue #77. The manager
 plus two worker authenticated-transport demonstration is tracked with runtime
 composition in issue #61. Host resource inventory and refusal to place work on
-incompatible workers are tracked in issues #66 and #67. Executable digest
-verification is tracked in issue #63. These remain explicit qualification gaps
-until their implementation and macOS evidence are complete.
+incompatible workers are tracked in issues #66 and #67. These remain explicit
+qualification gaps until their implementation and macOS evidence are complete.
+
+Before launch, the worker rejects native executables whose object format or
+architecture differs from its own. Universal Mach-O binaries are accepted
+when they contain a slice for the worker architecture. Interpreter scripts
+delegate executable selection to their shebang interpreter. When a job
+includes `executableDigest`, the worker also hashes the configured executable
+immediately before launch and fails the run without spawning it if the digest
+does not match. The digest confirms file contents; it does not provide a
+sandbox or protect against a same-user process changing the file after
+verification. A compatible format and architecture do not guarantee that
+dynamic libraries or other runtime requirements are installed.
 
 ## macOS prerequisites
 

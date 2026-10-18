@@ -20,11 +20,15 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 
 use conductor_core::{
-    InspectRun, JobSpec, LogStream, MAX_LOG_CHUNK_BYTES, MAX_WORKER_CAPACITY, ReadRunLogs,
-    ResolveRun, RunFailureReason, RunLogChunk, RunLogStatus, RunObservation, RunState,
-    RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId, WorkerStatus,
+    Architecture as WorkerArchitecture, CommandEnvelope, CommandId, InspectRun, JobSpec, LogStream,
+    MAX_LOG_CHUNK_BYTES, MAX_WORKER_CAPACITY, OperatingSystem, ReadRunLogs, ResolveRun,
+    RunFailureReason, RunLogChunk, RunLogStatus, RunObservation, RunState, RunTerminationReason,
+    StartRun, StopRun, WorkerDescriptor, WorkerId, WorkerStatus,
 };
+use object::read::{FileKind, Object, ReadCache, macho::FatArch};
+use object::{Architecture as ObjectArchitecture, BinaryFormat};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use sha2::{Digest, Sha256};
 use tokio::runtime::Runtime;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 
@@ -32,7 +36,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_PERSISTENCE_BUDGET: Duration = Duration::from_secs(2);
 const PERSISTENCE_BLOCKING_CAPACITY: usize = 2;
@@ -69,6 +73,17 @@ pub enum WorkerError {
     LogsNotFound,
     LogsPruned,
     StorageUnavailable,
+}
+
+/// A worker report persisted with its command result until the manager
+/// acknowledges the report sequence.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredWorkerReport {
+    pub command_id: CommandId,
+    pub worker_id: WorkerId,
+    pub worker_incarnation: u64,
+    pub report_sequence: u64,
+    pub result_json: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -754,15 +769,52 @@ impl WorkerService {
                     incarnation INTEGER NOT NULL CHECK (incarnation >= 0)
                 );
                 INSERT OR IGNORE INTO worker_meta (id, incarnation) VALUES (1, 0);
-                UPDATE worker_meta SET incarnation = incarnation + 1 WHERE id = 1;
-                PRAGMA user_version = 3;",
+                CREATE TABLE IF NOT EXISTS worker_commands (
+                    command_id TEXT PRIMARY KEY NOT NULL,
+                    worker_id TEXT NOT NULL,
+                    worker_incarnation INTEGER NOT NULL CHECK (worker_incarnation >= 0),
+                    command_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('accepted', 'completed', 'acknowledged')),
+                    result_json TEXT,
+                    report_sequence INTEGER CHECK (report_sequence IS NULL OR report_sequence > 0),
+                    accepted_at_ms INTEGER NOT NULL,
+                    CHECK ((state = 'accepted' AND result_json IS NULL AND report_sequence IS NULL)
+                        OR (state IN ('completed', 'acknowledged') AND result_json IS NOT NULL AND report_sequence IS NOT NULL)),
+                    UNIQUE (worker_incarnation, report_sequence)
+                );
+                CREATE INDEX IF NOT EXISTS worker_commands_pending_reports
+                    ON worker_commands (worker_incarnation, report_sequence)
+                    WHERE state = 'completed';
+                CREATE TABLE IF NOT EXISTS worker_report_state (
+                    incarnation INTEGER NOT NULL CHECK (incarnation >= 0),
+                    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                    PRIMARY KEY (incarnation)
+                );
+                INSERT OR IGNORE INTO worker_report_state (incarnation, sequence) VALUES (0, 0);
+                PRAGMA user_version = 4;",
                 )
                 .map_err(storage_error)?;
+            let changed = transaction
+                .execute(
+                    "UPDATE worker_meta SET incarnation = incarnation + 1
+                     WHERE id = 1 AND incarnation < 9223372036854775807",
+                    [],
+                )
+                .map_err(storage_error)?;
+            if changed == 0 {
+                return Err(io::Error::other("worker incarnation is exhausted"));
+            }
             let generation = transaction
                 .query_row(
                     "SELECT incarnation FROM worker_meta WHERE id = 1",
                     [],
                     |row| row.get::<_, i64>(0),
+                )
+                .map_err(storage_error)?;
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO worker_report_state (incarnation, sequence) VALUES (?1, 0)",
+                    [generation],
                 )
                 .map_err(storage_error)?;
             transaction.commit().map_err(storage_error)?;
@@ -903,6 +955,45 @@ impl WorkerService {
                 return self.finish_backend_failure(starting);
             }
         };
+
+        if let Some(expected) = spec.job().executable_digest() {
+            match executable_digest_matches(Path::new(&spec.job().command()[0]), expected.value()) {
+                Ok(true) => {}
+                Ok(false) => {
+                    drop(stdout_file);
+                    drop(stderr_file);
+                    self.mark_log_closed(spec.id().as_str(), LogStream::Stdout);
+                    self.mark_log_closed(spec.id().as_str(), LogStream::Stderr);
+                    return self
+                        .finish_failure(starting, RunFailureReason::ExecutableDigestMismatch);
+                }
+                Err(_) => {
+                    drop(stdout_file);
+                    drop(stderr_file);
+                    self.mark_log_closed(spec.id().as_str(), LogStream::Stdout);
+                    self.mark_log_closed(spec.id().as_str(), LogStream::Stderr);
+                    return self.finish_backend_failure(starting);
+                }
+            }
+        }
+
+        match executable_is_compatible(Path::new(&spec.job().command()[0])) {
+            Ok(true) => {}
+            Ok(false) => {
+                drop(stdout_file);
+                drop(stderr_file);
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stdout);
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stderr);
+                return self.finish_failure(starting, RunFailureReason::IncompatibleExecutable);
+            }
+            Err(_) => {
+                drop(stdout_file);
+                drop(stderr_file);
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stdout);
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stderr);
+                return self.finish_backend_failure(starting);
+            }
+        }
 
         let child = match self.backend.spawn(spec.id().as_str(), spec.job()) {
             Ok(child) => child,
@@ -1266,6 +1357,341 @@ impl WorkerService {
         Ok(resolved)
     }
 
+    /// Durably accepts a command before its side effect is attempted. A report
+    /// returned here is the immutable result of an earlier delivery of the
+    /// same command ID and contents.
+    pub fn accept_command(
+        &self,
+        envelope: &CommandEnvelope,
+    ) -> Result<Option<StoredWorkerReport>, WorkerError> {
+        if envelope.target_worker_id != self.worker_id
+            || envelope.target_worker_incarnation != self.incarnation
+        {
+            return Err(WorkerError::WorkerMismatch);
+        }
+        let command_json =
+            serde_json::to_string(envelope).map_err(|_| WorkerError::StorageUnavailable)?;
+        if command_json.len() > 128 * 1024 {
+            return Err(WorkerError::StorageUnavailable);
+        }
+        let mut state = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let existing = transaction
+            .query_row(
+                "SELECT command_json, state, result_json, report_sequence,
+                        worker_id, worker_incarnation
+                 FROM worker_commands WHERE command_id = ?1",
+                [envelope.command_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        if let Some((stored_json, status, result_json, sequence, worker_id, incarnation)) = existing
+        {
+            if stored_json != command_json
+                || worker_id != self.worker_id.as_str()
+                || u64::try_from(incarnation).ok() != Some(self.incarnation)
+            {
+                return Err(WorkerError::RunConflict);
+            }
+            let report = match (result_json, sequence) {
+                (Some(result_json), Some(sequence))
+                    if matches!(status.as_str(), "completed" | "acknowledged") =>
+                {
+                    Some(StoredWorkerReport {
+                        command_id: envelope.command_id.clone(),
+                        worker_id: self.worker_id.clone(),
+                        worker_incarnation: self.incarnation,
+                        report_sequence: u64::try_from(sequence)
+                            .map_err(|_| WorkerError::StorageUnavailable)?,
+                        result_json,
+                    })
+                }
+                (None, None) if status == "accepted" => None,
+                _ => return Err(WorkerError::StorageUnavailable),
+            };
+            transaction
+                .commit()
+                .map_err(|_| WorkerError::StorageUnavailable)?;
+            return Ok(report);
+        }
+        transaction
+            .execute(
+                "INSERT INTO worker_commands
+                    (command_id, worker_id, worker_incarnation, command_json,
+                     state, accepted_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, 'accepted', ?5)",
+                params![
+                    envelope.command_id.as_str(),
+                    self.worker_id.as_str(),
+                    i64::try_from(self.incarnation).map_err(|_| WorkerError::StorageUnavailable)?,
+                    command_json,
+                    now_ms().map_err(|_| WorkerError::StorageUnavailable)?
+                ],
+            )
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        Ok(None)
+    }
+
+    /// Commits the command result and its monotonically increasing report
+    /// sequence in one SQLite transaction.
+    pub fn complete_command(
+        &self,
+        envelope: &CommandEnvelope,
+        result_json: &str,
+    ) -> Result<StoredWorkerReport, WorkerError> {
+        if result_json.len() > 128 * 1024
+            || serde_json::from_str::<serde_json::Value>(result_json).is_err()
+        {
+            return Err(WorkerError::StorageUnavailable);
+        }
+        let command_json =
+            serde_json::to_string(envelope).map_err(|_| WorkerError::StorageUnavailable)?;
+        let mut state = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let existing = transaction
+            .query_row(
+                "SELECT command_json, state, result_json, report_sequence,
+                        worker_id, worker_incarnation
+                 FROM worker_commands WHERE command_id = ?1",
+                [envelope.command_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| WorkerError::StorageUnavailable)?
+            .ok_or(WorkerError::RunConflict)?;
+        if existing.0 != command_json
+            || existing.4 != self.worker_id.as_str()
+            || u64::try_from(existing.5).ok() != Some(envelope.target_worker_incarnation)
+        {
+            return Err(WorkerError::RunConflict);
+        }
+        if matches!(existing.1.as_str(), "completed" | "acknowledged") {
+            let (Some(result_json), Some(sequence)) = (existing.2, existing.3) else {
+                return Err(WorkerError::StorageUnavailable);
+            };
+            transaction
+                .commit()
+                .map_err(|_| WorkerError::StorageUnavailable)?;
+            return Ok(StoredWorkerReport {
+                command_id: envelope.command_id.clone(),
+                worker_id: self.worker_id.clone(),
+                worker_incarnation: envelope.target_worker_incarnation,
+                report_sequence: u64::try_from(sequence)
+                    .map_err(|_| WorkerError::StorageUnavailable)?,
+                result_json,
+            });
+        }
+        if existing.1 != "accepted" || existing.2.is_some() || existing.3.is_some() {
+            return Err(WorkerError::StorageUnavailable);
+        }
+        let stored_incarnation = i64::try_from(envelope.target_worker_incarnation)
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let sequence: i64 = transaction
+            .query_row(
+                "SELECT sequence FROM worker_report_state WHERE incarnation = ?1",
+                [stored_incarnation],
+                |row| row.get(0),
+            )
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(WorkerError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "UPDATE worker_report_state SET sequence = ?1
+                 WHERE incarnation = ?2 AND sequence = ?3",
+                params![next_sequence, stored_incarnation, sequence],
+            )
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let changed = transaction
+            .execute(
+                "UPDATE worker_commands
+                 SET state = 'completed', result_json = ?1, report_sequence = ?2
+                 WHERE command_id = ?3 AND state = 'accepted'",
+                params![result_json, next_sequence, envelope.command_id.as_str()],
+            )
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        if changed != 1 {
+            return Err(WorkerError::StorageUnavailable);
+        }
+        transaction
+            .commit()
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        Ok(StoredWorkerReport {
+            command_id: envelope.command_id.clone(),
+            worker_id: self.worker_id.clone(),
+            worker_incarnation: envelope.target_worker_incarnation,
+            report_sequence: u64::try_from(next_sequence)
+                .map_err(|_| WorkerError::StorageUnavailable)?,
+            result_json: result_json.to_owned(),
+        })
+    }
+
+    /// Returns every completed report not yet acknowledged by the manager for
+    /// this worker incarnation, in sequence order.
+    pub fn pending_reports(&self) -> Result<Vec<StoredWorkerReport>, WorkerError> {
+        let state = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let mut statement = state
+            .connection
+            .prepare(
+                "SELECT command_id, worker_id, worker_incarnation, report_sequence, result_json
+                 FROM worker_commands
+                 WHERE state = 'completed'
+                 ORDER BY worker_incarnation, report_sequence",
+            )
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        rows.map(|row| {
+            let (command_id, worker_id, incarnation, sequence, result_json) =
+                row.map_err(|_| WorkerError::StorageUnavailable)?;
+            Ok(StoredWorkerReport {
+                command_id: CommandId::new(command_id)
+                    .map_err(|_| WorkerError::StorageUnavailable)?,
+                worker_id: WorkerId::new(worker_id).map_err(|_| WorkerError::StorageUnavailable)?,
+                worker_incarnation: u64::try_from(incarnation)
+                    .map_err(|_| WorkerError::StorageUnavailable)?,
+                report_sequence: u64::try_from(sequence)
+                    .map_err(|_| WorkerError::StorageUnavailable)?,
+                result_json,
+            })
+        })
+        .collect()
+    }
+
+    /// Returns accepted commands whose result has not yet been committed. The
+    /// transport reconciles them before polling for new work.
+    pub fn accepted_commands(&self) -> Result<Vec<CommandEnvelope>, WorkerError> {
+        let state = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let mut statement = state
+            .connection
+            .prepare(
+                "SELECT command_json FROM worker_commands
+                 WHERE state = 'accepted' ORDER BY accepted_at_ms, command_id",
+            )
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        rows.map(|row| {
+            serde_json::from_str(&row.map_err(|_| WorkerError::StorageUnavailable)?)
+                .map_err(|_| WorkerError::StorageUnavailable)
+        })
+        .collect()
+    }
+
+    /// Records the manager's report acknowledgement so a restart does not
+    /// resend a completed report unnecessarily.
+    pub fn acknowledge_report(
+        &self,
+        command_id: &CommandId,
+        worker_incarnation: u64,
+        report_sequence: u64,
+    ) -> Result<(), WorkerError> {
+        let mut state = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let transaction = state
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let record = transaction
+            .query_row(
+                "SELECT state, worker_incarnation, report_sequence
+                 FROM worker_commands WHERE command_id = ?1",
+                [command_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| WorkerError::StorageUnavailable)?
+            .ok_or(WorkerError::RunConflict)?;
+        if u64::try_from(record.1).ok() != Some(worker_incarnation)
+            || record.2.and_then(|value| u64::try_from(value).ok()) != Some(report_sequence)
+        {
+            return Err(WorkerError::RunConflict);
+        }
+        if record.0 == "acknowledged" {
+            transaction
+                .commit()
+                .map_err(|_| WorkerError::StorageUnavailable)?;
+            return Ok(());
+        }
+        if record.0 != "completed" {
+            return Err(WorkerError::RunConflict);
+        }
+        transaction
+            .execute(
+                "UPDATE worker_commands SET state = 'acknowledged'
+                 WHERE command_id = ?1 AND state = 'completed'",
+                [command_id.as_str()],
+            )
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| WorkerError::StorageUnavailable)
+    }
+
     pub fn descriptor(&self) -> WorkerDescriptor {
         WorkerDescriptor::new(self.worker_id.clone(), self.capacity, true)
             .with_incarnation(self.incarnation)
@@ -1608,6 +2034,14 @@ impl WorkerService {
     }
 
     fn finish_spawn_failure(&self, current: RunObservation) -> Result<RunObservation, WorkerError> {
+        self.finish_failure(current, RunFailureReason::SpawnFailed)
+    }
+
+    fn finish_failure(
+        &self,
+        current: RunObservation,
+        failure_reason: RunFailureReason,
+    ) -> Result<RunObservation, WorkerError> {
         self.mark_log_closed(current.run_id().as_str(), LogStream::Stdout);
         self.mark_log_closed(current.run_id().as_str(), LogStream::Stderr);
         let finished = now_ms().map_err(|_| WorkerError::StorageUnavailable)?;
@@ -1618,7 +2052,7 @@ impl WorkerService {
                 Some(finished),
                 None,
                 None,
-                Some(RunFailureReason::SpawnFailed),
+                Some(failure_reason),
             )
             .ok_or(WorkerError::StorageUnavailable)?;
         self.persist(&failed)?;
@@ -1695,6 +2129,174 @@ fn prepare_log_file(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     options.mode(0o600);
     options.open(path)
+}
+
+fn executable_digest_matches(path: &Path, expected: &str) -> io::Result<bool> {
+    let mut file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "configured executable is not a regular file",
+        ));
+    }
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let length = file.read(&mut buffer)?;
+        if length == 0 {
+            break;
+        }
+        hasher.update(&buffer[..length]);
+    }
+    let digest = hasher.finalize();
+    let alphabet = b"0123456789abcdef";
+    let mut encoded = [0_u8; 64];
+    for (index, byte) in digest.iter().enumerate() {
+        encoded[index * 2] = alphabet[usize::from(byte >> 4)];
+        encoded[index * 2 + 1] = alphabet[usize::from(byte & 0x0f)];
+    }
+    Ok(expected.as_bytes() == encoded)
+}
+
+/// Check native executable format and architecture before the backend can launch it.
+/// Interpreter scripts are delegated to their shebang interpreter, whose own
+/// native executable is checked by the operating system when the script starts.
+fn executable_is_compatible(path: &Path) -> io::Result<bool> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        // Preserve the backend's normal SpawnFailed result for missing commands.
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    if !file.metadata()?.is_file() {
+        return Ok(false);
+    }
+
+    let mut prefix = [0_u8; 2];
+    let prefix_length = file.read(&mut prefix)?;
+    if prefix_length == prefix.len() && prefix == *b"#!" {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::Start(0))?;
+
+    let cache = ReadCache::new(file);
+    let kind = match FileKind::parse(&cache) {
+        Ok(kind) => kind,
+        Err(_) => return Ok(false),
+    };
+    let target_os = target_operating_system();
+    let target_architecture = target_architecture();
+    let Some((target_os, target_architecture)) = target_os.zip(target_architecture) else {
+        return Ok(false);
+    };
+
+    match kind {
+        FileKind::Elf32 | FileKind::Elf64 => {
+            let Ok(file) = object::File::parse(&cache) else {
+                return Ok(false);
+            };
+            Ok(binary_is_compatible(
+                BinaryFormat::Elf,
+                file.architecture(),
+                target_os,
+                target_architecture,
+            ))
+        }
+        FileKind::MachO32 | FileKind::MachO64 => {
+            let Ok(file) = object::File::parse(&cache) else {
+                return Ok(false);
+            };
+            Ok(binary_is_compatible(
+                BinaryFormat::MachO,
+                file.architecture(),
+                target_os,
+                target_architecture,
+            ))
+        }
+        FileKind::MachOFat32 => {
+            let Ok(file) = object::read::macho::MachOFatFile32::parse(&cache) else {
+                return Ok(false);
+            };
+            Ok(fat_binary_is_compatible(
+                file.arches().iter().map(FatArch::architecture),
+                target_os,
+                target_architecture,
+            ))
+        }
+        FileKind::MachOFat64 => {
+            let Ok(file) = object::read::macho::MachOFatFile64::parse(&cache) else {
+                return Ok(false);
+            };
+            Ok(fat_binary_is_compatible(
+                file.arches().iter().map(FatArch::architecture),
+                target_os,
+                target_architecture,
+            ))
+        }
+        _ => Ok(false),
+    }
+}
+
+fn fat_binary_is_compatible(
+    architectures: impl Iterator<Item = ObjectArchitecture>,
+    target_os: OperatingSystem,
+    target_architecture: WorkerArchitecture,
+) -> bool {
+    architectures.into_iter().any(|architecture| {
+        binary_is_compatible(
+            BinaryFormat::MachO,
+            architecture,
+            target_os,
+            target_architecture,
+        )
+    })
+}
+
+fn binary_is_compatible(
+    format: BinaryFormat,
+    architecture: ObjectArchitecture,
+    target_os: OperatingSystem,
+    target_architecture: WorkerArchitecture,
+) -> bool {
+    let expected_format = match target_os {
+        OperatingSystem::Linux => BinaryFormat::Elf,
+        OperatingSystem::Macos => BinaryFormat::MachO,
+    };
+    let expected_architecture = match target_architecture {
+        WorkerArchitecture::Aarch64 => ObjectArchitecture::Aarch64,
+        WorkerArchitecture::X86_64 => ObjectArchitecture::X86_64,
+    };
+    format == expected_format && architecture == expected_architecture
+}
+
+const fn target_operating_system() -> Option<OperatingSystem> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(OperatingSystem::Linux)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Some(OperatingSystem::Macos)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
+const fn target_architecture() -> Option<WorkerArchitecture> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        Some(WorkerArchitecture::Aarch64)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        Some(WorkerArchitecture::X86_64)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        None
+    }
 }
 
 fn spawn_capture<R: CaptureRead + 'static>(
@@ -2416,4 +3018,47 @@ fn now_ms() -> io::Result<i64> {
 
 fn storage_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
+}
+
+#[cfg(test)]
+mod executable_compatibility_tests {
+    use super::{binary_is_compatible, fat_binary_is_compatible};
+    use conductor_core::{Architecture, OperatingSystem};
+    use object::{Architecture as ObjectArchitecture, BinaryFormat};
+
+    #[test]
+    fn native_format_and_architecture_must_both_match() {
+        assert!(binary_is_compatible(
+            BinaryFormat::MachO,
+            ObjectArchitecture::Aarch64,
+            OperatingSystem::Macos,
+            Architecture::Aarch64,
+        ));
+        assert!(!binary_is_compatible(
+            BinaryFormat::Elf,
+            ObjectArchitecture::Aarch64,
+            OperatingSystem::Macos,
+            Architecture::Aarch64,
+        ));
+        assert!(!binary_is_compatible(
+            BinaryFormat::MachO,
+            ObjectArchitecture::X86_64,
+            OperatingSystem::Macos,
+            Architecture::Aarch64,
+        ));
+    }
+
+    #[test]
+    fn universal_macho_requires_a_matching_worker_slice() {
+        assert!(fat_binary_is_compatible(
+            [ObjectArchitecture::X86_64, ObjectArchitecture::Aarch64].into_iter(),
+            OperatingSystem::Macos,
+            Architecture::Aarch64,
+        ));
+        assert!(!fat_binary_is_compatible(
+            [ObjectArchitecture::X86_64].into_iter(),
+            OperatingSystem::Macos,
+            Architecture::Aarch64,
+        ));
+    }
 }

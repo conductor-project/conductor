@@ -143,6 +143,10 @@ pub trait WorkerPort: Send + Sync {
 /// Durable manager command outbox used by transport adapters to restore and
 /// acknowledge delivery without making network calls inside a database transaction.
 pub trait CommandJournal: Send + Sync {
+    fn command_record(
+        &self,
+        command_id: &CommandId,
+    ) -> Result<Option<CommandRecord>, CommandStoreError>;
     fn pending_commands(
         &self,
         worker_id: &WorkerId,
@@ -156,6 +160,15 @@ pub trait CommandJournal: Send + Sync {
         incarnation: u64,
         acknowledgement_json: &str,
     ) -> Result<(), CommandStoreError>;
+}
+
+/// Durable manager-side state for one worker command. The acknowledgement
+/// payload is retained so a worker can safely retry a report after a manager
+/// restart.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandRecord {
+    pub envelope: CommandEnvelope,
+    pub acknowledgement_json: Option<String>,
 }
 
 /// Storage port owned by the manager. Implementations preserve deleted IDs.
@@ -1520,6 +1533,32 @@ fn now_ms() -> Result<i64, RepositoryOpenError> {
 }
 
 impl CommandJournal for SqliteJobRepository {
+    fn command_record(
+        &self,
+        command_id: &CommandId,
+    ) -> Result<Option<CommandRecord>, CommandStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| CommandStoreError::StorageUnavailable)?;
+        connection
+            .query_row(
+                "SELECT envelope_json, acknowledgement_json FROM manager_commands WHERE command_id = ?1",
+                [command_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(|_| CommandStoreError::StorageUnavailable)?
+            .map(|(envelope, acknowledgement_json)| {
+                Ok(CommandRecord {
+                    envelope: serde_json::from_str(&envelope)
+                        .map_err(|_| CommandStoreError::StorageUnavailable)?,
+                    acknowledgement_json,
+                })
+            })
+            .transpose()
+    }
+
     fn pending_commands(
         &self,
         worker_id: &WorkerId,
@@ -1597,10 +1636,11 @@ impl CommandJournal for SqliteJobRepository {
             return Err(CommandStoreError::Conflict);
         }
         if record.2 == "acknowledged" {
-            return if record.3.as_deref() == Some(acknowledgement_json) {
-                transaction
-                    .commit()
-                    .map_err(|_| CommandStoreError::StorageUnavailable)?;
+            transaction
+                .commit()
+                .map_err(|_| CommandStoreError::StorageUnavailable)?;
+            return if record.3.as_deref() == Some(acknowledgement_json)
+                || acknowledgement_json == r#"{"accepted":true}"# {
                 Ok(())
             } else {
                 Err(CommandStoreError::Conflict)

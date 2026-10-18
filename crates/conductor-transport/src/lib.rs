@@ -9,7 +9,7 @@ pub use identity::{
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, SyncSender};
+use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -26,8 +26,8 @@ use conductor_core::{
     ReadRunLogs, ResolveRun, RunId, RunLogChunk, RunLogStatus, RunObservation, StartRun, StopRun,
     WorkerDescriptor, WorkerId, WorkerStatus,
 };
-use conductor_manager::{WorkerPort, WorkerPortError};
-use conductor_worker::{WorkerError, WorkerService};
+use conductor_manager::{CommandJournal, WorkerPort, WorkerPortError};
+use conductor_worker::{StoredWorkerReport, WorkerError, WorkerService};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, Semaphore, watch};
@@ -223,17 +223,27 @@ impl std::error::Error for TransportError {}
 #[derive(Clone)]
 pub struct WorkerTransportHub {
     sessions: Arc<RwLock<BTreeMap<WorkerId, Arc<WorkerSession>>>>,
+    journal: Option<Arc<dyn CommandJournal>>,
 }
 
 impl Default for WorkerTransportHub {
     fn default() -> Self {
         Self {
             sessions: Arc::new(RwLock::new(BTreeMap::new())),
+            journal: None,
         }
     }
 }
 
 impl WorkerTransportHub {
+    /// Create a transport hub backed by the manager's durable command journal.
+    pub fn with_journal(journal: Arc<dyn CommandJournal>) -> Self {
+        Self {
+            sessions: Arc::new(RwLock::new(BTreeMap::new())),
+            journal: Some(journal),
+        }
+    }
+
     pub fn register_worker(
         &self,
         descriptor: WorkerDescriptor,
@@ -250,7 +260,11 @@ impl WorkerTransportHub {
         if sessions.len() >= MAX_REGISTERED_WORKERS {
             return Err(TransportError::WorkerLimitReached);
         }
-        let session = Arc::new(WorkerSession::new(descriptor, protocol_offer));
+        let session = Arc::new(WorkerSession::new(
+            descriptor,
+            protocol_offer,
+            self.journal.clone(),
+        ));
         sessions.insert(worker_id, Arc::clone(&session));
         Ok(Arc::new(RemoteWorkerPort { session }))
     }
@@ -353,7 +367,7 @@ async fn report_worker(
 
 struct PendingCommand {
     envelope: CommandEnvelope,
-    response: SyncSender<WorkerResult>,
+    responses: Vec<SyncSender<WorkerResult>>,
     retry_at: Instant,
 }
 
@@ -361,9 +375,11 @@ struct WorkerSession {
     descriptor: WorkerDescriptor,
     incarnation: AtomicU64,
     protocol_offer: ProtocolOffer,
+    journal: Option<Arc<dyn CommandJournal>>,
     status: Mutex<WorkerStatus>,
     pending: Mutex<BTreeMap<CommandId, PendingCommand>>,
-    last_report_sequence: Mutex<u64>,
+    restored_incarnation: AtomicU64,
+    last_report_sequence: Mutex<BTreeMap<u64, u64>>,
     recent_reports: Mutex<VecDeque<WorkerReport>>,
     changed: Notify,
     poll_gate: Semaphore,
@@ -373,15 +389,21 @@ struct WorkerSession {
 }
 
 impl WorkerSession {
-    fn new(descriptor: WorkerDescriptor, protocol_offer: ProtocolOffer) -> Self {
+    fn new(
+        descriptor: WorkerDescriptor,
+        protocol_offer: ProtocolOffer,
+        journal: Option<Arc<dyn CommandJournal>>,
+    ) -> Self {
         let incarnation = descriptor.incarnation();
         Self {
             status: Mutex::new(WorkerStatus::new(descriptor.clone(), 0, 0, false, false, 0)),
             descriptor,
             incarnation: AtomicU64::new(incarnation),
             protocol_offer,
+            journal,
             pending: Mutex::new(BTreeMap::new()),
-            last_report_sequence: Mutex::new(0),
+            restored_incarnation: AtomicU64::new(0),
+            last_report_sequence: Mutex::new(BTreeMap::new()),
             recent_reports: Mutex::new(VecDeque::new()),
             changed: Notify::new(),
             poll_gate: Semaphore::new(1),
@@ -444,17 +466,24 @@ impl WorkerSession {
             return Err(TransportError::QueueFull);
         }
         if let Some(existing) = pending.get(&envelope.command_id) {
-            return Err(if existing.envelope == envelope {
-                TransportError::Unavailable
-            } else {
-                TransportError::WorkerConflict
-            });
+            if existing.envelope != envelope {
+                return Err(TransportError::WorkerConflict);
+            }
+            if existing.responses.len() >= MAX_PENDING_COMMANDS {
+                return Err(TransportError::QueueFull);
+            }
+            pending
+                .get_mut(&envelope.command_id)
+                .ok_or(TransportError::Unavailable)?
+                .responses
+                .push(sender);
+            return Ok(receiver);
         }
         pending.insert(
             envelope.command_id.clone(),
             PendingCommand {
                 envelope,
-                response: sender,
+                responses: vec![sender],
                 retry_at: Instant::now(),
             },
         );
@@ -466,16 +495,11 @@ impl WorkerSession {
     async fn poll(&self, request: WorkerPollRequest) -> Result<WorkerPollResponse, StatusCode> {
         let current_incarnation = self.incarnation.load(Ordering::Acquire);
         let request_incarnation = request.worker_incarnation;
-        let expected_incarnation = if current_incarnation == 0 {
-            request_incarnation
-        } else {
-            current_incarnation
-        };
-        if request_incarnation != expected_incarnation {
+        if request_incarnation < current_incarnation {
             return Err(StatusCode::CONFLICT);
         }
         if request.status.worker_id() != self.descriptor.worker_id()
-            || request.status.incarnation() != expected_incarnation
+            || request.status.incarnation() != request_incarnation
             || request.status.capacity() != self.descriptor.capacity()
             || request.status.supports_process_execution()
                 != self.descriptor.supports_process_execution()
@@ -490,11 +514,10 @@ impl WorkerSession {
             .poll_gate
             .try_acquire()
             .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
-        if current_incarnation == 0 {
-            self.incarnation
-                .compare_exchange(0, request_incarnation, Ordering::AcqRel, Ordering::Acquire)
-                .map_err(|_| StatusCode::CONFLICT)?;
+        if request_incarnation > current_incarnation {
+            self.adopt_incarnation(request_incarnation)?;
         }
+        self.restore_pending(request_incarnation)?;
         *self
             .status
             .lock()
@@ -504,7 +527,7 @@ impl WorkerSession {
         let deadline = tokio::time::Instant::now() + POLL_TIMEOUT;
         let command = loop {
             let notified = self.changed.notified();
-            let (ready, next_retry) = self.next_poll_command()?;
+            let (ready, next_retry) = self.next_poll_command(request_incarnation)?;
             if let Some(command) = ready {
                 break Some(command);
             }
@@ -535,17 +558,92 @@ impl WorkerSession {
         })
     }
 
-    fn next_poll_command(&self) -> Result<(Option<CommandEnvelope>, Option<Instant>), StatusCode> {
+    fn adopt_incarnation(&self, incarnation: u64) -> Result<(), StatusCode> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let stale = pending
+            .iter()
+            .filter(|(_, item)| item.envelope.target_worker_incarnation != incarnation)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for command_id in stale {
+            if let Some(item) = pending.remove(&command_id) {
+                for response in item.responses {
+                    let _ = response.send(WorkerResult::Error(RemoteWorkerError::Unavailable));
+                }
+            }
+        }
+        self.incarnation.store(incarnation, Ordering::Release);
+        Ok(())
+    }
+
+    fn restore_pending(&self, incarnation: u64) -> Result<(), StatusCode> {
+        let Some(journal) = &self.journal else {
+            return Ok(());
+        };
+        if self.restored_incarnation.load(Ordering::Acquire) == incarnation {
+            return Ok(());
+        }
+        let commands = journal
+            .pending_commands(
+                self.descriptor.worker_id(),
+                incarnation,
+                MAX_PENDING_COMMANDS,
+            )
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        for envelope in commands {
+            if pending.contains_key(&envelope.command_id) {
+                continue;
+            }
+            if pending.len() >= MAX_PENDING_COMMANDS {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            let (response, receiver): (SyncSender<WorkerResult>, Receiver<WorkerResult>) =
+                mpsc::sync_channel(1);
+            drop(receiver);
+            pending.insert(
+                envelope.command_id.clone(),
+                PendingCommand {
+                    envelope,
+                    responses: vec![response],
+                    retry_at: Instant::now(),
+                },
+            );
+        }
+        self.restored_incarnation
+            .store(incarnation, Ordering::Release);
+        Ok(())
+    }
+
+    fn next_poll_command(
+        &self,
+        incarnation: u64,
+    ) -> Result<(Option<CommandEnvelope>, Option<Instant>), StatusCode> {
         let mut pending = self
             .pending
             .lock()
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
         let now = Instant::now();
-        if let Some((_, item)) = pending.iter_mut().find(|(_, item)| item.retry_at <= now) {
+        if let Some((_, item)) = pending.iter_mut().find(|(_, item)| {
+            item.envelope.target_worker_incarnation == incarnation && item.retry_at <= now
+        }) {
             item.retry_at = now + COMMAND_REDELIVERY_INTERVAL;
             Ok((Some(item.envelope.clone()), None))
         } else {
-            Ok((None, pending.values().map(|item| item.retry_at).min()))
+            Ok((
+                None,
+                pending
+                    .values()
+                    .filter(|item| item.envelope.target_worker_incarnation == incarnation)
+                    .map(|item| item.retry_at)
+                    .min(),
+            ))
         }
     }
 
@@ -560,17 +658,14 @@ impl WorkerSession {
     }
 
     fn report(&self, report: WorkerReport) -> Result<ReportAcknowledgement, StatusCode> {
-        if report.worker_incarnation != self.incarnation.load(Ordering::Acquire) {
-            return Err(StatusCode::CONFLICT);
-        }
         let mut recent = self
             .recent_reports
             .lock()
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        if let Some(previous) = recent
-            .iter()
-            .find(|previous| previous.report_sequence == report.report_sequence)
-        {
+        if let Some(previous) = recent.iter().find(|previous| {
+            previous.worker_incarnation == report.worker_incarnation
+                && previous.report_sequence == report.report_sequence
+        }) {
             return if previous == &report {
                 Ok(ReportAcknowledgement {
                     report_sequence: report.report_sequence,
@@ -580,34 +675,90 @@ impl WorkerSession {
                 Err(StatusCode::CONFLICT)
             };
         }
-        let mut last_sequence = self
+        let mut last_sequences = self
             .last_report_sequence
             .lock()
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let first_report = *last_sequence == 0 && recent.is_empty();
+        let last_sequence = last_sequences
+            .get(&report.worker_incarnation)
+            .copied()
+            .unwrap_or_default();
+        let first_report = last_sequence == 0;
         if report.report_sequence == 0
             || (!first_report && report.report_sequence != last_sequence.saturating_add(1))
         {
             return Err(StatusCode::CONFLICT);
         }
+        let acknowledgement_json =
+            serde_json::to_string(&report).map_err(|_| StatusCode::CONFLICT)?;
+        let durable_record = if let Some(journal) = &self.journal {
+            journal
+                .command_record(&report.command_id)
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        } else {
+            None
+        };
+        if let Some(record) = &durable_record {
+            if record.envelope.target_worker_id != report.worker_id
+                || record.envelope.target_worker_incarnation != report.worker_incarnation
+                || !result_matches(&record.envelope.command, &report.result)
+            {
+                return Err(StatusCode::CONFLICT);
+            }
+            if let Some(previous) = &record.acknowledgement_json {
+                if previous != &acknowledgement_json {
+                    return Err(StatusCode::CONFLICT);
+                }
+                self.mark_seen()?;
+                return Ok(ReportAcknowledgement {
+                    report_sequence: report.report_sequence,
+                    duplicate: true,
+                });
+            }
+        }
         let mut pending = self
             .pending
             .lock()
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let Some(item) = pending.get(&report.command_id) else {
+        let item = pending.get(&report.command_id);
+        if item.is_none() && durable_record.is_none() {
             return Err(StatusCode::CONFLICT);
-        };
-        if item.envelope.target_worker_id != report.worker_id
-            || item.envelope.target_worker_incarnation != report.worker_incarnation
-            || !result_matches(&item.envelope.command, &report.result)
+        }
+        if let Some(item) = item
+            && (item.envelope.target_worker_id != report.worker_id
+                || item.envelope.target_worker_incarnation != report.worker_incarnation
+                || !result_matches(&item.envelope.command, &report.result))
         {
             return Err(StatusCode::CONFLICT);
         }
+        if let Some(journal) = &self.journal
+            && durable_record.is_some()
+        {
+            journal
+                .acknowledge_command(
+                    &report.command_id,
+                    &report.worker_id,
+                    report.worker_incarnation,
+                    &acknowledgement_json,
+                )
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        }
         let Some(item) = pending.remove(&report.command_id) else {
-            return Err(StatusCode::CONFLICT);
+            last_sequences.insert(report.worker_incarnation, report.report_sequence);
+            recent.push_back(report.clone());
+            while recent.len() > MAX_RECENT_REPORTS {
+                recent.pop_front();
+            }
+            self.mark_seen()?;
+            return Ok(ReportAcknowledgement {
+                report_sequence: report.report_sequence,
+                duplicate: false,
+            });
         };
-        let _ = item.response.send(report.result.clone());
-        *last_sequence = report.report_sequence;
+        for response in item.responses {
+            let _ = response.send(report.result.clone());
+        }
+        last_sequences.insert(report.worker_incarnation, report.report_sequence);
         recent.push_back(report.clone());
         while recent.len() > MAX_RECENT_REPORTS {
             recent.pop_front();
@@ -775,8 +926,6 @@ fn map_transport_error(error: TransportError) -> WorkerPortError {
 pub struct WorkerTransportClient {
     endpoint: Url,
     client: reqwest::Client,
-    report_sequence: AtomicU64,
-    recent_reports: Mutex<VecDeque<WorkerReport>>,
 }
 
 impl WorkerTransportClient {
@@ -826,12 +975,7 @@ impl WorkerTransportClient {
         let client = builder
             .build()
             .map_err(|_| TransportError::InvalidIdentity)?;
-        Ok(Self {
-            endpoint,
-            client,
-            report_sequence: AtomicU64::new(0),
-            recent_reports: Mutex::new(VecDeque::new()),
-        })
+        Ok(Self { endpoint, client })
     }
 
     pub async fn poll(
@@ -853,7 +997,10 @@ impl WorkerTransportClient {
         .await
     }
 
-    async fn send_report(&self, report: &WorkerReport) -> Result<(), TransportError> {
+    async fn send_report(
+        &self,
+        report: &WorkerReport,
+    ) -> Result<ReportAcknowledgement, TransportError> {
         let acknowledgement: ReportAcknowledgement = self
             .post_json(
                 "v1/worker/report",
@@ -867,7 +1014,7 @@ impl WorkerTransportClient {
         if acknowledgement.report_sequence != report.report_sequence {
             return Err(TransportError::MalformedResponse);
         }
-        Ok(())
+        Ok(acknowledgement)
     }
 
     async fn post_json<RequestBody, ResponseBody>(
@@ -924,10 +1071,45 @@ impl WorkerTransportClient {
         let descriptor = worker.descriptor();
         let worker_id = descriptor.worker_id().clone();
         let incarnation = descriptor.incarnation();
+        let recovery_worker = Arc::clone(&worker);
+        tokio::task::spawn_blocking(move || recover_accepted_commands(&recovery_worker))
+            .await
+            .map_err(|_| TransportError::Unavailable)??;
         let mut failures = 0_u32;
         loop {
             if *shutdown.borrow() {
                 return Ok(());
+            }
+            let pending = worker
+                .pending_reports()
+                .map_err(|_| TransportError::Unavailable)?;
+            if let Some(stored) = pending.into_iter().next() {
+                let report = report_from_stored(stored)?;
+                loop {
+                    tokio::select! {
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                return Ok(());
+                            }
+                        }
+                        result = self.send_report(&report) => match result {
+                            Ok(_) => {
+                                worker.acknowledge_report(
+                                    &report.command_id,
+                                    report.worker_incarnation,
+                                    report.report_sequence,
+                                ).map_err(|_| TransportError::Unavailable)?;
+                                failures = 0;
+                                break;
+                            }
+                            Err(_) => {
+                                failures = failures.saturating_add(1);
+                                tokio::time::sleep(backoff(failures)).await;
+                            }
+                        }
+                    }
+                }
+                continue;
             }
             let polled = tokio::select! {
                 changed = shutdown.changed() => {
@@ -952,30 +1134,22 @@ impl WorkerTransportClient {
                     {
                         return Err(TransportError::WorkerConflict);
                     }
-                    let cached = self.cached_report(&command.command_id);
-                    let report = match cached {
-                        Some(report) => report,
-                        None => {
-                            let command_id = command.command_id.clone();
-                            let worker_id = worker_id.clone();
-                            let worker = Arc::clone(&worker);
-                            let sequence = self.next_report_sequence()?;
-                            let result = tokio::task::spawn_blocking(move || {
-                                execute_command(worker.as_ref(), command.command)
-                            })
-                            .await
-                            .map_err(|_| TransportError::Unavailable)?;
-                            let report = WorkerReport {
-                                command_id,
-                                worker_id,
-                                worker_incarnation: incarnation,
-                                report_sequence: sequence,
-                                result,
-                            };
-                            self.cache_report(report.clone())?;
-                            report
+                    let worker_for_command = Arc::clone(&worker);
+                    let report = tokio::task::spawn_blocking(move || {
+                        let accepted = worker_for_command.accept_command(&command)?;
+                        if let Some(stored) = accepted {
+                            return Ok::<_, WorkerError>(stored);
                         }
-                    };
+                        let result =
+                            execute_command(worker_for_command.as_ref(), command.command.clone());
+                        let result_json = serde_json::to_string(&result)
+                            .map_err(|_| WorkerError::StorageUnavailable)?;
+                        worker_for_command.complete_command(&command, &result_json)
+                    })
+                    .await
+                    .map_err(|_| TransportError::Unavailable)?
+                    .map_err(|_| TransportError::Unavailable)?;
+                    let report = report_from_stored(report)?;
                     loop {
                         tokio::select! {
                             changed = shutdown.changed() => {
@@ -984,7 +1158,14 @@ impl WorkerTransportClient {
                                 }
                             }
                             result = self.send_report(&report) => match result {
-                                Ok(()) => break,
+                                Ok(_) => {
+                                    worker.acknowledge_report(
+                                        &report.command_id,
+                                        report.worker_incarnation,
+                                        report.report_sequence,
+                                    ).map_err(|_| TransportError::Unavailable)?;
+                                    break;
+                                }
                                 Err(_) => {
                                     failures = failures.saturating_add(1);
                                     tokio::time::sleep(backoff(failures)).await;
@@ -1007,36 +1188,43 @@ impl WorkerTransportClient {
             }
         }
     }
+}
 
-    fn next_report_sequence(&self) -> Result<u64, TransportError> {
-        self.report_sequence
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |sequence| {
-                sequence.checked_add(1)
-            })
-            .map(|sequence| sequence + 1)
-            .map_err(|_| TransportError::Unavailable)
-    }
+fn report_from_stored(stored: StoredWorkerReport) -> Result<WorkerReport, TransportError> {
+    Ok(WorkerReport {
+        command_id: stored.command_id,
+        worker_id: stored.worker_id,
+        worker_incarnation: stored.worker_incarnation,
+        report_sequence: stored.report_sequence,
+        result: serde_json::from_str(&stored.result_json)
+            .map_err(|_| TransportError::Unavailable)?,
+    })
+}
 
-    fn cached_report(&self, command_id: &CommandId) -> Option<WorkerReport> {
-        self.recent_reports
-            .lock()
-            .ok()?
-            .iter()
-            .find(|report| &report.command_id == command_id)
-            .cloned()
-    }
-
-    fn cache_report(&self, report: WorkerReport) -> Result<(), TransportError> {
-        let mut reports = self
-            .recent_reports
-            .lock()
+fn recover_accepted_commands(worker: &WorkerService) -> Result<(), TransportError> {
+    let incarnation = worker.descriptor().incarnation();
+    for envelope in worker
+        .accepted_commands()
+        .map_err(|_| TransportError::Unavailable)?
+    {
+        let result = match &envelope.command {
+            WorkerCommand::StartRun(command)
+                if envelope.target_worker_incarnation != incarnation =>
+            {
+                match worker.inspect(conductor_core::InspectRun::new(command.spec().id().clone())) {
+                    Ok(Some(_)) => execute_command(worker, envelope.command.clone()),
+                    Ok(None) | Err(_) => WorkerResult::Error(RemoteWorkerError::Unavailable),
+                }
+            }
+            _ => execute_command(worker, envelope.command.clone()),
+        };
+        let result_json =
+            serde_json::to_string(&result).map_err(|_| TransportError::Unavailable)?;
+        worker
+            .complete_command(&envelope, &result_json)
             .map_err(|_| TransportError::Unavailable)?;
-        reports.push_back(report);
-        while reports.len() > MAX_RECENT_REPORTS {
-            reports.pop_front();
-        }
-        Ok(())
     }
+    Ok(())
 }
 
 struct BoundedJsonBody(Vec<u8>);
@@ -1097,11 +1285,40 @@ fn execute_command(worker: &WorkerService, command: WorkerCommand) -> WorkerResu
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use conductor_core::{ProtocolVersionRange, WorkerDescriptor};
+    use conductor_manager::{JobRepository, SqliteJobRepository};
     use tower::ServiceExt;
+
+    struct TestDatabase(PathBuf);
+
+    impl TestDatabase {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos();
+            Self(std::env::temp_dir().join(format!(
+                "conductor-transport-test-{}-{nonce}.sqlite3",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            for path in [
+                self.0.clone(),
+                PathBuf::from(format!("{}-wal", self.0.display())),
+                PathBuf::from(format!("{}-shm", self.0.display())),
+            ] {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
 
     use super::*;
 
@@ -1125,6 +1342,7 @@ mod tests {
         WorkerSession::new(
             WorkerDescriptor::new(worker_id("worker-a"), 4, true).with_incarnation(9),
             offer(1),
+            None,
         )
     }
 
@@ -1132,14 +1350,24 @@ mod tests {
         WorkerSession::new(
             WorkerDescriptor::new(worker_id("worker-a"), 4, true),
             offer(1),
+            None,
         )
     }
 
     fn poll_request(id: &str, version: u16) -> WorkerPollRequest {
-        let descriptor = WorkerDescriptor::new(worker_id(id), 4, true).with_incarnation(9);
+        poll_request_with_incarnation(id, version, 9)
+    }
+
+    fn poll_request_with_incarnation(
+        id: &str,
+        version: u16,
+        incarnation: u64,
+    ) -> WorkerPollRequest {
+        let descriptor =
+            WorkerDescriptor::new(worker_id(id), 4, true).with_incarnation(incarnation);
         WorkerPollRequest {
             worker_id: worker_id(id),
-            worker_incarnation: 9,
+            worker_incarnation: incarnation,
             status: WorkerStatus::new(descriptor, 0, 0, true, false, 1),
             protocol_offer: offer(version),
         }
@@ -1275,6 +1503,160 @@ mod tests {
                 .expect("pending command")
                 .target_worker_incarnation,
             9
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_restart_replays_old_report_then_adopts_new_incarnation() {
+        let session = Arc::new(session());
+        let old_command = CommandEnvelope {
+            command_id: CommandId::new("old-incarnation-report").unwrap(),
+            target_worker_id: worker_id("worker-a"),
+            target_worker_incarnation: 9,
+            command: WorkerCommand::InspectRun(InspectRun::new(RunId::new("run-old").unwrap())),
+        };
+        let old_receiver = session
+            .enqueue_envelope(old_command.clone())
+            .expect("queue old-incarnation command");
+        let report = WorkerReport {
+            command_id: old_command.command_id.clone(),
+            worker_id: worker_id("worker-a"),
+            worker_incarnation: 9,
+            report_sequence: 1,
+            result: WorkerResult::Inspection(None),
+        };
+        assert_eq!(
+            session.report(report.clone()),
+            Ok(ReportAcknowledgement {
+                report_sequence: 1,
+                duplicate: false,
+            })
+        );
+        assert_eq!(old_receiver.recv().unwrap(), report.result);
+
+        let stale = CommandEnvelope {
+            command_id: CommandId::new("old-incarnation-not-received").unwrap(),
+            target_worker_id: worker_id("worker-a"),
+            target_worker_incarnation: 9,
+            command: WorkerCommand::InspectRun(InspectRun::new(RunId::new("run-stale").unwrap())),
+        };
+        let stale_receiver = session
+            .enqueue_envelope(stale)
+            .expect("queue stale command");
+        let polling_session = Arc::clone(&session);
+        let poll = tokio::spawn(async move {
+            polling_session
+                .poll(poll_request_with_incarnation("worker-a", 1, 10))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.descriptor().incarnation() != 10 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("new worker incarnation should be adopted");
+        assert_eq!(
+            stale_receiver.recv().unwrap(),
+            WorkerResult::Error(RemoteWorkerError::Unavailable)
+        );
+        let new_command = CommandEnvelope {
+            command_id: CommandId::new("new-incarnation-command").unwrap(),
+            target_worker_id: worker_id("worker-a"),
+            target_worker_incarnation: 10,
+            command: WorkerCommand::InspectRun(InspectRun::new(RunId::new("run-new").unwrap())),
+        };
+        let _new_receiver = session
+            .enqueue_envelope(new_command.clone())
+            .expect("queue command for new incarnation");
+        let response = poll.await.unwrap().unwrap();
+        assert_eq!(response.command, Some(new_command.clone()));
+        let new_report = WorkerReport {
+            command_id: new_command.command_id,
+            worker_id: worker_id("worker-a"),
+            worker_incarnation: 10,
+            report_sequence: 1,
+            result: WorkerResult::Inspection(None),
+        };
+        assert_eq!(
+            session.report(new_report),
+            Ok(ReportAcknowledgement {
+                report_sequence: 1,
+                duplicate: false,
+            })
+        );
+    }
+
+    #[test]
+    fn manager_restart_restores_commands_and_deduplicates_report_retries() {
+        let database = TestDatabase::new();
+        let repository =
+            Arc::new(SqliteJobRepository::open(&database.0).expect("open manager journal"));
+        let job: conductor_core::JobSpec =
+            serde_json::from_str(r#"{"id":"job-durable","command":["/bin/true"],"cwd":"/tmp"}"#)
+                .expect("valid job");
+        repository.insert(job.clone()).expect("insert job");
+        let worker_key = worker_id("worker-a");
+        let admission = repository
+            .create_run_for_worker(job.id(), &worker_key, 9, 4, None)
+            .expect("create run");
+        let envelope = admission.command.expect("durable command envelope");
+
+        let restarted_session = WorkerSession::new(
+            WorkerDescriptor::new(worker_key.clone(), 4, true).with_incarnation(9),
+            offer(1),
+            Some(repository.clone()),
+        );
+        restarted_session
+            .restore_pending(9)
+            .expect("restore pending command from journal");
+        assert!(
+            restarted_session
+                .pending
+                .lock()
+                .expect("pending lock")
+                .contains_key(&envelope.command_id)
+        );
+
+        let report = WorkerReport {
+            command_id: envelope.command_id.clone(),
+            worker_id: worker_key,
+            worker_incarnation: 9,
+            report_sequence: 1,
+            result: WorkerResult::Observation(RunObservation::requested(&admission.spec, 1)),
+        };
+        let report_session = WorkerSession::new(
+            WorkerDescriptor::new(worker_id("worker-a"), 4, true).with_incarnation(9),
+            offer(1),
+            Some(repository.clone()),
+        );
+        assert_eq!(
+            report_session.report(report.clone()),
+            Ok(ReportAcknowledgement {
+                report_sequence: 1,
+                duplicate: false,
+            })
+        );
+        let stored = repository
+            .command_record(&report.command_id)
+            .expect("read durable command")
+            .expect("command record exists");
+        assert_eq!(
+            stored.acknowledgement_json.as_deref(),
+            Some(serde_json::to_string(&report).unwrap().as_str())
+        );
+
+        let next_manager_session = WorkerSession::new(
+            WorkerDescriptor::new(worker_id("worker-a"), 4, true).with_incarnation(9),
+            offer(1),
+            Some(repository),
+        );
+        assert_eq!(
+            next_manager_session.report(report),
+            Ok(ReportAcknowledgement {
+                report_sequence: 1,
+                duplicate: true,
+            })
         );
     }
 
