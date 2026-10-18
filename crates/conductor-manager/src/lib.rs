@@ -18,7 +18,7 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 
 /// Temporary limit for active jobs. Pagination is a later milestone.
 pub const MAX_JOBS: usize = 1_000;
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -41,6 +41,14 @@ pub enum RunStoreError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryError {
     InvalidCursor,
+    StorageUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkerIdentityError {
+    CredentialInvalid,
+    IdentityExists,
+    IdentityUnavailable,
     StorageUnavailable,
 }
 
@@ -203,6 +211,9 @@ impl SqliteJobRepository {
         connection
             .busy_timeout(SQLITE_BUSY_TIMEOUT)
             .map_err(RepositoryOpenError::Sqlite)?;
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(RepositoryOpenError::Sqlite)?;
 
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -236,6 +247,231 @@ impl SqliteJobRepository {
         Ok(Self {
             connection: Mutex::new(connection),
         })
+    }
+
+    /// Persist a hashed, one-time enrollment credential. The raw credential is never stored.
+    pub fn create_enrollment_credential(
+        &self,
+        token_hash: &[u8; 32],
+        worker_id: &WorkerId,
+        expires_at_ms: i64,
+    ) -> Result<(), WorkerIdentityError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        connection
+            .execute(
+                "INSERT INTO enrollment_credentials(token_hash, worker_id, expires_at_ms) VALUES (?1, ?2, ?3)",
+                params![token_hash.as_slice(), worker_id.as_str(), expires_at_ms],
+            )
+            .map(|_| ())
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)
+    }
+
+    pub fn worker_for_enrollment_credential(
+        &self,
+        token_hash: &[u8; 32],
+        now_ms: i64,
+    ) -> Result<Option<WorkerId>, WorkerIdentityError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        let worker_id = connection
+            .query_row(
+                "SELECT worker_id FROM enrollment_credentials WHERE token_hash = ?1 AND consumed_at_ms IS NULL AND expires_at_ms > ?2",
+                params![token_hash.as_slice(), now_ms],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        worker_id
+            .map(WorkerId::new)
+            .transpose()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)
+    }
+
+    pub fn worker_for_active_certificate(
+        &self,
+        fingerprint: &[u8; 32],
+        now_ms: i64,
+    ) -> Result<Option<WorkerId>, WorkerIdentityError> {
+        self.authenticate_worker_certificate(fingerprint, now_ms)
+    }
+
+    /// Atomically consume a valid enrollment credential and install the first certificate.
+    pub fn enroll_worker_identity(
+        &self,
+        token_hash: &[u8; 32],
+        fingerprint: &[u8; 32],
+        serial: &str,
+        not_before_ms: i64,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<WorkerId, WorkerIdentityError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        let credential = transaction
+            .query_row(
+                "SELECT worker_id FROM enrollment_credentials WHERE token_hash = ?1 AND consumed_at_ms IS NULL AND expires_at_ms > ?2",
+                params![token_hash.as_slice(), now_ms],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?
+            .ok_or(WorkerIdentityError::CredentialInvalid)?;
+        let worker_id =
+            WorkerId::new(credential).map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        let existing = transaction
+            .query_row(
+                "SELECT 1 FROM worker_identities WHERE worker_id = ?1 AND revoked_at_ms IS NULL",
+                [worker_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        if existing.is_some() {
+            return Err(WorkerIdentityError::IdentityExists);
+        }
+        transaction
+            .execute(
+                "UPDATE enrollment_credentials SET consumed_at_ms = ?2 WHERE token_hash = ?1 AND consumed_at_ms IS NULL",
+                params![token_hash.as_slice(), now_ms],
+            )
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO worker_certificates(fingerprint, worker_id, serial, not_before_ms, expires_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![fingerprint.as_slice(), worker_id.as_str(), serial, not_before_ms, expires_at_ms],
+            )
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO worker_identities(worker_id, active_fingerprint, created_at_ms) VALUES (?1, ?2, ?3) ON CONFLICT(worker_id) DO UPDATE SET active_fingerprint = excluded.active_fingerprint, created_at_ms = excluded.created_at_ms, revoked_at_ms = NULL",
+                params![worker_id.as_str(), fingerprint.as_slice(), now_ms],
+            )
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        Ok(worker_id)
+    }
+
+    /// Replace the active certificate only when the presenting certificate is current.
+    pub fn renew_worker_identity(
+        &self,
+        current_fingerprint: &[u8; 32],
+        replacement_fingerprint: &[u8; 32],
+        serial: &str,
+        not_before_ms: i64,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<WorkerId, WorkerIdentityError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        let worker_id = transaction
+            .query_row(
+                "SELECT i.worker_id FROM worker_identities i JOIN worker_certificates c ON c.fingerprint = i.active_fingerprint WHERE i.active_fingerprint = ?1 AND i.revoked_at_ms IS NULL AND c.revoked_at_ms IS NULL AND c.expires_at_ms > ?2",
+                params![current_fingerprint.as_slice(), now_ms],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?
+            .ok_or(WorkerIdentityError::IdentityUnavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO worker_certificates(fingerprint, worker_id, serial, not_before_ms, expires_at_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![replacement_fingerprint.as_slice(), worker_id, serial, not_before_ms, expires_at_ms],
+            )
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "UPDATE worker_certificates SET revoked_at_ms = ?2 WHERE fingerprint = ?1",
+                params![current_fingerprint.as_slice(), now_ms],
+            )
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "UPDATE worker_identities SET active_fingerprint = ?2 WHERE worker_id = ?1",
+                params![worker_id, replacement_fingerprint.as_slice()],
+            )
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        WorkerId::new(worker_id).map_err(|_| WorkerIdentityError::StorageUnavailable)
+    }
+
+    /// Revoke an identity and all of its certificates immediately.
+    pub fn revoke_worker_identity(
+        &self,
+        worker_id: &WorkerId,
+        now_ms: i64,
+    ) -> Result<bool, WorkerIdentityError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        let changed = transaction
+            .execute(
+                "UPDATE worker_identities SET revoked_at_ms = COALESCE(revoked_at_ms, ?2) WHERE worker_id = ?1",
+                params![worker_id.as_str(), now_ms],
+            )
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "UPDATE worker_certificates SET revoked_at_ms = COALESCE(revoked_at_ms, ?2) WHERE worker_id = ?1",
+                params![worker_id.as_str(), now_ms],
+            )
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "DELETE FROM enrollment_credentials WHERE worker_id = ?1 AND consumed_at_ms IS NULL",
+                [worker_id.as_str()],
+            )
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        Ok(changed != 0)
+    }
+
+    /// Resolve a presented certificate fingerprint only while it is active and unexpired.
+    pub fn authenticate_worker_certificate(
+        &self,
+        fingerprint: &[u8; 32],
+        now_ms: i64,
+    ) -> Result<Option<WorkerId>, WorkerIdentityError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        let worker_id = connection
+            .query_row(
+                "SELECT i.worker_id FROM worker_identities i JOIN worker_certificates c ON c.fingerprint = i.active_fingerprint WHERE c.fingerprint = ?1 AND c.expires_at_ms > ?2 AND c.revoked_at_ms IS NULL AND i.revoked_at_ms IS NULL",
+                params![fingerprint.as_slice(), now_ms],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        worker_id
+            .map(WorkerId::new)
+            .transpose()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)
     }
 }
 
@@ -292,6 +528,51 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
         connection
             .prepare("SELECT run_id, job_id, worker_id, job_spec_json, observation_json, revision, state, idempotency_key, request_fingerprint, run_order FROM runs LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare("SELECT token_hash, worker_id, expires_at_ms, consumed_at_ms FROM enrollment_credentials LIMIT 0")
+            .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare("SELECT fingerprint, worker_id, serial, not_before_ms, expires_at_ms, revoked_at_ms FROM worker_certificates LIMIT 0")
+            .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare("SELECT worker_id, active_fingerprint, created_at_ms, revoked_at_ms FROM worker_identities LIMIT 0")
+            .map_err(MigrationError::Sqlite)?;
+        return Ok(());
+    }
+
+    if version == 3 {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(MigrationError::Sqlite)?;
+        transaction
+            .execute_batch(
+                "CREATE TABLE enrollment_credentials (
+                    token_hash BLOB PRIMARY KEY NOT NULL CHECK (length(token_hash) = 32),
+                    worker_id TEXT NOT NULL,
+                    expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms >= 0),
+                    consumed_at_ms INTEGER CHECK (consumed_at_ms IS NULL OR consumed_at_ms >= 0)
+                );
+                CREATE TABLE worker_certificates (
+                    fingerprint BLOB PRIMARY KEY NOT NULL CHECK (length(fingerprint) = 32),
+                    worker_id TEXT NOT NULL,
+                    serial TEXT NOT NULL UNIQUE,
+                    not_before_ms INTEGER NOT NULL CHECK (not_before_ms >= 0),
+                    expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > not_before_ms),
+                    revoked_at_ms INTEGER CHECK (revoked_at_ms IS NULL OR revoked_at_ms >= 0)
+                );
+                CREATE INDEX worker_certificates_by_worker ON worker_certificates(worker_id);
+                CREATE TABLE worker_identities (
+                    worker_id TEXT PRIMARY KEY NOT NULL,
+                    active_fingerprint BLOB NOT NULL UNIQUE REFERENCES worker_certificates(fingerprint),
+                    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                    revoked_at_ms INTEGER CHECK (revoked_at_ms IS NULL OR revoked_at_ms >= 0)
+                );",
+            )
+            .map_err(MigrationError::Sqlite)?;
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(MigrationError::Sqlite)?;
+        transaction.commit().map_err(MigrationError::Sqlite)?;
         return Ok(());
     }
 
@@ -318,10 +599,10 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
             )
             .map_err(MigrationError::Sqlite)?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 3)
             .map_err(MigrationError::Sqlite)?;
         transaction.commit().map_err(MigrationError::Sqlite)?;
-        return Ok(());
+        return migrate(connection);
     }
 
     let transaction = connection
@@ -397,6 +678,31 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
         CREATE UNIQUE INDEX runs_by_idempotency_key ON runs(idempotency_key) WHERE idempotency_key IS NOT NULL;
         CREATE TABLE run_sequence (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL);
         INSERT INTO run_sequence (id, value) VALUES (1, 0);",
+        )
+        .map_err(MigrationError::Sqlite)?;
+    transaction
+        .execute_batch(
+            "CREATE TABLE enrollment_credentials (
+                token_hash BLOB PRIMARY KEY NOT NULL CHECK (length(token_hash) = 32),
+                worker_id TEXT NOT NULL,
+                expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms >= 0),
+                consumed_at_ms INTEGER CHECK (consumed_at_ms IS NULL OR consumed_at_ms >= 0)
+            );
+            CREATE TABLE worker_certificates (
+                fingerprint BLOB PRIMARY KEY NOT NULL CHECK (length(fingerprint) = 32),
+                worker_id TEXT NOT NULL,
+                serial TEXT NOT NULL UNIQUE,
+                not_before_ms INTEGER NOT NULL CHECK (not_before_ms >= 0),
+                expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms > not_before_ms),
+                revoked_at_ms INTEGER CHECK (revoked_at_ms IS NULL OR revoked_at_ms >= 0)
+            );
+            CREATE INDEX worker_certificates_by_worker ON worker_certificates(worker_id);
+            CREATE TABLE worker_identities (
+                worker_id TEXT PRIMARY KEY NOT NULL,
+                active_fingerprint BLOB NOT NULL UNIQUE REFERENCES worker_certificates(fingerprint),
+                created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+                revoked_at_ms INTEGER CHECK (revoked_at_ms IS NULL OR revoked_at_ms >= 0)
+            );",
         )
         .map_err(MigrationError::Sqlite)?;
     transaction
