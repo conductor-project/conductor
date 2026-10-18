@@ -112,6 +112,7 @@ fn operator_command(address: SocketAddr, token_file: &Path, args: &[&str]) -> Ou
     Command::new(env!("CARGO_BIN_EXE_conductor"))
         .args(["operator", "--server"])
         .arg(format!("http://{address}"))
+        .args(["--output", "json"])
         .args(["--token-file"])
         .arg(token_file)
         .args(args)

@@ -1,13 +1,15 @@
 ---
 type: Runbook
 title: Operate Conductor with the CLI
-description: Inspect workers and services, mutate desired state safely, drain workers, page run history, and retrieve bounded logs.
+description: Select named manager connection contexts, inspect workers and services, mutate desired state safely, drain workers, page run history, and retrieve bounded logs.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: c696ef83dd136b8317c3c440ad4e4e2401c54a8c
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/operator_cli.rs
     title: Operator command parsing and requests
+  - resource: ../src/contexts.rs
+    title: Named context configuration
   - resource: ../../conductor-api/src/lib.rs
     title: Routes invoked by the CLI
   - resource: ../../conductor/tests/agent.rs
@@ -16,10 +18,23 @@ sources:
 
 # Connect and inspect
 
-The CLI uses the protected operator bearer token. Token files must be regular
-non-symlink files and owner-only on Unix; token contents are not printed in
-diagnostics. Plain HTTP is accepted only for loopback. Use a trusted TLS proxy
-for a remote manager.
+The CLI uses named contexts or explicit connection flags. Contexts store a
+server URL, timeout, and optional token-file and CA-file references. Token
+contents are not stored in the context JSON, and context list/show omit file
+paths. Context creation makes relative file references absolute. Use
+`conductor context use NAME` to select a default, or `operator --context NAME`
+to select one for a command. Explicit server, token-file, CA-file, and timeout
+flags override the corresponding context settings.
+
+Without a context, operator commands default to `http://127.0.0.1:8080` and do
+not require a dummy token. Token files must be regular non-symlink files and
+owner-only on Unix; token contents are not printed in diagnostics. Plain HTTP
+is accepted only for loopback, and remote manager use requires a token file.
+Use a trusted TLS proxy or a configured CA file for a remote manager.
+
+The default output is concise human text; use `--output json` for structured
+output. Errors are written to stderr with a nonzero exit code. Log bytes are
+written to stdout and log metadata to stderr so binary log data stays intact.
 
 ```sh
 conductor operator --server https://manager.example.net \

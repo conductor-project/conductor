@@ -19,6 +19,7 @@ serde_json.workspace = true
 ipnet.workspace = true
 ctrlc.workspace = true
 clap.workspace = true
+clap_complete.workspace = true
 tokio.workspace = true
 base64.workspace = true
 getrandom.workspace = true
