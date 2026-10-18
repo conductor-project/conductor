@@ -1389,6 +1389,7 @@ fn timestamp_ms() -> u128 {
 #[cfg(test)]
 mod access_tests {
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicU64;
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -1447,16 +1448,21 @@ mod access_tests {
 
     struct TestDatabase(PathBuf);
 
+    static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
     impl TestDatabase {
         fn new() -> Self {
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .expect("clock after epoch")
                 .as_nanos();
-            Self(std::env::temp_dir().join(format!(
-                "conductor-api-access-{}-{nonce}.sqlite3",
+            let sequence = TEMP_DIR_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "conductor-api-access-{}-{nonce}-{sequence}",
                 std::process::id()
-            )))
+            ));
+            std::fs::create_dir(&directory).expect("create temporary API database directory");
+            Self(directory.join("manager.sqlite3"))
         }
 
         fn manager(&self) -> Arc<JobService> {
@@ -1466,9 +1472,9 @@ mod access_tests {
 
     impl Drop for TestDatabase {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-            let _ = std::fs::remove_file(self.0.with_extension("sqlite3-shm"));
-            let _ = std::fs::remove_file(self.0.with_extension("sqlite3-wal"));
+            if let Some(directory) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(directory);
+            }
         }
     }
 
