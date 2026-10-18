@@ -88,6 +88,7 @@ macro_rules! stable_id {
 
 stable_id!(JobId);
 stable_id!(RunId);
+stable_id!(CommandId);
 stable_id!(WorkerId);
 
 mod execution;
