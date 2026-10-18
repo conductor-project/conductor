@@ -468,9 +468,23 @@ def main():
                     processes.append(Process([binary, "agent", "--config", config_path],
                                              root / f"{worker_name}.log", root))
                 wait_workers(base, worker_names, timings=result["timingsMs"])
-                ready_status, _, _ = request(base, "GET", "/readyz")
-                if ready_status != 200:
-                    raise RuntimeError(f"manager did not become ready after worker enrollment: HTTP {ready_status}")
+                readiness = {}
+
+                def manager_ready():
+                    status, _, body = request(base, "GET", "/readyz")
+                    readiness.update(status=status, body=body)
+                    return readiness if status == 200 else None
+
+                try:
+                    wait_until(
+                        "manager readiness after worker enrollment",
+                        manager_ready,
+                        timings=result["timingsMs"],
+                    )
+                except TimeoutError as error:
+                    raise TimeoutError(
+                        f"{error}; latest manager readiness response={readiness}"
+                    ) from error
                 result["scenarios"].append("two enrolled standalone workers report fresh status")
 
                 for service in ("frontend", "backend"):
@@ -675,7 +689,7 @@ def create_service_revision(
             "ports": [{"name": "http", "protocol": "tcp"}],
             "readinessProbe": {
                 "portName": "http", "protocol": "http", "path": "/health",
-                "intervalMs": 100, "timeoutMs": 250, "startupGraceMs": 0,
+                "intervalMs": 100, "timeoutMs": 50, "startupGraceMs": 0,
                 "successThreshold": 1, "failureThreshold": 3,
             },
         },
