@@ -275,6 +275,10 @@ fn valid_dns_label(value: &str) -> bool {
         && !value.ends_with('-')
 }
 
+fn valid_srv_label(value: &str) -> bool {
+    value.len() <= 62 && valid_dns_label(value)
+}
+
 /// Desired lifecycle for a job revision. Existing MVP1 jobs remain plain
 /// `JobSpec` values and map to `OneShot` when represented as an MVP2 revision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -381,7 +385,7 @@ impl ReadinessProbe {
         success_threshold: u16,
         failure_threshold: u16,
     ) -> Result<Self, ExecutionModelError> {
-        if !valid_dns_label(&port_name)
+        if !valid_srv_label(&port_name)
             || (protocol == ReadinessProbeProtocol::Http
                 && path.as_ref().is_none_or(|value| {
                     !value.starts_with('/')
@@ -474,7 +478,7 @@ fn tcp_protocol() -> ServicePortProtocol {
 impl ServicePort {
     pub fn tcp(name: impl Into<String>) -> Result<Self, ExecutionModelError> {
         let name = name.into();
-        if !valid_dns_label(&name) {
+        if !valid_srv_label(&name) {
             return Err(ExecutionModelError::InvalidServicePort);
         }
         Ok(Self {
@@ -546,7 +550,7 @@ impl AssignedServicePort {
     ) -> Result<Self, ExecutionModelError> {
         let name = name.into();
         let advertised_address = advertised_address.into();
-        if !valid_dns_label(&name) || port == 0 || !valid_advertised_address(&advertised_address) {
+        if !valid_srv_label(&name) || port == 0 || !valid_advertised_address(&advertised_address) {
             return Err(ExecutionModelError::InvalidServicePort);
         }
         Ok(Self {
@@ -571,7 +575,7 @@ impl AssignedServicePort {
     }
 
     pub fn is_valid(&self) -> bool {
-        valid_dns_label(&self.name)
+        valid_srv_label(&self.name)
             && self.port > 0
             && valid_advertised_address(&self.advertised_address)
     }
@@ -1212,7 +1216,7 @@ impl JobRevision {
             }
             let mut seen = std::collections::BTreeSet::new();
             for port in ports {
-                if !valid_dns_label(port.name())
+                if !valid_srv_label(port.name())
                     || !seen.insert(port.name())
                     || definition.env().contains_key(&port.environment_name())
                 {

@@ -1,3 +1,5 @@
+pub mod dns;
+
 use std::future::IntoFuture;
 use std::io;
 use std::sync::{
@@ -38,6 +40,8 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_PENDING_STARTS: usize = 32;
 const MAX_PENDING_BLOCKING_OPERATIONS: usize = 64;
 const MAX_PENDING_CONTROL_OPERATIONS: usize = 8;
+const MAX_ACTIVE_SERVICE_WATCHES: usize = 16;
+const MAX_SERVICE_WATCH_SECONDS: u64 = 30;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -63,6 +67,19 @@ struct ServiceAttemptCollection {
 #[serde(rename_all = "camelCase")]
 struct ServiceEndpointCollection {
     endpoints: Vec<ServiceEndpoint>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceWatchResponse {
+    endpoints: Vec<ServiceEndpoint>,
+    changed: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ServiceWatchQuery {
+    wait_seconds: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -164,6 +181,7 @@ struct ApiState {
     start_admission: Arc<Semaphore>,
     blocking_admission: Arc<Semaphore>,
     control_admission: Arc<Semaphore>,
+    service_watch_admission: Arc<Semaphore>,
     recovery_ready: Arc<AtomicBool>,
 }
 
@@ -380,6 +398,7 @@ fn router_with_recovery(
         start_admission: Arc::new(Semaphore::new(MAX_PENDING_STARTS)),
         blocking_admission: Arc::new(Semaphore::new(MAX_PENDING_BLOCKING_OPERATIONS)),
         control_admission: Arc::new(Semaphore::new(MAX_PENDING_CONTROL_OPERATIONS)),
+        service_watch_admission: Arc::new(Semaphore::new(MAX_ACTIVE_SERVICE_WATCHES)),
         recovery_ready,
     });
     let mut manager_routes = Router::new()
@@ -406,6 +425,10 @@ fn router_with_recovery(
         .route(
             "/v1/services/{namespace}/{name}/endpoints",
             get(list_catalog_endpoints),
+        )
+        .route(
+            "/v1/services/{namespace}/{name}/watch",
+            get(watch_catalog_endpoints),
         )
         .route("/v1/workers", get(list_workers))
         .route("/v1/workers/{id}", get(get_worker))
@@ -740,6 +763,74 @@ async fn list_catalog_endpoints(
         })
         .into_response(),
         Err(error_value) => service_catalog_error_response(error_value),
+    }
+}
+
+async fn watch_catalog_endpoints(
+    State(state): State<Arc<ApiState>>,
+    Path((namespace, name)): Path<(String, String)>,
+    query: Result<Query<ServiceWatchQuery>, QueryRejection>,
+) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => return query_rejection(rejection),
+    };
+    let wait_seconds = query.wait_seconds.unwrap_or(MAX_SERVICE_WATCH_SECONDS);
+    if !(1..=MAX_SERVICE_WATCH_SECONDS).contains(&wait_seconds) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_watch_timeout",
+            "waitSeconds must be between 1 and 30",
+        );
+    }
+    let identity = match ServiceIdentity::in_namespace(namespace, name) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_service_identity",
+                "the service namespace or name is invalid",
+            );
+        }
+    };
+    let _watch_permit = match Arc::clone(&state.service_watch_admission).try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let mut response = error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "service_watch_capacity_reached",
+                "all service watch slots are in use",
+            );
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
+    };
+
+    let initial = match query_service_catalog(&state, &identity).await {
+        Ok(endpoints) => endpoints,
+        Err(error_value) => return service_catalog_error_response(error_value),
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(wait_seconds);
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let current = match query_service_catalog(&state, &identity).await {
+            Ok(endpoints) => endpoints,
+            Err(error_value) => return service_catalog_error_response(error_value),
+        };
+        let changed = current != initial;
+        if changed || tokio::time::Instant::now() >= deadline {
+            return Json(ServiceWatchResponse {
+                endpoints: current
+                    .into_iter()
+                    .filter(|endpoint| endpoint.eligible)
+                    .map(service_endpoint_response)
+                    .collect(),
+                changed,
+            })
+            .into_response();
+        }
     }
 }
 
@@ -1959,6 +2050,14 @@ fn json_rejection(rejection: JsonRejection) -> Response {
     }
 }
 
+fn query_rejection(_rejection: QueryRejection) -> Response {
+    error(
+        StatusCode::BAD_REQUEST,
+        "invalid_query",
+        "query parameters are invalid",
+    )
+}
+
 /// Serve HTTP until the process requests a bounded graceful shutdown.
 pub async fn serve(
     listener: tokio::net::TcpListener,
@@ -2364,6 +2463,7 @@ mod access_tests {
             ("GET", "/v1/jobs"),
             ("GET", "/v1/jobs/job-a/service-attempts"),
             ("GET", "/v1/services/default/web/endpoints"),
+            ("GET", "/v1/services/default/web/watch?waitSeconds=1"),
             ("POST", "/v1/jobs"),
             ("DELETE", "/v1/jobs/job-a"),
             ("GET", "/v1/workers"),
@@ -2414,6 +2514,27 @@ mod access_tests {
                 .await
                 .expect("public health response");
             assert_eq!(response.status(), StatusCode::OK, "GET {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn service_watch_rejects_timeouts_outside_its_bounded_range() {
+        let database = TestDatabase::new();
+        let app = router(&database);
+        for wait_seconds in ["0", "31"] {
+            let response = app
+                .clone()
+                .oneshot(authorized_request(
+                    "GET",
+                    &format!("/v1/services/default/backend/watch?waitSeconds={wait_seconds}"),
+                    "",
+                    None,
+                    None,
+                    false,
+                ))
+                .await
+                .expect("bounded watch validation response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         }
     }
 

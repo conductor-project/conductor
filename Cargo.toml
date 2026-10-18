@@ -47,6 +47,9 @@ landlock = { version = "0.4.7", default-features = false }
 close_fds = { version = "0.3.2", default-features = false }
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
+async-trait = { version = "0.1.89", default-features = false }
+hickory-server = { version = "0.26.3", default-features = false }
+ipnet = { version = "2.11.0", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

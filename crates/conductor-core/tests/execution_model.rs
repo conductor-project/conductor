@@ -354,6 +354,7 @@ fn named_service_ports_validate_names_and_create_run_environment_overrides() {
     assert_eq!(declared.environment_name(), "CONDUCTOR_PORT_ADMIN_HTTP");
     assert!(ServicePort::tcp("Admin").is_err());
     assert!(ServicePort::tcp("bad_name").is_err());
+    assert!(ServicePort::tcp("a".repeat(63)).is_err());
 
     let spec = RunSpec::new(
         RunId::new("run-1").unwrap(),
