@@ -10,7 +10,7 @@ does not imply equivalent enforcement across operating systems.
 | OS | Architecture | Status | Qualification evidence |
 | --- | --- | --- | --- |
 | Linux | x86_64 | Supported | Required Linux CI builds, lints, runs debug and release suites, and exercises real cgroup v2 and Landlock behavior. |
-| macOS | arm64 (Apple silicon) | Debug runtime qualification passed; post-merge release qualification pending | Apple silicon CI run [39129469759](https://github.com/conductor-project/conductor/actions/runs/39129469759) passed dependency policy, formatting, all-target build, lint, and the full debug workspace suite. The suite starts two separate native worker processes, authenticates them to one manager over HTTPS, checks their distinct state and listeners, verifies shared manager configured host capacity, runs a native job, retrieves its output, and shuts both workers down. Release tests/build and inherited-descriptor qualification run after merge. |
+| macOS | arm64 (Apple silicon) | Qualified | PR CI [run 39147861895](https://github.com/conductor-project/conductor/actions/runs/39147861895) passed dependency policy, formatting, all-target build, lint, and the full debug workspace suite. Post-merge CI [run 39148005287](https://github.com/conductor-project/conductor/actions/runs/39148005287) passed the debug suite, release tests and build, and inherited-descriptor check. The multi-process test starts two separate native worker processes, authenticates them over HTTPS, checks their distinct state and listeners, verifies manager-configured shared-host capacity, runs a native job, retrieves its output, and shuts both workers down. |
 | macOS | x86_64 (Intel) | Not qualified | Intel macOS CI is outside the current qualification scope. |
 | Linux | arm64 | Not yet qualified | No required CI runner currently exercises this target. |
 
@@ -21,6 +21,22 @@ tests and builds, then checks inherited-descriptor hygiene. Release work stays
 on merged commits. Linux-only cgroup v2 and Landlock integration tests are
 compiled only on Linux and remain covered by the separate Linux job. A passing
 macOS build does not count as evidence for those Linux kernel guarantees.
+
+## macOS qualification evidence
+
+The Apple silicon claim is limited to the `macos-15` runner and arm64 debug
+qualification on this host. The CI jobs and tests map to the audited surfaces
+as follows:
+
+| Surface | Qualification evidence | Boundary |
+| --- | --- | --- |
+| Dependencies and portable build | The macOS CI job checks dependency policy, formatting, all-target builds, lint, and the full debug workspace suite. | This does not qualify Intel macOS or Linux-only cgroup v2 and Landlock behavior. |
+| Manager and two workers | `crates/conductor/tests/macos_multiprocess.rs::one_manager_authenticates_and_runs_on_two_native_worker_processes` starts two separate worker processes and an isolated loopback manager transport endpoint. It establishes mTLS worker sessions after enrollment, rejects a mismatched worker identity, verifies distinct worker IDs, PIDs, state directories and listeners, runs a native command, retrieves its output, and stops both workers with a deadline. | The test manager is the isolated manager service running in the test process; the two worker processes use the real worker service and transport client. This is one-host process evidence, not independent-host or routed-network qualification. |
+| Signals, shutdown, process groups, and restart | `crates/conductor/tests/agent.rs` covers SIGINT and SIGTERM shutdown, process-group cleanup, active-run shutdown, interrupted-run recovery, and normal and abrupt manager restarts. | Cleanup covers ordinary process-group members. Descendants that leave the process group remain outside the macOS guarantee. |
+| Logs | The multi-process test retrieves the worker's native stdout after completion; the agent tests also cover bounded binary logs, offsets, and retention metadata. | Log retrieval proves captured output, not a guarantee that logs survive every storage failure. |
+| Inherited descriptors | The post-merge macOS release job runs `scripts/test-inherited-fds.py` against the release binary. | The check verifies that a descriptor inherited by the daemon is unavailable to the spawned job. |
+| Resource inventory and enforcement | Worker status and the multi-process test report configured run slots and manager-assigned shared-host capacity. The platform matrix records cgroup v2 and Landlock as unavailable on macOS. | These values are scheduling metadata, not measured host inventory or kernel enforcement. Unsupported required protections are rejected. |
+| Executable architecture and digest | The OS loader selects or rejects the native executable; `crates/conductor-worker/tests/runs.rs::executable_digest_mismatch_fails_without_spawning_the_workload` checks digest rejection before spawn. | Conductor does not parse executable headers. The digest test is platform-neutral; macOS slice selection is delegated to the OS loader. |
 
 ## Platform capabilities and limits
 
