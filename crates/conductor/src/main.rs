@@ -212,7 +212,7 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     close_fds::set_fds_cloexec_threadsafe(3, &[]);
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
@@ -355,7 +355,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         },
         process_backend(&config)?,
     )?);
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     close_fds::set_fds_cloexec_threadsafe(3, &[]);
     let worker_port: Arc<dyn WorkerPort> = Arc::new(LocalWorkerPort(Arc::clone(&worker)));
     let listener = TcpListener::bind(config.listen)?;

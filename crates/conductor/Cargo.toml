@@ -25,6 +25,9 @@ nix.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 close_fds.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+close_fds.workspace = true
+
 [dev-dependencies]
 rusqlite.workspace = true
 

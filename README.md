@@ -1,12 +1,12 @@
 # Conductor
 
-Conductor is an early-stage Linux daemon for managing and running jobs. MVP1 targets one `conductor` binary that combines manager and worker responsibilities behind explicit interfaces. It validates and stores immutable job definitions, starts local host processes, and records run observations through a loopback HTTP API. Job definitions and run history survive agent restarts; a process whose outcome becomes ambiguous across a crash is marked `unknown` and is not automatically replayed.
+Conductor is an early-stage daemon for managing and running jobs. MVP1 targets one `conductor` binary that combines manager and worker responsibilities behind explicit interfaces. It validates and stores immutable job definitions, starts local host processes, and records run observations through a loopback HTTP API. Job definitions and run history survive agent restarts; a process whose outcome becomes ambiguous across a crash is marked `unknown` and is not automatically replayed.
 
 The host process backend runs with the daemon user's operating-system permissions and network access. It is not a security sandbox. Each process starts in a dedicated process group; ordinary group members are force-cleaned after the leader exits and during daemon shutdown. A process can deliberately leave its group, so process groups alone are not containment. Optional Linux cgroup v2 enforcement places the launcher in a per-run cgroup before it executes the job, applies CPU, memory, swap, and process-count limits, and cleans up descendants that leave the process group. It does not provide filesystem or network isolation, and workloads sharing the daemon UID may interfere with cgroup files if the administrator has not protected the delegated hierarchy. Optional Landlock enforcement restricts filesystem operations for selected jobs; it supplements Unix permissions and does not isolate networking or mounts, hide all metadata, revoke already-open handles, or prevent every same-UID interaction.
 
 ## Requirements
 
-- Linux for the supported daemon deployment.
+- See the [platform support matrix](docs/platform-support.md) for OS and architecture status and platform-specific guarantees.
 - Rust 1.99.1 with `rustfmt` and `clippy` (installed by `rust-toolchain.toml`).
 - `curl` and `jq` for the HTTP walkthrough.
 - Python 3.9 or newer for the reproducible agent demo and release probe.
