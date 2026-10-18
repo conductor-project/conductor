@@ -1,63 +1,78 @@
 ---
 type: Verification Record
-title: Local README walkthrough evidence
-description: The documented first-job, log-readback, cancellation, and shutdown flow completed against the debug daemon on Apple silicon macOS.
+title: Local MVP3 CLI workflow evidence
+description: Debug CLI workflows are exercised against real local agents on Apple silicon macOS, with portable integration coverage in the conductor crate.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: bff6a3d635a1d9599e7185f0a7f484fd48749a0c
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../README.md
-    title: User walkthrough
-  - resource: ../crates/conductor/tests/agent.rs
-    title: Binary integration tests
-  - resource: ../crates/conductor-api/src/lib.rs
-    title: HTTP route implementation
+    title: User CLI walkthrough and operator behavior reference
+  - resource: ../crates/conductor/tests/run_cli.rs
+    title: First-job, JSON run ID, wait, logs, and inspect integration test
+  - resource: ../crates/conductor/tests/job_cli.rs
+    title: Job submission, validation, conflict, and timeout integration tests
+  - resource: ../crates/conductor/tests/deployment_cli.rs
+    title: Checked-in service deployment, rollback, scale, and wait integration tests
+  - resource: ../crates/conductor/tests/worker_cli.rs
+    title: Worker inventory and drain integration tests
+  - resource: ../crates/conductor/tests/service_discovery_cli.rs
+    title: Service endpoint and diagnostics integration tests
 ---
 
 # Environment
 
-- Repository source revision exercised: `f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a`.
-- Host: macOS 27.0.1, Darwin `arm64` (Apple silicon).
+- Host: macOS 27.0.0, Darwin `arm64` (Apple silicon).
 - Toolchain: `rustc 1.99.1 (58cf8f9c3 2026-10-13)` and Cargo 1.99.1.
-- Build profile: debug (`target/debug/conductor`). No release build or test ran.
-- State: unique temporary directory for configuration, manager DB, worker DB,
-  job payloads, and daemon output; removed after validation.
-- Listener: ephemeral port `57177` bound to `127.0.0.1`; no external network
-  access.
+- Profile: debug only. No release build or test was run.
+- Integration fixtures use unique temporary state and ephemeral loopback
+  listeners. Tests bound readiness polling and clean up child agents on exit.
+- No privileged fixtures or GitHub workflow changes are part of this evidence.
 
 # Commands and observations
 
-Build command:
+The README walkthrough uses the checked-in `examples/local.json` configuration
+and checked-in job/service JSON files. Its first-job flow submits the JSON job,
+copies the JSON `runId`, waits for the run, reads the raw stdout log bytes, and
+inspects the terminal run state. The observed log payload is
+`hello conductor\n`.
+
+The integration test
+`checked_in_first_job_example_submits_waits_and_exposes_logs` was run with:
+
+```sh
+cargo test -p conductor --test run_cli checked_in_first_job_example_submits_waits_and_exposes_logs -- --exact
+```
+
+It passed against a real debug `conductor` agent using temporary manager and
+worker state. The test consumes the JSON submission response to obtain the
+run ID and verifies the separate wait, raw log, and inspect commands.
+
+Other portable integration coverage in the same crate exercises failed and
+timed-out runs, interruption, invalid strict JSON, duplicate job conflicts,
+server loss, pagination, deployment generation conflicts, deployment waits,
+worker drains, service discovery, readiness, and metrics. The focused checks
+for these were included in the full locked workspace test run. Final local
+debug checks were:
 
 ```sh
 cargo +1.99.1 build --locked -p conductor
+python3 scripts/check-dependency-policy.py
+cargo fmt --all -- --check
+cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
+cargo test --workspace --locked --all-targets --all-features -- --test-threads=1
 ```
 
-The debug daemon was started with `agent --config <temporary-file>` and an
-`all`-role JSON config using separate temporary manager/worker directories,
-local API access, and a loopback listener. Readiness requests were polled every
-100 ms for at most 5 seconds, with a 1-second per-request timeout. The job was
-registered and started through the documented HTTP API; the initial run start
-included a saved `Idempotency-Key`, and its returned `runId` was polled every
-100 ms for at most 30 seconds with a 1-second per-request timeout. The terminal
-state was `succeeded`. The stdout API returned base64 output which decoded
-exactly to `hello conductor\n`.
+The build, dependency policy, formatting, and Clippy checks passed. The full
+workspace test command passed 247 tests across 22 suites in 65.74 seconds.
+Linux and macOS debug CI passed for the service and diagnostics CLI changes in
+PR #145. That CI does not perform release builds or privileged multi-host
+qualification.
 
-A distinct `/bin/sleep 30` job was registered and started. The HTTP stop route
-was called and the run was polled every 100 ms for at most 10 seconds; the
-terminal state was `cancelled`. The cancelled definition was deleted before
-daemon shutdown. Sending SIGINT to the daemon then produced a successful
-process exit. The observed health and readiness endpoints returned success
-before job submission. Submission, stop, log, and deletion requests used
-bounded client timeouts.
+# Scope and limits
 
-# Scope
-
-This is one local runtime walkthrough on Apple silicon macOS, not a Linux
-qualification or independent-host deployment test. It does not exercise
-operator-token proxying, service deployment, cgroup v2, Landlock, or routed
-multi-host DNS. The README commands use POSIX shell syntax, `curl`, `jq`, and
-Python base64 support, but this walkthrough was not run on Linux. Linux CI
-covers repository builds and tests, not execution of this exact README
-sequence. The demo's fixed example port is 8080; this evidence run used an
-ephemeral loopback port to avoid conflicts.
+This record describes local debug execution on Apple silicon macOS plus the
+repository's Linux/macOS debug CI. It does not establish remote-host reachability
+of advertised service addresses, production proxy configuration, or multi-host
+service routing. The current service watch API has no cursor or version
+semantics; the CLI can retry transient errors only within its bounded deadline.
