@@ -1962,6 +1962,16 @@ where
     .map_err(io::Error::other)?
 }
 
+async fn kill_process_group_off_executor(
+    backend: &Arc<dyn ExecutionBackend>,
+    group_id: u32,
+) -> io::Result<()> {
+    let backend = Arc::clone(backend);
+    tokio::task::spawn_blocking(move || backend.kill_process_group(group_id))
+        .await
+        .map_err(io::Error::other)?
+}
+
 async fn supervise(supervision: RunSupervision) {
     let RunSupervision {
         state,
@@ -2118,7 +2128,7 @@ async fn supervise(supervision: RunSupervision) {
                 }
             }
             if tokio::time::Instant::now() >= grace_deadline {
-                let _ = backend.kill_process_group(group_id);
+                let _ = kill_process_group_off_executor(&backend, group_id).await;
                 if let Some(child) = spawned.child.as_mut() {
                     let _ = child.kill();
                     let reap_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
@@ -2146,7 +2156,7 @@ async fn supervise(supervision: RunSupervision) {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
-    let _ = backend.kill_process_group(group_id);
+    let _ = kill_process_group_off_executor(&backend, group_id).await;
     // Reaping and output drain happen off the Tokio executor. Terminal process
     // state is persisted independently from log capture completion.
     let reader_completion = match spawned.enqueue_readers() {
@@ -2336,6 +2346,9 @@ async fn supervise(supervision: RunSupervision) {
             emit_worker_event("terminal_persistence_recovered", run_id.as_str());
         }
     }
+    // The process has exited and its terminal observation is durable (or its
+    // persistence has been recorded as pending). Log draining and retention do
+    // not consume an execution slot.
     if let Ok(mut state) = state.0.lock() {
         state.active_groups.remove(&run_id);
     }

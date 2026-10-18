@@ -214,6 +214,41 @@ fn cleanup_admission_bounds_reaper_backlog_without_blocking_supervision() {
     );
 }
 
+struct SlowCleanupBackend;
+
+impl ExecutionBackend for SlowCleanupBackend {
+    fn spawn(&self, _run_id: &str, _job: &JobSpec) -> io::Result<Child> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "spawn is not used by this test",
+        ))
+    }
+
+    fn terminate_process_group(&self, _group_id: u32) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn kill_process_group(&self, _group_id: u32) -> io::Result<()> {
+        thread::sleep(Duration::from_millis(100));
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocking_process_group_cleanup_does_not_block_the_executor() {
+    let backend: Arc<dyn ExecutionBackend> = Arc::new(SlowCleanupBackend);
+    let cleanup =
+        tokio::spawn(async move { super::kill_process_group_off_executor(&backend, 1).await });
+
+    tokio::time::timeout(
+        Duration::from_millis(50),
+        tokio::time::sleep(Duration::from_millis(10)),
+    )
+    .await
+    .expect("the executor must keep servicing timers during backend cleanup");
+    cleanup.await.unwrap().unwrap();
+}
+
 #[test]
 fn spawn_guard_drop_enqueues_cleanup_without_waiting_for_reaper() {
     let directory = TestDirectory::new();
