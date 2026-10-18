@@ -1,18 +1,19 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use conductor_core::{
-    InspectRun, JobId, JobSpec, LogStream, ReadRunLogs, RunFailureReason, RunLogChunk,
-    RunLogStatus, RunObservation, RunState, StartRun, WorkerDescriptor, WorkerId,
+    CommandEnvelope, CommandId, InspectRun, JobId, JobSpec, LogStream, ReadRunLogs, ResolveRun,
+    RunFailureReason, RunId, RunLogChunk, RunLogStatus, RunObservation, RunState, StartRun,
+    StopRun, WorkerCommand, WorkerDescriptor, WorkerId,
 };
 use conductor_manager::{
-    JobRepository, JobService, MAX_JOBS, ManagerError, RepositoryOpenError, RunStoreError,
-    SqliteJobRepository, WorkerPort, WorkerPortError,
+    CommandJournal, CommandStoreError, JobRepository, JobService, MAX_JOBS, ManagerError,
+    RepositoryOpenError, RunStoreError, SqliteJobRepository, WorkerPort, WorkerPortError,
 };
 use rusqlite::Connection;
 
@@ -166,7 +167,7 @@ fn legacy_schema_migrates_transactionally_and_repeated_startup_is_stable() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read migrated schema and fixture");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     assert_eq!(created_at, 1234);
     assert_eq!(deleted_at, None);
 }
@@ -216,7 +217,7 @@ fn schema_two_migration_adds_idempotency_and_indexed_run_order() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     assert!(columns.iter().any(|column| column == "idempotency_key"));
     assert!(columns.iter().any(|column| column == "request_fingerprint"));
     assert!(columns.iter().any(|column| column == "run_order"));
@@ -487,7 +488,7 @@ fn version_one_manager_database_migrates_runs_and_accepts_timeout_specs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 }
 
 struct FullWorker(WorkerId);
@@ -546,6 +547,125 @@ impl WorkerPort for UncertainWorker {
     fn status(&self) -> Result<conductor_core::WorkerStatus, WorkerPortError> {
         Err(WorkerPortError::Unavailable)
     }
+}
+
+struct RetryWorker {
+    worker_id: WorkerId,
+    deliveries: AtomicUsize,
+    attempts: AtomicUsize,
+    commands: std::sync::Mutex<Vec<CommandId>>,
+    runs: std::sync::Mutex<BTreeMap<RunId, RunObservation>>,
+}
+
+impl WorkerPort for RetryWorker {
+    fn descriptor(&self) -> WorkerDescriptor {
+        WorkerDescriptor::new(self.worker_id.clone(), 1, true).with_incarnation(5)
+    }
+
+    fn start(&self, command: StartRun) -> Result<RunObservation, WorkerPortError> {
+        let spec = command.spec();
+        let requested = RunObservation::requested(spec, 10).with_worker_incarnation(5);
+        let starting = requested
+            .next_revision(RunState::Starting, Some(11), None, None, None, None)
+            .unwrap();
+        let running = starting
+            .next_revision(RunState::Running, Some(11), None, None, None, None)
+            .unwrap();
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        self.runs
+            .lock()
+            .unwrap()
+            .insert(spec.id().clone(), running.clone());
+        Ok(running)
+    }
+
+    fn dispatch_command(
+        &self,
+        envelope: CommandEnvelope,
+    ) -> Result<RunObservation, WorkerPortError> {
+        self.commands
+            .lock()
+            .unwrap()
+            .push(envelope.command_id.clone());
+        let observation = match envelope.command {
+            WorkerCommand::StartRun(command) => {
+                let run_id = command.spec().id().clone();
+                if let Some(observation) = self.runs.lock().unwrap().get(&run_id).cloned() {
+                    observation
+                } else {
+                    self.start(*command)?
+                }
+            }
+            _ => return Err(WorkerPortError::Unavailable),
+        };
+        if self.deliveries.fetch_add(1, Ordering::SeqCst) == 0 {
+            // The worker accepted the command, but the manager lost the response.
+            return Err(WorkerPortError::Unavailable);
+        }
+        Ok(observation)
+    }
+
+    fn inspect(&self, command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError> {
+        Ok(self.runs.lock().unwrap().get(command.run_id()).cloned())
+    }
+
+    fn stop(&self, _command: StopRun) -> Result<RunObservation, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
+
+    fn read_logs(&self, _command: ReadRunLogs) -> Result<RunLogChunk, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
+}
+
+#[test]
+fn retry_after_lost_start_response_reuses_command_without_repeating_attempt() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    manager.register(job("retry-start")).unwrap();
+    let worker_id = WorkerId::new("retry-worker").unwrap();
+    let worker = RetryWorker {
+        worker_id: worker_id.clone(),
+        deliveries: AtomicUsize::new(0),
+        attempts: AtomicUsize::new(0),
+        commands: std::sync::Mutex::new(Vec::new()),
+        runs: std::sync::Mutex::new(BTreeMap::new()),
+    };
+
+    assert_eq!(
+        manager.start_run_with_key(
+            &JobId::new("retry-start").unwrap(),
+            &worker_id,
+            1,
+            Some("retry-key"),
+            &worker,
+        ),
+        Err(ManagerError::WorkerUnavailable)
+    );
+    drop(manager);
+    let manager = service(&directory);
+    let started = manager
+        .start_run_with_key(
+            &JobId::new("retry-start").unwrap(),
+            &worker_id,
+            1,
+            Some("retry-key"),
+            &worker,
+        )
+        .unwrap();
+
+    assert_eq!(started.state(), RunState::Running);
+    assert_eq!(worker.attempts.load(Ordering::SeqCst), 1);
+    let commands = worker.commands.lock().unwrap();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0], commands[1]);
+    assert!(
+        SqliteJobRepository::open(directory.database())
+            .unwrap()
+            .pending_commands(&worker_id, 5, 32)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 struct LogOnlyWorker(WorkerId);
@@ -743,6 +863,13 @@ fn rejected_worker_admission_does_not_leave_a_stale_manager_reservation() {
         runs.is_empty(),
         "rejected admission must not create a run record"
     );
+    assert!(
+        SqliteJobRepository::open(directory.database())
+            .unwrap()
+            .pending_commands(&worker_id, 0, 32)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -765,6 +892,14 @@ fn ambiguous_worker_dispatch_is_marked_unknown_and_keeps_its_reservation() {
         .unwrap();
     assert_eq!(runs.len(), 1);
     assert_eq!(
+        SqliteJobRepository::open(directory.database())
+            .unwrap()
+            .pending_commands(&worker_id, 0, 32)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
         manager.start_run(&JobId::new("ambiguous").unwrap(), &worker_id, 1, &worker),
         Err(ManagerError::JobConflict)
     );
@@ -780,7 +915,7 @@ fn stop_intent_is_durable_and_terminal_runs_are_unchanged() {
         .create_run(&JobId::new("stoppable").unwrap(), &worker_id, 1, None)
         .unwrap();
     let manager = JobService::new(repository.clone());
-    let worker = UncertainWorker(worker_id);
+    let worker = UncertainWorker(worker_id.clone());
 
     let stopping = manager.stop_run(spec.id(), &worker).unwrap();
     assert_eq!(stopping.state(), RunState::Stopping);
@@ -793,6 +928,14 @@ fn stop_intent_is_durable_and_terminal_runs_are_unchanged() {
         Some(stopping.clone())
     );
     assert_eq!(manager.stop_run(spec.id(), &worker).unwrap(), stopping);
+    let pending = repository.pending_commands(&worker_id, 0, 32).unwrap();
+    assert_eq!(
+        pending
+            .iter()
+            .filter(|envelope| matches!(envelope.command, WorkerCommand::StopRun(_)))
+            .count(),
+        1
+    );
 
     let terminal = stopping
         .next_revision(
@@ -807,4 +950,112 @@ fn stop_intent_is_durable_and_terminal_runs_are_unchanged() {
         .with_termination_reason(conductor_core::RunTerminationReason::Cancelled);
     repository.record_observation(&terminal).unwrap();
     assert_eq!(manager.stop_run(spec.id(), &worker).unwrap(), terminal);
+}
+
+#[test]
+fn committed_start_command_survives_reopen_and_duplicate_acknowledgement() {
+    let directory = TempDir::new();
+    let repository = SqliteJobRepository::open(directory.database()).unwrap();
+    repository.insert(job("durable-start")).unwrap();
+    let worker_id = WorkerId::new("worker").unwrap();
+    let first = repository
+        .create_run_for_worker(
+            &JobId::new("durable-start").unwrap(),
+            &worker_id,
+            7,
+            1,
+            Some("request-1"),
+        )
+        .unwrap();
+    let envelope = first.command.unwrap();
+    assert_eq!(envelope.target_worker_incarnation, 7);
+    assert_eq!(
+        repository.pending_commands(&worker_id, 7, 1).unwrap(),
+        vec![envelope.clone()]
+    );
+    drop(repository);
+
+    let reopened = SqliteJobRepository::open(directory.database()).unwrap();
+    let replay = reopened
+        .create_run_for_worker(
+            &JobId::new("durable-start").unwrap(),
+            &worker_id,
+            7,
+            1,
+            Some("request-1"),
+        )
+        .unwrap();
+    assert_eq!(replay.replay.unwrap().run_id(), first.spec.id());
+    assert_eq!(replay.command, Some(envelope.clone()));
+
+    let acknowledgement = r#"{"accepted":true}"#;
+    reopened
+        .acknowledge_command(&envelope.command_id, &worker_id, 7, acknowledgement)
+        .unwrap();
+    reopened
+        .acknowledge_command(&envelope.command_id, &worker_id, 7, acknowledgement)
+        .unwrap();
+    assert!(
+        reopened
+            .pending_commands(&worker_id, 7, 1)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        reopened.acknowledge_command(
+            &envelope.command_id,
+            &WorkerId::new("other-worker").unwrap(),
+            7,
+            acknowledgement,
+        ),
+        Err(CommandStoreError::Conflict)
+    );
+    assert_eq!(
+        reopened.acknowledge_command(&envelope.command_id, &worker_id, 7, r#"{"accepted":false}"#,),
+        Err(CommandStoreError::Conflict)
+    );
+}
+
+#[test]
+fn pending_command_delivery_is_bounded_per_worker() {
+    let directory = TempDir::new();
+    let repository = SqliteJobRepository::open(directory.database()).unwrap();
+    repository.insert(job("bounded-commands")).unwrap();
+    let job_id = JobId::new("bounded-commands").unwrap();
+    let worker_id = WorkerId::new("worker").unwrap();
+    let admission = repository
+        .create_run_for_worker(&job_id, &worker_id, 2, 1, None)
+        .unwrap();
+    for index in 0..31 {
+        repository
+            .command_for_run(
+                admission.spec.id(),
+                &worker_id,
+                2,
+                WorkerCommand::ResolveRun(ResolveRun::new(
+                    admission.spec.id().clone(),
+                    format!("reason-{index}"),
+                )),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        repository
+            .pending_commands(&worker_id, 2, 32)
+            .unwrap()
+            .len(),
+        32
+    );
+    assert_eq!(
+        repository.command_for_run(
+            admission.spec.id(),
+            &worker_id,
+            2,
+            WorkerCommand::ResolveRun(ResolveRun::new(
+                admission.spec.id().clone(),
+                "one-more-reason".to_owned(),
+            )),
+        ),
+        Err(CommandStoreError::PendingLimit)
+    );
 }

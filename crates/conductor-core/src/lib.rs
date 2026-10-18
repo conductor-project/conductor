@@ -91,6 +91,32 @@ stable_id!(RunId);
 stable_id!(CommandId);
 stable_id!(WorkerId);
 
+/// Transport-neutral command sent by a manager to one worker.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "payload",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum WorkerCommand {
+    StartRun(Box<StartRun>),
+    InspectRun(InspectRun),
+    StopRun(StopRun),
+    ResolveRun(ResolveRun),
+    ReadRunLogs(ReadRunLogs),
+}
+
+/// Stable manager-owned command identity and worker-incarnation target.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CommandEnvelope {
+    pub command_id: CommandId,
+    pub target_worker_id: WorkerId,
+    pub target_worker_incarnation: u64,
+    pub command: WorkerCommand,
+}
+
 mod execution;
 mod protocol;
 pub use execution::{

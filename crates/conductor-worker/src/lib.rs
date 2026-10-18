@@ -839,12 +839,12 @@ impl WorkerService {
                 return serde_json::from_str(&stored_observation)
                     .map_err(|_| WorkerError::StorageUnavailable);
             }
-            let cleanup_permit = Arc::clone(&self.cleanup_admission)
-                .try_acquire_owned()
-                .map_err(|_| WorkerError::CapacityReached)?;
             if self.is_degraded() {
                 return Err(WorkerError::StorageUnavailable);
             }
+            let cleanup_permit = Arc::clone(&self.cleanup_admission)
+                .try_acquire_owned()
+                .map_err(|_| WorkerError::CapacityReached)?;
             let active_count: i64 = transaction.query_row(
                 "SELECT COUNT(*) FROM runs WHERE state IN ('requested', 'starting', 'running', 'stopping', 'unknown')",
                 [],

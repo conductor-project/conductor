@@ -37,13 +37,15 @@ behavior and has compatibility tests.
 ## SQLite schemas
 
 Manager and worker databases have separate SQLite `user_version` values. The
-current schema version for both databases is 3. Startup migrates supported
+manager schema is version 4 and the worker schema remains version 3. Manager
+schema 4 adds the durable command outbox described in
+[manager command delivery](mvp2-command-outbox.md). Startup migrates supported
 older schemas transactionally and preserves the existing job, run, log, and
 worker-incarnation records. A schema newer than the binary supports is a
 startup error with the detected version; startup must not reset or rewrite
 that database. An unrecognized legacy layout also fails instead of guessing.
 
-The manager migrator handles schemas 0, 1, and 2, and fixtures prove that
+The manager migrator handles schemas 0, 1, 2, and 3, and fixtures prove that
 version-2 run history survives migration. The worker migrator handles schemas
 0, 1, and 2, and a version-1 fixture proves its run history and log metadata
 survive migration. New migration steps must be append-only, transactional,
