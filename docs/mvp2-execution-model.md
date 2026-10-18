@@ -83,3 +83,7 @@ protocol, persistence, reconciliation, and scheduler work. They make no
 guarantee about remote delivery, retry policy, health checks, port ownership,
 external-resource fencing, or manager high availability. Existing MVP1
 one-shot JSON contracts and combined manager/worker mode remain unchanged.
+
+See [MVP2 command and report semantics](mvp2-command-semantics.md) for the
+worker-incarnation, assignment-generation, command-deduplication, and report
+ordering contract used by distributed execution.
