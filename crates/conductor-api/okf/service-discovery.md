@@ -3,7 +3,7 @@ type: Reference
 title: Service catalog and DNS discovery
 description: The API exposes observed service endpoints over HTTP and can serve DNS records from the manager catalog.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: a739b4c20dd8e81ded656dfa7bb9859f48d73f9e
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/lib.rs
@@ -60,12 +60,25 @@ These short TTLs bound stale DNS cache exposure; they do not make endpoint
 replacement instantaneous. Clients should resolve on connection attempts and
 handle failed connections by looking up the service again.
 
-# Known correctness limitation
+# Service-wide names and SRV targets
 
-Issue [#118](https://github.com/conductor-project/conductor/issues/118) was
-open at the source revision reviewed here. It reports that replica SRV targets
-can share a hostname whose A/AAAA records include other replicas, breaking the
-advertised address/port pairing. Until fixed and verified, do not rely on
-endpoint-specific SRV answers for multi-address service connections. The
-local same-address harness does not prove this pairing for independently
-addressed hosts. Check current issue/CI state before deployment decisions.
+The service FQDN `<service>.<namespace>.service.<suffix>.` keeps its
+service-wide A/AAAA behavior and returns the advertised addresses of all
+currently eligible replicas. Each TCP SRV answer instead names a deterministic
+endpoint target containing that replica's advertised IP and port tuple. A or
+AAAA lookup of that target returns only the matching endpoint, and only while
+the tuple remains in the current eligible catalog. If a replica is withdrawn
+or replaced with a different address or port, its former target no longer
+resolves after the catalog changes. These lookups use fresh worker status and
+catalog observations; DNS caches may retain answers for the configured TTL.
+
+Issue [#118](https://github.com/conductor-project/conductor/issues/118) is
+implemented at the reviewed source revision. Debug tests cover two replicas
+with distinct IPv4/IPv6 addresses and ports, follow each SRV target to its
+matching address, and verify withdrawn-target and replacement behavior. The
+full workspace debug suite passed (204 tests across 16 suites), along with
+workspace Clippy, formatting, and dependency-policy checks. These tests verify
+record construction and current-catalog filtering; they do not qualify routed
+multi-host behavior, resolver installation, or network reachability. Issues
+#77 and #78 were cancelled, and no deployment-owned routed testbed is
+available.

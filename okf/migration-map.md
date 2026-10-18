@@ -74,8 +74,9 @@ sections maps as follows:
 - Deleted job IDs remain reserved. The README uses fresh per-invocation IDs
   and does not depend on deleting and re-registering the same ID.
 - Issues #77 and #78 were cancelled; no routed independent-host qualification
-  claim is made. Issue #118 was open when reviewed and is called out as a
-  service-discovery limitation.
+  claim is made. Issue #118's SRV target/address pairing fix is implemented and
+  covered by debug tests; the lack of routed independent-host qualification
+  remains explicit in the service discovery and platform evidence pages.
 - Release builds and tests are post-merge CI only except for reproducing a
   specific CI issue. The local onboarding walkthrough uses debug build output.
 
@@ -97,7 +98,7 @@ sections maps as follows:
 
 ## Maintenance
 
-This map and the concepts were source-reviewed at `f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a`.
+This map and the concepts were source-reviewed at `a739b4c20dd8e81ded656dfa7bb9859f48d73f9e`.
 That records the review baseline only; it is not a claim that every topic was
 runtime tested. The current README walkthrough is validated separately on the
 host and commit recorded in the change review. Update this map when adding,
