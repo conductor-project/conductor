@@ -46,13 +46,14 @@ impl HostProcessBackend {
     #[cfg(target_os = "linux")]
     pub fn with_cgroup_v2(
         root: &Path,
+        lock_directory: &Path,
         worker_id: &str,
         maximums: ResourceLimits,
         launcher: PathBuf,
     ) -> io::Result<Self> {
         Ok(Self {
             cgroup: Some(CgroupBackend {
-                manager: CgroupV2::open(root, worker_id, maximums)?,
+                manager: CgroupV2::open(root, lock_directory, worker_id, maximums)?,
                 groups: Arc::new(Mutex::new(BTreeMap::new())),
             }),
             landlock: None,
@@ -82,6 +83,7 @@ impl HostProcessBackend {
     #[cfg(not(target_os = "linux"))]
     pub fn with_cgroup_v2(
         _root: &std::path::Path,
+        _lock_directory: &std::path::Path,
         _worker_id: &str,
         _maximums: ResourceLimits,
         _launcher: std::path::PathBuf,

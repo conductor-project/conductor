@@ -95,6 +95,24 @@ def reserve_address():
         return ("127.0.0.1", reserved.getsockname()[1])
 
 
+def wait_for_private_tmp_namespace(process, namespace_file):
+    host_namespace = os.readlink("/proc/self/ns/mnt")
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if namespace_file.is_file():
+            namespace = namespace_file.read_text(encoding="ascii").strip()
+            if not namespace:
+                time.sleep(0.01)
+                continue
+            if namespace != host_namespace:
+                return namespace
+            raise RuntimeError("daemon remained in the host mount namespace")
+        if process.poll() is not None:
+            raise RuntimeError(f"daemon exited before entering a private /tmp mount namespace: {process.returncode}")
+        time.sleep(0.01)
+    raise TimeoutError("daemon did not enter a distinct mount namespace with a private tmpfs at /tmp")
+
+
 def reap_owned_groups(worker_root):
     if not worker_root.exists():
         return
@@ -133,12 +151,15 @@ def main():
     if not args.binary.is_file():
         parser.error("release binary does not exist")
 
-    with tempfile.TemporaryDirectory(prefix="conductor-cgroup-v2-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="conductor-cgroup-v2-", dir="/var/tmp") as temporary:
         state = Path(temporary)
         address = reserve_address()
         port = address[1]
         worker_id = "cgroup-v2-test"
         worker_root = worker_cgroup_root(delegated_root, worker_id)
+        lock_directory = state / "shared-ownership-locks"
+        lock_directory.mkdir(mode=0o1770)
+        lock_directory.chmod(0o1770)
         config = {
             "role": "all",
             "listen": f"127.0.0.1:{port}",
@@ -150,6 +171,7 @@ def main():
             "cgroup_v2": {
                 "enabled": True,
                 "delegatedRoot": str(delegated_root),
+                "ownershipLockDir": str(lock_directory),
                 "maximums": {
                     "cpuQuotaUs": 200_000,
                     "cpuPeriodUs": 100_000,
@@ -164,14 +186,33 @@ def main():
         config_path.write_text(json.dumps(config), encoding="utf-8")
 
         def launch(path=config_path, log=agent_log, cwd=state):
+            namespace_file = log.with_suffix(log.suffix + ".mount-namespace")
+            command = [
+                "unshare",
+                "--mount",
+                "--propagation",
+                "private",
+                "sh",
+                "-c",
+                'mount --make-rprivate / && mount -t tmpfs -o mode=1777 tmpfs /tmp && awk \'$5=="/tmp" && / - tmpfs / {found=1} END{exit !found}\' /proc/self/mountinfo && readlink /proc/self/ns/mnt > "$1" && shift && exec "$@"',
+                "conductor-private-tmp",
+                str(namespace_file),
+                str(args.binary.resolve()),
+                "agent",
+                "--config",
+                str(path),
+            ]
             return subprocess.Popen(
-                [str(args.binary.resolve()), "agent", "--config", str(path)],
+                command,
                 cwd=cwd,
                 stdout=subprocess.DEVNULL,
                 stderr=log.open("ab"),
             )
 
         process = launch()
+        process_mount_namespace = wait_for_private_tmp_namespace(
+            process, agent_log.with_suffix(agent_log.suffix + ".mount-namespace")
+        )
         run_ids = []
         try:
             wait_agent(process, address)
@@ -242,6 +283,10 @@ def main():
                 "same-owner", worker_id, alias_root
             )
             contender = launch(contender_config, contender_log, contender_config.parent)
+            contender_mount_namespace = wait_for_private_tmp_namespace(
+                contender, contender_log.with_suffix(contender_log.suffix + ".mount-namespace")
+            )
+            assert contender_mount_namespace != process_mount_namespace, "contender did not enter a distinct mount namespace"
             contender.wait(timeout=5)
             contender_output = contender_log.read_text(encoding="utf-8", errors="replace")
             assert "startup_failed" in contender_output, contender_output
@@ -279,6 +324,18 @@ def main():
                 launch(path, log, path.parent)
                 for path, log, _ in race_specs
             ]
+            racer_mount_namespaces = [
+                wait_for_private_tmp_namespace(
+                    race_process,
+                    spec[1].with_suffix(spec[1].suffix + ".mount-namespace"),
+                )
+                for race_process, spec in zip(racers, race_specs)
+            ]
+            assert len(set(racer_mount_namespaces + [process_mount_namespace])) == 3, (
+                "concurrent daemons did not enter distinct mount namespaces",
+                racer_mount_namespaces,
+                process_mount_namespace,
+            )
             states = {}
             deadline = time.monotonic() + 10
             try:
