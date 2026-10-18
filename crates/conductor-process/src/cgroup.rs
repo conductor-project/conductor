@@ -304,49 +304,6 @@ fn acquire_namespace_ownership(delegated_root: &Path, namespace_name: &str) -> i
     }
 }
 
-#[cfg(test)]
-mod ownership_tests {
-    use super::acquire_namespace_ownership;
-    use std::fs;
-    use std::io;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(1);
-
-    #[test]
-    fn namespace_ownership_excludes_aliases_and_releases_after_drop() {
-        let root = std::env::temp_dir().join(format!(
-            "conductor-lock-test-{}-{}",
-            std::process::id(),
-            NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&root).expect("create delegated root fixture");
-        let alias = PathBuf::from(format!("{}-alias", root.display()));
-        symlink_root(&root, &alias);
-
-        let owner = acquire_namespace_ownership(&root, "conductor-worker")
-            .expect("acquire first namespace owner");
-        let alias_error = acquire_namespace_ownership(&alias, "conductor-worker")
-            .expect_err("canonical alias must share the ownership lock");
-        assert_eq!(alias_error.kind(), io::ErrorKind::AlreadyExists);
-        let distinct = acquire_namespace_ownership(&root, "conductor-other-worker")
-            .expect("distinct worker namespaces have independent locks");
-
-        drop(owner);
-        let recovered = acquire_namespace_ownership(&alias, "conductor-worker")
-            .expect("OS lock must be released when the owner exits");
-        drop((distinct, recovered));
-        fs::remove_file(&alias).expect("remove delegated root alias");
-        fs::remove_dir(&root).expect("remove delegated root fixture");
-    }
-
-    #[cfg(unix)]
-    fn symlink_root(root: &std::path::Path, alias: &std::path::Path) {
-        std::os::unix::fs::symlink(root, alias).expect("create delegated root alias");
-    }
-}
-
 fn write_control(directory: &Path, name: &str, value: &str) -> io::Result<()> {
     fs::write(directory.join(name), value)
 }
@@ -398,4 +355,47 @@ fn unescape_mount_path(value: &str) -> Option<String> {
         }
     }
     String::from_utf8(decoded).ok()
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::acquire_namespace_ownership;
+    use std::fs;
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn namespace_ownership_excludes_aliases_and_releases_after_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "conductor-lock-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("create delegated root fixture");
+        let alias = PathBuf::from(format!("{}-alias", root.display()));
+        symlink_root(&root, &alias);
+
+        let owner = acquire_namespace_ownership(&root, "conductor-worker")
+            .expect("acquire first namespace owner");
+        let alias_error = acquire_namespace_ownership(&alias, "conductor-worker")
+            .expect_err("canonical alias must share the ownership lock");
+        assert_eq!(alias_error.kind(), io::ErrorKind::AlreadyExists);
+        let distinct = acquire_namespace_ownership(&root, "conductor-other-worker")
+            .expect("distinct worker namespaces have independent locks");
+
+        drop(owner);
+        let recovered = acquire_namespace_ownership(&alias, "conductor-worker")
+            .expect("OS lock must be released when the owner exits");
+        drop((distinct, recovered));
+        fs::remove_file(&alias).expect("remove delegated root alias");
+        fs::remove_dir(&root).expect("remove delegated root fixture");
+    }
+
+    #[cfg(unix)]
+    fn symlink_root(root: &std::path::Path, alias: &std::path::Path) {
+        std::os::unix::fs::symlink(root, alias).expect("create delegated root alias");
+    }
 }
