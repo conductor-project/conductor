@@ -50,7 +50,7 @@ list the configured worker. A full worker can still be ready; run admission
 checks capacity separately.
 
 ```sh
-./target/debug/conductor operator workers list
+./target/debug/conductor worker list
 ```
 
 The config and state directories above persist across restarts. See
@@ -89,7 +89,7 @@ JSON from stdin. See [job and service behavior](okf/jobs-and-services.md) for
 revision, deployment, retries, IDs, and API contracts.
 
 If the daemon is unavailable, confirm Terminal A is still running; the
-`operator workers list` command below confirms the API is reachable. Registering
+`worker list` command below confirms the API is reachable. Registering
 a different definition under an existing ID returns `409`; registering the
 same definition is safe. Deleted IDs stay reserved, so choose a new ID. If run
 start returns `429`, the worker has no
@@ -169,6 +169,31 @@ count, and delete keeps deployment history after stopping instances.
 Deletion preserves an ID reservation and does not delete persistent manager or
 worker state. Do not delete the state directories as a routine cleanup step.
 
+## Inspect and drain workers
+
+`worker list` reports the manager's inventory, including capacity, available
+slots, connectivity freshness, readiness, and drain state. `worker inspect`
+shows the same details for one worker. A disconnected worker remains visible
+but is reported unavailable or stale; an empty inventory is a successful empty
+list.
+
+Draining prevents new placements on that worker and withdraws its service
+endpoints from manager discovery. Existing runs continue; Conductor does not
+promise to migrate them or terminate them when a drain is requested. Use a
+bounded wait to observe completion. If the wait times out or you press Ctrl-C,
+the accepted drain remains active. Clear it only after the manager reports
+completion.
+
+```sh
+./target/debug/conductor worker list --output json
+./target/debug/conductor worker inspect local-worker --output json
+./target/debug/conductor worker drain local-worker \
+  --grace-period-seconds 30 --wait --wait-timeout-seconds 120
+./target/debug/conductor worker drain-status local-worker --output json
+./target/debug/conductor worker drain-wait local-worker --timeout-seconds 120
+./target/debug/conductor worker undrain local-worker
+```
+
 Stopping a run is different from stopping the daemon. To stop the daemon, press
 Ctrl-C in Terminal A and wait for its shutdown to finish. Job definitions and
 run history persist. A daemon restart can leave an ambiguous run in `unknown`;
@@ -209,8 +234,8 @@ CA certificate file:
   --ca-file /etc/conductor/manager-ca.pem \
   --timeout-seconds 10
 ./target/debug/conductor context show production
-./target/debug/conductor operator --context production workers list
-./target/debug/conductor operator --context production --output json workers list
+./target/debug/conductor worker --context production list
+./target/debug/conductor worker --context production --output json list
 ./target/debug/conductor completions zsh
 ```
 
