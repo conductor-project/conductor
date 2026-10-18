@@ -10,15 +10,17 @@ does not imply equivalent enforcement across operating systems.
 | OS | Architecture | Status | Qualification evidence |
 | --- | --- | --- | --- |
 | Linux | x86_64 | Supported | Required Linux CI builds, lints, runs debug and release suites, and exercises real cgroup v2 and Landlock behavior. |
-| macOS | arm64 (Apple silicon) | In qualification | Local Apple silicon debug and release suites and the inherited-descriptor check have passed; MVP2 issue #79 adds required hosted CI coverage. |
+| macOS | arm64 (Apple silicon) | Early baseline qualified; final issue #79 qualification pending | On macOS 27.0.1 arm64, dependency policy, formatting, all-target debug build, lint, and workspace debug tests passed (139 tests across 16 suites). Hosted Apple silicon PR CI run [39120735872](https://github.com/conductor-project/conductor/actions/runs/39120735872) passed. Release tests/build and inherited-descriptor qualification run after merge; final integrated runtime evidence follows #61 and #63. |
 | macOS | x86_64 (Intel) | Not qualified | Intel macOS CI is outside the current qualification scope. |
 | Linux | arm64 | Not yet qualified | No required CI runner currently exercises this target. |
 
-The macOS CI jobs run the workspace build, lint, debug and release test suites,
-including the real-binary portable process lifecycle tests. Linux-only cgroup v2
-and Landlock integration tests are compiled only on Linux and remain covered by
-the separate Linux job. A passing macOS build does not count as evidence for
-those Linux kernel guarantees.
+On pull requests, the macOS job checks dependency policy and formatting, builds
+all targets, runs lint, and runs the full debug test suite including the
+portable multi-process lifecycle test. The post-merge macOS job runs release
+tests and builds, then checks inherited-descriptor hygiene. Release work stays
+on merged commits. Linux-only cgroup v2 and Landlock integration tests are
+compiled only on Linux and remain covered by the separate Linux job. A passing
+macOS build does not count as evidence for those Linux kernel guarantees.
 
 ## Platform capabilities and limits
 
@@ -32,7 +34,7 @@ those Linux kernel guarantees.
 | Landlock filesystem policy | Optional, when the kernel and administrator configuration meet the requirements | Unavailable |
 | Resource requests and reservations | Scheduling metadata; only configured cgroup limits are kernel enforcement | Scheduling metadata only; no kernel resource enforcement |
 | Filesystem-policy request | Enforced by Landlock or rejected before launch, depending on policy mode | Rejected before launch |
-| Executable architecture and digest | The worker checks ELF format and worker architecture before launch, and verifies an optional operator-provisioned SHA-256 digest | The worker checks Mach-O format and worker architecture before launch, and verifies an optional operator-provisioned SHA-256 digest |
+| Executable architecture and digest | The OS loader decides whether the executable can run on this host; the worker independently verifies an optional operator-provisioned SHA-256 digest before launch | The OS loader decides whether the executable can run on this host, including selecting a compatible universal-binary slice; the worker independently verifies an optional operator-provisioned SHA-256 digest before launch |
 
 Conductor does not silently replace a requested Linux protection with a weaker
 macOS behavior. A macOS worker cannot advertise cgroup or Landlock enforcement,
@@ -47,16 +49,17 @@ composition in issue #61. Host resource inventory and refusal to place work on
 incompatible workers are tracked in issues #66 and #67. These remain explicit
 qualification gaps until their implementation and macOS evidence are complete.
 
-Before launch, the worker rejects native executables whose object format or
-architecture differs from its own. Universal Mach-O binaries are accepted
-when they contain a slice for the worker architecture. Interpreter scripts
-delegate executable selection to their shebang interpreter. When a job
-includes `executableDigest`, the worker also hashes the configured executable
-immediately before launch and fails the run without spawning it if the digest
-does not match. The digest confirms file contents; it does not provide a
-sandbox or protect against a same-user process changing the file after
-verification. A compatible format and architecture do not guarantee that
-dynamic libraries or other runtime requirements are installed.
+Conductor does not inspect ELF or Mach-O headers before launch. It passes the
+configured command to the native process backend and lets the OS loader decide
+whether the format and CPU architecture can run on that host. This also leaves
+universal Mach-O slice selection to macOS. An OS launch rejection is reported
+as `spawn_failed`; interpreter scripts are handled by their shebang
+interpreter. When a job includes `executableDigest`, the worker independently
+hashes the configured executable immediately before launch and fails the run
+without spawning it if the digest does not match. The digest confirms file
+contents; it does not provide a sandbox or protect against a same-user process
+changing the file after verification. A successful OS launch does not guarantee
+that dynamic libraries or other runtime requirements are available.
 
 ## macOS prerequisites
 
