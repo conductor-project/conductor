@@ -22,12 +22,22 @@ conductor-manager = { path = "crates/conductor-manager", default-features = fals
 conductor-worker = { path = "crates/conductor-worker", default-features = false }
 conductor-process = { path = "crates/conductor-process", default-features = false }
 conductor-api = { path = "crates/conductor-api", default-features = false }
+conductor-transport = { path = "crates/conductor-transport", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 ctrlc = { version = "3.4", default-features = false, features = ["termination"] }
 clap = { version = "4.5", default-features = false, features = ["derive", "error-context", "help", "std", "usage"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls"] }
+axum-server-mtls = { version = "0.1.2", default-features = false }
+rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser", "zeroize"] }
+rustls = { version = "0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+sha2 = { version = "0.11.0", default-features = false }
+getrandom = { version = "0.4.3", default-features = false, features = ["std"] }
+time = { version = "0.3.55", default-features = false, features = ["std"] }
+zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
+x509-parser = { version = "0.18.1", default-features = false }
 tower = { version = "0.5", default-features = false, features = ["util"] }
 tokio = { version = "1", default-features = false, features = ["macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"] }

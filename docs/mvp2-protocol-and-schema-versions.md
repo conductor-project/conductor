@@ -37,9 +37,12 @@ behavior and has compatibility tests.
 ## SQLite schemas
 
 Manager and worker databases have separate SQLite `user_version` values. The
-manager schema is version 4 and the worker schema remains version 3. Manager
-schema 4 adds the durable command outbox described in
-[manager command delivery](mvp2-command-outbox.md). Startup migrates supported
+manager schema is version 5 and the worker schema remains version 3. Manager
+schema 4 was used by two independently developed MVP2 changes: worker identity
+tables and the durable command outbox described in
+[manager command delivery](mvp2-command-outbox.md). Schema 5 contains both.
+Startup recognizes either schema 4 layout and adds only the missing tables
+transactionally. It also migrates supported
 older schemas transactionally and preserves the existing job, run, log, and
 worker-incarnation records. A schema newer than the binary supports is a
 startup error with the detected version; startup must not reset or rewrite

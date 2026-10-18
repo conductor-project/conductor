@@ -36,6 +36,33 @@ enum Commands {
         #[arg(long, value_enum)]
         role: Option<Role>,
     },
+    /// Create a one-time worker enrollment credential in a protected file.
+    EnrollWorker {
+        /// Manager data directory containing manager.sqlite3.
+        #[arg(long)]
+        manager_data_dir: PathBuf,
+        /// Directory holding the manager CA certificate and protected private key.
+        #[arg(long)]
+        identity_dir: PathBuf,
+        /// Stable worker identifier authorized by this credential.
+        #[arg(long)]
+        worker_id: String,
+        /// Credential lifetime in seconds, from 1 through 86400.
+        #[arg(long, default_value_t = 3600, value_parser = clap::value_parser!(u64).range(1..=86400))]
+        valid_for_seconds: u64,
+        /// New output file for the raw credential; existing files are never overwritten.
+        #[arg(long)]
+        output: PathBuf,
+    },
+    /// Revoke a worker certificate identity and any unused enrollment credentials.
+    RevokeWorker {
+        /// Manager data directory containing manager.sqlite3.
+        #[arg(long)]
+        manager_data_dir: PathBuf,
+        /// Stable worker identifier to revoke.
+        #[arg(long)]
+        worker_id: String,
+    },
     /// Internal launcher used only to enter a configured cgroup before exec.
     #[command(name = "__internal-launch", hide = true)]
     InternalLaunch {
@@ -186,6 +213,67 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     };
     let (config_path, role_override) = match cli.command {
         Commands::Agent { config, role } => (config, role),
+        Commands::EnrollWorker {
+            manager_data_dir,
+            identity_dir,
+            worker_id,
+            valid_for_seconds,
+            output,
+        } => {
+            let worker_id = WorkerId::new(worker_id)?;
+            let manager_data_dir = state_lock::prepare_directory(&manager_data_dir)?;
+            let manager = Arc::new(conductor_manager::SqliteJobRepository::open(
+                manager_data_dir.join("manager.sqlite3"),
+            )?);
+            let authority = Arc::new(conductor_transport::CertificateAuthority::open_or_create(
+                identity_dir,
+            )?);
+            let service = conductor_transport::WorkerEnrollmentService::new(manager, authority);
+            let expires_at_ms = timestamp_ms()
+                .try_into()
+                .ok()
+                .and_then(|now: i64| {
+                    i64::try_from(valid_for_seconds)
+                        .ok()
+                        .and_then(|seconds| seconds.checked_mul(1_000))
+                        .and_then(|lifetime| now.checked_add(lifetime))
+                })
+                .ok_or("system time or credential expiration is out of range")?;
+            service.create_credential_file(&worker_id, expires_at_ms, &output)?;
+            eprintln!(
+                "{{\"timestampMs\":{},\"severity\":\"info\",\"component\":\"identity\",\"event\":\"enrollment_credential_created\",\"workerId\":{},\"expiresAtMs\":{},\"credentialFile\":{}}}",
+                timestamp_ms(),
+                serde_json::to_string(worker_id.as_str())?,
+                expires_at_ms,
+                serde_json::to_string(&output.to_string_lossy().as_ref())?
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+        Commands::RevokeWorker {
+            manager_data_dir,
+            worker_id,
+        } => {
+            let worker_id = WorkerId::new(worker_id)?;
+            let manager_data_dir = state_lock::prepare_directory(&manager_data_dir)?;
+            let manager = conductor_manager::SqliteJobRepository::open(
+                manager_data_dir.join("manager.sqlite3"),
+            )?;
+            let now_ms = timestamp_ms()
+                .try_into()
+                .map_err(|_| "system time is out of range")?;
+            if !manager
+                .revoke_worker_identity(&worker_id, now_ms)
+                .map_err(|_| "worker identity storage is unavailable")?
+            {
+                return Err("worker identity does not exist".into());
+            }
+            eprintln!(
+                "{{\"timestampMs\":{},\"severity\":\"info\",\"component\":\"identity\",\"event\":\"worker_identity_revoked\",\"workerId\":{}}}",
+                timestamp_ms(),
+                serde_json::to_string(worker_id.as_str())?
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
         Commands::InternalLaunch {
             cgroup_path,
             ready_socket,
