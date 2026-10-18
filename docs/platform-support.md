@@ -32,7 +32,7 @@ those Linux kernel guarantees.
 | Landlock filesystem policy | Optional, when the kernel and administrator configuration meet the requirements | Unavailable |
 | Resource requests and reservations | Scheduling metadata; only configured cgroup limits are kernel enforcement | Scheduling metadata only; no kernel resource enforcement |
 | Filesystem-policy request | Enforced by Landlock or rejected before launch, depending on policy mode | Rejected before launch |
-| Executable architecture and digest | The worker checks ELF format and worker architecture before launch, and verifies an optional operator-provisioned SHA-256 digest | The worker checks Mach-O format and worker architecture before launch, and verifies an optional operator-provisioned SHA-256 digest |
+| Executable architecture and digest | The OS loader decides whether the executable can run on this host; the worker independently verifies an optional operator-provisioned SHA-256 digest before launch | The OS loader decides whether the executable can run on this host, including selecting a compatible universal-binary slice; the worker independently verifies an optional operator-provisioned SHA-256 digest before launch |
 
 Conductor does not silently replace a requested Linux protection with a weaker
 macOS behavior. A macOS worker cannot advertise cgroup or Landlock enforcement,
@@ -47,16 +47,17 @@ composition in issue #61. Host resource inventory and refusal to place work on
 incompatible workers are tracked in issues #66 and #67. These remain explicit
 qualification gaps until their implementation and macOS evidence are complete.
 
-Before launch, the worker rejects native executables whose object format or
-architecture differs from its own. Universal Mach-O binaries are accepted
-when they contain a slice for the worker architecture. Interpreter scripts
-delegate executable selection to their shebang interpreter. When a job
-includes `executableDigest`, the worker also hashes the configured executable
-immediately before launch and fails the run without spawning it if the digest
-does not match. The digest confirms file contents; it does not provide a
-sandbox or protect against a same-user process changing the file after
-verification. A compatible format and architecture do not guarantee that
-dynamic libraries or other runtime requirements are installed.
+Conductor does not inspect ELF or Mach-O headers before launch. It passes the
+configured command to the native process backend and lets the OS loader decide
+whether the format and CPU architecture can run on that host. This also leaves
+universal Mach-O slice selection to macOS. An OS launch rejection is reported
+as `spawn_failed`; interpreter scripts are handled by their shebang
+interpreter. When a job includes `executableDigest`, the worker independently
+hashes the configured executable immediately before launch and fails the run
+without spawning it if the digest does not match. The digest confirms file
+contents; it does not provide a sandbox or protect against a same-user process
+changing the file after verification. A successful OS launch does not guarantee
+that dynamic libraries or other runtime requirements are available.
 
 ## macOS prerequisites
 
