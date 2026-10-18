@@ -15,9 +15,7 @@ those claims. This repository does not publish downloadable binaries or
 package-manager installs. [Install Rustup](https://rustup.rs/) for your OS,
 then install the pinned toolchain with
 `rustup toolchain install 1.99.1 --profile minimal`. Build the binary from
-source with that toolchain. The first-job example uses `curl`,
-`jq`, and Python 3 to inspect and decode HTTP responses; these are walkthrough
-client tools, not daemon runtime dependencies.
+source with that toolchain. Operator tasks use the `conductor` CLI.
 
 ## Build and start a local daemon
 
@@ -72,65 +70,34 @@ roles, remote access, and backups.
 
 ## Submit and inspect your first job
 
-Registering a job stores its definition. Starting it creates a separate run.
-The command is an argument array, not shell text: this example runs the system
-`printf` executable directly and does not expand shell syntax.
+Registering a job stores its definition. Submitting it starts a separate run.
+The checked-in JSON file runs the system `printf` executable directly; a job
+command is an argument array and Conductor does not implicitly invoke a shell.
 
 ```sh
-JOB_ID="hello-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
-jq -n --arg id "$JOB_ID" \
-  '{id:$id,command:["/usr/bin/printf","hello conductor\\n"],cwd:"/tmp",
-    env:{},inheritEnv:false,timeoutMs:null,terminationGraceMs:5000}' \
-  > /tmp/conductor-first-job.json
-
-curl --fail-with-body --max-time 5 -H 'Content-Type: application/json' \
-  --data-binary @/tmp/conductor-first-job.json \
-  http://127.0.0.1:8080/v1/jobs
-IDEMPOTENCY_KEY="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
-run_response=$(curl --fail-with-body --max-time 5 -X POST \
-  -H "Idempotency-Key: $IDEMPOTENCY_KEY" \
-  "http://127.0.0.1:8080/v1/jobs/$JOB_ID/runs")
-RUN_ID=$(printf '%s' "$run_response" | jq -r .runId)
+./target/debug/conductor job --output json submit examples/cli-job.json \
+  --idempotency-key mvp3-first-job --wait --wait-timeout-seconds 30
 ```
 
-Poll the returned run ID for up to 30 seconds. A successful run ends in
-`succeeded`; other terminal states include `failed`, `cancelled`, and
-`timed_out`.
+The JSON result includes stable `jobId` and `runId` values. Retry the same
+command with the same input and idempotency key after an ambiguous timeout; the
+same accepted run is returned instead of starting another. A successful
+`--wait` ends in `succeeded`; other terminal states include `failed`,
+`cancelled`, and `timed_out`. A wait timeout does not stop the remote run.
 
 ```sh
-finished=0
-deadline=$(( $(date +%s) + 30 ))
-while [ "$(date +%s)" -lt "$deadline" ]; do
-  run=$(curl --fail-with-body --max-time 1 \
-    "http://127.0.0.1:8080/v1/runs/$RUN_ID")
-  state=$(printf '%s' "$run" | jq -r .state)
-  case "$state" in
-    succeeded|failed|cancelled|timed_out|abandoned)
-      finished=1
-      break
-      ;;
-    unknown)
-      echo "Run outcome is unknown; operator resolution is required" >&2
-      exit 1
-      ;;
-  esac
-  sleep 0.1
-done
-[ "$finished" -eq 1 ] || { echo "Run did not finish within 30 seconds" >&2; exit 1; }
-printf '%s\n' "$run" | jq '{runId,state,exitCode,failureReason}'
-[ "$state" = succeeded ] || { echo "Job did not succeed" >&2; exit 1; }
-
-curl --fail-with-body --max-time 5 \
-  "http://127.0.0.1:8080/v1/runs/$RUN_ID/logs?stream=stdout&offset=0&limit=4096" \
-  | jq -r .data \
-  | python3 -c 'import base64,sys; sys.stdout.buffer.write(base64.b64decode(sys.stdin.read()))'
+./target/debug/conductor job list --output json
+./target/debug/conductor job inspect mvp3-first-job --output json
+./target/debug/conductor operator --output json runs --job-id mvp3-first-job
+./target/debug/conductor operator logs RUN_ID --stream stdout --offset 0 --limit 4096
 ```
 
 The final command prints `hello conductor`. The executable and working
 directory must exist on the worker that executes the job. Set `inheritEnv` to
-`false` and provide only the needed variables in `env`; Conductor does not
-implicitly invoke a shell. See [job and service behavior](okf/jobs-and-services.md)
-for definitions, deployments, retries, IDs, and API contracts.
+`false` and provide only the needed variables in `env`. Use `conductor job
+register FILE` to store a definition without starting a run; input `-` reads
+JSON from stdin. See [job and service behavior](okf/jobs-and-services.md) for
+revision, deployment, retries, IDs, and API contracts.
 
 If the daemon is unavailable, confirm Terminal A is still running and check
 `/readyz`. Registering an already-used ID returns `409`; deleted IDs stay

@@ -1,13 +1,15 @@
 ---
 type: Runbook
 title: Operate Conductor with the CLI
-description: Select named manager connection contexts, inspect workers and services, mutate desired state safely, drain workers, page run history, and retrieve bounded logs.
+description: Select named manager connection contexts, submit and manage jobs and revisions, inspect workers and services, mutate desired state safely, drain workers, page run history, and retrieve bounded logs.
 status: stable
-source_revision: c696ef83dd136b8317c3c440ad4e4e2401c54a8c
+source_revision: 4108a1c0f4eec94945ac91869fd9d2f73f3c9c67
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/operator_cli.rs
     title: Operator command parsing and requests
+  - resource: ../src/job_cli.rs
+    title: Job and revision commands
   - resource: ../src/contexts.rs
     title: Named context configuration
   - resource: ../../conductor-api/src/lib.rs
@@ -31,6 +33,38 @@ not require a dummy token. Token files must be regular non-symlink files and
 owner-only on Unix; token contents are not printed in diagnostics. Plain HTTP
 is accepted only for loopback, and remote manager use requires a token file.
 Use a trusted TLS proxy or a configured CA file for a remote manager.
+
+# Submit and manage jobs
+
+Use `conductor job register FILE` to store an immutable one-shot job without
+starting it. `conductor job submit FILE --idempotency-key KEY` registers the
+definition and starts one run. Both commands accept `-` in place of a file to
+read JSON from stdin. `job submit` handles an identical existing definition by
+reusing it; an ID with a different definition conflicts, and a deleted ID
+remains reserved. Reuse the same idempotency key after an ambiguous submit
+result to recover the run instead of creating a second one.
+
+Add `--wait --wait-timeout-seconds N` to submit when the run should be observed
+to completion. Timing out the local wait does not stop the remote run. Unknown
+execution results are reported as unresolved and need an explicit operator
+decision. JSON errors can include a `partial` object with known job and run IDs
+and a safe recovery command when registration succeeded but run start did not.
+
+```sh
+conductor job register examples/cli-job.json
+conductor job submit examples/cli-job.json --idempotency-key first-job --wait
+conductor job list --output json
+conductor job inspect mvp3-first-job --output json
+conductor job revision create mvp3-first-job examples/cli-job-revision.json \
+  --idempotency-key first-job-revision
+conductor job revision inspect mvp3-first-job 1 --output json
+conductor job delete mvp3-first-job
+```
+
+Service workload input belongs in a revision and deployment workflow. Create a
+service revision and use the deployment commands to select it; do not submit a
+service workload as a one-shot job. Job deletion keeps the ID reserved and
+fails while a run is active or unresolved.
 
 The default output is concise human text; use `--output json` for structured
 output. Errors are written to stderr with a nonzero exit code. Log bytes are

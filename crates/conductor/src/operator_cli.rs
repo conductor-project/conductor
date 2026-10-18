@@ -254,47 +254,13 @@ fn effective_connection(
 
 impl OperatorClient {
     fn new(args: &OperatorArgs) -> Result<Self, String> {
-        let context =
-            crate::contexts::resolve(args.context.as_deref())?.map(|(_, context)| context);
-        let effective = effective_connection(
+        let client = build_client(
             args.server.as_deref(),
-            args.token_file.as_ref(),
-            args.ca_file.as_ref(),
+            args.context.as_deref(),
+            args.token_file.as_deref(),
+            args.ca_file.as_deref(),
             args.timeout_seconds,
-            context,
-        );
-        let base_url = parse_server_url(&effective.server)?;
-        let token_file = effective.token_file.as_ref();
-        let is_loopback = base_url.host_str().is_some_and(is_loopback_host);
-        if !is_loopback && token_file.is_none() {
-            return Err(
-                "authenticated remote use requires --token-file or a context token file".to_owned(),
-            );
-        }
-        let bearer_token = if let Some(token_file) = token_file {
-            let token = read_operator_token(token_file)?;
-            Some(
-                std::str::from_utf8(&token)
-                    .map_err(|_| "operator token file contains an invalid token".to_owned())?
-                    .to_owned(),
-            )
-        } else {
-            None
-        };
-        let ca_certificate_pem = effective
-            .ca_file
-            .as_ref()
-            .map(|path| {
-                std::fs::read_to_string(path)
-                    .map_err(|_| "configured CA certificate file could not be read".to_owned())
-            })
-            .transpose()?;
-        let mut config = ClientConfig::new(effective.server);
-        config.bearer_token = bearer_token;
-        config.ca_certificate_pem = ca_certificate_pem;
-        config.timeout = Duration::from_secs(effective.timeout_seconds);
-        let client = ApiClient::new(config)
-            .map_err(|_| "operator HTTP client could not be configured".to_owned())?;
+        )?;
         Ok(Self {
             client,
             output: args.output,
@@ -388,6 +354,58 @@ impl OperatorClient {
             }
         }
     }
+}
+
+/// Construct the shared management API client using the same context and
+/// credential precedence as the legacy `operator` command.
+pub(crate) fn build_client(
+    server: Option<&str>,
+    context_name: Option<&str>,
+    token_file: Option<&std::path::Path>,
+    ca_file: Option<&std::path::Path>,
+    timeout_seconds: Option<u64>,
+) -> Result<ApiClient, String> {
+    let context = crate::contexts::resolve(context_name)?.map(|(_, context)| context);
+    let token_file = token_file.map(PathBuf::from);
+    let ca_file = ca_file.map(PathBuf::from);
+    let effective = effective_connection(
+        server,
+        token_file.as_ref(),
+        ca_file.as_ref(),
+        timeout_seconds,
+        context,
+    );
+    let base_url = parse_server_url(&effective.server)?;
+    let token_file = effective.token_file.as_ref();
+    let is_loopback = base_url.host_str().is_some_and(is_loopback_host);
+    if !is_loopback && token_file.is_none() {
+        return Err(
+            "authenticated remote use requires --token-file or a context token file".to_owned(),
+        );
+    }
+    let bearer_token = if let Some(token_file) = token_file {
+        let token = read_operator_token(token_file)?;
+        Some(
+            std::str::from_utf8(&token)
+                .map_err(|_| "operator token file contains an invalid token".to_owned())?
+                .to_owned(),
+        )
+    } else {
+        None
+    };
+    let ca_certificate_pem = effective
+        .ca_file
+        .as_ref()
+        .map(|path| {
+            std::fs::read_to_string(path)
+                .map_err(|_| "configured CA certificate file could not be read".to_owned())
+        })
+        .transpose()?;
+    let mut config = ClientConfig::new(effective.server);
+    config.bearer_token = bearer_token;
+    config.ca_certificate_pem = ca_certificate_pem;
+    config.timeout = Duration::from_secs(effective.timeout_seconds);
+    ApiClient::new(config).map_err(|_| "operator HTTP client could not be configured".to_owned())
 }
 
 fn header_value<'a>(headers: &'a [(&str, String)], name: &str) -> Result<Option<&'a str>, String> {

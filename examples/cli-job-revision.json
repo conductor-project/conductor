@@ -1,0 +1,20 @@
+{
+  "definition": {
+    "id": "mvp3-first-job",
+    "command": ["/usr/bin/printf", "hello conductor\n"],
+    "cwd": "/tmp",
+    "env": {},
+    "inheritEnv": false,
+    "timeoutMs": null,
+    "terminationGraceMs": 5000
+  },
+  "workload": {
+    "kind": "one_shot"
+  },
+  "executableDigest": {
+    "algorithm": "sha256",
+    "value": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "executionRequirements": {},
+  "resourceRequest": {}
+}
