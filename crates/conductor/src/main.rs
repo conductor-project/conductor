@@ -45,6 +45,8 @@ enum Commands {
         ready_socket: PathBuf,
         #[arg(long)]
         landlock_policy_file: Option<PathBuf>,
+        #[arg(long)]
+        environment_file: PathBuf,
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
@@ -186,12 +188,14 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             cgroup_path,
             ready_socket,
             landlock_policy_file,
+            environment_file,
             command,
         } => {
             return Ok(ExitCode::from(conductor_process::internal_launch(
                 cgroup_path.as_deref(),
                 &ready_socket,
                 landlock_policy_file.as_deref(),
+                &environment_file,
                 &command,
             ) as u8));
         }
