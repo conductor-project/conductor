@@ -862,6 +862,64 @@ fn retry_after_lost_start_response_reuses_command_without_repeating_attempt() {
     );
 }
 
+#[test]
+fn startup_reconciliation_resumes_pending_start_without_repeating_attempt() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    manager.register(job("recover-pending-start")).unwrap();
+    let worker_id = WorkerId::new("retry-worker").unwrap();
+    let worker = RetryWorker {
+        worker_id: worker_id.clone(),
+        deliveries: AtomicUsize::new(0),
+        attempts: AtomicUsize::new(0),
+        commands: std::sync::Mutex::new(Vec::new()),
+        runs: std::sync::Mutex::new(BTreeMap::new()),
+    };
+
+    assert_eq!(
+        manager.start_run_with_key(
+            &JobId::new("recover-pending-start").unwrap(),
+            &worker_id,
+            1,
+            Some("recover-key"),
+            &worker,
+        ),
+        Err(ManagerError::WorkerUnavailable)
+    );
+    drop(manager);
+
+    let manager = service(&directory);
+    manager.register(job("recovery-capacity-probe")).unwrap();
+    manager.reconcile(&worker).unwrap();
+    let run = manager
+        .list_runs(Some(&JobId::new("recover-pending-start").unwrap()), None, 1)
+        .unwrap()
+        .pop()
+        .expect("recovered run");
+    assert_eq!(run.state(), RunState::Running);
+    assert_eq!(worker.attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        manager.start_run(
+            &JobId::new("recovery-capacity-probe").unwrap(),
+            &worker_id,
+            1,
+            &worker,
+        ),
+        Err(ManagerError::CapacityReached)
+    );
+    assert_eq!(worker.attempts.load(Ordering::SeqCst), 1);
+    let commands = worker.commands.lock().unwrap();
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0], commands[1]);
+    assert!(
+        SqliteJobRepository::open(directory.database())
+            .unwrap()
+            .pending_commands(&worker_id, 5, 32)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 struct LogOnlyWorker(WorkerId);
 
 impl WorkerPort for LogOnlyWorker {

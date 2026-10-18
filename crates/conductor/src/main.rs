@@ -506,7 +506,8 @@ fn run_manager(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
         ]),
         BTreeSet::new(),
     )?;
-    let mut worker_ports = Vec::with_capacity(config.additional_workers.len() + 1);
+    let mut worker_ports: Vec<Arc<dyn WorkerPort>> =
+        Vec::with_capacity(config.additional_workers.len() + 1);
     worker_ports.push(hub.register_worker(descriptor, offer.clone())?);
     for additional in &config.additional_workers {
         worker_ports.push(hub.register_worker(
@@ -557,6 +558,7 @@ fn run_manager(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
         );
         let api_listener = tokio::net::TcpListener::from_std(api_listener)?;
         let readiness_ports = worker_ports.clone();
+        let recovery_ports = worker_ports.clone();
         let workers_ready = Arc::new(AtomicBool::new(false));
         let ready_for_workers = Arc::clone(&workers_ready);
         let readiness_task = tokio::spawn(async move {
@@ -575,7 +577,7 @@ fn run_manager(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
             worker_ports.remove(0),
             request_timeout,
             api_access,
-            workers_ready,
+            conductor_api::ManagerRecovery::new(workers_ready, recovery_ports),
         ));
         let (completed_transport, api_result, transport_result) = tokio::select! {
             api_result = &mut api_task => (false, api_result, None),

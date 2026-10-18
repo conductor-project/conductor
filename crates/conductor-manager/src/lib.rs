@@ -2137,6 +2137,50 @@ impl JobService {
     /// Converge persisted manager reservations with the selected worker before reopening admission.
     pub fn reconcile(&self, worker: &dyn WorkerPort) -> Result<(), ManagerError> {
         let descriptor = worker.descriptor();
+        let pending = self
+            .repository
+            .pending_commands(
+                descriptor.worker_id(),
+                descriptor.incarnation(),
+                MAX_PENDING_COMMANDS_PER_WORKER,
+            )
+            .map_err(|_| ManagerError::StorageUnavailable)?;
+        for envelope in pending {
+            let expected_run_id = match &envelope.command {
+                WorkerCommand::StartRun(command) => command.spec().id().clone(),
+                WorkerCommand::InspectRun(command) => command.run_id().clone(),
+                WorkerCommand::StopRun(command) => command.run_id().clone(),
+                WorkerCommand::ResolveRun(command) => command.run_id().clone(),
+                WorkerCommand::ReadRunLogs(command) => command.run_id().clone(),
+            };
+            if envelope.target_worker_id != *descriptor.worker_id()
+                || envelope.target_worker_incarnation != descriptor.incarnation()
+            {
+                return Err(ManagerError::StorageUnavailable);
+            }
+            let observation = worker
+                .dispatch_command(envelope.clone())
+                .map_err(|_| ManagerError::WorkerUnavailable)?;
+            if observation.run_id() != &expected_run_id
+                || observation.worker_id() != descriptor.worker_id()
+                || (!observation.state().is_terminal()
+                    && observation.worker_incarnation() != descriptor.incarnation())
+            {
+                return Err(ManagerError::WorkerUnavailable);
+            }
+            let stored = self
+                .repository
+                .get_run(&expected_run_id)
+                .map_err(|_| ManagerError::StorageUnavailable)?
+                .ok_or(ManagerError::StorageUnavailable)?;
+            if observation.job_id() != stored.job_id() {
+                return Err(ManagerError::WorkerUnavailable);
+            }
+            self.repository
+                .record_observation(&observation)
+                .map_err(|_| ManagerError::StorageUnavailable)?;
+            self.acknowledge_command(&envelope)?;
+        }
         let active = self
             .repository
             .list_active_runs(descriptor.worker_id(), MAX_WORKER_CAPACITY)
