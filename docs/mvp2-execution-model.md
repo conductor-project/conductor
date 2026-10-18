@@ -40,10 +40,20 @@ execution backends, and actual enforcement capabilities. A job's
 `ExecutionRequirements` matches each explicit platform/backend constraint and
 requires every listed enforcement capability. Assignment is invalid when the
 worker does not satisfy those requirements; unsupported required protections
-must not be silently downgraded. MVP2 currently models Linux and macOS native
-process execution, with cgroup v2 and Landlock as distinct enforcement
-capabilities. Listing a platform does not imply that it implements either
-capability.
+must not be silently downgraded. Optional `workerLabels` constraints use
+exact key/value matches against manager-controlled worker labels. MVP2
+currently models Linux and macOS native process execution, with cgroup v2 and
+Landlock as distinct enforcement capabilities. Listing a platform does not
+imply that it implements either capability.
+
+Service scheduling persists one allocation reservation per desired replica.
+Placement checks worker capacity and the aggregate capacity of each shared
+resource domain in one SQLite immediate transaction. Assigned and uncertain
+allocations both consume capacity; a lost worker makes its assignments
+uncertain and does not free the reservation. Candidate workers are selected
+deterministically by current reserved slots and then worker ID. Omitted
+one-shot resource requests retain the no-reservation behavior; service requests
+must specify positive CPU and memory dimensions.
 
 ## Allocation transitions
 

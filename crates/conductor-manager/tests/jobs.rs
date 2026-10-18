@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -7,10 +7,12 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use conductor_core::{
-    CommandEnvelope, CommandId, DeploymentMutation, DeploymentPendingReason, DeploymentStatus,
-    InspectRun, JobId, JobRevisionDraft, JobSpec, LogStream, ReadRunLogs, ResolveRun,
+    AllocationState, Architecture, CommandEnvelope, CommandId, DeploymentMutation,
+    DeploymentPendingReason, DeploymentStatus, EnforcementCapability, ExecutionBackend, InspectRun,
+    JobId, JobRevisionDraft, JobSpec, LogStream, OperatingSystem, ReadRunLogs, ResolveRun,
     RunFailureReason, RunId, RunLogChunk, RunLogStatus, RunObservation, RunState, StartRun,
-    StopRun, WorkerCommand, WorkerDescriptor, WorkerId,
+    StopRun, WorkerCapabilities, WorkerCommand, WorkerDescriptor, WorkerId, WorkerInventory,
+    WorkerResourceCapacity, WorkerStatus,
 };
 use conductor_manager::{
     CommandJournal, CommandStoreError, ExecutionStoreError, JobRepository, JobService, MAX_JOBS,
@@ -198,6 +200,82 @@ fn service_revision_draft(command_arg: &str) -> JobRevisionDraft {
     serde_json::from_str(&json).expect("valid service revision draft")
 }
 
+#[allow(clippy::too_many_arguments)]
+fn scheduling_worker(
+    worker_id: &str,
+    domain_id: &str,
+    worker_cpu_millis: u32,
+    worker_memory_bytes: u64,
+    domain_cpu_millis: u32,
+    domain_memory_bytes: u64,
+    labels: BTreeMap<String, String>,
+    fresh: bool,
+) -> WorkerStatus {
+    scheduling_worker_with_capabilities(
+        worker_id,
+        domain_id,
+        worker_cpu_millis,
+        worker_memory_bytes,
+        domain_cpu_millis,
+        domain_memory_bytes,
+        labels,
+        fresh,
+        OperatingSystem::Linux,
+        BTreeSet::from([
+            EnforcementCapability::CgroupV2,
+            EnforcementCapability::Landlock,
+        ]),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scheduling_worker_with_capabilities(
+    worker_id: &str,
+    domain_id: &str,
+    worker_cpu_millis: u32,
+    worker_memory_bytes: u64,
+    domain_cpu_millis: u32,
+    domain_memory_bytes: u64,
+    labels: BTreeMap<String, String>,
+    fresh: bool,
+    operating_system: OperatingSystem,
+    enforcement: BTreeSet<EnforcementCapability>,
+) -> WorkerStatus {
+    let worker_id = WorkerId::new(worker_id).expect("valid worker ID");
+    let domain_id = WorkerId::new(domain_id).expect("valid resource-domain ID");
+    let capacity = WorkerResourceCapacity::new(worker_cpu_millis, worker_memory_bytes)
+        .expect("positive worker capacity");
+    let domain_capacity = WorkerResourceCapacity::new(domain_cpu_millis, domain_memory_bytes)
+        .expect("positive domain capacity");
+    let capabilities = WorkerCapabilities::new(
+        operating_system,
+        Architecture::X86_64,
+        BTreeSet::from([ExecutionBackend::NativeProcess]),
+        enforcement,
+    )
+    .expect("valid worker capabilities");
+    let inventory =
+        WorkerInventory::new(capabilities, capacity, capacity, 4).expect("valid worker inventory");
+    WorkerStatus::new(
+        WorkerDescriptor::new(worker_id, 4, true),
+        0,
+        0,
+        true,
+        false,
+        1_000,
+    )
+    .with_inventory(inventory)
+    .with_manager_metadata(domain_id, domain_capacity, labels, 1_000, fresh)
+    .expect("valid manager worker metadata")
+}
+
+fn deployment_request(replicas: u32) -> DeploymentMutation {
+    DeploymentMutation::Deploy {
+        revision: 1,
+        replicas,
+    }
+}
+
 #[test]
 fn revisions_and_deployment_mutations_are_durable_conditional_and_idempotent() {
     let directory = TempDir::new();
@@ -231,7 +309,7 @@ fn revisions_and_deployment_mutations_are_durable_conditional_and_idempotent() {
     assert_eq!(initial.status(), DeploymentStatus::Pending);
     assert_eq!(
         initial.pending_reason(),
-        Some(DeploymentPendingReason::PlacementPending)
+        Some(DeploymentPendingReason::WorkerDisconnected)
     );
     assert_eq!(
         manager
@@ -387,6 +465,393 @@ fn invalid_revision_submission_does_not_reserve_its_job_or_idempotency_key() {
 }
 
 #[test]
+fn placement_spreads_replicas_deterministically_and_honors_worker_labels() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let mut draft = serde_json::to_value(service_revision_draft("v1")).unwrap();
+    draft["executionRequirements"]["workerLabels"] = serde_json::json!({"pool": "blue"});
+    let draft: JobRevisionDraft = serde_json::from_value(draft).unwrap();
+    let revision = manager.create_revision(&draft, "revision").unwrap();
+    let workers = [
+        scheduling_worker(
+            "worker-a",
+            "host-a",
+            500,
+            512 * 1024 * 1024,
+            500,
+            512 * 1024 * 1024,
+            BTreeMap::from([("pool".into(), "blue".into())]),
+            true,
+        ),
+        scheduling_worker(
+            "worker-b",
+            "host-b",
+            500,
+            512 * 1024 * 1024,
+            500,
+            512 * 1024 * 1024,
+            BTreeMap::from([("pool".into(), "blue".into())]),
+            true,
+        ),
+        scheduling_worker(
+            "worker-c",
+            "host-c",
+            500,
+            512 * 1024 * 1024,
+            500,
+            512 * 1024 * 1024,
+            BTreeMap::from([("pool".into(), "green".into())]),
+            true,
+        ),
+    ];
+    let deployment = manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &deployment_request(3),
+            "deploy",
+            &workers,
+        )
+        .unwrap();
+    assert_eq!(deployment.status(), DeploymentStatus::Ready);
+    let assignments = manager
+        .list_allocations(revision.id().job_id())
+        .unwrap()
+        .into_iter()
+        .map(|record| {
+            assert_eq!(record.allocation().state(), AllocationState::Assigned);
+            record
+                .allocation()
+                .assigned_worker_id()
+                .unwrap()
+                .as_str()
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(assignments, ["worker-a", "worker-b", "worker-a"]);
+}
+
+#[test]
+fn placement_enforces_aggregate_shared_host_capacity() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let revision = manager
+        .create_revision(&service_revision_draft("v1"), "revision")
+        .unwrap();
+    let workers = [
+        scheduling_worker(
+            "worker-a",
+            "shared-host",
+            500,
+            512 * 1024 * 1024,
+            250,
+            256 * 1024 * 1024,
+            BTreeMap::new(),
+            true,
+        ),
+        scheduling_worker(
+            "worker-b",
+            "shared-host",
+            500,
+            512 * 1024 * 1024,
+            250,
+            256 * 1024 * 1024,
+            BTreeMap::new(),
+            true,
+        ),
+    ];
+    let deployment = manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &deployment_request(2),
+            "deploy",
+            &workers,
+        )
+        .unwrap();
+    assert_eq!(deployment.status(), DeploymentStatus::Pending);
+    assert_eq!(
+        deployment.pending_reason(),
+        Some(DeploymentPendingReason::SharedHostCapacityExhausted)
+    );
+    assert_eq!(
+        manager
+            .list_allocations(revision.id().job_id())
+            .unwrap()
+            .iter()
+            .filter(|record| record.allocation().state() == AllocationState::Assigned)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn placement_never_downgrades_unavailable_execution_protection() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let mut draft = serde_json::to_value(service_revision_draft("limited")).unwrap();
+    draft["definition"]["resourceLimits"] = serde_json::json!({
+        "cpuQuotaUs": 25_000,
+        "cpuPeriodUs": 100_000
+    });
+    let draft: JobRevisionDraft = serde_json::from_value(draft).unwrap();
+    let revision = manager.create_revision(&draft, "revision").unwrap();
+    let macos_worker = scheduling_worker_with_capabilities(
+        "macos-worker",
+        "macos-host",
+        500,
+        512 * 1024 * 1024,
+        500,
+        512 * 1024 * 1024,
+        BTreeMap::new(),
+        true,
+        OperatingSystem::Macos,
+        BTreeSet::new(),
+    );
+    let deployment = manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &deployment_request(1),
+            "deploy",
+            &[macos_worker],
+        )
+        .unwrap();
+    assert_eq!(deployment.status(), DeploymentStatus::Pending);
+    assert_eq!(
+        deployment.pending_reason(),
+        Some(DeploymentPendingReason::RequiredProtectionUnavailable)
+    );
+    assert_eq!(
+        manager.list_allocations(revision.id().job_id()).unwrap()[0]
+            .allocation()
+            .state(),
+        AllocationState::Pending
+    );
+}
+
+#[test]
+fn uncertain_allocations_keep_reservations_during_replacement_placement() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let revision = manager
+        .create_revision(&service_revision_draft("v1"), "revision")
+        .unwrap();
+    let initial_worker = scheduling_worker(
+        "worker-a",
+        "shared-host",
+        500,
+        512 * 1024 * 1024,
+        250,
+        256 * 1024 * 1024,
+        BTreeMap::new(),
+        true,
+    );
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &deployment_request(1),
+            "deploy",
+            &[initial_worker],
+        )
+        .unwrap();
+
+    let pending = manager
+        .reconcile_deployment_placement(revision.id().job_id(), &[])
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.status(), DeploymentStatus::Pending);
+    assert_eq!(
+        pending.pending_reason(),
+        Some(DeploymentPendingReason::WorkerDisconnected)
+    );
+    let allocations = manager.list_allocations(revision.id().job_id()).unwrap();
+    assert_eq!(allocations.len(), 2);
+    assert_eq!(
+        allocations
+            .iter()
+            .filter(|record| record.allocation().state() == AllocationState::Uncertain)
+            .count(),
+        1
+    );
+    assert_eq!(
+        allocations
+            .iter()
+            .filter(|record| record.allocation().state() == AllocationState::Pending)
+            .count(),
+        1
+    );
+
+    let replacement_worker = scheduling_worker(
+        "worker-b",
+        "shared-host",
+        500,
+        512 * 1024 * 1024,
+        250,
+        256 * 1024 * 1024,
+        BTreeMap::new(),
+        true,
+    );
+    let placed = manager
+        .reconcile_deployment_placement(revision.id().job_id(), &[replacement_worker])
+        .unwrap()
+        .unwrap();
+    assert_eq!(placed.status(), DeploymentStatus::Pending);
+    assert_eq!(
+        placed.pending_reason(),
+        Some(DeploymentPendingReason::SharedHostCapacityExhausted)
+    );
+    let allocations = manager.list_allocations(revision.id().job_id()).unwrap();
+    assert_eq!(
+        allocations
+            .iter()
+            .filter(|record| record.allocation().state() == AllocationState::Uncertain)
+            .count(),
+        1
+    );
+    assert_eq!(
+        allocations
+            .iter()
+            .filter(|record| record.allocation().state() == AllocationState::Pending)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn deleting_deployment_with_assigned_allocations_retains_ownership() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let revision = manager
+        .create_revision(&service_revision_draft("v1"), "revision")
+        .unwrap();
+    let worker = scheduling_worker(
+        "worker-a",
+        "host-a",
+        500,
+        512 * 1024 * 1024,
+        500,
+        512 * 1024 * 1024,
+        BTreeMap::new(),
+        true,
+    );
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &deployment_request(1),
+            "deploy",
+            &[worker],
+        )
+        .unwrap();
+
+    let deleting = manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            Some(1),
+            &DeploymentMutation::Delete,
+            "delete",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(deleting.status(), DeploymentStatus::Deleting);
+    assert_eq!(deleting.desired_replicas(), 0);
+    assert_eq!(
+        manager.list_allocations(revision.id().job_id()).unwrap()[0]
+            .allocation()
+            .state(),
+        AllocationState::Assigned
+    );
+    assert_eq!(
+        manager
+            .reconcile_deployment_placement(revision.id().job_id(), &[])
+            .unwrap()
+            .unwrap()
+            .status(),
+        DeploymentStatus::Deleting
+    );
+}
+
+#[test]
+fn concurrent_deployments_cannot_oversubscribe_a_shared_resource_domain() {
+    let directory = TempDir::new();
+    let manager = Arc::new(service(&directory));
+    let first_revision = manager
+        .create_revision(&service_revision_draft("one"), "revision-one")
+        .unwrap();
+    let mut second_draft = serde_json::to_value(service_revision_draft("two")).unwrap();
+    second_draft["definition"]["id"] = serde_json::json!("web-two");
+    second_draft["workload"]["identity"]["name"] = serde_json::json!("web-two");
+    let second_draft: JobRevisionDraft = serde_json::from_value(second_draft).unwrap();
+    let second_revision = manager
+        .create_revision(&second_draft, "revision-two")
+        .unwrap();
+    let workers = vec![
+        scheduling_worker(
+            "worker-a",
+            "shared-host",
+            500,
+            512 * 1024 * 1024,
+            250,
+            256 * 1024 * 1024,
+            BTreeMap::new(),
+            true,
+        ),
+        scheduling_worker(
+            "worker-b",
+            "shared-host",
+            500,
+            512 * 1024 * 1024,
+            250,
+            256 * 1024 * 1024,
+            BTreeMap::new(),
+            true,
+        ),
+    ];
+    let barrier = Arc::new(Barrier::new(3));
+    let deploy = |revision: conductor_core::JobRevision, key: &'static str| {
+        let manager = Arc::clone(&manager);
+        let barrier = Arc::clone(&barrier);
+        let workers = workers.clone();
+        thread::spawn(move || {
+            barrier.wait();
+            manager.mutate_deployment_with_workers(
+                revision.id().job_id(),
+                None,
+                &deployment_request(1),
+                key,
+                &workers,
+            )
+        })
+    };
+    let first = deploy(first_revision, "deploy-one");
+    let second = deploy(second_revision, "deploy-two");
+    barrier.wait();
+    let deployments = [
+        first.join().unwrap().unwrap(),
+        second.join().unwrap().unwrap(),
+    ];
+    assert_eq!(
+        deployments
+            .iter()
+            .filter(|deployment| deployment.status() == DeploymentStatus::Ready)
+            .count(),
+        1
+    );
+    assert_eq!(
+        deployments
+            .iter()
+            .filter(|deployment| {
+                deployment.pending_reason()
+                    == Some(DeploymentPendingReason::SharedHostCapacityExhausted)
+            })
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn concurrent_deployment_updates_cannot_overwrite_the_same_generation() {
     let directory = TempDir::new();
     let manager = Arc::new(service(&directory));
@@ -458,6 +923,9 @@ fn schema_five_migrates_execution_tables_without_losing_jobs() {
             "DROP TABLE execution_idempotency;
              DROP TABLE job_deployments;
              DROP TABLE job_revisions;
+             DROP TABLE allocations;
+             DROP TABLE service_instances;
+             DROP TABLE scheduling_sequence;
              PRAGMA user_version = 5;",
         )
         .unwrap();
@@ -473,10 +941,37 @@ fn schema_five_migrates_execution_tables_without_losing_jobs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     assert!(table_exists(&connection, "job_revisions"));
     assert!(table_exists(&connection, "job_deployments"));
     assert!(table_exists(&connection, "execution_idempotency"));
+}
+
+#[test]
+fn schema_six_adds_durable_scheduling_tables() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    drop(manager);
+    let connection = Connection::open(directory.database()).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE allocations;
+             DROP TABLE service_instances;
+             DROP TABLE scheduling_sequence;
+             PRAGMA user_version = 6;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let _migrated = service(&directory);
+    let connection = Connection::open(directory.database()).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 7);
+    assert!(table_exists(&connection, "service_instances"));
+    assert!(table_exists(&connection, "allocations"));
+    assert!(table_exists(&connection, "scheduling_sequence"));
 }
 
 fn all_jobs(manager: &JobService) -> Vec<JobSpec> {
@@ -582,7 +1077,7 @@ fn legacy_schema_migrates_transactionally_and_repeated_startup_is_stable() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read migrated schema and fixture");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     assert_eq!(created_at, 1234);
     assert_eq!(deleted_at, None);
 }
@@ -632,7 +1127,7 @@ fn schema_two_migration_adds_idempotency_and_indexed_run_order() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     assert!(columns.iter().any(|column| column == "idempotency_key"));
     assert!(columns.iter().any(|column| column == "request_fingerprint"));
     assert!(columns.iter().any(|column| column == "run_order"));
@@ -677,6 +1172,9 @@ fn schema_four_identity_layout_migrates_with_command_outbox_without_losing_token
              DROP TABLE execution_idempotency;
              DROP TABLE job_deployments;
              DROP TABLE job_revisions;
+             DROP TABLE allocations;
+             DROP TABLE service_instances;
+             DROP TABLE scheduling_sequence;
              PRAGMA user_version = 4;",
         )
         .unwrap();
@@ -694,7 +1192,7 @@ fn schema_four_identity_layout_migrates_with_command_outbox_without_losing_token
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     let outbox_exists = table_exists(&connection, "manager_commands");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     assert!(outbox_exists);
 }
 
@@ -714,6 +1212,9 @@ fn schema_four_command_layout_migrates_with_identity_tables_without_resetting_se
              DROP TABLE execution_idempotency;
              DROP TABLE job_deployments;
              DROP TABLE job_revisions;
+             DROP TABLE allocations;
+             DROP TABLE service_instances;
+             DROP TABLE scheduling_sequence;
              PRAGMA user_version = 4;",
         )
         .unwrap();
@@ -732,7 +1233,7 @@ fn schema_four_command_layout_migrates_with_identity_tables_without_resetting_se
         )
         .unwrap();
     let identity_exists = table_exists(&connection, "worker_identities");
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
     assert_eq!(sequence, 17);
     assert!(identity_exists);
 }
@@ -992,7 +1493,7 @@ fn version_one_manager_database_migrates_runs_and_accepts_timeout_specs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 struct FullWorker(WorkerId);

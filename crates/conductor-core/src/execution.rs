@@ -1,6 +1,6 @@
 //! Transport-neutral MVP2 execution contracts.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64};
 
@@ -75,6 +75,7 @@ pub enum ExecutionModelError {
     InvalidServiceInstance,
     IncompleteServiceResourceRequest,
     ResourceRequestBelowExecutionLimit,
+    InvalidWorkerLabelConstraint,
     ConflictingExecutableDigest,
     MissingExecutionBackend,
     UnsupportedPlatformCapability,
@@ -103,6 +104,7 @@ impl fmt::Display for ExecutionModelError {
             Self::ResourceRequestBelowExecutionLimit => {
                 "service resource requests must cover their configured CPU and memory limits"
             }
+            Self::InvalidWorkerLabelConstraint => "worker label constraints are invalid",
             Self::ConflictingExecutableDigest => {
                 "revision and job definition executable digests must match"
             }
@@ -492,6 +494,8 @@ pub struct ExecutionRequirements {
     backend: Option<ExecutionBackend>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     required_enforcement: BTreeSet<EnforcementCapability>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    worker_labels: BTreeMap<String, String>,
 }
 
 impl ExecutionRequirements {
@@ -506,7 +510,19 @@ impl ExecutionRequirements {
             architecture,
             backend,
             required_enforcement,
+            worker_labels: BTreeMap::new(),
         }
+    }
+
+    pub fn with_worker_labels(
+        mut self,
+        worker_labels: BTreeMap<String, String>,
+    ) -> Result<Self, ExecutionModelError> {
+        if !crate::valid_worker_labels(&worker_labels) {
+            return Err(ExecutionModelError::InvalidWorkerLabelConstraint);
+        }
+        self.worker_labels = worker_labels;
+        Ok(self)
     }
 
     pub fn operating_system(&self) -> Option<OperatingSystem> {
@@ -523,6 +539,17 @@ impl ExecutionRequirements {
 
     pub fn required_enforcement(&self) -> &BTreeSet<EnforcementCapability> {
         &self.required_enforcement
+    }
+
+    /// Exact manager-configured worker labels required for placement.
+    pub fn worker_labels(&self) -> &BTreeMap<String, String> {
+        &self.worker_labels
+    }
+
+    pub fn labels_are_satisfied_by(&self, labels: &BTreeMap<String, String>) -> bool {
+        self.worker_labels
+            .iter()
+            .all(|(key, required)| labels.get(key) == Some(required))
     }
 
     fn with_required_enforcement(
@@ -845,6 +872,9 @@ impl JobRevision {
     ) -> Result<Self, ExecutionModelError> {
         if id.job_id() != definition.id() {
             return Err(ExecutionModelError::RevisionJobMismatch);
+        }
+        if !crate::valid_worker_labels(execution_requirements.worker_labels()) {
+            return Err(ExecutionModelError::InvalidWorkerLabelConstraint);
         }
         let resource_request_provenance = if resource_request.cpu_millis().is_some()
             || resource_request.memory_bytes().is_some()

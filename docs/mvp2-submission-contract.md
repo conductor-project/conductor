@@ -50,6 +50,13 @@ The request has no administrator defaults, so accepted values remain stable
 across retries and manager restarts. A service request is marked `explicit`; an
 omitted one-shot request is marked `unspecified`.
 
+`executionRequirements.workerLabels` is an optional map of exact-match worker
+label constraints. Omission means no label constraints; an empty map has the
+same meaning. The manager selects only fresh, available workers whose platform,
+backend, enforcement capabilities, and labels satisfy the revision. Missing
+required protection is reported as `required_protection_unavailable`; the
+manager does not weaken the requirement to place the service.
+
 Revision keys are scoped to the revision-creation operation and job ID.
 Deployment mutation keys are scoped to the deployment operation and job ID.
 The revision idempotency key is required. Repeating the same key and canonical
@@ -125,6 +132,17 @@ Pending placement reasons are stable machine-readable values:
 response also includes a bounded human-readable explanation. Pending and
 uncertain allocations retain their resource reservations until reconciliation
 proves they were never accepted or confirms terminal cleanup.
+
+Each service replica has a durable allocation and reservation. Placement is
+serialized with deployment changes, checks per-worker limits and shared-host
+resource-domain budgets, and spreads replicas across workers with the fewest
+current reservations (worker ID breaks ties). A worker's resource domain is
+manager-provided metadata; workers sharing a physical host must use the same
+domain ID and aggregate capacity. Reservations in `assigned` or `uncertain`
+state count against both worker and domain budgets, including while a worker is
+disconnected. An allocation whose worker becomes stale is marked uncertain and
+its reservation remains held while a replacement is considered. The manager
+does not assume that a lost worker stopped its process.
 
 ## HTTP examples
 
