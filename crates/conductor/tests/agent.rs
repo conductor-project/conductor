@@ -108,6 +108,58 @@ fn command(config: &Path, role: Option<&str>) -> Command {
     command
 }
 
+fn operator_command(address: SocketAddr, token_file: &Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args(["operator", "--server"])
+        .arg(format!("http://{address}"))
+        .args(["--token-file"])
+        .arg(token_file)
+        .args(args)
+        .output()
+        .expect("run operator CLI")
+}
+
+fn create_operator_token(path: &Path) -> String {
+    let output = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args(["create-operator-token", "--output"])
+        .arg(path)
+        .output()
+        .expect("create operator token");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    fs::read_to_string(path)
+        .expect("read operator token")
+        .trim()
+        .to_owned()
+}
+
+fn wait_for_operator_run(address: SocketAddr, token: &str, run_id: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (status, _, body) = http_with_custom_headers(
+            address,
+            "GET",
+            &format!("/v1/runs/{run_id}"),
+            None,
+            &[("Authorization", &format!("Bearer {token}"))],
+            &[],
+        );
+        assert_eq!(status, 200, "{body}");
+        let observation: serde_json::Value = serde_json::from_str(&body).expect("run observation");
+        if observation["state"] == "succeeded" {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run did not succeed: {observation}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn start(path: &Path, config_role: &str, role_override: Option<&str>) -> (Agent, SocketAddr) {
     start_with_capacity(path, config_role, role_override, 1)
 }
@@ -1801,6 +1853,518 @@ fn operator_token_cli_config_and_routes_enforce_operator_access() {
     assert_eq!(status, 200);
     signal(&child, "INT");
     wait_for_exit(&mut child);
+}
+
+#[test]
+fn operator_cli_authenticates_inspects_paginates_and_reads_bounded_logs() {
+    let path = TempDir::new("operator-cli");
+    let token_path = path.join("operator-token");
+    let token = create_operator_token(&token_path);
+    let wrong_token_path = path.join("wrong-operator-token");
+    let wrong_token = create_operator_token(&wrong_token_path);
+    assert_ne!(token, wrong_token);
+
+    let config = write_config(
+        &path,
+        "all",
+        "127.0.0.1:0",
+        ",\"log_max_bytes_per_stream\":128",
+    );
+    let content = fs::read_to_string(&config)
+        .expect("read generated config")
+        .replace(
+            "\"api_access\":{\"mode\":\"local\"}",
+            &format!(
+                "\"api_access\":{{\"mode\":\"operator_token_file\",\"token_file\":{}}}",
+                serde_json::to_string(token_path.to_str().expect("utf8 token path"))
+                    .expect("encode token path")
+            ),
+        );
+    fs::write(&config, content).expect("write operator config");
+    let (mut agent, address) = start_config(config, None);
+
+    let unauthorized = operator_command(address, &wrong_token_path, &["workers", "list"]);
+    let unauthorized_stderr = String::from_utf8_lossy(&unauthorized.stderr);
+    assert!(!unauthorized.status.success());
+    assert!(
+        unauthorized_stderr.contains("HTTP 401"),
+        "{unauthorized_stderr}"
+    );
+    assert!(!unauthorized_stderr.contains(&wrong_token));
+
+    let workers = operator_command(address, &token_path, &["workers", "list"]);
+    assert!(
+        workers.status.success(),
+        "{}",
+        String::from_utf8_lossy(&workers.stderr)
+    );
+    let workers: serde_json::Value = serde_json::from_slice(&workers.stdout).unwrap();
+    assert_eq!(workers[0]["workerId"], "test-worker");
+
+    let worker = operator_command(address, &token_path, &["workers", "inspect", "test-worker"]);
+    assert!(
+        worker.status.success(),
+        "{}",
+        String::from_utf8_lossy(&worker.stderr)
+    );
+    let worker: serde_json::Value = serde_json::from_slice(&worker.stdout).unwrap();
+    assert_eq!(worker["workerId"], "test-worker");
+
+    let body = job_json("operator-cli-logs", &["/usr/bin/printf", "%0500d", "0"]);
+    let (status, _, response) = http_with_custom_headers(
+        address,
+        "POST",
+        "/v1/jobs",
+        Some("application/json"),
+        &[("Authorization", &format!("Bearer {token}"))],
+        &body,
+    );
+    assert_eq!(status, 201, "{response}");
+    let mut run_ids = Vec::new();
+    for key in ["operator-cli-run-one", "operator-cli-run-two"] {
+        let (status, _, response) = http_with_custom_headers(
+            address,
+            "POST",
+            "/v1/jobs/operator-cli-logs/runs",
+            None,
+            &[
+                ("Authorization", &format!("Bearer {token}")),
+                ("Idempotency-Key", key),
+            ],
+            &[],
+        );
+        assert_eq!(status, 202, "{response}");
+        let response: serde_json::Value = serde_json::from_str(&response).unwrap();
+        let run_id = response["runId"].as_str().unwrap().to_owned();
+        wait_for_operator_run(address, &token, &run_id);
+        run_ids.push(run_id);
+    }
+
+    let first_page = operator_command(
+        address,
+        &token_path,
+        &["runs", "--job-id", "operator-cli-logs", "--limit", "1"],
+    );
+    assert!(
+        first_page.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first_page.stderr)
+    );
+    let first_page: serde_json::Value = serde_json::from_slice(&first_page.stdout).unwrap();
+    assert_eq!(first_page["runs"].as_array().unwrap().len(), 1);
+    let cursor = first_page["nextCursor"].as_str().expect("next page cursor");
+    let second_page = operator_command(
+        address,
+        &token_path,
+        &[
+            "runs",
+            "--job-id",
+            "operator-cli-logs",
+            "--limit",
+            "1",
+            "--cursor",
+            cursor,
+        ],
+    );
+    assert!(
+        second_page.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second_page.stderr)
+    );
+    let second_page: serde_json::Value = serde_json::from_slice(&second_page.stdout).unwrap();
+    assert_eq!(second_page["runs"].as_array().unwrap().len(), 1);
+    assert_ne!(
+        first_page["runs"][0]["runId"], second_page["runs"][0]["runId"],
+        "cursor pagination must return distinct stable run IDs"
+    );
+
+    let log = operator_command(
+        address,
+        &token_path,
+        &[
+            "logs",
+            &run_ids[1],
+            "--stream",
+            "stdout",
+            "--limit",
+            "65536",
+        ],
+    );
+    assert!(
+        log.status.success(),
+        "{}",
+        String::from_utf8_lossy(&log.stderr)
+    );
+    assert_eq!(
+        log.stdout.len(),
+        128,
+        "configured log storage cap is respected"
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&log.stderr).unwrap();
+    assert_eq!(metadata["runId"], run_ids[1]);
+    assert_eq!(metadata["offset"], 0);
+    assert_eq!(metadata["nextOffset"], 128);
+    assert_eq!(metadata["truncated"], true);
+
+    let missing_run = operator_command(
+        address,
+        &token_path,
+        &["logs", "missing-run", "--stream", "stdout"],
+    );
+    let missing_stderr = String::from_utf8_lossy(&missing_run.stderr);
+    assert!(!missing_run.status.success());
+    assert!(missing_stderr.contains("HTTP 404"), "{missing_stderr}");
+    assert!(!missing_stderr.contains(&token));
+
+    signal(&agent, "INT");
+    wait_for_exit(&mut agent);
+}
+
+#[test]
+fn operator_cli_preserves_disconnected_worker_status() {
+    let path = TempDir::new("operator-cli-disconnected-worker");
+    let token_path = path.join("operator-token");
+    create_operator_token(&token_path);
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock manager API");
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept operator request");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("bound operator request read");
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk).expect("read operator request");
+            assert_ne!(read, 0, "operator client must send request headers");
+            request.extend_from_slice(&chunk[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+            assert!(request.len() < 8192, "operator headers stay bounded");
+        }
+        let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer "));
+        let body = br#"[{"workerId":"worker-offline","capacity":2,"usedSlots":1,"availableSlots":1,"available":false,"degraded":false,"draining":false,"fresh":false,"unknownRuns":1}]"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write mock API headers");
+        stream.write_all(body).expect("write mock API response");
+    });
+    let output = operator_command(address, &token_path, &["workers", "list"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let workers: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(workers[0]["workerId"], "worker-offline");
+    assert_eq!(workers[0]["available"], false);
+    assert_eq!(workers[0]["fresh"], false);
+    assert_eq!(workers[0]["unknownRuns"], 1);
+    server.join().expect("mock manager request completed");
+}
+
+#[test]
+fn operator_cli_deploys_scales_rolls_back_and_drains_with_generation_guards() {
+    let path = TempDir::new("operator-cli-deployment");
+    let token_path = path.join("operator-token");
+    let token = create_operator_token(&token_path);
+    let config = write_config(&path, "all", "127.0.0.1:0", "");
+    let content = fs::read_to_string(&config)
+        .expect("read generated config")
+        .replace("\"worker_concurrency\":1", "\"worker_concurrency\":2")
+        .replace(
+            "\"api_access\":{\"mode\":\"local\"}",
+            &format!(
+                "\"api_access\":{{\"mode\":\"operator_token_file\",\"token_file\":{}}}",
+                serde_json::to_string(token_path.to_str().expect("utf8 token path"))
+                    .expect("encode token path")
+            ),
+        );
+    fs::write(&config, content).expect("write operator config");
+    let (mut agent, address) = start_config(config, None);
+    let authorization = format!("Bearer {token}");
+    let digest_output = Command::new("shasum")
+        .args(["-a", "256", "/bin/sleep"])
+        .output()
+        .expect("hash service executable");
+    assert!(digest_output.status.success(), "hash service executable");
+    let executable_digest = String::from_utf8(digest_output.stdout)
+        .expect("digest output is UTF-8")
+        .split_ascii_whitespace()
+        .next()
+        .expect("digest value")
+        .to_owned();
+
+    let create_revision = |argument: &str, key: &str| {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "definition": {
+                "id": "operator-cli-service",
+                "command": ["/bin/sleep", argument],
+                "cwd": "/tmp",
+                "terminationGraceMs": 1000,
+            },
+            "workload": {
+                "kind": "service",
+                "identity": { "namespace": "default", "name": "operator-cli-service" },
+            },
+            "executableDigest": {
+                "algorithm": "sha256",
+                "value": executable_digest,
+            },
+            "executionRequirements": {},
+            "resourceRequest": { "cpuMillis": 250, "memoryBytes": 268435456 },
+        }))
+        .unwrap();
+        let (status, _, response) = http_with_custom_headers(
+            address,
+            "POST",
+            "/v1/jobs/operator-cli-service/revisions",
+            Some("application/json"),
+            &[("Authorization", &authorization), ("Idempotency-Key", key)],
+            &body,
+        );
+        assert_eq!(status, 201, "{response}");
+    };
+
+    create_revision("30", "operator-cli-revision-one");
+    let deployed = operator_command(
+        address,
+        &token_path,
+        &[
+            "deploy",
+            "operator-cli-service",
+            "--create",
+            "--revision",
+            "1",
+            "--replicas",
+            "1",
+            "--idempotency-key",
+            "operator-cli-deploy-one",
+        ],
+    );
+    assert!(
+        deployed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&deployed.stderr)
+    );
+    let deployed: serde_json::Value = serde_json::from_slice(&deployed.stdout).unwrap();
+    assert_eq!(deployed["revisionId"]["revision"], 1);
+
+    let inspect_ready = |replicas: usize| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let output = operator_command(
+                address,
+                &token_path,
+                &["service", "inspect", "operator-cli-service"],
+            );
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            let attempts = value["serviceAttempts"].as_array().unwrap();
+            if value["deployment"]["status"] == "ready"
+                && attempts.len() == replicas
+                && attempts
+                    .iter()
+                    .all(|attempt| attempt["currentRun"]["state"] == "running")
+            {
+                return value;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "service did not become ready: {value}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let one_replica = inspect_ready(1);
+    let stable_instance = one_replica["serviceAttempts"][0]["serviceInstanceId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let generation = one_replica["deployment"]["generation"].as_u64().unwrap();
+    let generation_arg = generation.to_string();
+    let scaled = operator_command(
+        address,
+        &token_path,
+        &[
+            "scale",
+            "operator-cli-service",
+            "--replicas",
+            "2",
+            "--if-match-generation",
+            &generation_arg,
+            "--idempotency-key",
+            "operator-cli-scale-two",
+        ],
+    );
+    assert!(
+        scaled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&scaled.stderr)
+    );
+    let two_replicas = inspect_ready(2);
+    assert!(
+        two_replicas["serviceAttempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attempt| {
+                attempt["serviceInstanceId"] == stable_instance
+                    && attempt["allocation"]["allocation"]["jobRevisionId"]["revision"] == 1
+            })
+    );
+    assert_eq!(
+        two_replicas["deployment"]["pendingReason"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        two_replicas["etag"],
+        format!(
+            "\"{}\"",
+            two_replicas["deployment"]["generation"].as_u64().unwrap()
+        )
+    );
+
+    create_revision("31", "operator-cli-revision-two");
+    let generation = two_replicas["deployment"]["generation"].as_u64().unwrap();
+    let generation_arg = generation.to_string();
+    let updated = operator_command(
+        address,
+        &token_path,
+        &[
+            "deploy",
+            "operator-cli-service",
+            "--revision",
+            "2",
+            "--replicas",
+            "2",
+            "--if-match-generation",
+            &generation_arg,
+            "--idempotency-key",
+            "operator-cli-deploy-two",
+        ],
+    );
+    assert!(
+        updated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&updated.stderr)
+    );
+    let updated: serde_json::Value = serde_json::from_slice(&updated.stdout).unwrap();
+    assert_eq!(updated["revisionId"]["revision"], 2);
+    let two_updated = inspect_ready(2);
+    assert_eq!(two_updated["deployment"]["revisionId"]["revision"], 2);
+    assert!(
+        two_updated["serviceAttempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|attempt| {
+                attempt["serviceInstanceId"] == stable_instance
+                    && attempt["allocation"]["allocation"]["jobRevisionId"]["revision"] == 2
+            })
+    );
+
+    let generation = two_updated["deployment"]["generation"].as_u64().unwrap();
+    let generation_arg = generation.to_string();
+    let rollback = operator_command(
+        address,
+        &token_path,
+        &[
+            "rollback",
+            "operator-cli-service",
+            "--revision",
+            "1",
+            "--if-match-generation",
+            &generation_arg,
+            "--idempotency-key",
+            "operator-cli-rollback-one",
+        ],
+    );
+    assert!(
+        rollback.status.success(),
+        "{}",
+        String::from_utf8_lossy(&rollback.stderr)
+    );
+    let rolled_back = inspect_ready(2);
+    assert_eq!(rolled_back["deployment"]["revisionId"]["revision"], 1);
+
+    let generation = rolled_back["deployment"]["generation"].as_u64().unwrap();
+    let generation_arg = generation.to_string();
+    let zero = operator_command(
+        address,
+        &token_path,
+        &[
+            "scale",
+            "operator-cli-service",
+            "--replicas",
+            "0",
+            "--if-match-generation",
+            &generation_arg,
+            "--idempotency-key",
+            "operator-cli-scale-zero",
+        ],
+    );
+    assert!(
+        zero.status.success(),
+        "{}",
+        String::from_utf8_lossy(&zero.stderr)
+    );
+    let drained = operator_command(
+        address,
+        &token_path,
+        &[
+            "drain",
+            "start",
+            "test-worker",
+            "--grace-period-seconds",
+            "30",
+        ],
+    );
+    assert!(
+        drained.status.success(),
+        "{}",
+        String::from_utf8_lossy(&drained.stderr)
+    );
+    let drained: serde_json::Value = serde_json::from_slice(&drained.stdout).unwrap();
+    assert_eq!(drained["workerId"], "test-worker");
+    let drain_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = operator_command(address, &token_path, &["drain", "status", "test-worker"]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        if status["state"] == "completed" {
+            break;
+        }
+        assert!(
+            Instant::now() < drain_deadline,
+            "worker drain did not complete: {status}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let cleared = operator_command(address, &token_path, &["drain", "clear", "test-worker"]);
+    assert!(
+        cleared.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cleared.stderr)
+    );
+    let cleared: serde_json::Value = serde_json::from_slice(&cleared.stdout).unwrap();
+    assert_eq!(cleared["state"], "cleared");
+
+    signal(&agent, "INT");
+    wait_for_exit(&mut agent);
 }
 
 fn http(
