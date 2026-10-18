@@ -1,0 +1,28 @@
+{
+  "definition": {
+    "id": "web",
+    "command": ["/bin/sleep", "3600"],
+    "cwd": "/tmp",
+    "env": {},
+    "inheritEnv": false,
+    "timeoutMs": null,
+    "terminationGraceMs": 5000
+  },
+  "workload": {
+    "kind": "service",
+    "identity": {
+      "namespace": "default",
+      "name": "web"
+    },
+    "ports": []
+  },
+  "executableDigest": {
+    "algorithm": "sha256",
+    "value": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "executionRequirements": {},
+  "resourceRequest": {
+    "cpuMillis": 250,
+    "memoryBytes": 268435456
+  }
+}
