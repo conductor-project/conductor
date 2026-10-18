@@ -1,8 +1,10 @@
 mod contexts;
 mod deployment_cli;
+mod diagnostics_cli;
 mod job_cli;
 mod operator_cli;
 mod run_cli;
+mod service_cli;
 mod state_lock;
 mod worker_cli;
 
@@ -61,6 +63,10 @@ enum Commands {
     Deployment(deployment_cli::DeploymentArgs),
     /// Inspect workers and manage graceful worker drains.
     Worker(worker_cli::WorkerArgs),
+    /// Look up and watch manager-published service endpoints.
+    Service(service_cli::ServiceArgs),
+    /// Check manager health, readiness, and metrics.
+    Diagnostics(diagnostics_cli::DiagnosticsArgs),
     /// Generate shell completion scripts for the implemented CLI commands.
     Completions {
         #[arg(value_enum)]
@@ -342,6 +348,8 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Commands::Run(args) => return Ok(run_cli::run(args)),
         Commands::Deployment(args) => return Ok(deployment_cli::run(args)),
         Commands::Worker(args) => return Ok(worker_cli::run(args)),
+        Commands::Service(args) => return Ok(service_cli::run(args)),
+        Commands::Diagnostics(args) => return Ok(diagnostics_cli::run(args)),
         Commands::Completions { shell } => {
             let mut command = Cli::command();
             clap_complete::generate(shell, &mut command, "conductor", &mut std::io::stdout());

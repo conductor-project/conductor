@@ -194,6 +194,32 @@ completion.
 ./target/debug/conductor worker undrain local-worker
 ```
 
+## Discover service endpoints and check manager health
+
+Endpoint commands report only endpoints currently eligible in the manager's
+service catalog. An empty result is successful. Returned addresses are the
+workers' advertised network addresses; lookup does not configure host DNS or
+prove that the address is reachable from the caller. Use `watch` to long-poll
+for a catalog change. The current API does not provide watch cursors or
+versions, so the CLI retries transient connection and capacity failures within
+the requested deadline; Ctrl-C stops observation without changing deployment
+state.
+
+```sh
+./target/debug/conductor service endpoints mvp3-demo-service --output json
+./target/debug/conductor service lookup default mvp3-demo-service --output json
+./target/debug/conductor service watch default mvp3-demo-service \
+  --timeout-seconds 300 --output json
+./target/debug/conductor diagnostics health --output json
+./target/debug/conductor diagnostics ready --output json
+./target/debug/conductor diagnostics metrics
+```
+
+Health reports whether the API responds and the manager process is healthy.
+Readiness reports whether the manager can currently accept work; a reachable
+manager can be not ready while draining, degraded, or recovering. Metrics are
+Prometheus text by default; use `--output json` to wrap them in a JSON response.
+
 Stopping a run is different from stopping the daemon. To stop the daemon, press
 Ctrl-C in Terminal A and wait for its shutdown to finish. Job definitions and
 run history persist. A daemon restart can leave an ambiguous run in `unknown`;
