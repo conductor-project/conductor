@@ -632,6 +632,124 @@ pub enum DeploymentPendingReason {
     ServiceRestartBackoff,
     ServiceRestartBudgetExhausted,
     ServiceAttemptUnresolved,
+    ServiceReadinessPending,
+    RolloutProgressDeadlineExceeded,
+}
+
+/// Bounded policy for replacing service replicas during a revision update.
+/// This manager currently supports zero surge because each stable service
+/// instance has one durable execution attempt at a time.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeploymentUpdateStrategy {
+    max_surge: u32,
+    max_unavailable: u32,
+    progress_deadline_seconds: u32,
+}
+
+impl Default for DeploymentUpdateStrategy {
+    fn default() -> Self {
+        Self {
+            max_surge: 0,
+            max_unavailable: 1,
+            progress_deadline_seconds: 300,
+        }
+    }
+}
+
+impl DeploymentUpdateStrategy {
+    pub fn new(
+        max_surge: u32,
+        max_unavailable: u32,
+        progress_deadline_seconds: u32,
+    ) -> Result<Self, ExecutionModelError> {
+        if max_surge != 0
+            || max_unavailable == 0
+            || max_unavailable > MAX_DEPLOYMENT_REPLICAS
+            || !(1..=86_400).contains(&progress_deadline_seconds)
+        {
+            return Err(ExecutionModelError::InvalidDeployment);
+        }
+        Ok(Self {
+            max_surge,
+            max_unavailable,
+            progress_deadline_seconds,
+        })
+    }
+
+    pub fn max_surge(self) -> u32 {
+        self.max_surge
+    }
+
+    pub fn max_unavailable(self) -> u32 {
+        self.max_unavailable
+    }
+
+    pub fn progress_deadline_seconds(self) -> u32 {
+        self.progress_deadline_seconds
+    }
+}
+
+/// Durable state for an in-progress revision replacement. The selected
+/// revision remains the deployment's desired revision; this record retains
+/// the source revision until the target has passed its rollout gate.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeploymentRollout {
+    previous_revision_id: JobRevisionId,
+    started_at_ms: i64,
+    progress_deadline_at_ms: Option<i64>,
+    strategy: DeploymentUpdateStrategy,
+    rolling_back: bool,
+}
+
+impl DeploymentRollout {
+    pub fn new(
+        previous_revision_id: JobRevisionId,
+        started_at_ms: i64,
+        progress_deadline_at_ms: Option<i64>,
+        strategy: DeploymentUpdateStrategy,
+        rolling_back: bool,
+    ) -> Result<Self, ExecutionModelError> {
+        if started_at_ms < 0
+            || progress_deadline_at_ms.is_some_and(|deadline| deadline < started_at_ms)
+            || DeploymentUpdateStrategy::new(
+                strategy.max_surge,
+                strategy.max_unavailable,
+                strategy.progress_deadline_seconds,
+            )
+            .is_err()
+        {
+            return Err(ExecutionModelError::InvalidDeployment);
+        }
+        Ok(Self {
+            previous_revision_id,
+            started_at_ms,
+            progress_deadline_at_ms,
+            strategy,
+            rolling_back,
+        })
+    }
+
+    pub fn previous_revision_id(&self) -> &JobRevisionId {
+        &self.previous_revision_id
+    }
+
+    pub fn started_at_ms(&self) -> i64 {
+        self.started_at_ms
+    }
+
+    pub fn progress_deadline_at_ms(&self) -> Option<i64> {
+        self.progress_deadline_at_ms
+    }
+
+    pub fn strategy(&self) -> DeploymentUpdateStrategy {
+        self.strategy
+    }
+
+    pub fn rolling_back(&self) -> bool {
+        self.rolling_back
+    }
 }
 
 /// Mutable service intent. Revision contents remain immutable; scaling and
@@ -647,6 +765,8 @@ pub struct JobDeployment {
     status: DeploymentStatus,
     pending_reason: Option<DeploymentPendingReason>,
     pending_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rollout: Option<DeploymentRollout>,
 }
 
 #[derive(Deserialize)]
@@ -662,6 +782,8 @@ struct RawJobDeployment {
     pending_reason: Option<DeploymentPendingReason>,
     #[serde(default)]
     pending_message: Option<String>,
+    #[serde(default)]
+    rollout: Option<DeploymentRollout>,
 }
 
 impl JobDeployment {
@@ -706,7 +828,13 @@ impl JobDeployment {
             status,
             pending_reason,
             pending_message,
+            rollout: None,
         })
+    }
+
+    pub fn with_rollout(mut self, rollout: Option<DeploymentRollout>) -> Self {
+        self.rollout = rollout;
+        self
     }
 
     pub fn job_id(&self) -> &JobId {
@@ -741,6 +869,10 @@ impl JobDeployment {
         self.pending_message.as_deref()
     }
 
+    pub fn rollout(&self) -> Option<&DeploymentRollout> {
+        self.rollout.as_ref()
+    }
+
     pub fn next_generation(
         &self,
         revision: &JobRevision,
@@ -763,6 +895,14 @@ impl JobDeployment {
             pending_reason,
             pending_message,
         )
+        .map(|next| {
+            let rollout = if desired_replicas == 0 || &self.revision_id != revision.id() {
+                None
+            } else {
+                self.rollout.clone()
+            };
+            next.with_rollout(rollout)
+        })
     }
 }
 
@@ -793,6 +933,20 @@ impl<'de> Deserialize<'de> for JobDeployment {
                 .pending_message
                 .as_ref()
                 .is_some_and(|message| message.trim().is_empty() || message.len() > 512)
+            || raw.rollout.as_ref().is_some_and(|rollout| {
+                rollout.previous_revision_id.job_id() != &raw.job_id
+                    || rollout.previous_revision_id == raw.revision_id
+                    || rollout.started_at_ms < 0
+                    || rollout
+                        .progress_deadline_at_ms
+                        .is_some_and(|deadline| deadline < rollout.started_at_ms)
+                    || DeploymentUpdateStrategy::new(
+                        rollout.strategy.max_surge,
+                        rollout.strategy.max_unavailable,
+                        rollout.strategy.progress_deadline_seconds,
+                    )
+                    .is_err()
+            })
         {
             return Err(serde::de::Error::custom(
                 "deployment state, revision, and pending fields disagree",
@@ -807,6 +961,7 @@ impl<'de> Deserialize<'de> for JobDeployment {
             status: raw.status,
             pending_reason: raw.pending_reason,
             pending_message: raw.pending_message,
+            rollout: raw.rollout,
         })
     }
 }
@@ -1141,15 +1296,28 @@ pub struct JobRevisionDraft {
     resource_request: ResourceRequest,
 }
 
+fn is_default_deployment_update_strategy(strategy: &DeploymentUpdateStrategy) -> bool {
+    strategy == &DeploymentUpdateStrategy::default()
+}
+
 /// Conditional update requested for the mutable deployment of one logical job.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum DeploymentMutation {
-    Deploy { revision: u64, replicas: u32 },
-    Scale { replicas: u32 },
+    Deploy {
+        revision: u64,
+        replicas: u32,
+        #[serde(default, skip_serializing_if = "is_default_deployment_update_strategy")]
+        strategy: DeploymentUpdateStrategy,
+    },
+    Scale {
+        replicas: u32,
+    },
     Suspend,
     Resume,
-    Rollback { revision: u64 },
+    Rollback {
+        revision: u64,
+    },
     Delete,
 }
 

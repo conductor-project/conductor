@@ -20,9 +20,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine;
 use conductor_core::{
-    DEFAULT_LOG_CHUNK_BYTES, DeploymentMutation, DeploymentStatus, JobId, JobRevisionDraft,
-    JobRevisionId, JobSpec, LogStream, MAX_DEPLOYMENT_REPLICAS, MAX_LOG_CHUNK_BYTES, ReadRunLogs,
-    RunId, RunState, ServiceIdentity, WorkerId, Workload,
+    DEFAULT_LOG_CHUNK_BYTES, DeploymentMutation, DeploymentStatus, DeploymentUpdateStrategy, JobId,
+    JobRevisionDraft, JobRevisionId, JobSpec, LogStream, MAX_DEPLOYMENT_REPLICAS,
+    MAX_LOG_CHUNK_BYTES, ReadRunLogs, RunId, RunState, ServiceIdentity, WorkerId, Workload,
 };
 use conductor_manager::{
     DEFAULT_PAGE_SIZE, ExecutionStoreError, JobService, MAX_PAGE_SIZE, ManagerError, QueryError,
@@ -158,6 +158,8 @@ struct ResolveRunRequest {
 struct DeployRequest {
     revision: u64,
     replicas: u32,
+    #[serde(default)]
+    strategy: DeploymentUpdateStrategy,
 }
 
 #[derive(Deserialize)]
@@ -925,6 +927,20 @@ async fn deploy_revision(
             "replicas must be between 0 and 10000",
         );
     }
+    let strategy = match DeploymentUpdateStrategy::new(
+        payload.strategy.max_surge(),
+        payload.strategy.max_unavailable(),
+        payload.strategy.progress_deadline_seconds(),
+    ) {
+        Ok(strategy) => strategy,
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_rollout_strategy",
+                "maxSurge must be zero, maxUnavailable must be positive, and progressDeadlineSeconds must be between 1 and 86400",
+            );
+        }
+    };
     let expected_generation = match deployment_precondition(&headers, true) {
         Ok(generation) => generation,
         Err(error_value) => return deployment_precondition_error(error_value, true),
@@ -940,6 +956,7 @@ async fn deploy_revision(
         DeploymentMutation::Deploy {
             revision: payload.revision,
             replicas: payload.replicas,
+            strategy,
         },
         key,
     )
@@ -3024,7 +3041,7 @@ mod access_tests {
             .oneshot(authorized_request(
                 "PUT",
                 "/v1/jobs/web/deployment",
-                r#"{"revision":2,"replicas":2}"#,
+                r#"{"revision":2,"replicas":2,"strategy":{"maxSurge":0,"maxUnavailable":1,"progressDeadlineSeconds":300}}"#,
                 Some("deployment-two"),
                 Some("\"4\""),
                 false,
@@ -3033,6 +3050,19 @@ mod access_tests {
             .unwrap();
         assert_eq!(updated.status(), StatusCode::ACCEPTED);
         assert_eq!(updated.headers().get(header::ETAG).unwrap(), "\"5\"");
+        let invalid_strategy = restarted_app
+            .clone()
+            .oneshot(authorized_request(
+                "PUT",
+                "/v1/jobs/web/deployment",
+                r#"{"revision":2,"replicas":2,"strategy":{"maxSurge":1,"maxUnavailable":1,"progressDeadlineSeconds":300}}"#,
+                Some("invalid-surge"),
+                Some("\"5\""),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(invalid_strategy.status(), StatusCode::BAD_REQUEST);
         let rolled_back = restarted_app
             .clone()
             .oneshot(authorized_request(

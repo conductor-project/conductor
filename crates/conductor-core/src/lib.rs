@@ -123,13 +123,14 @@ mod inventory;
 mod protocol;
 pub use execution::{
     Allocation, AllocationId, AllocationState, Architecture, AssignedServicePort, AttemptState,
-    DeploymentMutation, DeploymentPendingReason, DeploymentStatus, DigestAlgorithm,
-    EnforcementCapability, ExecutableDigest, ExecutionAttempt, ExecutionAttemptId,
-    ExecutionBackend, ExecutionModelError, ExecutionRequirements, JobDeployment, JobRevision,
-    JobRevisionDraft, JobRevisionId, MAX_DEPLOYMENT_REPLICAS, OperatingSystem, ReadinessProbe,
-    ReadinessProbeProtocol, ResourceRequest, ResourceRequestProvenance, ResourceReservation,
-    ServiceIdentity, ServiceInstance, ServiceInstanceId, ServicePort, ServicePortProtocol,
-    WorkerCapabilities, Workload,
+    DeploymentMutation, DeploymentPendingReason, DeploymentRollout, DeploymentStatus,
+    DeploymentUpdateStrategy, DigestAlgorithm, EnforcementCapability, ExecutableDigest,
+    ExecutionAttempt, ExecutionAttemptId, ExecutionBackend, ExecutionModelError,
+    ExecutionRequirements, JobDeployment, JobRevision, JobRevisionDraft, JobRevisionId,
+    MAX_DEPLOYMENT_REPLICAS, OperatingSystem, ReadinessProbe, ReadinessProbeProtocol,
+    ResourceRequest, ResourceRequestProvenance, ResourceReservation, ServiceIdentity,
+    ServiceInstance, ServiceInstanceId, ServicePort, ServicePortProtocol, WorkerCapabilities,
+    Workload,
 };
 pub use inventory::{
     WorkerInventory, WorkerInventoryEntry, WorkerInventoryError, WorkerInventoryPage,

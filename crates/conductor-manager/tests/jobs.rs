@@ -310,6 +310,7 @@ fn deployment_request(replicas: u32) -> DeploymentMutation {
     DeploymentMutation::Deploy {
         revision: 1,
         replicas,
+        strategy: conductor_core::DeploymentUpdateStrategy::default(),
     }
 }
 
@@ -323,6 +324,36 @@ struct ServiceRunner {
 }
 
 impl ServiceRunner {
+    fn mark_running_with_readiness(&self, readiness: ReadinessState) {
+        let mut runs = self.runs.lock().expect("worker run lock");
+        for observation in runs.values_mut() {
+            if observation.state().is_terminal() {
+                continue;
+            }
+            let running = if observation.state() == RunState::Running {
+                observation.clone()
+            } else {
+                observation
+                    .next_revision(RunState::Running, Some(2), None, None, None, None)
+                    .expect("requested run can start")
+            };
+            *observation = running.with_readiness(readiness);
+        }
+    }
+
+    fn mark_run_running_with_readiness(&self, run_id: &RunId, readiness: ReadinessState) {
+        let mut runs = self.runs.lock().expect("worker run lock");
+        let observation = runs.get_mut(run_id).expect("known worker run");
+        let running = if observation.state() == RunState::Running {
+            observation.clone()
+        } else {
+            observation
+                .next_revision(RunState::Running, Some(2), None, None, None, None)
+                .expect("requested run can start")
+        };
+        *observation = running.with_readiness(readiness);
+    }
+
     fn fail_all(&self) {
         let mut runs = self.runs.lock().expect("worker run lock");
         for observation in runs.values_mut() {
@@ -473,6 +504,7 @@ fn service_reconciliation_starts_each_replica_once_and_keeps_one_shot_semantics(
             &DeploymentMutation::Deploy {
                 revision: 1,
                 replicas: 2,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
             },
             "service-reconcile-deploy",
             std::slice::from_ref(&worker_status),
@@ -575,6 +607,371 @@ fn service_reconciliation_starts_each_replica_once_and_keeps_one_shot_semantics(
 }
 
 #[test]
+fn revision_rollout_is_readiness_gated_and_deadline_restores_the_previous_revision() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let revision_one = manager
+        .create_revision(&service_revision_with_probe("v1"), "rollout-revision-one")
+        .unwrap();
+    let service_network = WorkerServiceNetwork::new(
+        WorkerId::new("host-rollout").unwrap(),
+        32_000,
+        32_010,
+        "192.0.2.21",
+    )
+    .unwrap();
+    let worker_status = scheduling_worker(
+        "worker-rollout",
+        "host-rollout",
+        2_000,
+        2_147_483_648,
+        2_000,
+        2_147_483_648,
+        BTreeMap::new(),
+        true,
+    )
+    .with_service_network(service_network)
+    .unwrap();
+    manager
+        .mutate_deployment_with_workers(
+            revision_one.id().job_id(),
+            None,
+            &DeploymentMutation::Deploy {
+                revision: 1,
+                replicas: 2,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
+            },
+            "rollout-deploy-one",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    let runner = Arc::new(ServiceRunner {
+        worker_id: WorkerId::new("worker-rollout").unwrap(),
+        status: worker_status.clone(),
+        starts: AtomicUsize::new(0),
+        disconnected: AtomicBool::new(false),
+        runs: Mutex::new(BTreeMap::new()),
+        stale_inspection: Mutex::new(None),
+    });
+    let worker: Arc<dyn WorkerPort> = runner.clone();
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    runner.mark_running_with_readiness(ReadinessState::Ready);
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    let stable_instances = manager
+        .list_service_attempts(revision_one.id().job_id())
+        .unwrap()
+        .iter()
+        .map(|attempt| attempt.service_instance_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(stable_instances.len(), 2);
+    let old_run_ids = manager
+        .list_service_attempts(revision_one.id().job_id())
+        .unwrap()
+        .into_iter()
+        .filter_map(|attempt| attempt.current_run_id)
+        .collect::<BTreeSet<_>>();
+
+    let revision_two = manager
+        .create_revision(&service_revision_with_probe("v2"), "rollout-revision-two")
+        .unwrap();
+    let revision_three = manager
+        .create_revision(&service_revision_with_probe("v3"), "rollout-revision-three")
+        .unwrap();
+    let updated = manager
+        .mutate_deployment_with_workers(
+            revision_one.id().job_id(),
+            Some(1),
+            &DeploymentMutation::Deploy {
+                revision: revision_two.id().revision(),
+                replicas: 2,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
+            },
+            "rollout-deploy-two",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    assert_eq!(updated.rollout().unwrap().strategy().max_unavailable(), 1);
+    assert_eq!(
+        manager.mutate_deployment_with_workers(
+            revision_one.id().job_id(),
+            Some(updated.generation()),
+            &DeploymentMutation::Deploy {
+                revision: revision_three.id().revision(),
+                replicas: 2,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
+            },
+            "rollout-conflicting-deploy",
+            std::slice::from_ref(&worker_status),
+        ),
+        Err(conductor_manager::ExecutionStoreError::Conflict),
+        "a second revision update waits for the active rollout to finish"
+    );
+    drop(manager);
+    let manager = service(&directory);
+    let old_terminal_count = || {
+        manager
+            .list_runs(Some(revision_one.id().job_id()), None, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|run| old_run_ids.contains(run.run_id()) && run.state().is_terminal())
+            .count()
+    };
+
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    assert_eq!(
+        old_terminal_count(),
+        1,
+        "only one old replica may be unavailable before a replacement is ready"
+    );
+
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    runner.mark_running_with_readiness(ReadinessState::Ready);
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    assert_eq!(
+        old_terminal_count(),
+        2,
+        "the next old replica is retired after the first replacement is ready"
+    );
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    runner.mark_running_with_readiness(ReadinessState::Ready);
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    let ready = manager
+        .get_deployment(revision_one.id().job_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(ready.status(), DeploymentStatus::Ready);
+    assert!(ready.rollout().is_none());
+    let attempts = manager
+        .list_service_attempts(revision_one.id().job_id())
+        .unwrap();
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|attempt| attempt.service_instance_id.clone())
+            .collect::<BTreeSet<_>>(),
+        stable_instances,
+        "replacement attempts retain stable replica identities"
+    );
+    assert!(attempts.iter().all(|attempt| {
+        attempt
+            .allocation
+            .as_ref()
+            .is_some_and(|record| record.allocation().job_revision_id() == revision_two.id())
+            && attempt.current_run.as_ref().is_some_and(|run| {
+                run.state() == RunState::Running && run.readiness() == Some(ReadinessState::Ready)
+            })
+    }));
+
+    let deploy_three = manager
+        .mutate_deployment_with_workers(
+            revision_one.id().job_id(),
+            Some(ready.generation()),
+            &DeploymentMutation::Deploy {
+                revision: revision_three.id().revision(),
+                replicas: 2,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
+            },
+            "rollout-deploy-three",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    let scaled_to_zero = manager
+        .mutate_deployment_with_workers(
+            revision_one.id().job_id(),
+            Some(deploy_three.generation()),
+            &DeploymentMutation::Scale { replicas: 0 },
+            "rollout-scale-zero",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    assert_eq!(scaled_to_zero.desired_replicas(), 0);
+    assert!(scaled_to_zero.rollout().is_none());
+    drop(manager);
+    let manager = service(&directory);
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    assert!(
+        manager
+            .list_service_attempts(revision_one.id().job_id())
+            .unwrap()
+            .iter()
+            .all(|attempt| attempt
+                .current_run
+                .as_ref()
+                .is_none_or(|run| run.state().is_terminal()))
+    );
+
+    let scaled_up = manager
+        .mutate_deployment_with_workers(
+            revision_one.id().job_id(),
+            Some(scaled_to_zero.generation()),
+            &DeploymentMutation::Scale { replicas: 2 },
+            "rollout-scale-up",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    runner.mark_running_with_readiness(ReadinessState::Ready);
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    let resumed = manager
+        .get_deployment(revision_one.id().job_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(resumed.revision_id(), revision_three.id());
+    assert_eq!(resumed.status(), DeploymentStatus::Ready);
+    assert_eq!(resumed.generation(), scaled_up.generation());
+
+    let revision_four = manager
+        .create_revision(&service_revision_with_probe("v4"), "rollout-revision-four")
+        .unwrap();
+    manager
+        .mutate_deployment_with_workers(
+            revision_one.id().job_id(),
+            Some(resumed.generation()),
+            &DeploymentMutation::Deploy {
+                revision: revision_four.id().revision(),
+                replicas: 2,
+                strategy: conductor_core::DeploymentUpdateStrategy::new(0, 1, 1).unwrap(),
+            },
+            "rollout-deploy-four",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    let unready_attempt =
+        manager
+            .list_service_attempts(revision_one.id().job_id())
+            .unwrap()
+            .into_iter()
+            .find(|attempt| {
+                attempt.allocation.as_ref().is_some_and(|record| {
+                    record.allocation().job_revision_id() == revision_four.id()
+                }) && attempt.current_run_id.is_some()
+            })
+            .expect("one replacement run starts before its readiness gate");
+    runner.mark_run_running_with_readiness(
+        unready_attempt.current_run_id.as_ref().unwrap(),
+        ReadinessState::Unready,
+    );
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    let pending = manager
+        .get_deployment(revision_one.id().job_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.status(), DeploymentStatus::Pending);
+    assert_eq!(
+        pending.pending_reason(),
+        Some(DeploymentPendingReason::ServiceReadinessPending)
+    );
+    assert!(
+        manager
+            .list_service_attempts(revision_one.id().job_id())
+            .unwrap()
+            .iter()
+            .any(|attempt| attempt
+                .current_run
+                .as_ref()
+                .is_some_and(|run| run.state() == RunState::Running)
+                && attempt
+                    .allocation
+                    .as_ref()
+                    .is_some_and(
+                        |record| record.allocation().job_revision_id() == revision_three.id()
+                    ))
+    );
+
+    let connection = Connection::open(directory.database()).unwrap();
+    let mut deployment_json: serde_json::Value = connection
+        .query_row(
+            "SELECT deployment_json FROM job_deployments WHERE job_id = ?1",
+            [revision_one.id().job_id().as_str()],
+            |row| row.get::<_, String>(0),
+        )
+        .map(|json| serde_json::from_str(&json).unwrap())
+        .unwrap();
+    deployment_json["rollout"]["progressDeadlineAtMs"] = serde_json::json!(0);
+    deployment_json["rollout"]["startedAtMs"] = serde_json::json!(0);
+    connection
+        .execute(
+            "UPDATE job_deployments SET deployment_json = ?1 WHERE job_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&deployment_json).unwrap(),
+                revision_one.id().job_id().as_str(),
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    assert_eq!(
+        manager
+            .get_deployment(revision_one.id().job_id())
+            .unwrap()
+            .unwrap()
+            .rollout()
+            .unwrap()
+            .progress_deadline_at_ms(),
+        Some(0)
+    );
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    let rolling_back = manager
+        .get_deployment(revision_one.id().job_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(rolling_back.revision_id(), revision_three.id());
+    assert_eq!(rolling_back.generation(), pending.generation() + 1);
+    assert!(
+        rolling_back
+            .rollout()
+            .is_some_and(|rollout| rollout.rolling_back())
+    );
+
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    runner.mark_running_with_readiness(ReadinessState::Ready);
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    let rolled_back = manager
+        .get_deployment(revision_one.id().job_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(rolled_back.revision_id(), revision_three.id());
+    assert_eq!(rolled_back.status(), DeploymentStatus::Ready);
+    assert!(rolled_back.rollout().is_none());
+}
+
+#[test]
 fn scale_to_zero_before_first_run_releases_assigned_reservations() {
     let directory = TempDir::new();
     let manager = service(&directory);
@@ -601,6 +998,7 @@ fn scale_to_zero_before_first_run_releases_assigned_reservations() {
             &DeploymentMutation::Deploy {
                 revision: 1,
                 replicas: 1,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
             },
             "scale-before-start-deploy",
             std::slice::from_ref(&worker_status),
@@ -632,6 +1030,7 @@ fn scale_to_zero_before_first_run_releases_assigned_reservations() {
             &DeploymentMutation::Deploy {
                 revision: replacement_revision.id().revision(),
                 replicas: 1,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
             },
             "scale-before-start-replace",
             std::slice::from_ref(&worker_status),
@@ -1267,6 +1666,7 @@ fn service_restart_backoff_survives_manager_restart_and_retries_after_bounded_po
             &DeploymentMutation::Deploy {
                 revision: 1,
                 replicas: 1,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
             },
             "restart-deploy",
             std::slice::from_ref(&worker_status),
@@ -1347,6 +1747,7 @@ fn persisted_terminal_service_result_is_consumed_after_worker_disconnect() {
             &DeploymentMutation::Deploy {
                 revision: 1,
                 replicas: 1,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
             },
             "terminal-report-deploy",
             std::slice::from_ref(&worker_status),
@@ -1438,6 +1839,7 @@ fn capacity_rejection_atomically_clears_the_unaccepted_service_attempt() {
             &DeploymentMutation::Deploy {
                 revision: 1,
                 replicas: 1,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
             },
             "capacity-rejection-deploy",
             std::slice::from_ref(&worker_status),
@@ -1502,6 +1904,7 @@ fn exhausted_service_retry_budget_is_reported_and_stops_relaunching() {
             &DeploymentMutation::Deploy {
                 revision: 1,
                 replicas: 1,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
             },
             "retry-budget-deploy",
             std::slice::from_ref(&worker_status),
@@ -1594,6 +1997,7 @@ fn unresolved_service_run_is_not_relaunched_during_worker_disconnect() {
             &DeploymentMutation::Deploy {
                 revision: 1,
                 replicas: 1,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
             },
             "disconnect-deploy",
             std::slice::from_ref(&worker_status),
@@ -1653,6 +2057,7 @@ fn revisions_and_deployment_mutations_are_durable_conditional_and_idempotent() {
             &DeploymentMutation::Deploy {
                 revision: 1,
                 replicas: 3,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
             },
             "deploy-one",
         )
@@ -1671,6 +2076,7 @@ fn revisions_and_deployment_mutations_are_durable_conditional_and_idempotent() {
                 &DeploymentMutation::Deploy {
                     revision: 1,
                     replicas: 3,
+                    strategy: conductor_core::DeploymentUpdateStrategy::default(),
                 },
                 "deploy-one",
             )
@@ -1741,6 +2147,7 @@ fn revisions_and_deployment_mutations_are_durable_conditional_and_idempotent() {
             &DeploymentMutation::Deploy {
                 revision: 2,
                 replicas: 3,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
             },
             "deploy-two",
         )
@@ -2233,6 +2640,7 @@ fn concurrent_deployment_updates_cannot_overwrite_the_same_generation() {
             &DeploymentMutation::Deploy {
                 revision: 1,
                 replicas: 2,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
             },
             "deploy",
         )

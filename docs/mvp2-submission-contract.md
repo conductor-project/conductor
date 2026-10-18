@@ -88,8 +88,14 @@ returns `409 idempotency_conflict`. Validation failures do not consume a key.
 `PUT /v1/jobs/{jobId}/deployment` selects a previously created service revision
 and sets `replicas` from zero through 10,000. The first
 deployment requires `If-None-Match: *`. Replacing an existing deployment
-requires its current strong ETag in `If-Match`. The response includes the
-deployment generation as its ETag and a durable `pending` or `suspended` state.
+requires its current strong ETag in `If-Match`. An optional `strategy` configures
+revision updates; it defaults to `{"maxSurge":0,"maxUnavailable":1,
+"progressDeadlineSeconds":300}`. `maxSurge` must currently be zero because a
+service slot persists one execution attempt at a time. `maxUnavailable` must be
+positive and is the maximum number of replica slots the manager replaces in one
+readiness-gated wave. The progress deadline is from 1 through 86,400 seconds.
+The response includes the deployment generation as its ETag and a durable
+`pending` or `suspended` state.
 An accepted deployment is durable before placement begins; placement failures
 remain visible with an actionable `pendingReason`.
 
@@ -121,14 +127,26 @@ state. Every rollback is conditional on the current generation, so concurrent
 scale, update, suspend, resume, and rollback requests cannot overwrite one
 another silently.
 
+For a revision update, the manager retains the previous revision in durable
+rollout state and replaces at most `maxUnavailable` slots at once. If a
+readiness probe is declared, the next wave waits until every replacement in the
+current wave reports `ready`; without a probe, a running process passes the
+rollout gate. When the progress deadline expires before the target revision
+converges, the manager advances the deployment generation and sets the previous
+revision as desired. This rollback is itself readiness gated, preserves the
+replica count, and is visible in `GET .../deployment` as the desired revision
+plus `rollout.rollingBack`. Scale-to-zero cancels rollout progress and retains
+the selected revision; suspension retains the rollout for resume.
+
 `GET /v1/jobs/{jobId}/revisions/{revision}` returns immutable revision history.
 `pending` means the requested replica state has not converged. This includes
 unplaced replicas, assigned replicas that have not started, retries waiting for
 backoff, exhausted retry budgets, and unresolved worker outcomes. `ready` means
 every desired replica has a running process, or the desired replica count is
-zero. Service health probes remain separate from deployment convergence: an
-unready probe does not stop a running process from satisfying deployment
-convergence.
+zero. Outside a revision rollout, service health probes remain separate from
+deployment convergence: an unready probe does not stop a running process from
+satisfying deployment convergence. During a rollout, readiness gates only the
+advance to the next replacement wave.
 
 `GET /v1/jobs/{jobId}/service-attempts` returns each known service slot's
 current allocation and run, retry count, next eligible start time, and
