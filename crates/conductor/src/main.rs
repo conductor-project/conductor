@@ -83,6 +83,8 @@ struct CgroupV2Config {
     #[serde(default)]
     delegated_root: Option<PathBuf>,
     #[serde(default)]
+    ownership_lock_dir: Option<PathBuf>,
+    #[serde(default)]
     maximums: conductor_core::ResourceLimits,
 }
 
@@ -280,21 +282,25 @@ fn process_backend(
 ) -> Result<Arc<dyn conductor_worker::ExecutionBackend>, Box<dyn std::error::Error>> {
     #[cfg(target_os = "linux")]
     {
-        let mut backend = if config.cgroup_v2.enabled {
-            let root = config
-                .cgroup_v2
-                .delegated_root
-                .as_deref()
-                .ok_or("cgroup_v2.delegated_root is required when cgroup_v2.enabled is true")?;
-            conductor_process::HostProcessBackend::with_cgroup_v2(
-                root,
-                &config.worker_id,
-                config.cgroup_v2.maximums.clone(),
-                std::env::current_exe()?,
-            )?
-        } else {
-            conductor_process::HostProcessBackend::default()
-        };
+        let mut backend =
+            if config.cgroup_v2.enabled {
+                let root =
+                    config.cgroup_v2.delegated_root.as_deref().ok_or(
+                        "cgroup_v2.delegated_root is required when cgroup_v2.enabled is true",
+                    )?;
+                let lock_directory = config.cgroup_v2.ownership_lock_dir.as_deref().ok_or(
+                    "cgroup_v2.ownership_lock_dir is required when cgroup_v2.enabled is true",
+                )?;
+                conductor_process::HostProcessBackend::with_cgroup_v2(
+                    root,
+                    lock_directory,
+                    &config.worker_id,
+                    config.cgroup_v2.maximums.clone(),
+                    std::env::current_exe()?,
+                )?
+            } else {
+                conductor_process::HostProcessBackend::default()
+            };
         backend = backend.with_landlock(
             match config.landlock.mode {
                 LandlockModeConfig::Disabled => conductor_process::LandlockMode::Disabled,
@@ -454,6 +460,19 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             "cgroup_v2 requires enabled=true with delegated_root, or enabled=false without delegated_root".into(),
         );
     }
+    if config.cgroup_v2.enabled != config.cgroup_v2.ownership_lock_dir.is_some() {
+        return Err(
+            "cgroup_v2 requires enabled=true with ownership_lock_dir, or enabled=false without ownership_lock_dir".into(),
+        );
+    }
+    if config
+        .cgroup_v2
+        .ownership_lock_dir
+        .as_ref()
+        .is_some_and(|path| !path.is_absolute())
+    {
+        return Err("cgroup_v2.ownership_lock_dir must be an absolute path".into());
+    }
     let maximums = &config.cgroup_v2.maximums;
     conductor_core::ResourceLimits::new(
         maximums.cpu_quota_us(),
@@ -505,6 +524,25 @@ mod tests {
         let mut excessive_capacity = config("127.0.0.1:8080");
         excessive_capacity.worker_concurrency = conductor_core::MAX_WORKER_CAPACITY + 1;
         assert!(validate(&excessive_capacity).is_err());
+    }
+
+    #[test]
+    fn cgroup_configuration_requires_an_absolute_shared_ownership_lock_directory() {
+        let mut config = config("127.0.0.1:8080");
+        config.cgroup_v2.enabled = true;
+        config.cgroup_v2.delegated_root = Some(PathBuf::from("/sys/fs/cgroup/worker"));
+        assert!(validate(&config).is_err());
+
+        config.cgroup_v2.ownership_lock_dir = Some(PathBuf::from("relative/locks"));
+        assert!(validate(&config).is_err());
+
+        config.cgroup_v2.ownership_lock_dir =
+            Some(PathBuf::from("/var/lib/conductor/cgroup-locks"));
+        assert!(validate(&config).is_ok());
+
+        config.cgroup_v2.enabled = false;
+        config.cgroup_v2.delegated_root = None;
+        assert!(validate(&config).is_err());
     }
 
     #[test]

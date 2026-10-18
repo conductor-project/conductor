@@ -279,6 +279,8 @@ def main():
         worker = root / "worker"
         manager.mkdir(mode=0o700)
         worker.mkdir(mode=0o700)
+        lock_directory = root / "shared-ownership-locks"
+        lock_directory.mkdir(mode=0o700)
         secret = manager / "credential-fixture"
         secret.write_text("not-for-jobs\n", encoding="utf-8")
         secret.chmod(0o644)
@@ -325,6 +327,7 @@ def main():
             "cgroup_v2": {
                 "enabled": True,
                 "delegatedRoot": str(delegated_root),
+                "ownershipLockDir": str(lock_directory),
                 "maximums": {"pidsMax": 32},
             },
             "landlock": {"mode": "required", "grants": grants},
