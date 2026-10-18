@@ -34,7 +34,7 @@ curl --fail http://127.0.0.1:8080/healthz
 curl --fail http://127.0.0.1:8080/readyz
 ```
 
-The agent prints a structured startup event with its bound address to stderr. `/healthz` reports liveness; `/readyz` reports whether recovery permits new work. Stop it with Ctrl-C or SIGTERM and verify it exits successfully. `--role all` runs the combined baseline; `--role manager` and `--role worker` are recognized but fail as unsupported until remote transport is available. A CLI role overrides the JSON `role` value.
+The agent prints a structured startup event with its bound address to stderr. `/healthz` reports liveness; `/readyz` reports whether recovery permits new work. Stop it with Ctrl-C or SIGTERM and verify it exits successfully. `--role all` runs the combined local mode; `--role manager` starts the loopback operator API and a separate mTLS worker-transport listener; `--role worker` starts a worker that enrolls once and polls the configured manager endpoint. A CLI role overrides the JSON `role` value. See the [standalone role walkthrough](docs/standalone-roles.md) and the [manager](examples/manager.json), [worker one](examples/worker-one.json), and [worker two](examples/worker-two.json) configurations for role-specific setup and listener requirements.
 
 ### Reproducible lifecycle demo
 

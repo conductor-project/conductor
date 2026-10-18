@@ -1,0 +1,10 @@
+{
+  "role": "worker",
+  "worker_data_dir": "./state/worker-one",
+  "worker_id": "worker-one",
+  "worker_concurrency": 2,
+  "manager_endpoint": "https://localhost:9443/",
+  "manager_ca_file": "./state/worker-one/worker-ca.pem",
+  "worker_enrollment_credential_file": "./state/worker-one/enrollment-token",
+  "worker_identity_file": "./state/worker-one/identity.pem"
+}

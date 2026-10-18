@@ -359,6 +359,7 @@ struct PendingCommand {
 
 struct WorkerSession {
     descriptor: WorkerDescriptor,
+    incarnation: AtomicU64,
     protocol_offer: ProtocolOffer,
     status: Mutex<WorkerStatus>,
     pending: Mutex<BTreeMap<CommandId, PendingCommand>>,
@@ -373,9 +374,11 @@ struct WorkerSession {
 
 impl WorkerSession {
     fn new(descriptor: WorkerDescriptor, protocol_offer: ProtocolOffer) -> Self {
+        let incarnation = descriptor.incarnation();
         Self {
             status: Mutex::new(WorkerStatus::new(descriptor.clone(), 0, 0, false, false, 0)),
             descriptor,
+            incarnation: AtomicU64::new(incarnation),
             protocol_offer,
             pending: Mutex::new(BTreeMap::new()),
             last_report_sequence: Mutex::new(0),
@@ -403,6 +406,12 @@ impl WorkerSession {
         CommandId::new(value).map_err(|_| TransportError::Unavailable)
     }
 
+    fn descriptor(&self) -> WorkerDescriptor {
+        self.descriptor
+            .clone()
+            .with_incarnation(self.incarnation.load(Ordering::Acquire))
+    }
+
     fn enqueue(
         &self,
         command: WorkerCommand,
@@ -411,7 +420,7 @@ impl WorkerSession {
         let envelope = CommandEnvelope {
             command_id: command_id.clone(),
             target_worker_id: self.descriptor.worker_id().clone(),
-            target_worker_incarnation: self.descriptor.incarnation(),
+            target_worker_incarnation: self.incarnation.load(Ordering::Acquire),
             command,
         };
         self.enqueue_envelope(envelope)
@@ -422,7 +431,7 @@ impl WorkerSession {
         envelope: CommandEnvelope,
     ) -> Result<mpsc::Receiver<WorkerResult>, TransportError> {
         if envelope.target_worker_id != *self.descriptor.worker_id()
-            || envelope.target_worker_incarnation != self.descriptor.incarnation()
+            || envelope.target_worker_incarnation != self.incarnation.load(Ordering::Acquire)
         {
             return Err(TransportError::WorkerConflict);
         }
@@ -455,11 +464,18 @@ impl WorkerSession {
     }
 
     async fn poll(&self, request: WorkerPollRequest) -> Result<WorkerPollResponse, StatusCode> {
-        if request.worker_incarnation != self.descriptor.incarnation() {
+        let current_incarnation = self.incarnation.load(Ordering::Acquire);
+        let request_incarnation = request.worker_incarnation;
+        let expected_incarnation = if current_incarnation == 0 {
+            request_incarnation
+        } else {
+            current_incarnation
+        };
+        if request_incarnation != expected_incarnation {
             return Err(StatusCode::CONFLICT);
         }
         if request.status.worker_id() != self.descriptor.worker_id()
-            || request.status.incarnation() != self.descriptor.incarnation()
+            || request.status.incarnation() != expected_incarnation
             || request.status.capacity() != self.descriptor.capacity()
             || request.status.supports_process_execution()
                 != self.descriptor.supports_process_execution()
@@ -474,6 +490,11 @@ impl WorkerSession {
             .poll_gate
             .try_acquire()
             .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+        if current_incarnation == 0 {
+            self.incarnation
+                .compare_exchange(0, request_incarnation, Ordering::AcqRel, Ordering::Acquire)
+                .map_err(|_| StatusCode::CONFLICT)?;
+        }
         *self
             .status
             .lock()
@@ -539,7 +560,7 @@ impl WorkerSession {
     }
 
     fn report(&self, report: WorkerReport) -> Result<ReportAcknowledgement, StatusCode> {
-        if report.worker_incarnation != self.descriptor.incarnation() {
+        if report.worker_incarnation != self.incarnation.load(Ordering::Acquire) {
             return Err(StatusCode::CONFLICT);
         }
         let mut recent = self
@@ -563,7 +584,10 @@ impl WorkerSession {
             .last_report_sequence
             .lock()
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        if report.report_sequence != last_sequence.saturating_add(1) {
+        let first_report = *last_sequence == 0 && recent.is_empty();
+        if report.report_sequence == 0
+            || (!first_report && report.report_sequence != last_sequence.saturating_add(1))
+        {
             return Err(StatusCode::CONFLICT);
         }
         let mut pending = self
@@ -662,7 +686,7 @@ impl RemoteWorkerPort {
 
 impl WorkerPort for RemoteWorkerPort {
     fn descriptor(&self) -> WorkerDescriptor {
-        self.session.descriptor.clone()
+        self.session.descriptor()
     }
 
     fn is_draining(&self) -> bool {
@@ -797,7 +821,7 @@ impl WorkerTransportClient {
             .timeout(CLIENT_REQUEST_TIMEOUT)
             .identity(identity);
         if let Some(root) = root {
-            builder = builder.add_root_certificate(root);
+            builder = builder.tls_certs_only([root]);
         }
         let client = builder
             .build()
@@ -1104,6 +1128,13 @@ mod tests {
         )
     }
 
+    fn uninitialized_session() -> WorkerSession {
+        WorkerSession::new(
+            WorkerDescriptor::new(worker_id("worker-a"), 4, true),
+            offer(1),
+        )
+    }
+
     fn poll_request(id: &str, version: u16) -> WorkerPollRequest {
         let descriptor = WorkerDescriptor::new(worker_id(id), 4, true).with_incarnation(9);
         WorkerPollRequest {
@@ -1189,6 +1220,62 @@ mod tests {
             Err(StatusCode::UPGRADE_REQUIRED)
         );
         assert!(!session.is_fresh());
+    }
+
+    #[tokio::test]
+    async fn rejected_first_poll_does_not_bind_worker_incarnation() {
+        let session = Arc::new(uninitialized_session());
+
+        let mut invalid_status = poll_request("worker-a", 1);
+        invalid_status.status = WorkerStatus::new(
+            WorkerDescriptor::new(worker_id("worker-a"), 8, true).with_incarnation(9),
+            0,
+            0,
+            true,
+            false,
+            1,
+        );
+        assert_eq!(
+            session.poll(invalid_status).await,
+            Err(StatusCode::CONFLICT)
+        );
+        assert_eq!(session.descriptor().incarnation(), 0);
+
+        let incompatible = poll_request("worker-a", 2);
+        assert_eq!(
+            session.poll(incompatible).await,
+            Err(StatusCode::UPGRADE_REQUIRED)
+        );
+        assert_eq!(session.descriptor().incarnation(), 0);
+
+        let poll_session = Arc::clone(&session);
+        let poll =
+            tokio::spawn(async move { poll_session.poll(poll_request("worker-a", 1)).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.descriptor().incarnation() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("valid first poll should bind incarnation");
+        let _receiver = session
+            .enqueue(WorkerCommand::InspectRun(InspectRun::new(
+                RunId::new("run-first-valid-poll").expect("valid run id"),
+            )))
+            .expect("queue command for immediate valid poll response");
+        let response = poll
+            .await
+            .expect("valid poll task")
+            .expect("valid worker poll");
+        assert_eq!(session.descriptor().incarnation(), 9);
+        assert!(session.is_fresh());
+        assert_eq!(
+            response
+                .command
+                .expect("pending command")
+                .target_worker_incarnation,
+            9
+        );
     }
 
     #[test]
@@ -1282,6 +1369,71 @@ mod tests {
         let mut skipped_sequence = report;
         skipped_sequence.report_sequence = 3;
         assert_eq!(session.report(skipped_sequence), Err(StatusCode::CONFLICT));
+    }
+
+    #[test]
+    fn new_session_accepts_worker_report_sequence_after_manager_restart() {
+        let session = session();
+        let first_receiver = session
+            .enqueue(WorkerCommand::InspectRun(InspectRun::new(
+                RunId::new("run-after-restart-first").expect("valid run id"),
+            )))
+            .expect("enqueue first command");
+        let first_command = session
+            .pending
+            .lock()
+            .expect("pending lock")
+            .keys()
+            .next()
+            .expect("first command ID")
+            .clone();
+        let first_report = WorkerReport {
+            command_id: first_command,
+            worker_id: worker_id("worker-a"),
+            worker_incarnation: 9,
+            report_sequence: 7,
+            result: WorkerResult::Inspection(None),
+        };
+        let mut zero_sequence = first_report.clone();
+        zero_sequence.report_sequence = 0;
+        assert_eq!(session.report(zero_sequence), Err(StatusCode::CONFLICT));
+        assert_eq!(
+            session.report(first_report.clone()),
+            Ok(ReportAcknowledgement {
+                report_sequence: 7,
+                duplicate: false,
+            })
+        );
+        let _ = first_receiver.recv().expect("first command response");
+
+        let second_receiver = session
+            .enqueue(WorkerCommand::InspectRun(InspectRun::new(
+                RunId::new("run-after-restart-second").expect("valid run id"),
+            )))
+            .expect("enqueue second command");
+        let second_command = session
+            .pending
+            .lock()
+            .expect("pending lock")
+            .keys()
+            .find(|command_id| **command_id != first_report.command_id)
+            .expect("second command ID")
+            .clone();
+        let second_report = WorkerReport {
+            command_id: second_command,
+            worker_id: worker_id("worker-a"),
+            worker_incarnation: 9,
+            report_sequence: 8,
+            result: WorkerResult::Inspection(None),
+        };
+        assert_eq!(
+            session.report(second_report),
+            Ok(ReportAcknowledgement {
+                report_sequence: 8,
+                duplicate: false,
+            })
+        );
+        let _ = second_receiver.recv().expect("second command response");
     }
 
     struct TestAuthenticator(Option<WorkerId>);
