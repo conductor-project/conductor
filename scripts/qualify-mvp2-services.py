@@ -392,10 +392,10 @@ def main():
             "worker_resource_domain_id": "mvp2-host",
             "worker_labels": {"suite": "mvp2"},
             "worker_service_network": {
-                "network_domain_id": "mvp2-loopback",
-                "port_range_start": service_ranges[0],
-                "port_range_end": service_ranges[0] + 9,
-                "advertised_address": "127.0.0.1",
+                "networkDomainId": "mvp2-loopback",
+                "portRangeStart": service_ranges[0],
+                "portRangeEnd": service_ranges[0] + 9,
+                "advertisedAddress": "127.0.0.1",
             },
             "additional_workers": [
                 {
@@ -404,10 +404,10 @@ def main():
                     "resource_domain_id": "mvp2-host",
                     "labels": {"suite": "mvp2"},
                     "service_network": {
-                        "network_domain_id": "mvp2-loopback",
-                        "port_range_start": service_ranges[1],
-                        "port_range_end": service_ranges[1] + 9,
-                        "advertised_address": "127.0.0.1",
+                        "networkDomainId": "mvp2-loopback",
+                        "portRangeStart": service_ranges[1],
+                        "portRangeEnd": service_ranges[1] + 9,
+                        "advertisedAddress": "127.0.0.1",
                     },
                 }
             ],
