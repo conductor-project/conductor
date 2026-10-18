@@ -226,8 +226,10 @@ The manager and combined `all` role expose the management API; a standalone
 `worker` role does not. The API listens on loopback by default. Remote operator
 access is supported through a trusted TLS proxy in front of the loopback API;
 the proxy terminates TLS and forwards to the manager. Do not expose the local
-API directly on an untrusted network. Use a token file and CA file in the
-operator context for the proxy's authenticated HTTPS endpoint.
+API directly on an untrusted network. Configure manager/all API access with an
+operator token and protect the token and proxy configuration. Use a token file
+and CA file in the operator context for the proxy's authenticated HTTPS
+endpoint. See [operator access configuration](okf/configuration.md#operator-access).
 
 Successful commands exit with status `0`. Application or API errors exit with
 status `1`; command-line usage errors exit with status `2`. With `--output json`,
