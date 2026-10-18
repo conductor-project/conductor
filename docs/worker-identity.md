@@ -1,19 +1,12 @@
-# Worker enrollment and identity
+# Worker Identity
 
-The transport crate provides one-time worker enrollment, durable certificate identity, certificate renewal, and revocation. `WorkerEnrollmentService` uses the manager SQLite database for enrollment-token hashes and active certificate fingerprints. The raw enrollment token is returned once by `create_credential`; the manager never stores or logs it. The CLI can write it once to a protected operator file. Tokens contain 256 bits from the operating system random source, expire within 24 hours, and are consumed in the same database transaction that installs the first certificate.
+This page is retained as a compatibility link for existing references. Its
+content was audited and migrated to the canonical knowledge bundle pages below.
 
-An administrator creates a one-time token locally with `conductor enroll-worker --manager-data-dir <manager-dir> --identity-dir <identity-dir> --worker-id <worker-id> --output <new-token-file>`. The command writes the credential to a new owner-only file and logs only its path, worker ID, and expiry. Do not place the credential file in source control or send it through an untrusted channel.
+- [Enrollment and worker identity](../crates/conductor-transport/okf/enrollment-and-identity.md)
+- [Bootstrap CLI](../crates/conductor/okf/composition-and-lifecycle.md)
+- [Complete documentation migration map](../okf/migration-map.md)
 
-An administrator can revoke a worker locally with `conductor revoke-worker --manager-data-dir <manager-dir> --worker-id <worker-id>`. Revocation is persisted before the command reports success and invalidates every certificate and unused enrollment token for that worker.
-
-Standalone workers generate an ECDSA P-256 key and signed CSR locally on first start, redeem the configured one-time credential over HTTPS using the operator-provisioned CA trust anchor, and persist the returned certificate with the private key in `worker_identity_file`. The file is created with owner-only permissions on Unix and is never overwritten. The consumed credential file is removed after the identity is persisted. A pre-enrolled worker can instead start with an existing protected identity file and omit the credential setting. The manager binds the issued certificate's subject to the worker ID stored with the enrollment token, ignores subject names supplied by the CSR, and returns only the public certificate and CA certificate. The worker private key never leaves the worker.
-
-The manager creates `worker-ca.pem` and `worker-ca-key.pem` in the configured identity directory and restricts that directory to mode `0700` on Unix. The CA key file is created with mode `0600`, rejected if its existing permissions grant access to group or other users, and kept out of the repository. The certificate and key must both exist and match; a partial or mismatched pair prevents startup. Server keys issued by `issue_server_identity` can be persisted with `IssuedServerIdentity::write_private_key_once`, which also uses mode `0600`. Back up the CA key through the operator's protected secret-storage process because losing it prevents certificate renewal and reconnects.
-
-Bootstrap trust is provisioned out of band. The worker must already trust the manager's HTTPS server certificate or pinned CA before sending its enrollment credential. The manager CA certificate returned in an enrollment response is public and can be checked against the operator-provisioned fingerprint; a worker must not trust a CA certificate merely because it arrived in an enrollment response. Standalone workers use the configured `manager_ca_file` for enrollment and subsequent mTLS connections.
-
-Build the HTTPS listener with `CertificateAuthority::issue_server_identity`, `CertificateAuthority::mtls_acceptor`, and the enrollment service's `router_with_hub`. The server requests a client certificate signed by the manager CA but allows certificate-less TLS handshakes so a worker can enroll. The enrollment route requires the TLS peer-certificate extension; poll and report routes require a registered, active certificate. Renewal requires the current active certificate and a new CSR. It atomically activates the replacement and revokes the old fingerprint. Revocation marks the identity and all its certificates, and each authenticated transport request checks durable state, so revocation takes effect without waiting for a CRL refresh or daemon restart.
-
-Certificates are valid for 90 days by default. Renewal replaces the certificate immediately, so workers must reconnect with the returned certificate and their newly generated local private key. If renewal or reconnect cannot complete, the worker must obtain a new administrator-issued one-time credential after its identity is revoked.
-
-The private CA key and worker keys are protected by filesystem permissions and local process access controls; they are not encrypted by Conductor. Operators should place them on protected storage and restrict access to the daemon or worker account. MVP2 does not claim hardware-backed key storage.
+See the linked pages for current behavior and source evidence. This pointer is
+not an independent contract; update canonical pages when implementation
+changes.
