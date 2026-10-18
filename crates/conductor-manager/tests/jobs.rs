@@ -341,6 +341,21 @@ impl ServiceRunner {
         }
     }
 
+    fn finish_run_naturally(&self, run_id: &RunId) {
+        let mut runs = self.runs.lock().expect("worker run lock");
+        let observation = runs.get_mut(run_id).expect("known worker run");
+        *observation = observation
+            .next_revision(
+                RunState::Succeeded,
+                observation.started_at_ms(),
+                Some(3),
+                Some(0),
+                None,
+                None,
+            )
+            .expect("running run can finish naturally");
+    }
+
     fn mark_run_running_with_readiness(&self, run_id: &RunId, readiness: ReadinessState) {
         let mut runs = self.runs.lock().expect("worker run lock");
         let observation = runs.get_mut(run_id).expect("known worker run");
@@ -378,6 +393,100 @@ impl ServiceRunner {
 
     fn disconnect(&self) {
         self.disconnected.store(true, Ordering::Release);
+    }
+}
+
+struct AsyncStoppingServiceRunner {
+    inner: Arc<ServiceRunner>,
+    stop_calls: AtomicUsize,
+    async_stops_remaining: AtomicUsize,
+    fail_next_stop: AtomicBool,
+}
+
+impl AsyncStoppingServiceRunner {
+    fn complete_stopping_runs(&self) {
+        let mut runs = self.inner.runs.lock().expect("worker run lock");
+        for observation in runs.values_mut() {
+            if observation.state() == RunState::Stopping {
+                *observation = observation
+                    .next_revision(
+                        RunState::Cancelled,
+                        observation.started_at_ms(),
+                        Some(3),
+                        None,
+                        None,
+                        None,
+                    )
+                    .expect("stopping run can finish");
+            }
+        }
+    }
+}
+
+impl WorkerPort for AsyncStoppingServiceRunner {
+    fn descriptor(&self) -> WorkerDescriptor {
+        self.inner.descriptor()
+    }
+
+    fn start(&self, command: StartRun) -> Result<RunObservation, WorkerPortError> {
+        self.inner.start(command)
+    }
+
+    fn inspect(&self, command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError> {
+        self.inner.inspect(command)
+    }
+
+    fn stop(&self, command: StopRun) -> Result<RunObservation, WorkerPortError> {
+        if self.inner.disconnected.load(Ordering::Acquire) {
+            return Err(WorkerPortError::Unavailable);
+        }
+        self.stop_calls.fetch_add(1, Ordering::Relaxed);
+        if self.fail_next_stop.swap(false, Ordering::AcqRel) {
+            return Err(WorkerPortError::Unavailable);
+        }
+        let mut runs = self
+            .inner
+            .runs
+            .lock()
+            .map_err(|_| WorkerPortError::Unavailable)?;
+        let current = runs
+            .get(command.run_id())
+            .cloned()
+            .ok_or(WorkerPortError::RunConflict)?;
+        if current.state().is_terminal() {
+            return Ok(current);
+        }
+        let state = if self
+            .async_stops_remaining
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            RunState::Stopping
+        } else {
+            RunState::Cancelled
+        };
+        let stopping = current
+            .next_revision(
+                state,
+                current.started_at_ms(),
+                state.is_terminal().then_some(3),
+                None,
+                None,
+                None,
+            )
+            .ok_or(WorkerPortError::RunConflict)?;
+        runs.insert(stopping.run_id().clone(), stopping.clone());
+        Ok(stopping)
+    }
+
+    fn status(&self) -> Result<WorkerStatus, WorkerPortError> {
+        Ok(self.inner.status.clone())
+    }
+
+    fn read_logs(&self, _command: ReadRunLogs) -> Result<RunLogChunk, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
     }
 }
 
@@ -607,6 +716,130 @@ fn service_reconciliation_starts_each_replica_once_and_keeps_one_shot_semantics(
 }
 
 #[test]
+fn rollout_retries_a_failed_stop_and_normalizes_a_naturally_finished_run() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let revision_one = manager
+        .create_revision(
+            &service_revision_with_probe("v1"),
+            "retry-stop-revision-one",
+        )
+        .unwrap();
+    let service_network = WorkerServiceNetwork::new(
+        WorkerId::new("host-retry-stop").unwrap(),
+        33_000,
+        33_010,
+        "192.0.2.31",
+    )
+    .unwrap();
+    let worker_status = scheduling_worker(
+        "worker-retry-stop",
+        "host-retry-stop",
+        2_000,
+        2_147_483_648,
+        2_000,
+        2_147_483_648,
+        BTreeMap::new(),
+        true,
+    )
+    .with_service_network(service_network)
+    .unwrap();
+    manager
+        .mutate_deployment_with_workers(
+            revision_one.id().job_id(),
+            None,
+            &DeploymentMutation::Deploy {
+                revision: 1,
+                replicas: 1,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
+            },
+            "retry-stop-deploy-one",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    let runner = Arc::new(ServiceRunner {
+        worker_id: WorkerId::new("worker-retry-stop").unwrap(),
+        status: worker_status.clone(),
+        starts: AtomicUsize::new(0),
+        disconnected: AtomicBool::new(false),
+        runs: Mutex::new(BTreeMap::new()),
+        stale_inspection: Mutex::new(None),
+    });
+    let async_runner = Arc::new(AsyncStoppingServiceRunner {
+        inner: Arc::clone(&runner),
+        stop_calls: AtomicUsize::new(0),
+        async_stops_remaining: AtomicUsize::new(1),
+        fail_next_stop: AtomicBool::new(true),
+    });
+    let worker: Arc<dyn WorkerPort> = async_runner;
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    runner.mark_running_with_readiness(ReadinessState::Ready);
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    let old_run_id = manager
+        .list_service_attempts(revision_one.id().job_id())
+        .unwrap()[0]
+        .current_run_id
+        .clone()
+        .unwrap();
+
+    let revision_two = manager
+        .create_revision(
+            &service_revision_with_probe("v2"),
+            "retry-stop-revision-two",
+        )
+        .unwrap();
+    manager
+        .mutate_deployment_with_workers(
+            revision_one.id().job_id(),
+            Some(1),
+            &DeploymentMutation::Deploy {
+                revision: revision_two.id().revision(),
+                replicas: 1,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
+            },
+            "retry-stop-deploy-two",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    assert_eq!(
+        manager
+            .get_run(&old_run_id, worker.as_ref())
+            .unwrap()
+            .unwrap()
+            .state(),
+        RunState::Stopping,
+        "the failed dispatch leaves durable stop intent"
+    );
+
+    // The process can exit naturally at the same revision as the manager's
+    // persisted Stopping state before the pending stop is redelivered.
+    runner.finish_run_naturally(&old_run_id);
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    let old_run = manager
+        .get_run(&old_run_id, worker.as_ref())
+        .unwrap()
+        .unwrap();
+    assert_eq!(old_run.state(), RunState::Succeeded);
+    assert_eq!(old_run.revision(), 4);
+    assert!(
+        manager
+            .list_allocations(revision_one.id().job_id())
+            .unwrap()
+            .iter()
+            .any(|allocation| allocation.allocation().state() == AllocationState::Released)
+    );
+}
+
+#[test]
 fn revision_rollout_is_readiness_gated_and_deadline_restores_the_previous_revision() {
     let directory = TempDir::new();
     let manager = service(&directory);
@@ -653,7 +886,13 @@ fn revision_rollout_is_readiness_gated_and_deadline_restores_the_previous_revisi
         runs: Mutex::new(BTreeMap::new()),
         stale_inspection: Mutex::new(None),
     });
-    let worker: Arc<dyn WorkerPort> = runner.clone();
+    let async_runner = Arc::new(AsyncStoppingServiceRunner {
+        inner: Arc::clone(&runner),
+        stop_calls: AtomicUsize::new(0),
+        async_stops_remaining: AtomicUsize::new(2),
+        fail_next_stop: AtomicBool::new(true),
+    });
+    let worker: Arc<dyn WorkerPort> = async_runner.clone();
     manager
         .reconcile_services(std::slice::from_ref(&worker))
         .unwrap();
@@ -725,11 +964,36 @@ fn revision_rollout_is_readiness_gated_and_deadline_restores_the_previous_revisi
         .reconcile_services(std::slice::from_ref(&worker))
         .unwrap();
     assert_eq!(
-        old_terminal_count(),
+        manager
+            .list_runs(Some(revision_one.id().job_id()), None, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|run| old_run_ids.contains(run.run_id()) && run.state() == RunState::Stopping)
+            .count(),
         1,
-        "only one old replica may be unavailable before a replacement is ready"
+        "only one old replica may be stopping before a replacement is ready"
     );
+    assert_eq!(async_runner.stop_calls.load(Ordering::Relaxed), 1);
 
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    assert_eq!(async_runner.stop_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        manager
+            .list_runs(Some(revision_one.id().job_id()), None, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|run| old_run_ids.contains(run.run_id()) && run.state() == RunState::Stopping)
+            .count(),
+        1,
+        "a pending stop is redelivered without consuming another rollout slot"
+    );
+    async_runner.complete_stopping_runs();
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    assert_eq!(old_terminal_count(), 1);
     manager
         .reconcile_services(std::slice::from_ref(&worker))
         .unwrap();
@@ -737,6 +1001,12 @@ fn revision_rollout_is_readiness_gated_and_deadline_restores_the_previous_revisi
     manager
         .reconcile_services(std::slice::from_ref(&worker))
         .unwrap();
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    assert_eq!(async_runner.stop_calls.load(Ordering::Relaxed), 3);
+    assert_eq!(old_terminal_count(), 1);
+    async_runner.complete_stopping_runs();
     manager
         .reconcile_services(std::slice::from_ref(&worker))
         .unwrap();
