@@ -25,7 +25,7 @@ use conductor_core::{
     CommandId, InspectRun, LogStream, MAX_WORKER_CAPACITY, ProtocolCapability,
     ProtocolNegotiationError, ProtocolOffer, ReadRunLogs, ResolveRun, RunId, RunLogChunk,
     RunLogStatus, RunObservation, StartRun, StopRun, WorkerDescriptor, WorkerId,
-    WorkerInventoryPage, WorkerStatus,
+    WorkerInventoryPage, WorkerMetadata, WorkerStatus,
 };
 use conductor_manager::{CommandJournal, CommandStoreError, WorkerPort, WorkerPortError};
 use conductor_worker::{StoredWorkerReport, WorkerError, WorkerService};
@@ -260,6 +260,16 @@ impl WorkerTransportHub {
         descriptor: WorkerDescriptor,
         protocol_offer: ProtocolOffer,
     ) -> Result<Arc<RemoteWorkerPort>, TransportError> {
+        let metadata = WorkerMetadata::automatic(descriptor.worker_id().clone());
+        self.register_worker_with_metadata(descriptor, protocol_offer, metadata)
+    }
+
+    pub fn register_worker_with_metadata(
+        &self,
+        descriptor: WorkerDescriptor,
+        protocol_offer: ProtocolOffer,
+        metadata: WorkerMetadata,
+    ) -> Result<Arc<RemoteWorkerPort>, TransportError> {
         let mut sessions = self
             .sessions
             .write()
@@ -271,10 +281,11 @@ impl WorkerTransportHub {
         if sessions.len() >= MAX_REGISTERED_WORKERS {
             return Err(TransportError::WorkerLimitReached);
         }
-        let session = Arc::new(WorkerSession::new(
+        let session = Arc::new(WorkerSession::new_with_metadata(
             descriptor,
             protocol_offer,
             self.journal.clone(),
+            metadata,
         ));
         sessions.insert(worker_id, Arc::clone(&session));
         Ok(Arc::new(RemoteWorkerPort { session }))
@@ -384,6 +395,7 @@ struct PendingCommand {
 
 struct WorkerSession {
     descriptor: WorkerDescriptor,
+    metadata: WorkerMetadata,
     incarnation: AtomicU64,
     protocol_offer: ProtocolOffer,
     journal: Option<Arc<dyn CommandJournal>>,
@@ -408,15 +420,27 @@ struct WorkerInventorySync {
 }
 
 impl WorkerSession {
+    #[cfg(test)]
     fn new(
         descriptor: WorkerDescriptor,
         protocol_offer: ProtocolOffer,
         journal: Option<Arc<dyn CommandJournal>>,
     ) -> Self {
+        let metadata = WorkerMetadata::automatic(descriptor.worker_id().clone());
+        Self::new_with_metadata(descriptor, protocol_offer, journal, metadata)
+    }
+
+    fn new_with_metadata(
+        descriptor: WorkerDescriptor,
+        protocol_offer: ProtocolOffer,
+        journal: Option<Arc<dyn CommandJournal>>,
+        metadata: WorkerMetadata,
+    ) -> Self {
         let incarnation = descriptor.incarnation();
         Self {
             status: Mutex::new(WorkerStatus::new(descriptor.clone(), 0, 0, false, false, 0)),
             descriptor,
+            metadata,
             incarnation: AtomicU64::new(incarnation),
             protocol_offer,
             journal,
@@ -526,6 +550,28 @@ impl WorkerSession {
         {
             return Err(StatusCode::CONFLICT);
         }
+        if request.status.inventory().is_none()
+            || !request.status.is_valid()
+            || request.status.resource_domain_id().is_some()
+            || request.status.resource_domain_capacity().is_some()
+            || !request.status.labels().is_empty()
+            || request.status.fresh()
+            || request.status.last_seen_at_ms().is_some()
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+        if request_incarnation == current_incarnation {
+            let current = self
+                .status
+                .lock()
+                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+            if current
+                .inventory()
+                .is_some_and(|inventory| Some(inventory) != request.status.inventory())
+            {
+                return Err(StatusCode::CONFLICT);
+            }
+        }
         let negotiated = self
             .protocol_offer
             .negotiate(&request.protocol_offer)
@@ -539,10 +585,27 @@ impl WorkerSession {
         }
         self.restore_pending(request_incarnation)?;
         let inventory_acknowledgement = self.reconcile_inventory(&request.inventory_page)?;
+        let worker_allocatable = request
+            .status
+            .inventory()
+            .map(|inventory| inventory.allocatable())
+            .ok_or(StatusCode::CONFLICT)?;
+        let domain_capacity = self.metadata.capacity().unwrap_or(worker_allocatable);
+        let mut status = request.status;
+        let last_seen_at_ms = manager_time_ms().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+        status = status
+            .with_manager_metadata(
+                self.metadata.resource_domain_id().clone(),
+                domain_capacity,
+                self.metadata.labels().clone(),
+                last_seen_at_ms,
+                true,
+            )
+            .ok_or(StatusCode::CONFLICT)?;
         *self
             .status
             .lock()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)? = request.status;
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)? = status;
         self.mark_seen()?;
 
         let deadline = tokio::time::Instant::now() + POLL_TIMEOUT;
@@ -905,6 +968,14 @@ impl WorkerSession {
     }
 }
 
+fn manager_time_ms() -> Option<i64> {
+    let milliseconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    i64::try_from(milliseconds).ok()
+}
+
 fn result_matches(command: &WorkerCommand, result: &WorkerResult) -> bool {
     matches!(
         (command, result),
@@ -1008,10 +1079,9 @@ impl WorkerPort for RemoteWorkerPort {
     }
 
     fn status(&self) -> Result<WorkerStatus, WorkerPortError> {
-        if !self.session.is_fresh() {
-            return Err(WorkerPortError::Unavailable);
-        }
-        self.session.status()
+        self.session
+            .status()
+            .map(|status| status.with_freshness(self.session.is_fresh()))
     }
 
     fn read_logs(&self, command: ReadRunLogs) -> Result<RunLogChunk, WorkerPortError> {
@@ -1444,7 +1514,9 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use conductor_core::{
-        JobSpec, ProtocolVersionRange, RunSpec, RunState, WorkerDescriptor, WorkerInventoryEntry,
+        Architecture, ExecutionBackend, JobSpec, OperatingSystem, ProtocolVersionRange, RunSpec,
+        RunState, WorkerCapabilities, WorkerDescriptor, WorkerInventory, WorkerInventoryEntry,
+        WorkerResourceCapacity,
     };
     use conductor_manager::{CommandJournal, JobRepository, SqliteJobRepository};
     use tower::ServiceExt;
@@ -1488,16 +1560,34 @@ mod tests {
             BTreeSet::from([
                 ProtocolCapability::OrderedReports,
                 ProtocolCapability::WorkerIncarnations,
+                ProtocolCapability::WorkerResourceInventory,
             ]),
-            BTreeSet::new(),
+            BTreeSet::from([ProtocolCapability::WorkerResourceInventory]),
         )
         .expect("valid protocol offer")
+    }
+
+    fn test_inventory(slots: usize) -> WorkerInventory {
+        test_inventory_for_os(slots, OperatingSystem::Linux)
+    }
+
+    fn test_inventory_for_os(slots: usize, os: OperatingSystem) -> WorkerInventory {
+        let capabilities = WorkerCapabilities::new(
+            os,
+            Architecture::X86_64,
+            BTreeSet::from([ExecutionBackend::NativeProcess]),
+            BTreeSet::new(),
+        )
+        .expect("valid worker capabilities");
+        let capacity = WorkerResourceCapacity::new(8_000, 8 * 1024 * 1024 * 1024)
+            .expect("valid test capacity");
+        WorkerInventory::new(capabilities, capacity, capacity, slots).expect("worker inventory")
     }
 
     fn session() -> WorkerSession {
         WorkerSession::new(
             WorkerDescriptor::new(worker_id("worker-a"), 4, true).with_incarnation(9),
-            offer(2),
+            offer(3),
             None,
         )
     }
@@ -1505,7 +1595,7 @@ mod tests {
     fn uninitialized_session() -> WorkerSession {
         WorkerSession::new(
             WorkerDescriptor::new(worker_id("worker-a"), 4, true),
-            offer(2),
+            offer(3),
             None,
         )
     }
@@ -1524,7 +1614,8 @@ mod tests {
         WorkerPollRequest {
             worker_id: worker_id(id),
             worker_incarnation: incarnation,
-            status: WorkerStatus::new(descriptor, 0, 0, true, false, 1),
+            status: WorkerStatus::new(descriptor, 0, 0, true, false, 1)
+                .with_inventory(test_inventory(4)),
             inventory_page: WorkerInventoryPage {
                 worker_id: worker_id(id),
                 worker_incarnation: incarnation,
@@ -1554,11 +1645,11 @@ mod tests {
             .unwrap()
             .clone();
         let first = session
-            .poll(poll_request("worker-a", 2))
+            .poll(poll_request("worker-a", 3))
             .await
             .expect("compatible worker poll");
         let first_command = first.command.expect("queued command");
-        assert_eq!(first.protocol_version, 2);
+        assert_eq!(first.protocol_version, 3);
         assert_eq!(first_command.command_id, command_id);
         assert!(session.is_fresh());
         assert_eq!(session.status().expect("worker status").capacity(), 4);
@@ -1571,7 +1662,7 @@ mod tests {
             .expect("pending command")
             .retry_at = Instant::now();
         let reconnected = session
-            .poll(poll_request("worker-a", 2))
+            .poll(poll_request("worker-a", 3))
             .await
             .expect("reconnected worker poll");
         assert_eq!(reconnected.command, Some(first_command));
@@ -1592,7 +1683,7 @@ mod tests {
             .enqueue_envelope(envelope.clone())
             .expect("enqueue durable command");
         let response = session
-            .poll(poll_request("worker-a", 2))
+            .poll(poll_request("worker-a", 3))
             .await
             .expect("compatible worker poll");
         assert_eq!(response.command, Some(envelope));
@@ -1601,14 +1692,14 @@ mod tests {
     #[tokio::test]
     async fn rejects_wrong_incarnation_and_incompatible_protocol() {
         let session = session();
-        let mut wrong_incarnation = poll_request("worker-a", 2);
+        let mut wrong_incarnation = poll_request("worker-a", 3);
         wrong_incarnation.worker_incarnation = 8;
         assert_eq!(
             session.poll(wrong_incarnation).await,
             Err(StatusCode::CONFLICT)
         );
         assert_eq!(
-            session.poll(poll_request("worker-a", 3)).await,
+            session.poll(poll_request("worker-a", 2)).await,
             Err(StatusCode::UPGRADE_REQUIRED)
         );
         assert!(!session.is_fresh());
@@ -1618,7 +1709,7 @@ mod tests {
     async fn rejected_first_poll_does_not_bind_worker_incarnation() {
         let session = Arc::new(uninitialized_session());
 
-        let mut invalid_status = poll_request("worker-a", 2);
+        let mut invalid_status = poll_request("worker-a", 3);
         invalid_status.status = WorkerStatus::new(
             WorkerDescriptor::new(worker_id("worker-a"), 8, true).with_incarnation(9),
             0,
@@ -1626,14 +1717,15 @@ mod tests {
             true,
             false,
             1,
-        );
+        )
+        .with_inventory(test_inventory(8));
         assert_eq!(
             session.poll(invalid_status).await,
             Err(StatusCode::CONFLICT)
         );
         assert_eq!(session.descriptor().incarnation(), 0);
 
-        let incompatible = poll_request("worker-a", 3);
+        let incompatible = poll_request("worker-a", 2);
         assert_eq!(
             session.poll(incompatible).await,
             Err(StatusCode::UPGRADE_REQUIRED)
@@ -1642,7 +1734,7 @@ mod tests {
 
         let poll_session = Arc::clone(&session);
         let poll =
-            tokio::spawn(async move { poll_session.poll(poll_request("worker-a", 2)).await });
+            tokio::spawn(async move { poll_session.poll(poll_request("worker-a", 3)).await });
         tokio::time::timeout(Duration::from_secs(1), async {
             while session.descriptor().incarnation() == 0 {
                 tokio::task::yield_now().await;
@@ -1668,6 +1760,69 @@ mod tests {
                 .target_worker_incarnation,
             9
         );
+    }
+
+    #[tokio::test]
+    async fn rejects_inventory_changes_and_worker_supplied_manager_metadata() {
+        let session = session();
+        let command_id = CommandId::new("first-inventory-command").expect("command ID");
+        let _receiver = session
+            .enqueue_envelope(conductor_core::CommandEnvelope {
+                command_id,
+                target_worker_id: worker_id("worker-a"),
+                target_worker_incarnation: 9,
+                command: conductor_core::WorkerCommand::InspectRun(InspectRun::new(
+                    RunId::new("inventory-check").expect("run ID"),
+                )),
+            })
+            .expect("enqueue first poll command");
+        session
+            .poll(poll_request("worker-a", 3))
+            .await
+            .expect("initial inventory is accepted");
+
+        let mut changed = poll_request("worker-a", 3);
+        changed.status = changed
+            .status
+            .with_inventory(test_inventory_for_os(4, OperatingSystem::Macos));
+        assert_eq!(session.poll(changed).await, Err(StatusCode::CONFLICT));
+
+        let mut forged = poll_request("worker-a", 3);
+        forged.status = forged
+            .status
+            .with_inventory(test_inventory(4))
+            .with_freshness(true);
+        assert_eq!(session.poll(forged).await, Err(StatusCode::CONFLICT));
+    }
+
+    #[tokio::test]
+    async fn stale_remote_status_retains_inventory_and_reports_freshness() {
+        let session = Arc::new(session());
+        let command_id = CommandId::new("freshness-command").expect("command ID");
+        let _receiver = session
+            .enqueue_envelope(conductor_core::CommandEnvelope {
+                command_id,
+                target_worker_id: worker_id("worker-a"),
+                target_worker_incarnation: 9,
+                command: conductor_core::WorkerCommand::InspectRun(InspectRun::new(
+                    RunId::new("freshness-run").expect("run ID"),
+                )),
+            })
+            .expect("enqueue command");
+        session
+            .poll(poll_request("worker-a", 3))
+            .await
+            .expect("worker poll accepted");
+        *session.last_seen.lock().expect("last seen lock") =
+            Instant::now() - WORKER_FRESHNESS_TIMEOUT - Duration::from_millis(1);
+        let remote = RemoteWorkerPort {
+            session: Arc::clone(&session),
+        };
+        let status = remote.status().expect("stale status remains inspectable");
+        assert!(!status.fresh());
+        assert!(status.inventory().is_some());
+        assert!(status.last_seen_at_ms().is_some());
+        assert!(remote.is_degraded());
     }
 
     #[tokio::test]
@@ -1707,12 +1862,12 @@ mod tests {
         let stale_receiver = session
             .enqueue_envelope(stale)
             .expect("queue stale command");
+        let mut restarted_request = poll_request_with_incarnation("worker-a", 3, 10);
+        restarted_request.status = restarted_request
+            .status
+            .with_inventory(test_inventory_for_os(4, OperatingSystem::Macos));
         let polling_session = Arc::clone(&session);
-        let poll = tokio::spawn(async move {
-            polling_session
-                .poll(poll_request_with_incarnation("worker-a", 2, 10))
-                .await
-        });
+        let poll = tokio::spawn(async move { polling_session.poll(restarted_request).await });
         tokio::time::timeout(Duration::from_secs(1), async {
             while session.descriptor().incarnation() != 10 {
                 tokio::task::yield_now().await;
@@ -1897,7 +2052,7 @@ mod tests {
 
         let first_session = WorkerSession::new(
             WorkerDescriptor::new(worker_key.clone(), 4, true).with_incarnation(9),
-            offer(2),
+            offer(3),
             Some(Arc::clone(&repository) as Arc<dyn CommandJournal>),
         );
         let acknowledgement = first_session
@@ -1908,7 +2063,7 @@ mod tests {
 
         let restarted_session = WorkerSession::new(
             WorkerDescriptor::new(worker_key, 4, true).with_incarnation(9),
-            offer(2),
+            offer(3),
             Some(repository),
         );
         assert!(
@@ -1944,7 +2099,7 @@ mod tests {
 
         let restarted_session = WorkerSession::new(
             WorkerDescriptor::new(worker_key.clone(), 4, true).with_incarnation(9),
-            offer(2),
+            offer(3),
             Some(repository.clone()),
         );
         restarted_session
@@ -1967,7 +2122,7 @@ mod tests {
         };
         let report_session = WorkerSession::new(
             WorkerDescriptor::new(worker_id("worker-a"), 4, true).with_incarnation(9),
-            offer(2),
+            offer(3),
             Some(repository.clone()),
         );
         assert_eq!(
@@ -1988,7 +2143,7 @@ mod tests {
 
         let next_manager_session = WorkerSession::new(
             WorkerDescriptor::new(worker_id("worker-a"), 4, true).with_incarnation(9),
-            offer(2),
+            offer(3),
             Some(repository),
         );
         assert_eq!(
@@ -2030,14 +2185,14 @@ mod tests {
         for index in 0..MAX_REGISTERED_WORKERS {
             hub.register_worker(
                 WorkerDescriptor::new(worker_id(&format!("worker-{index}")), 1, true),
-                offer(2),
+                offer(3),
             )
             .expect("worker within registry bound");
         }
         assert!(matches!(
             hub.register_worker(
                 WorkerDescriptor::new(worker_id("worker-overflow"), 1, true),
-                offer(2),
+                offer(3),
             ),
             Err(TransportError::WorkerLimitReached)
         ));
@@ -2184,7 +2339,7 @@ mod tests {
         let hub = WorkerTransportHub::default();
         hub.register_worker(
             WorkerDescriptor::new(worker_id("worker-a"), 4, true).with_incarnation(9),
-            offer(2),
+            offer(3),
         )
         .expect("register worker");
 
@@ -2215,12 +2370,12 @@ mod tests {
         let hub = WorkerTransportHub::default();
         hub.register_worker(
             WorkerDescriptor::new(worker_id("worker-a"), 4, true).with_incarnation(9),
-            offer(2),
+            offer(3),
         )
         .expect("register authenticated worker");
         let router = hub.router(Arc::new(TestAuthenticator(Some(worker_id("worker-a")))));
 
-        let poll = serde_json::to_vec(&poll_request("worker-b", 2)).expect("serialize poll");
+        let poll = serde_json::to_vec(&poll_request("worker-b", 3)).expect("serialize poll");
         let poll_response = router
             .clone()
             .oneshot(request(poll))

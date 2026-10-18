@@ -1915,7 +1915,14 @@ impl JobService {
 
     /// Read bounded worker operational state through its owner port.
     pub fn worker_status(&self, worker: &dyn WorkerPort) -> Result<WorkerStatus, ManagerError> {
-        worker.status().map_err(|_| ManagerError::WorkerUnavailable)
+        let status = worker
+            .status()
+            .map_err(|_| ManagerError::WorkerUnavailable)?;
+        if status.is_valid() {
+            Ok(status)
+        } else {
+            Err(ManagerError::WorkerUnavailable)
+        }
     }
 
     pub fn list_page(

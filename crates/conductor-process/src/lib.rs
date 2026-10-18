@@ -96,6 +96,27 @@ impl HostProcessBackend {
 }
 
 impl ExecutionBackend for HostProcessBackend {
+    fn enforcement_capabilities(
+        &self,
+    ) -> std::collections::BTreeSet<conductor_core::EnforcementCapability> {
+        #[allow(unused_mut)]
+        let mut capabilities = std::collections::BTreeSet::new();
+        #[cfg(target_os = "linux")]
+        {
+            if self.cgroup.is_some() {
+                capabilities.insert(conductor_core::EnforcementCapability::CgroupV2);
+            }
+            if self
+                .landlock
+                .as_ref()
+                .is_some_and(landlock::LandlockBackend::supports_enforcement)
+            {
+                capabilities.insert(conductor_core::EnforcementCapability::Landlock);
+            }
+        }
+        capabilities
+    }
+
     fn spawn(&self, run_id: &str, job: &JobSpec) -> io::Result<Child> {
         #[cfg(target_os = "linux")]
         {

@@ -8,6 +8,7 @@ license.workspace = true
 [dependencies]
 conductor-core.workspace = true
 rusqlite.workspace = true
+sysinfo.workspace = true
 serde_json.workspace = true
 nix.workspace = true
 object.workspace = true

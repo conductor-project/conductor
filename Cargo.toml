@@ -46,6 +46,7 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 nix = { version = "0.31.3", default-features = false, features = ["fs", "poll", "process", "signal"] }
 landlock = { version = "0.4.7", default-features = false }
 close_fds = { version = "0.3.2", default-features = false }
+sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 base64 = { version = "0.22.1", default-features = false, features = ["alloc"] }
 
 [workspace.lints.rust]

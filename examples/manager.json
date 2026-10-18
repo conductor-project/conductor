@@ -7,8 +7,16 @@
   "manager_server_name": "localhost",
   "worker_id": "worker-one",
   "worker_transport_capacity": 2,
+  "worker_resource_domain_id": "local-host",
+  "host_resource_domains": [
+    { "id": "local-host", "cpu_millis": 1000, "memory_bytes": 1073741824 }
+  ],
   "additional_workers": [
-    { "worker_id": "worker-two", "capacity": 2 }
+    {
+      "worker_id": "worker-two",
+      "capacity": 2,
+      "resource_domain_id": "local-host"
+    }
   ],
   "api_access": {
     "mode": "local"

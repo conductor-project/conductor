@@ -128,7 +128,10 @@ pub use execution::{
     OperatingSystem, ResourceRequest, ResourceReservation, ServiceIdentity, ServiceInstance,
     ServiceInstanceId, WorkerCapabilities, Workload,
 };
-pub use inventory::{WorkerInventoryEntry, WorkerInventoryPage};
+pub use inventory::{
+    WorkerInventory, WorkerInventoryEntry, WorkerInventoryError, WorkerInventoryPage,
+    WorkerMetadata, WorkerResourceCapacity,
+};
 pub use protocol::{
     CURRENT_PROTOCOL_VERSION, NegotiatedProtocol, ProtocolCapability, ProtocolNegotiationError,
     ProtocolOffer, ProtocolVersionRange,
@@ -189,6 +192,18 @@ pub struct WorkerStatus {
     degraded: bool,
     draining: bool,
     observed_at_ms: i64,
+    #[serde(default)]
+    inventory: Option<WorkerInventory>,
+    #[serde(default)]
+    resource_domain_id: Option<WorkerId>,
+    #[serde(default)]
+    resource_domain_capacity: Option<WorkerResourceCapacity>,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+    #[serde(default)]
+    fresh: bool,
+    #[serde(default)]
+    last_seen_at_ms: Option<i64>,
 }
 
 impl WorkerStatus {
@@ -216,6 +231,76 @@ impl WorkerStatus {
             degraded: false,
             draining,
             observed_at_ms,
+            inventory: None,
+            resource_domain_id: None,
+            resource_domain_capacity: None,
+            labels: BTreeMap::new(),
+            fresh: false,
+            last_seen_at_ms: None,
+        }
+    }
+
+    pub fn with_inventory(mut self, inventory: WorkerInventory) -> Self {
+        self.inventory = Some(inventory);
+        self
+    }
+
+    pub fn with_freshness(mut self, fresh: bool) -> Self {
+        self.fresh = fresh;
+        self
+    }
+
+    /// Attach manager-controlled labels, resource-domain metadata, and freshness.
+    pub fn with_manager_metadata(
+        mut self,
+        resource_domain_id: WorkerId,
+        resource_domain_capacity: WorkerResourceCapacity,
+        labels: BTreeMap<String, String>,
+        last_seen_at_ms: i64,
+        fresh: bool,
+    ) -> Option<Self> {
+        if !valid_worker_labels(&labels) || last_seen_at_ms < 0 {
+            return None;
+        }
+        let inventory = self.inventory.as_ref()?;
+        if !resource_domain_capacity.fits_within(inventory.allocatable()) {
+            return None;
+        }
+        self.resource_domain_id = Some(resource_domain_id);
+        self.resource_domain_capacity = Some(resource_domain_capacity);
+        self.labels = labels;
+        self.last_seen_at_ms = Some(last_seen_at_ms);
+        self.fresh = fresh;
+        Some(self)
+    }
+
+    /// Validate all worker-reported and manager-enriched fields before use.
+    pub fn is_valid(&self) -> bool {
+        if self.capacity == 0
+            || self.capacity > MAX_WORKER_CAPACITY
+            || self.used_slots > self.capacity
+            || self.available_slots != self.capacity.saturating_sub(self.used_slots)
+            || self.unknown_runs > self.used_slots
+            || self.live_processes > self.capacity
+            || self.pending_persistence > self.capacity
+            || self.observed_at_ms < 0
+            || !valid_worker_labels(&self.labels)
+            || self.last_seen_at_ms.is_some_and(|timestamp| timestamp < 0)
+        {
+            return false;
+        }
+        if let Some(inventory) = &self.inventory
+            && (inventory.execution_slots() != self.capacity || inventory.capabilities().is_err())
+        {
+            return false;
+        }
+        match (&self.resource_domain_id, self.resource_domain_capacity) {
+            (Some(_), Some(domain_capacity)) => self
+                .inventory
+                .as_ref()
+                .is_some_and(|inventory| domain_capacity.fits_within(inventory.allocatable())),
+            (None, None) => self.labels.is_empty() && self.last_seen_at_ms.is_none() && !self.fresh,
+            _ => false,
         }
     }
 
@@ -270,9 +355,48 @@ impl WorkerStatus {
     pub fn draining(&self) -> bool {
         self.draining
     }
+    pub fn inventory(&self) -> Option<&WorkerInventory> {
+        self.inventory.as_ref()
+    }
+    pub fn resource_domain_id(&self) -> Option<&WorkerId> {
+        self.resource_domain_id.as_ref()
+    }
+    pub fn resource_domain_capacity(&self) -> Option<WorkerResourceCapacity> {
+        self.resource_domain_capacity
+    }
+    pub fn labels(&self) -> &BTreeMap<String, String> {
+        &self.labels
+    }
+    pub fn fresh(&self) -> bool {
+        self.fresh
+    }
+    pub fn last_seen_at_ms(&self) -> Option<i64> {
+        self.last_seen_at_ms
+    }
     pub fn observed_at_ms(&self) -> i64 {
         self.observed_at_ms
     }
+}
+
+pub const MAX_WORKER_LABELS: usize = 32;
+pub const MAX_WORKER_LABEL_BYTES: usize = 4_096;
+
+pub fn valid_worker_labels(labels: &BTreeMap<String, String>) -> bool {
+    labels.len() <= MAX_WORKER_LABELS
+        && labels.iter().all(|(key, value)| {
+            !key.is_empty()
+                && key.len() <= 64
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+                && value.len() <= 256
+                && !value.bytes().any(|byte| byte.is_ascii_control())
+        })
+        && labels
+            .iter()
+            .map(|(key, value)| key.len() + value.len())
+            .sum::<usize>()
+            <= MAX_WORKER_LABEL_BYTES
 }
 
 /// A fixed job-definition snapshot assigned to one worker execution attempt.

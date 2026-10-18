@@ -20,11 +20,13 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::OpenOptionsExt;
 
 use conductor_core::{
-    Architecture as WorkerArchitecture, CommandEnvelope, CommandId, InspectRun, JobSpec, LogStream,
+    Architecture as WorkerArchitecture, CommandEnvelope, CommandId, EnforcementCapability,
+    ExecutionBackend as WorkerExecutionBackend, InspectRun, JobSpec, LogStream,
     MAX_LOG_CHUNK_BYTES, MAX_WORKER_CAPACITY, MAX_WORKER_INVENTORY_PAGE_SIZE, OperatingSystem,
     ReadRunLogs, ResolveRun, RunFailureReason, RunLogChunk, RunLogStatus, RunObservation, RunState,
-    RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId, WorkerInventoryEntry,
-    WorkerInventoryPage, WorkerStatus,
+    RunTerminationReason, StartRun, StopRun, WorkerCapabilities, WorkerDescriptor, WorkerId,
+    WorkerInventory, WorkerInventoryEntry, WorkerInventoryPage, WorkerResourceCapacity,
+    WorkerStatus,
 };
 use object::read::{FileKind, Object, ReadCache, macho::FatArch};
 use object::{Architecture as ObjectArchitecture, BinaryFormat};
@@ -62,6 +64,11 @@ pub trait ExecutionBackend: Send + Sync {
     /// Implementations must bound this operation because it runs on the reader reaper.
     fn cleanup_execution(&self, _group_id: u32) -> io::Result<()> {
         Ok(())
+    }
+
+    /// Kernel enforcement guarantees this backend has been configured to apply.
+    fn enforcement_capabilities(&self) -> BTreeSet<EnforcementCapability> {
+        BTreeSet::new()
     }
 }
 
@@ -542,6 +549,7 @@ impl PendingPersistence {
 pub struct WorkerService {
     worker_id: WorkerId,
     capacity: usize,
+    inventory: WorkerInventory,
     incarnation: u64,
     state_directory: PathBuf,
     log_policy: LogPolicy,
@@ -598,6 +606,7 @@ impl WorkerService {
                 "worker capacity must be between 1 and 64",
             ));
         }
+        let inventory = host_inventory(capacity, backend.as_ref())?;
         if log_policy.max_bytes_per_stream == 0
             || log_policy.max_bytes_per_stream > MAX_LOG_MAX_BYTES_PER_STREAM
             || log_policy.retention_runs > MAX_LOG_RETENTION_RUNS
@@ -826,6 +835,7 @@ impl WorkerService {
         let service = Self {
             worker_id,
             capacity,
+            inventory,
             incarnation,
             state_directory,
             log_policy,
@@ -1813,7 +1823,8 @@ impl WorkerService {
             draining,
             observed_at,
         )
-        .with_runtime_state(live_processes, pending, degraded))
+        .with_runtime_state(live_processes, pending, degraded)
+        .with_inventory(self.inventory.clone()))
     }
 
     pub fn is_draining(&self) -> bool {
@@ -3099,6 +3110,84 @@ fn now_ms() -> io::Result<i64> {
     i64::try_from(milliseconds).map_err(|_| io::Error::other("system time exceeds supported range"))
 }
 
+fn host_inventory(capacity: usize, backend: &dyn ExecutionBackend) -> io::Result<WorkerInventory> {
+    let available_cpu_count = thread::available_parallelism()?.get();
+    let mut system = sysinfo::System::new();
+    system.refresh_cpu_all();
+    system.refresh_memory_specifics(sysinfo::MemoryRefreshKind::nothing().with_ram());
+    let total_cpu_count = system.cpus().len();
+    if total_cpu_count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "host CPU capacity is unavailable",
+        ));
+    }
+    let total_cpu_millis = total_cpu_count
+        .checked_mul(1_000)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "CPU capacity is out of range")
+        })?;
+    let total_memory_bytes = system.total_memory();
+    let allocatable_cpu_millis = available_cpu_count
+        .min(total_cpu_count)
+        .checked_mul(800)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "allocatable CPU capacity is out of range",
+            )
+        })?;
+    let allocatable_memory_bytes = total_memory_bytes.saturating_mul(80) / 100;
+    let total =
+        WorkerResourceCapacity::new(total_cpu_millis, total_memory_bytes).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "host capacity is unavailable")
+        })?;
+    let allocatable = WorkerResourceCapacity::new(allocatable_cpu_millis, allocatable_memory_bytes)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "allocatable capacity is unavailable",
+            )
+        })?;
+
+    #[cfg(target_os = "linux")]
+    let operating_system = OperatingSystem::Linux;
+    #[cfg(target_os = "macos")]
+    let operating_system = OperatingSystem::Macos;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "worker inventory is supported only on Linux and macOS",
+    ));
+
+    #[cfg(target_arch = "x86_64")]
+    let architecture = WorkerArchitecture::X86_64;
+    #[cfg(target_arch = "aarch64")]
+    let architecture = WorkerArchitecture::Aarch64;
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    return Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "worker inventory is supported only on x86_64 and aarch64",
+    ));
+
+    let capabilities = WorkerCapabilities::new(
+        operating_system,
+        architecture,
+        BTreeSet::from([WorkerExecutionBackend::NativeProcess]),
+        backend.enforcement_capabilities(),
+    )
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "worker capabilities are invalid",
+        )
+    })?;
+    WorkerInventory::new(capabilities, total, allocatable, capacity)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "worker inventory is invalid"))
+}
+
 fn storage_error(error: impl std::fmt::Display) -> io::Error {
     io::Error::other(error.to_string())
 }
@@ -3143,5 +3232,47 @@ mod executable_compatibility_tests {
             OperatingSystem::Macos,
             Architecture::Aarch64,
         ));
+    }
+}
+
+#[cfg(test)]
+mod host_inventory_tests {
+    use std::io;
+    use std::process::Child;
+
+    use super::{ExecutionBackend, host_inventory};
+    use conductor_core::JobSpec;
+
+    struct NoExec;
+
+    impl ExecutionBackend for NoExec {
+        fn spawn(&self, _run_id: &str, _job: &JobSpec) -> io::Result<Child> {
+            Err(io::Error::other("test backend does not spawn"))
+        }
+
+        fn terminate_process_group(&self, _group_id: u32) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn kill_process_group(&self, _group_id: u32) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn host_inventory_reports_safe_platform_capacity_with_headroom() {
+        let inventory = host_inventory(4, &NoExec).expect("host inventory is available");
+        assert!(inventory.total().cpu_millis() > 0);
+        assert!(inventory.total().memory_bytes() > 0);
+        assert!(inventory.allocatable().fits_within(inventory.total()));
+        assert!(inventory.allocatable().cpu_millis() < inventory.total().cpu_millis());
+        assert!(inventory.allocatable().memory_bytes() < inventory.total().memory_bytes());
+        assert_eq!(inventory.execution_slots(), 4);
+        assert!(
+            inventory
+                .backends()
+                .contains(&conductor_core::ExecutionBackend::NativeProcess)
+        );
+        assert!(inventory.enforcement().is_empty());
     }
 }

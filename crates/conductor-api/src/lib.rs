@@ -99,6 +99,7 @@ struct ResolveRunRequest {
 struct ApiState {
     manager: Arc<JobService>,
     worker: Arc<dyn WorkerPort>,
+    workers: Vec<Arc<dyn WorkerPort>>,
     worker_id: WorkerId,
     worker_capacity: usize,
     role: ApiRole,
@@ -307,9 +308,14 @@ fn router_with_recovery(
     readiness: ApiReadiness,
 ) -> Router {
     let descriptor = worker.descriptor();
+    let workers = readiness
+        .recovery_workers
+        .clone()
+        .unwrap_or_else(|| vec![Arc::clone(&worker)]);
     let state = Arc::new(ApiState {
         manager,
         worker,
+        workers,
         worker_id: descriptor.worker_id().clone(),
         worker_capacity: descriptor.capacity(),
         role: readiness.role,
@@ -492,8 +498,8 @@ async fn readyz(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
 }
 
 async fn list_workers(State(state): State<Arc<ApiState>>) -> Response {
-    match query_worker_status(&state).await {
-        Ok(status) => (StatusCode::OK, Json(vec![status])).into_response(),
+    match query_worker_statuses(&state).await {
+        Ok(statuses) => (StatusCode::OK, Json(statuses)).into_response(),
         Err(error) => manager_error(error),
     }
 }
@@ -506,24 +512,39 @@ async fn get_worker(State(state): State<Arc<ApiState>>, Path(raw_id): Path<Strin
             "the worker ID is invalid",
         );
     };
-    if id != state.worker_id {
+    let Some(worker) = state
+        .workers
+        .iter()
+        .find(|worker| worker.descriptor().worker_id() == &id)
+        .cloned()
+    else {
         return error(
             StatusCode::NOT_FOUND,
             "worker_not_found",
             "the worker does not exist",
         );
-    }
-    match query_worker_status(&state).await {
+    };
+    match query_single_worker_status(&state, worker).await {
         Ok(status) => (StatusCode::OK, Json(status)).into_response(),
         Err(error) => manager_error(error),
     }
 }
 
-async fn query_worker_status(
+async fn query_worker_statuses(
     state: &Arc<ApiState>,
+) -> Result<Vec<conductor_core::WorkerStatus>, ManagerError> {
+    let mut statuses = Vec::with_capacity(state.workers.len());
+    for worker in &state.workers {
+        statuses.push(query_single_worker_status(state, Arc::clone(worker)).await?);
+    }
+    Ok(statuses)
+}
+
+async fn query_single_worker_status(
+    state: &Arc<ApiState>,
+    worker: Arc<dyn WorkerPort>,
 ) -> Result<conductor_core::WorkerStatus, ManagerError> {
     let manager = Arc::clone(&state.manager);
-    let worker = Arc::clone(&state.worker);
     match run_blocking(state, BlockingClass::General, move || {
         manager.worker_status(worker.as_ref())
     })
@@ -1442,7 +1463,28 @@ mod access_tests {
         }
 
         fn status(&self) -> Result<WorkerStatus, WorkerPortError> {
-            Ok(WorkerStatus::new(self.descriptor(), 0, 0, true, false, 0))
+            let capacity = conductor_core::WorkerResourceCapacity::new(1_000, 1_000_000)
+                .expect("test capacity");
+            let capabilities = conductor_core::WorkerCapabilities::new(
+                conductor_core::OperatingSystem::Linux,
+                conductor_core::Architecture::X86_64,
+                std::collections::BTreeSet::from([conductor_core::ExecutionBackend::NativeProcess]),
+                std::collections::BTreeSet::new(),
+            )
+            .expect("test capabilities");
+            let inventory =
+                conductor_core::WorkerInventory::new(capabilities, capacity, capacity, 1)
+                    .expect("test inventory");
+            Ok(WorkerStatus::new(self.descriptor(), 0, 0, true, false, 0)
+                .with_inventory(inventory)
+                .with_manager_metadata(
+                    self.descriptor().worker_id().clone(),
+                    capacity,
+                    std::collections::BTreeMap::new(),
+                    0,
+                    true,
+                )
+                .expect("valid manager metadata"))
         }
     }
 
