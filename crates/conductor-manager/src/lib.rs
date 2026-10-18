@@ -20,6 +20,7 @@ use conductor_core::{
     WorkerResourceCapacity, WorkerStatus,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use serde::Serialize;
 
 /// Temporary limit for active jobs. Pagination is a later milestone.
 pub const MAX_JOBS: usize = 1_000;
@@ -102,14 +103,16 @@ pub struct RunAdmission {
 
 /// Durable service-slot allocation and the shared host domain that owns its
 /// reservation. Pending allocations have no worker or resource domain yet.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AllocationRecord {
     allocation: Allocation,
     resource_domain_id: Option<WorkerId>,
 }
 
 /// Persisted control state for one service instance's current or next execution.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServiceAttemptRecord {
     pub service_instance_id: ServiceInstanceId,
     pub replica_index: u32,
@@ -3910,6 +3913,13 @@ impl JobService {
         id: &JobId,
     ) -> Result<Vec<AllocationRecord>, ExecutionStoreError> {
         self.repository.list_allocations(id)
+    }
+
+    pub fn list_service_attempts(
+        &self,
+        id: &JobId,
+    ) -> Result<Vec<ServiceAttemptRecord>, ExecutionStoreError> {
+        self.repository.list_service_attempts(id)
     }
 
     /// Reconcile placed service slots with their workers. Repeated calls are

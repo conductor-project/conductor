@@ -24,7 +24,7 @@ use conductor_core::{
 };
 use conductor_manager::{
     DEFAULT_PAGE_SIZE, ExecutionStoreError, JobService, MAX_PAGE_SIZE, ManagerError, QueryError,
-    WorkerPort,
+    ServiceAttemptRecord, WorkerPort,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,6 +51,12 @@ struct JobCollection {
 struct RunCollection {
     runs: Vec<conductor_core::RunObservation>,
     next_cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceAttemptCollection {
+    service_attempts: Vec<ServiceAttemptRecord>,
 }
 
 #[derive(Serialize)]
@@ -365,6 +371,7 @@ fn router_with_recovery(
             post(rollback_deployment),
         )
         .route("/v1/jobs/{id}/runs", post(start_run))
+        .route("/v1/jobs/{id}/service-attempts", get(list_service_attempts))
         .route("/v1/workers", get(list_workers))
         .route("/v1/workers/{id}", get(get_worker))
         .route("/v1/runs", get(list_runs))
@@ -572,6 +579,39 @@ async fn get_deployment(
         ),
         Err(error_value) => execution_store_error(error_value),
     }
+}
+
+async fn list_service_attempts(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+) -> Response {
+    let Ok(job_id) = JobId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_id",
+            "the job ID is invalid",
+        );
+    };
+    let attempts = match run_blocking(&state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        move || manager.list_service_attempts(&job_id)
+    })
+    .await
+    {
+        Ok(Ok(attempts)) => attempts,
+        Ok(Err(_)) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "service attempts could not be read",
+            );
+        }
+        Err(error_value) => return blocking_error(error_value),
+    };
+    Json(ServiceAttemptCollection {
+        service_attempts: attempts,
+    })
+    .into_response()
 }
 
 async fn deploy_revision(
@@ -2140,6 +2180,7 @@ mod access_tests {
 
         for (method, path) in [
             ("GET", "/v1/jobs"),
+            ("GET", "/v1/jobs/job-a/service-attempts"),
             ("POST", "/v1/jobs"),
             ("DELETE", "/v1/jobs/job-a"),
             ("GET", "/v1/workers"),
@@ -2254,6 +2295,27 @@ mod access_tests {
         let initial: conductor_core::JobDeployment =
             serde_json::from_slice(&initial_bytes).unwrap();
         assert_eq!(initial.status(), DeploymentStatus::Pending);
+
+        let service_attempts = app
+            .clone()
+            .oneshot(authorized_request(
+                "GET",
+                "/v1/jobs/web/service-attempts",
+                "",
+                None,
+                None,
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(service_attempts.status(), StatusCode::OK);
+        let attempts_bytes = axum::body::to_bytes(service_attempts.into_body(), 65_536)
+            .await
+            .unwrap();
+        let attempts: serde_json::Value = serde_json::from_slice(&attempts_bytes).unwrap();
+        let instances = attempts["serviceAttempts"].as_array().unwrap();
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0]["terminalFailure"], false);
 
         drop(app);
         let restarted_app = router(&database);

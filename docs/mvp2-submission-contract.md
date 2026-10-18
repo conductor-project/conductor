@@ -106,6 +106,12 @@ another silently.
 the current desired state is satisfied, including a desired replica count of
 zero. Service health probes remain separate from deployment convergence.
 
+`GET /v1/jobs/{jobId}/service-attempts` returns each known service slot's
+current allocation and run, retry count, next eligible start time, and
+`terminalFailure` flag. This distinguishes a service whose retry budget is
+exhausted from a deployment that is merely waiting for placement. The terminal
+run remains available through the run history endpoint.
+
 `DELETE /v1/jobs/{jobId}/deployment` is conditional and idempotent. It records a
 durable deleting tombstone and returns `202` while active or uncertain
 allocations still need reconciliation. It does not delete revision history or

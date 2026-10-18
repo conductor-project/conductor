@@ -397,6 +397,7 @@ dependencies = [
  "base64 0.22.1",
  "conductor-core",
  "rusqlite",
+ "serde",
  "serde_json",
 ]
 
