@@ -4,9 +4,12 @@
 //! delegated root must be prepared by the administrator; this code never
 //! enables controllers or changes any ancestor cgroup.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -21,6 +24,7 @@ static NEXT_GROUP: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct CgroupV2 {
     root: PathBuf,
     maximums: ResourceLimits,
+    _ownership: Arc<File>,
 }
 
 impl CgroupV2 {
@@ -68,7 +72,9 @@ impl CgroupV2 {
                 ));
             }
         }
-        let root = delegated_root.join(format!("conductor-{:016x}", stable_run_hash(worker_id)));
+        let worker_root_name = format!("conductor-{:016x}", stable_run_hash(worker_id));
+        let ownership = acquire_namespace_ownership(&delegated_root, &worker_root_name)?;
+        let root = delegated_root.join(worker_root_name);
         match fs::create_dir(&root) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -81,7 +87,11 @@ impl CgroupV2 {
             ));
         }
         fs::write(root.join("cgroup.subtree_control"), "+cpu +memory +pids")?;
-        let manager = Self { root, maximums };
+        let manager = Self {
+            root,
+            maximums,
+            _ownership: Arc::new(ownership),
+        };
         manager.reconcile_owned_groups()?;
         Ok(manager)
     }
@@ -227,6 +237,113 @@ impl CgroupV2 {
             }
             thread::sleep(Duration::from_millis(10));
         }
+    }
+}
+
+fn acquire_namespace_ownership(delegated_root: &Path, namespace_name: &str) -> io::Result<File> {
+    use std::os::unix::fs::MetadataExt;
+
+    const LOCK_DIRECTORY: &str = "/tmp";
+    let delegated_root = fs::canonicalize(delegated_root)?;
+    let directory = fs::metadata(LOCK_DIRECTORY)?;
+    if !directory.is_dir() || directory.mode() & 0o1002 != 0o1002 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "shared cgroup ownership lock directory is not a sticky world-writable directory",
+        ));
+    }
+
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in delegated_root
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .copied()
+        .chain(std::iter::once(0))
+        .chain(namespace_name.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let path = Path::new(LOCK_DIRECTORY).join(format!("conductor-cgroup-{hash:016x}.lock"));
+    let mut create = OpenOptions::new();
+    create.write(true).read(true).create_new(true).mode(0o666);
+    let (file, newly_created) = match create.open(&path) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let mut open = OpenOptions::new();
+            open.write(true).read(true);
+            (open.open(&path)?, false)
+        }
+        Err(error) => return Err(error),
+    };
+    if newly_created {
+        file.set_permissions(fs::Permissions::from_mode(0o666))?;
+    }
+
+    let metadata = file.metadata()?;
+    let path_metadata = fs::symlink_metadata(&path)?;
+    if !metadata.is_file()
+        || !path_metadata.is_file()
+        || metadata.dev() != path_metadata.dev()
+        || metadata.ino() != path_metadata.ino()
+        || metadata.mode() & 0o666 != 0o666
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cgroup ownership lock is not a shared regular file",
+        ));
+    }
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "worker cgroup namespace is already owned by another agent",
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    use super::acquire_namespace_ownership;
+    use std::fs;
+    use std::io;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TEST_ROOT: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn namespace_ownership_excludes_aliases_and_releases_after_drop() {
+        let root = std::env::temp_dir().join(format!(
+            "conductor-lock-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).expect("create delegated root fixture");
+        let alias = PathBuf::from(format!("{}-alias", root.display()));
+        symlink_root(&root, &alias);
+
+        let owner = acquire_namespace_ownership(&root, "conductor-worker")
+            .expect("acquire first namespace owner");
+        let alias_error = acquire_namespace_ownership(&alias, "conductor-worker")
+            .expect_err("canonical alias must share the ownership lock");
+        assert_eq!(alias_error.kind(), io::ErrorKind::AlreadyExists);
+        let distinct = acquire_namespace_ownership(&root, "conductor-other-worker")
+            .expect("distinct worker namespaces have independent locks");
+
+        drop(owner);
+        let recovered = acquire_namespace_ownership(&alias, "conductor-worker")
+            .expect("OS lock must be released when the owner exits");
+        drop((distinct, recovered));
+        fs::remove_file(&alias).expect("remove delegated root alias");
+        fs::remove_dir(&root).expect("remove delegated root fixture");
+    }
+
+    #[cfg(unix)]
+    fn symlink_root(root: &std::path::Path, alias: &std::path::Path) {
+        std::os::unix::fs::symlink(root, alias).expect("create delegated root alias");
     }
 }
 
