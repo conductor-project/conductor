@@ -479,6 +479,8 @@ pub enum RunFailureReason {
     CapacityRejected,
     BackendFailure,
     ExecutableDigestMismatch,
+    /// Retained to read observations written by older workers. Native
+    /// executable compatibility is delegated to the operating system.
     IncompatibleExecutable,
     OutcomeUnknown,
 }

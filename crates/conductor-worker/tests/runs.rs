@@ -603,7 +603,7 @@ fn executable_digest_mismatch_fails_without_spawning_the_workload() {
 }
 
 #[test]
-fn incompatible_executable_format_fails_before_backend_spawn() {
+fn operating_system_rejects_invalid_executable_after_backend_spawn_attempt() {
     let directory = TempDir::new();
     let backend = Arc::new(TestBackend::default());
     let service = open_worker(&directory, 1, Arc::clone(&backend));
@@ -623,9 +623,9 @@ fn incompatible_executable_format_fails_before_backend_spawn() {
     assert_eq!(observation.state(), RunState::Failed);
     assert_eq!(
         observation.failure_reason(),
-        Some(RunFailureReason::IncompatibleExecutable)
+        Some(RunFailureReason::SpawnFailed)
     );
-    assert_eq!(backend.spawns.load(Ordering::SeqCst), 0);
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
 }
 
 #[test]
