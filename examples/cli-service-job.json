@@ -1,0 +1,9 @@
+{
+  "id": "mvp3-demo-service",
+  "command": ["/bin/sleep", "300"],
+  "cwd": "/tmp",
+  "env": {},
+  "inheritEnv": false,
+  "timeoutMs": null,
+  "terminationGraceMs": 5000
+}

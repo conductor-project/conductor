@@ -1,4 +1,5 @@
 mod contexts;
+mod deployment_cli;
 mod job_cli;
 mod operator_cli;
 mod run_cli;
@@ -55,6 +56,8 @@ enum Commands {
     Job(job_cli::JobArgs),
     /// Start, inspect, wait for, stop, resolve, or read logs from runs.
     Run(run_cli::RunArgs),
+    /// Apply and manage service deployments.
+    Deployment(deployment_cli::DeploymentArgs),
     /// Generate shell completion scripts for the implemented CLI commands.
     Completions {
         #[arg(value_enum)]
@@ -334,6 +337,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Commands::Context(args) => return Ok(contexts::run(args)),
         Commands::Job(args) => return Ok(job_cli::run(args)),
         Commands::Run(args) => return Ok(run_cli::run(args)),
+        Commands::Deployment(args) => return Ok(deployment_cli::run(args)),
         Commands::Completions { shell } => {
             let mut command = Cli::command();
             clap_complete::generate(shell, &mut command, "conductor", &mut std::io::stdout());

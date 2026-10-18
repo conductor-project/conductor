@@ -3,7 +3,7 @@ type: Runbook
 title: Operate Conductor with the CLI
 description: Select named manager connection contexts, submit and manage jobs and revisions, observe and control runs, follow bounded logs, inspect workers and services, mutate desired state safely, drain workers, and page history.
 status: stable
-source_revision: 260db332e2ba3eedad6a59a203e769dd65a2e4be
+source_revision: 23498bc4c3e95665cde4c2e4115c0a5b45aa182d
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/operator_cli.rs
@@ -12,6 +12,8 @@ sources:
     title: Job and revision commands
   - resource: ../src/run_cli.rs
     title: Run lifecycle and log commands
+  - resource: ../src/deployment_cli.rs
+    title: Conditional deployment mutations and rollout waiting
   - resource: ../src/contexts.rs
     title: Named context configuration
   - resource: ../../conductor-api/src/lib.rs
@@ -20,6 +22,8 @@ sources:
     title: Operator CLI integration coverage
   - resource: ../../conductor/tests/run_cli.rs
     title: Run lifecycle and log CLI integration coverage
+  - resource: ../../conductor/tests/deployment_cli.rs
+    title: Deployment CLI integration coverage
 ---
 
 # Connect and inspect
@@ -112,24 +116,45 @@ conductor operator --server https://manager.example.net \
 pending placement reason, rollout progress, and per-replica allocation and run
 state.
 
-# Mutate service intent
+# Manage deployment intent
 
-Initial deployment uses `--create`. Later updates require the current
-generation from `service inspect`. Supply a fresh idempotency key for each
-mutation and reuse that same key if retrying after an ambiguous client result.
-Refresh the generation after each accepted mutation; stale generations are
-rejected instead of overwriting newer desired state.
+`conductor deployment apply JOB_ID FILE` creates a deployment when no
+`--generation` is supplied. To update, provide the current generation reported
+by `deployment inspect`; the CLI sends it as a conditional ETag and reports a
+conflict if another operator changed the deployment. The JSON file contains a
+revision number, desired replica count, and optional rollout strategy. The
+strategy defaults to zero surge, one unavailable replica, and a 300-second
+progress deadline.
+
+Every mutation requires a fresh idempotency key. Reuse the same key only when
+retrying an ambiguous request. `--wait` observes rollout status with a bounded
+deadline; acceptance of desired state is reported separately from rollout
+completion. A timeout or Ctrl-C stops local observation but does not cancel the
+manager's desired state. Inspect again or resume waiting to see progress. A
+failed rollout returns its latest deployment state and pending reason.
+
+Rollback requires an explicit immutable revision number. Suspension retains the
+desired replica count while stopping service placements; resume schedules that
+count again. Delete stops active instances and preserves deleted deployment
+history. None of these commands implies cross-host traffic migration or client
+cache convergence.
 
 ```sh
-conductor operator --token-file ./operator-token deploy frontend \
-  --create --revision 1 --replicas 2 --idempotency-key frontend-deploy-1
-conductor operator --token-file ./operator-token scale frontend \
-  --replicas 3 --if-match-generation 1 --idempotency-key frontend-scale-3
-conductor operator --token-file ./operator-token deploy frontend \
-  --revision 2 --replicas 3 --if-match-generation 2 \
-  --idempotency-key frontend-deploy-2
-conductor operator --token-file ./operator-token rollback frontend \
-  --revision 1 --if-match-generation 3 --idempotency-key frontend-rollback-1
+conductor deployment apply frontend examples/cli-deployment.json \
+  --idempotency-key frontend-deploy-1 --wait
+conductor deployment inspect frontend --output json
+conductor deployment apply frontend examples/cli-deployment-v2.json \
+  --generation 1 --idempotency-key frontend-deploy-2 --wait
+conductor deployment scale frontend --replicas 3 --generation 2 \
+  --idempotency-key frontend-scale-3 --wait
+conductor deployment rollback frontend --revision 1 --generation 3 \
+  --idempotency-key frontend-rollback-1 --wait
+conductor deployment suspend frontend --generation 4 \
+  --idempotency-key frontend-suspend-1 --wait
+conductor deployment resume frontend --generation 5 \
+  --idempotency-key frontend-resume-1 --wait
+conductor deployment delete frontend --generation 6 \
+  --idempotency-key frontend-delete-1 --wait
 ```
 
 # Drain a worker and inspect runs
