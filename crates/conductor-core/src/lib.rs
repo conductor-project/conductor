@@ -12,6 +12,7 @@ const DEFAULT_TERMINATION_GRACE_MS: u64 = 5_000;
 const MAX_TERMINATION_GRACE_MS: u64 = 300_000;
 const MAX_TIMEOUT_MS: u64 = 604_800_000;
 pub const MAX_WORKER_CAPACITY: usize = 64;
+pub const MAX_WORKER_INVENTORY_PAGE_SIZE: usize = 32;
 pub const DEFAULT_LOG_CHUNK_BYTES: usize = 4_096;
 pub const MAX_LOG_CHUNK_BYTES: usize = 65_536;
 
@@ -118,6 +119,7 @@ pub struct CommandEnvelope {
 }
 
 mod execution;
+mod inventory;
 mod protocol;
 pub use execution::{
     Allocation, AllocationId, AllocationState, Architecture, AttemptState, DigestAlgorithm,
@@ -126,6 +128,7 @@ pub use execution::{
     OperatingSystem, ResourceRequest, ResourceReservation, ServiceIdentity, ServiceInstance,
     ServiceInstanceId, WorkerCapabilities, Workload,
 };
+pub use inventory::{WorkerInventoryEntry, WorkerInventoryPage};
 pub use protocol::{
     CURRENT_PROTOCOL_VERSION, NegotiatedProtocol, ProtocolCapability, ProtocolNegotiationError,
     ProtocolOffer, ProtocolVersionRange,

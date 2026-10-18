@@ -21,9 +21,10 @@ use std::os::unix::fs::OpenOptionsExt;
 
 use conductor_core::{
     Architecture as WorkerArchitecture, CommandEnvelope, CommandId, InspectRun, JobSpec, LogStream,
-    MAX_LOG_CHUNK_BYTES, MAX_WORKER_CAPACITY, OperatingSystem, ReadRunLogs, ResolveRun,
-    RunFailureReason, RunLogChunk, RunLogStatus, RunObservation, RunState, RunTerminationReason,
-    StartRun, StopRun, WorkerDescriptor, WorkerId, WorkerStatus,
+    MAX_LOG_CHUNK_BYTES, MAX_WORKER_CAPACITY, MAX_WORKER_INVENTORY_PAGE_SIZE, OperatingSystem,
+    ReadRunLogs, ResolveRun, RunFailureReason, RunLogChunk, RunLogStatus, RunObservation, RunState,
+    RunTerminationReason, StartRun, StopRun, WorkerDescriptor, WorkerId, WorkerInventoryEntry,
+    WorkerInventoryPage, WorkerStatus,
 };
 use object::read::{FileKind, Object, ReadCache, macho::FatArch};
 use object::{Architecture as ObjectArchitecture, BinaryFormat};
@@ -1606,6 +1607,88 @@ impl WorkerService {
             })
         })
         .collect()
+    }
+
+    /// Read one bounded page of durable run history. The first page captures a
+    /// rowid high-water mark; later pages remain bounded to that snapshot.
+    pub fn inventory_page(
+        &self,
+        snapshot_generation: Option<u64>,
+        after_sequence: u64,
+        limit: usize,
+    ) -> Result<WorkerInventoryPage, WorkerError> {
+        if limit == 0 || limit > MAX_WORKER_INVENTORY_PAGE_SIZE {
+            return Err(WorkerError::StorageUnavailable);
+        }
+        if snapshot_generation.is_none() && after_sequence != 0 {
+            return Err(WorkerError::StorageUnavailable);
+        }
+        let state = self
+            .state
+            .0
+            .lock()
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let generation = match snapshot_generation {
+            Some(generation) => generation,
+            None => {
+                let highest: i64 = state
+                    .connection
+                    .query_row("SELECT COALESCE(MAX(rowid), 0) FROM runs", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|_| WorkerError::StorageUnavailable)?;
+                u64::try_from(highest).map_err(|_| WorkerError::StorageUnavailable)?
+            }
+        };
+        if after_sequence > generation {
+            return Err(WorkerError::StorageUnavailable);
+        }
+        let after = i64::try_from(after_sequence).map_err(|_| WorkerError::StorageUnavailable)?;
+        let generation_i64 =
+            i64::try_from(generation).map_err(|_| WorkerError::StorageUnavailable)?;
+        let read_limit = i64::try_from(limit + 1).map_err(|_| WorkerError::StorageUnavailable)?;
+        let mut statement = state
+            .connection
+            .prepare(
+                "SELECT rowid, observation_json FROM runs
+                 WHERE rowid > ?1 AND rowid <= ?2 ORDER BY rowid LIMIT ?3",
+            )
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let rows = statement
+            .query_map(params![after, generation_i64, read_limit], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| WorkerError::StorageUnavailable)?;
+        let mut entries = rows
+            .map(|row| {
+                let (sequence, observation) = row.map_err(|_| WorkerError::StorageUnavailable)?;
+                Ok(WorkerInventoryEntry {
+                    sequence: u64::try_from(sequence)
+                        .map_err(|_| WorkerError::StorageUnavailable)?,
+                    observation: serde_json::from_str(&observation)
+                        .map_err(|_| WorkerError::StorageUnavailable)?,
+                })
+            })
+            .collect::<Result<Vec<_>, WorkerError>>()?;
+        let more = entries.len() > limit;
+        if more {
+            entries.pop();
+        }
+        let next_after_sequence = more
+            .then(|| entries.last().map(|entry| entry.sequence))
+            .flatten();
+        let page = WorkerInventoryPage {
+            worker_id: self.worker_id.clone(),
+            worker_incarnation: self.incarnation,
+            snapshot_generation: generation,
+            after_sequence,
+            entries,
+            next_after_sequence,
+        };
+        if !page.is_valid() {
+            return Err(WorkerError::StorageUnavailable);
+        }
+        Ok(page)
     }
 
     /// Returns accepted commands whose result has not yet been committed. The

@@ -7,7 +7,7 @@ use std::num::NonZeroU16;
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// The protocol version implemented by this MVP2 release.
-pub const CURRENT_PROTOCOL_VERSION: u16 = NonZeroU16::MIN.get();
+pub const CURRENT_PROTOCOL_VERSION: u16 = 2;
 
 /// An inclusive range of protocol versions a peer can speak compatibly.
 ///
@@ -30,9 +30,11 @@ struct RawProtocolVersionRange {
 
 impl ProtocolVersionRange {
     pub fn current() -> Self {
+        let version =
+            NonZeroU16::new(CURRENT_PROTOCOL_VERSION).expect("protocol version is nonzero");
         Self {
-            min: NonZeroU16::MIN,
-            max: NonZeroU16::MIN,
+            min: version,
+            max: version,
         }
     }
 

@@ -6,7 +6,7 @@ pub use identity::{
     WorkerEnrollmentService, WorkerKeyMaterial,
 };
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
@@ -22,11 +22,12 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use base64::Engine;
 use conductor_core::{
-    CommandId, InspectRun, LogStream, ProtocolCapability, ProtocolNegotiationError, ProtocolOffer,
-    ReadRunLogs, ResolveRun, RunId, RunLogChunk, RunLogStatus, RunObservation, StartRun, StopRun,
-    WorkerDescriptor, WorkerId, WorkerStatus,
+    CommandId, InspectRun, LogStream, MAX_WORKER_CAPACITY, ProtocolCapability,
+    ProtocolNegotiationError, ProtocolOffer, ReadRunLogs, ResolveRun, RunId, RunLogChunk,
+    RunLogStatus, RunObservation, StartRun, StopRun, WorkerDescriptor, WorkerId,
+    WorkerInventoryPage, WorkerStatus,
 };
-use conductor_manager::{CommandJournal, WorkerPort, WorkerPortError};
+use conductor_manager::{CommandJournal, CommandStoreError, WorkerPort, WorkerPortError};
 use conductor_worker::{StoredWorkerReport, WorkerError, WorkerService};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -155,6 +156,7 @@ pub struct WorkerPollRequest {
     pub worker_id: WorkerId,
     pub worker_incarnation: u64,
     pub status: WorkerStatus,
+    pub inventory_page: WorkerInventoryPage,
     pub protocol_offer: ProtocolOffer,
 }
 
@@ -163,7 +165,16 @@ pub struct WorkerPollRequest {
 pub struct WorkerPollResponse {
     pub protocol_version: u16,
     pub capabilities: Vec<ProtocolCapability>,
+    pub inventory_acknowledgement: WorkerInventoryAcknowledgement,
     pub command: Option<CommandEnvelope>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerInventoryAcknowledgement {
+    pub snapshot_generation: u64,
+    pub next_after_sequence: Option<u64>,
+    pub restart_scan: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -376,6 +387,7 @@ struct WorkerSession {
     incarnation: AtomicU64,
     protocol_offer: ProtocolOffer,
     journal: Option<Arc<dyn CommandJournal>>,
+    inventory_sync: Mutex<Option<WorkerInventorySync>>,
     status: Mutex<WorkerStatus>,
     pending: Mutex<BTreeMap<CommandId, PendingCommand>>,
     restored_incarnation: AtomicU64,
@@ -386,6 +398,13 @@ struct WorkerSession {
     last_seen: Mutex<Instant>,
     connected: AtomicBool,
     next_command: AtomicU64,
+}
+
+struct WorkerInventorySync {
+    worker_incarnation: u64,
+    snapshot_generation: u64,
+    expected_after_sequence: u64,
+    observed_manager_runs: BTreeSet<RunId>,
 }
 
 impl WorkerSession {
@@ -401,6 +420,7 @@ impl WorkerSession {
             incarnation: AtomicU64::new(incarnation),
             protocol_offer,
             journal,
+            inventory_sync: Mutex::new(None),
             pending: Mutex::new(BTreeMap::new()),
             restored_incarnation: AtomicU64::new(0),
             last_report_sequence: Mutex::new(BTreeMap::new()),
@@ -518,6 +538,7 @@ impl WorkerSession {
             self.adopt_incarnation(request_incarnation)?;
         }
         self.restore_pending(request_incarnation)?;
+        let inventory_acknowledgement = self.reconcile_inventory(&request.inventory_page)?;
         *self
             .status
             .lock()
@@ -554,7 +575,100 @@ impl WorkerSession {
         Ok(WorkerPollResponse {
             protocol_version: negotiated.version(),
             capabilities,
+            inventory_acknowledgement,
             command,
+        })
+    }
+
+    fn reconcile_inventory(
+        &self,
+        page: &WorkerInventoryPage,
+    ) -> Result<WorkerInventoryAcknowledgement, StatusCode> {
+        if page.worker_id != *self.descriptor.worker_id()
+            || page.worker_incarnation != self.incarnation.load(Ordering::Acquire)
+            || !page.is_valid()
+        {
+            return Err(StatusCode::CONFLICT);
+        }
+        let Some(journal) = &self.journal else {
+            return Ok(WorkerInventoryAcknowledgement {
+                snapshot_generation: page.snapshot_generation,
+                next_after_sequence: page.next_after_sequence,
+                restart_scan: false,
+            });
+        };
+        let mut sync = self
+            .inventory_sync
+            .lock()
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        if page.after_sequence == 0 {
+            *sync = Some(WorkerInventorySync {
+                worker_incarnation: page.worker_incarnation,
+                snapshot_generation: page.snapshot_generation,
+                expected_after_sequence: 0,
+                observed_manager_runs: BTreeSet::new(),
+            });
+        }
+        let Some(current) = sync.as_mut() else {
+            return Ok(WorkerInventoryAcknowledgement {
+                snapshot_generation: page.snapshot_generation,
+                next_after_sequence: None,
+                restart_scan: true,
+            });
+        };
+        if current.worker_incarnation != page.worker_incarnation
+            || current.snapshot_generation != page.snapshot_generation
+            || current.expected_after_sequence != page.after_sequence
+        {
+            *sync = None;
+            return Ok(WorkerInventoryAcknowledgement {
+                snapshot_generation: page.snapshot_generation,
+                next_after_sequence: None,
+                restart_scan: true,
+            });
+        }
+        let seen = journal
+            .reconcile_worker_inventory_page(
+                &page.worker_id,
+                page.worker_incarnation,
+                &page.entries,
+            )
+            .map_err(|error| match error {
+                CommandStoreError::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+                CommandStoreError::NotFound
+                | CommandStoreError::Conflict
+                | CommandStoreError::PendingLimit => StatusCode::CONFLICT,
+            })?;
+        current.observed_manager_runs.extend(seen);
+        if current.observed_manager_runs.len() > MAX_WORKER_CAPACITY {
+            *sync = None;
+            return Err(StatusCode::CONFLICT);
+        }
+        if let Some(next_after_sequence) = page.next_after_sequence {
+            current.expected_after_sequence = next_after_sequence;
+        } else {
+            journal
+                .finish_worker_inventory(
+                    &page.worker_id,
+                    page.worker_incarnation,
+                    &current
+                        .observed_manager_runs
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(|error| match error {
+                    CommandStoreError::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
+                    CommandStoreError::NotFound
+                    | CommandStoreError::Conflict
+                    | CommandStoreError::PendingLimit => StatusCode::CONFLICT,
+                })?;
+            *sync = None;
+        }
+        Ok(WorkerInventoryAcknowledgement {
+            snapshot_generation: page.snapshot_generation,
+            next_after_sequence: page.next_after_sequence,
+            restart_scan: false,
         })
     }
 
@@ -576,6 +690,10 @@ impl WorkerSession {
             }
         }
         self.incarnation.store(incarnation, Ordering::Release);
+        *self
+            .inventory_sync
+            .lock()
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)? = None;
         Ok(())
     }
 
@@ -983,6 +1101,7 @@ impl WorkerTransportClient {
         worker_id: &WorkerId,
         worker_incarnation: u64,
         status: &WorkerStatus,
+        inventory_page: &WorkerInventoryPage,
         protocol_offer: &ProtocolOffer,
     ) -> Result<WorkerPollResponse, TransportError> {
         self.post_json(
@@ -991,6 +1110,7 @@ impl WorkerTransportClient {
                 worker_id: worker_id.clone(),
                 worker_incarnation,
                 status: status.clone(),
+                inventory_page: inventory_page.clone(),
                 protocol_offer: protocol_offer.clone(),
             },
         )
@@ -1076,6 +1196,8 @@ impl WorkerTransportClient {
             .await
             .map_err(|_| TransportError::Unavailable)??;
         let mut failures = 0_u32;
+        let mut inventory_snapshot = None;
+        let mut inventory_after_sequence = 0;
         loop {
             if *shutdown.borrow() {
                 return Ok(());
@@ -1120,12 +1242,44 @@ impl WorkerTransportClient {
                 }
                 result = async {
                     let status = worker.status().map_err(|_| TransportError::Unavailable)?;
-                    self.poll(&worker_id, incarnation, &status, &protocol_offer).await
+                    let inventory_worker = Arc::clone(&worker);
+                    let snapshot = inventory_snapshot;
+                    let after = inventory_after_sequence;
+                    let inventory_page = tokio::task::spawn_blocking(move || {
+                        inventory_worker.inventory_page(
+                            snapshot,
+                            after,
+                            conductor_core::MAX_WORKER_INVENTORY_PAGE_SIZE,
+                        )
+                    })
+                    .await
+                    .map_err(|_| TransportError::Unavailable)?
+                    .map_err(|_| TransportError::Unavailable)?;
+                    let response = self
+                        .poll(&worker_id, incarnation, &status, &inventory_page, &protocol_offer)
+                        .await?;
+                    Ok::<_, TransportError>((response, inventory_page))
                 } => result,
             };
             match polled {
-                Ok(response) => {
+                Ok((response, inventory_page)) => {
                     failures = 0;
+                    let acknowledgement = response.inventory_acknowledgement;
+                    if acknowledgement.restart_scan {
+                        inventory_snapshot = None;
+                        inventory_after_sequence = 0;
+                    } else if acknowledgement.snapshot_generation
+                        != inventory_page.snapshot_generation
+                        || acknowledgement.next_after_sequence != inventory_page.next_after_sequence
+                    {
+                        return Err(TransportError::MalformedResponse);
+                    } else if let Some(next_after_sequence) = inventory_page.next_after_sequence {
+                        inventory_snapshot = Some(inventory_page.snapshot_generation);
+                        inventory_after_sequence = next_after_sequence;
+                    } else {
+                        inventory_snapshot = None;
+                        inventory_after_sequence = 0;
+                    }
                     let Some(command) = response.command else {
                         continue;
                     };
@@ -1289,8 +1443,10 @@ mod tests {
 
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use conductor_core::{ProtocolVersionRange, WorkerDescriptor};
-    use conductor_manager::{JobRepository, SqliteJobRepository};
+    use conductor_core::{
+        JobSpec, ProtocolVersionRange, RunSpec, RunState, WorkerDescriptor, WorkerInventoryEntry,
+    };
+    use conductor_manager::{CommandJournal, JobRepository, SqliteJobRepository};
     use tower::ServiceExt;
 
     struct TestDatabase(PathBuf);
@@ -1341,7 +1497,7 @@ mod tests {
     fn session() -> WorkerSession {
         WorkerSession::new(
             WorkerDescriptor::new(worker_id("worker-a"), 4, true).with_incarnation(9),
-            offer(1),
+            offer(2),
             None,
         )
     }
@@ -1349,7 +1505,7 @@ mod tests {
     fn uninitialized_session() -> WorkerSession {
         WorkerSession::new(
             WorkerDescriptor::new(worker_id("worker-a"), 4, true),
-            offer(1),
+            offer(2),
             None,
         )
     }
@@ -1369,6 +1525,14 @@ mod tests {
             worker_id: worker_id(id),
             worker_incarnation: incarnation,
             status: WorkerStatus::new(descriptor, 0, 0, true, false, 1),
+            inventory_page: WorkerInventoryPage {
+                worker_id: worker_id(id),
+                worker_incarnation: incarnation,
+                snapshot_generation: 0,
+                after_sequence: 0,
+                entries: Vec::new(),
+                next_after_sequence: None,
+            },
             protocol_offer: offer(version),
         }
     }
@@ -1390,11 +1554,11 @@ mod tests {
             .unwrap()
             .clone();
         let first = session
-            .poll(poll_request("worker-a", 1))
+            .poll(poll_request("worker-a", 2))
             .await
             .expect("compatible worker poll");
         let first_command = first.command.expect("queued command");
-        assert_eq!(first.protocol_version, 1);
+        assert_eq!(first.protocol_version, 2);
         assert_eq!(first_command.command_id, command_id);
         assert!(session.is_fresh());
         assert_eq!(session.status().expect("worker status").capacity(), 4);
@@ -1407,7 +1571,7 @@ mod tests {
             .expect("pending command")
             .retry_at = Instant::now();
         let reconnected = session
-            .poll(poll_request("worker-a", 1))
+            .poll(poll_request("worker-a", 2))
             .await
             .expect("reconnected worker poll");
         assert_eq!(reconnected.command, Some(first_command));
@@ -1428,7 +1592,7 @@ mod tests {
             .enqueue_envelope(envelope.clone())
             .expect("enqueue durable command");
         let response = session
-            .poll(poll_request("worker-a", 1))
+            .poll(poll_request("worker-a", 2))
             .await
             .expect("compatible worker poll");
         assert_eq!(response.command, Some(envelope));
@@ -1437,14 +1601,14 @@ mod tests {
     #[tokio::test]
     async fn rejects_wrong_incarnation_and_incompatible_protocol() {
         let session = session();
-        let mut wrong_incarnation = poll_request("worker-a", 1);
+        let mut wrong_incarnation = poll_request("worker-a", 2);
         wrong_incarnation.worker_incarnation = 8;
         assert_eq!(
             session.poll(wrong_incarnation).await,
             Err(StatusCode::CONFLICT)
         );
         assert_eq!(
-            session.poll(poll_request("worker-a", 2)).await,
+            session.poll(poll_request("worker-a", 3)).await,
             Err(StatusCode::UPGRADE_REQUIRED)
         );
         assert!(!session.is_fresh());
@@ -1454,7 +1618,7 @@ mod tests {
     async fn rejected_first_poll_does_not_bind_worker_incarnation() {
         let session = Arc::new(uninitialized_session());
 
-        let mut invalid_status = poll_request("worker-a", 1);
+        let mut invalid_status = poll_request("worker-a", 2);
         invalid_status.status = WorkerStatus::new(
             WorkerDescriptor::new(worker_id("worker-a"), 8, true).with_incarnation(9),
             0,
@@ -1469,7 +1633,7 @@ mod tests {
         );
         assert_eq!(session.descriptor().incarnation(), 0);
 
-        let incompatible = poll_request("worker-a", 2);
+        let incompatible = poll_request("worker-a", 3);
         assert_eq!(
             session.poll(incompatible).await,
             Err(StatusCode::UPGRADE_REQUIRED)
@@ -1478,7 +1642,7 @@ mod tests {
 
         let poll_session = Arc::clone(&session);
         let poll =
-            tokio::spawn(async move { poll_session.poll(poll_request("worker-a", 1)).await });
+            tokio::spawn(async move { poll_session.poll(poll_request("worker-a", 2)).await });
         tokio::time::timeout(Duration::from_secs(1), async {
             while session.descriptor().incarnation() == 0 {
                 tokio::task::yield_now().await;
@@ -1546,7 +1710,7 @@ mod tests {
         let polling_session = Arc::clone(&session);
         let poll = tokio::spawn(async move {
             polling_session
-                .poll(poll_request_with_incarnation("worker-a", 1, 10))
+                .poll(poll_request_with_incarnation("worker-a", 2, 10))
                 .await
         });
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -1588,6 +1752,182 @@ mod tests {
     }
 
     #[test]
+    fn inventory_reconciliation_is_monotonic_and_keeps_uncertain_ownership() {
+        let database = TestDatabase::new();
+        let repository = SqliteJobRepository::open(&database.0).expect("open manager journal");
+        let job: JobSpec =
+            serde_json::from_str(r#"{"id":"inventory-job","command":["/bin/true"],"cwd":"/tmp"}"#)
+                .expect("valid job");
+        repository.insert(job.clone()).expect("insert job");
+        let worker_key = worker_id("inventory-worker");
+        let admission = repository
+            .create_run_for_worker(job.id(), &worker_key, 9, 4, None)
+            .expect("create durable assignment");
+        let requested = repository
+            .get_run(admission.spec.id())
+            .expect("read requested run")
+            .expect("run exists");
+        let running = requested
+            .next_revision(RunState::Running, Some(2), None, None, None, None)
+            .expect("new observation revision")
+            .with_worker_incarnation(9);
+        let entry = WorkerInventoryEntry {
+            sequence: 1,
+            observation: running.clone(),
+        };
+
+        assert_eq!(
+            repository
+                .reconcile_worker_inventory_page(&worker_key, 9, std::slice::from_ref(&entry))
+                .expect("reconcile worker inventory"),
+            vec![admission.spec.id().clone()]
+        );
+        repository
+            .finish_worker_inventory(&worker_key, 9, std::slice::from_ref(admission.spec.id()))
+            .expect("finish complete inventory round");
+        assert_eq!(
+            repository
+                .get_run(admission.spec.id())
+                .unwrap()
+                .unwrap()
+                .state(),
+            RunState::Running
+        );
+
+        repository
+            .finish_worker_inventory(&worker_key, 9, &[])
+            .expect("missing assigned run becomes uncertain");
+        let uncertain = repository.get_run(admission.spec.id()).unwrap().unwrap();
+        assert_eq!(uncertain.state(), RunState::Unknown);
+        assert_eq!(
+            repository
+                .list_active_runs(&worker_key, 4)
+                .expect("uncertain assignment remains reserved")
+                .len(),
+            1
+        );
+
+        repository
+            .reconcile_worker_inventory_page(&worker_key, 9, std::slice::from_ref(&entry))
+            .expect("stale inventory is ignored");
+        assert_eq!(
+            repository.get_run(admission.spec.id()).unwrap().unwrap(),
+            uncertain
+        );
+
+        let pending_job: JobSpec = serde_json::from_str(
+            r#"{"id":"inventory-pending-job","command":["/bin/true"],"cwd":"/tmp"}"#,
+        )
+        .expect("valid pending job");
+        repository
+            .insert(pending_job.clone())
+            .expect("insert pending job");
+        let pending = repository
+            .create_run_for_worker(pending_job.id(), &worker_key, 9, 4, None)
+            .expect("create second pending assignment");
+        repository
+            .finish_worker_inventory(&worker_key, 9, &[])
+            .expect("pending manager intent is not treated as missing worker state");
+        assert_eq!(
+            repository
+                .get_run(pending.spec.id())
+                .unwrap()
+                .unwrap()
+                .state(),
+            RunState::Requested
+        );
+
+        let future = WorkerInventoryEntry {
+            sequence: 2,
+            observation: running.with_worker_incarnation(10),
+        };
+        assert_eq!(
+            repository.reconcile_worker_inventory_page(&worker_key, 9, &[future]),
+            Err(CommandStoreError::Conflict)
+        );
+    }
+
+    #[test]
+    fn worker_inventory_scan_restarts_safely_after_manager_session_loss() {
+        let database = TestDatabase::new();
+        let repository =
+            Arc::new(SqliteJobRepository::open(&database.0).expect("open manager journal"));
+        let worker_key = worker_id("worker-a");
+        let job: JobSpec = serde_json::from_str(
+            r#"{"id":"inventory-page-job","command":["/bin/true"],"cwd":"/tmp"}"#,
+        )
+        .expect("valid inventory job");
+        let entries = (1..=32)
+            .map(|sequence| {
+                let run_id = RunId::new(format!("inventory-run-{sequence:02}"))
+                    .expect("valid inventory run id");
+                let spec = RunSpec::new(run_id, worker_key.clone(), job.clone());
+                WorkerInventoryEntry {
+                    sequence,
+                    observation: RunObservation::requested(&spec, 1),
+                }
+            })
+            .collect::<Vec<_>>();
+        let first_page = WorkerInventoryPage {
+            worker_id: worker_key.clone(),
+            worker_incarnation: 9,
+            snapshot_generation: 33,
+            after_sequence: 0,
+            entries,
+            next_after_sequence: Some(32),
+        };
+        let final_page = WorkerInventoryPage {
+            worker_id: worker_key.clone(),
+            worker_incarnation: 9,
+            snapshot_generation: 33,
+            after_sequence: 32,
+            entries: vec![WorkerInventoryEntry {
+                sequence: 33,
+                observation: RunObservation::requested(
+                    &RunSpec::new(
+                        RunId::new("inventory-run-33").unwrap(),
+                        worker_key.clone(),
+                        job,
+                    ),
+                    1,
+                ),
+            }],
+            next_after_sequence: None,
+        };
+
+        let first_session = WorkerSession::new(
+            WorkerDescriptor::new(worker_key.clone(), 4, true).with_incarnation(9),
+            offer(2),
+            Some(Arc::clone(&repository) as Arc<dyn CommandJournal>),
+        );
+        let acknowledgement = first_session
+            .reconcile_inventory(&first_page)
+            .expect("first inventory page accepted");
+        assert_eq!(acknowledgement.next_after_sequence, Some(32));
+        assert!(!acknowledgement.restart_scan);
+
+        let restarted_session = WorkerSession::new(
+            WorkerDescriptor::new(worker_key, 4, true).with_incarnation(9),
+            offer(2),
+            Some(repository),
+        );
+        assert!(
+            restarted_session
+                .reconcile_inventory(&final_page)
+                .expect("session loss requests a fresh scan")
+                .restart_scan
+        );
+        restarted_session
+            .reconcile_inventory(&first_page)
+            .expect("rescan first page");
+        let final_ack = restarted_session
+            .reconcile_inventory(&final_page)
+            .expect("rescan final page");
+        assert_eq!(final_ack.next_after_sequence, None);
+        assert!(!final_ack.restart_scan);
+    }
+
+    #[test]
     fn manager_restart_restores_commands_and_deduplicates_report_retries() {
         let database = TestDatabase::new();
         let repository =
@@ -1604,7 +1944,7 @@ mod tests {
 
         let restarted_session = WorkerSession::new(
             WorkerDescriptor::new(worker_key.clone(), 4, true).with_incarnation(9),
-            offer(1),
+            offer(2),
             Some(repository.clone()),
         );
         restarted_session
@@ -1627,7 +1967,7 @@ mod tests {
         };
         let report_session = WorkerSession::new(
             WorkerDescriptor::new(worker_id("worker-a"), 4, true).with_incarnation(9),
-            offer(1),
+            offer(2),
             Some(repository.clone()),
         );
         assert_eq!(
@@ -1648,7 +1988,7 @@ mod tests {
 
         let next_manager_session = WorkerSession::new(
             WorkerDescriptor::new(worker_id("worker-a"), 4, true).with_incarnation(9),
-            offer(1),
+            offer(2),
             Some(repository),
         );
         assert_eq!(
@@ -1690,14 +2030,14 @@ mod tests {
         for index in 0..MAX_REGISTERED_WORKERS {
             hub.register_worker(
                 WorkerDescriptor::new(worker_id(&format!("worker-{index}")), 1, true),
-                offer(1),
+                offer(2),
             )
             .expect("worker within registry bound");
         }
         assert!(matches!(
             hub.register_worker(
                 WorkerDescriptor::new(worker_id("worker-overflow"), 1, true),
-                offer(1),
+                offer(2),
             ),
             Err(TransportError::WorkerLimitReached)
         ));
@@ -1844,7 +2184,7 @@ mod tests {
         let hub = WorkerTransportHub::default();
         hub.register_worker(
             WorkerDescriptor::new(worker_id("worker-a"), 4, true).with_incarnation(9),
-            offer(1),
+            offer(2),
         )
         .expect("register worker");
 
@@ -1875,12 +2215,12 @@ mod tests {
         let hub = WorkerTransportHub::default();
         hub.register_worker(
             WorkerDescriptor::new(worker_id("worker-a"), 4, true).with_incarnation(9),
-            offer(1),
+            offer(2),
         )
         .expect("register authenticated worker");
         let router = hub.router(Arc::new(TestAuthenticator(Some(worker_id("worker-a")))));
 
-        let poll = serde_json::to_vec(&poll_request("worker-b", 1)).expect("serialize poll");
+        let poll = serde_json::to_vec(&poll_request("worker-b", 2)).expect("serialize poll");
         let poll_response = router
             .clone()
             .oneshot(request(poll))
