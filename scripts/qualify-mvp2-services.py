@@ -338,7 +338,7 @@ def host_service_address():
     return address
 
 
-def service_attempt_failed(base, service, latest):
+def service_attempt_retried(base, service, latest):
     status, _, response = request(base, "GET", f"/v1/jobs/{service}/service-attempts")
     latest.update(status=status, body=response)
     if status != 200:
@@ -347,7 +347,7 @@ def service_attempt_failed(base, service, latest):
         (
             attempt
             for attempt in response.get("serviceAttempts", [])
-            if (attempt.get("currentRun") or {}).get("state") == "failed"
+            if attempt.get("restartCount", 0) > 0
         ),
         None,
     )
@@ -496,13 +496,15 @@ def main():
 
                 service_program = root / "service.py"
                 service_program.write_text(SERVICE_PROGRAM, encoding="utf-8")
+                if conflict_port != service_ranges[0] + 1:
+                    raise RuntimeError("the reserved port does not match the first worker allocation")
                 create_service_revision(root, base, service_program, "port-conflict", "backend", 1)
                 deploy_service(base, "port-conflict", 1, create=True, key="mvp2-port-conflict-deploy")
                 latest_attempts = {}
                 try:
                     wait_until(
-                        "first service attempt to report the reserved port conflict",
-                        lambda: service_attempt_failed(base, "port-conflict", latest_attempts),
+                        "service attempt to retry after the reserved port conflict",
+                        lambda: service_attempt_retried(base, "port-conflict", latest_attempts),
                         timeout=8,
                         timings=result["timingsMs"],
                     )
