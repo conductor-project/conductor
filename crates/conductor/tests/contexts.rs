@@ -1,6 +1,9 @@
 use std::fs;
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_TEMP_CONFIG_HOME: AtomicU64 = AtomicU64::new(0);
 
 fn temp_config_home() -> std::path::PathBuf {
     let nonce = SystemTime::now()
@@ -8,8 +11,9 @@ fn temp_config_home() -> std::path::PathBuf {
         .expect("clock after Unix epoch")
         .as_nanos();
     let path = std::env::temp_dir().join(format!(
-        "conductor-context-test-{}-{nonce}",
-        std::process::id()
+        "conductor-context-test-{}-{nonce}-{}",
+        std::process::id(),
+        NEXT_TEMP_CONFIG_HOME.fetch_add(1, Ordering::Relaxed),
     ));
     fs::create_dir_all(&path).expect("create isolated config home");
     path
@@ -184,6 +188,9 @@ fn completions_follow_the_implemented_command_tree() {
     assert!(script.contains("conductor"));
     assert!(script.contains("context"));
     assert!(script.contains("operator"));
-    assert!(!script.contains("deployment <COMMAND>"));
+    assert!(script.contains("conductor,deployment"));
+    assert!(script.contains("conductor,run"));
+    assert!(script.contains("conductor,service"));
+    assert!(script.contains("conductor,diagnostics"));
     fs::remove_dir_all(config_home).expect("remove isolated context store");
 }

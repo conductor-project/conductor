@@ -199,9 +199,6 @@ fn checked_in_first_job_example_submits_waits_and_exposes_logs() {
             example.to_str().unwrap(),
             "--idempotency-key",
             "readme-first-job",
-            "--wait",
-            "--wait-timeout-seconds",
-            "5",
         ],
     );
     assert!(
@@ -211,12 +208,28 @@ fn checked_in_first_job_example_submits_waits_and_exposes_logs() {
     );
     let result = json_stdout(&submitted);
     let run_id = result["runId"].as_str().expect("run ID");
-    let logs = cli(
-        address,
-        &["logs", run_id, "--stream", "stdout", "--offset", "0"],
+    let waited = cli(address, &["wait", run_id, "--timeout-seconds", "5"]);
+    assert!(
+        waited.status.success(),
+        "{}",
+        String::from_utf8_lossy(&waited.stderr)
     );
+    assert_eq!(json_stdout(&waited)["state"], "succeeded");
+
+    let logs = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args(["run", "--server"])
+        .arg(format!("http://{address}"))
+        .args([
+            "logs", run_id, "--stream", "stdout", "--offset", "0", "--limit", "4096",
+        ])
+        .output()
+        .expect("read raw run logs");
     assert!(logs.status.success());
-    assert_eq!(json_stdout(&logs)["data"], "aGVsbG8gY29uZHVjdG9yCg==");
+    assert_eq!(logs.stdout, b"hello conductor\n");
+
+    let inspected = cli(address, &["inspect", run_id]);
+    assert!(inspected.status.success());
+    assert_eq!(json_stdout(&inspected)["state"], "succeeded");
     drop(agent);
 }
 
