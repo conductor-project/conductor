@@ -3,7 +3,7 @@ type: Runbook
 title: Configure host service discovery
 description: Route Conductor service DNS through host resolvers and roll resolver changes back safely.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: a739b4c20dd8e81ded656dfa7bb9859f48d73f9e
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../crates/conductor-api/src/dns.rs
@@ -18,7 +18,7 @@ sources:
 
 Conductor can expose service catalog records through an optional UDP and TCP DNS listener. The listener is disabled when `service_dns` is omitted. A loopback listener gets a loopback-only client range by default. A non-loopback listener must list explicit `allowedClients` CIDRs; the daemon rejects a non-loopback listener without them. The lower-level DNS listener rejects an empty client allowlist. The allowlist is an address filter, not authentication. Restrict it to workload hosts that need discovery.
 
-The default DNS suffix is `conductor.internal`. The stable FQDN is `<service>.default.service.<suffix>.`; `default` is the only supported namespace. A records contain advertised IPv4 addresses, AAAA records contain advertised IPv6 addresses, and named TCP ports are returned as SRV records. SRV is needed for dynamically assigned host ports. The [API service discovery reference](../crates/conductor-api/okf/service-discovery.md) documents record semantics, cache convergence, listener behavior, and the current SRV address/port association limitation.
+The default DNS suffix is `conductor.internal`. The stable FQDN is `<service>.default.service.<suffix>.`; `default` is the only supported namespace. A records contain advertised IPv4 addresses, AAAA records contain advertised IPv6 addresses, and named TCP ports are returned as SRV records. SRV is needed for dynamically assigned host ports. Each SRV target identifies its endpoint using the advertised IP and port; querying that target returns only the matching eligible address. Service-wide A/AAAA queries continue to aggregate all eligible replicas. The [API service discovery reference](../crates/conductor-api/okf/service-discovery.md) documents record semantics, cache convergence, listener behavior, and verification limits.
 
 For a single-host daemon, a loopback listener can use the configured default client range:
 

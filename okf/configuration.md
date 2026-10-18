@@ -3,7 +3,7 @@ type: Reference
 title: Conductor configuration and paths
 description: Strict JSON selects daemon roles, listeners, persistent state, worker identity, and optional host enforcement.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: a739b4c20dd8e81ded656dfa7bb9859f48d73f9e
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../crates/conductor/src/main.rs
@@ -78,6 +78,7 @@ uses its own `service_network` with those same camelCase network keys. Workers
 sharing one network use the same network-domain ID and disjoint ranges. The
 manager keeps logical port leases; it does not hold the workload's socket
 open, so the service process must bind the assigned port itself. See
-[`examples/manager.json`](../examples/manager.json). DNS SRV endpoint/address
-pairing has a known limitation tracked by [#118](https://github.com/conductor-project/conductor/issues/118);
-do not rely on endpoint-specific SRV placement until fixed.
+[`examples/manager.json`](../examples/manager.json). DNS SRV targets identify
+their replica by advertised IP and port; service-wide A/AAAA records continue
+to aggregate eligible replica addresses. See the [service discovery
+guide](service-discovery.md) for record behavior and verification scope.

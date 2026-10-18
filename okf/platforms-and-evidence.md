@@ -3,7 +3,7 @@ type: Reference
 title: Platform support and evidence
 description: Platform claims are scoped to source, tests, workflows, and the exact execution environment that produced evidence.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: a739b4c20dd8e81ded656dfa7bb9859f48d73f9e
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../.github/workflows/pr.yml
@@ -66,9 +66,13 @@ transport behavior only. Issue #117 was closed before this source revision; its
 rollout-unavailable accounting correction is included in the reviewed source.
 Issues #77 and #78, which proposed routed multi-host qualification, were
 cancelled; no routed deployment-owned Linux/worker/macOS testbed evidence is
-claimed here. Issue #118 (SRV target/address association) was open when this
-bundle was reviewed and remains a known issue; do not rely on DNS SRV answers
-for endpoint-specific address/port pairing until it is resolved and verified.
+claimed here. Issue #118's DNS record association fix is implemented: focused
+debug tests verify that each SRV target resolves only to its advertised
+address/port tuple, while service-wide A/AAAA remains aggregated. The tests and
+full workspace debug suite passed on the current macOS host; this is source and
+local-test evidence, not routed multi-host qualification, host resolver
+validation, or deployment reachability evidence. Issues #77 and #78 were
+cancelled, and no routed deployment-owned testbed evidence is available.
 
 Historical benchmark or qualification reports must retain their exact commit,
 OS, architecture, build profile, runner, workload, and command. Such reports
