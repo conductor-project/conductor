@@ -1,0 +1,9 @@
+{
+  "id": "mvp3-sleep-job",
+  "command": ["/bin/sleep", "30"],
+  "cwd": "/tmp",
+  "env": {},
+  "inheritEnv": false,
+  "timeoutMs": null,
+  "terminationGraceMs": 1000
+}
