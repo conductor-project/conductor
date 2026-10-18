@@ -350,6 +350,11 @@ fn process_backend(
                 {
                     protected.push(root.clone());
                 }
+                if config.cgroup_v2.enabled
+                    && let Some(lock_directory) = &config.cgroup_v2.ownership_lock_dir
+                {
+                    protected.push(lock_directory.clone());
+                }
                 protected
             },
             std::env::current_exe()?,
