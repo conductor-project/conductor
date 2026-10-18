@@ -3,11 +3,13 @@ type: Reference
 title: API authentication, request bounds, and operations
 description: Operator routes can require bearer authentication, while request size, handler concurrency, service watches, and output are bounded.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: 663bd0f
 source_reviewed_at: 2026-10-19
 sources:
-  - resource: ../src/lib.rs
+  - resource: ../src/server.rs
     title: Auth middleware, bounds, metrics, and readiness
+  - resource: ../src/client.rs
+    title: Client authentication and response bounds
   - resource: ../src/structs/bearer_token_authenticator.rs
     title: Token authentication
   - resource: ../src/structs/api_readiness.rs

@@ -50,7 +50,13 @@ for package in metadata["packages"]:
         errors.append(f"{manifest_path.relative_to(ROOT)} must inherit workspace lints")
     for dependency in package["dependencies"]:
         name = dependency["name"]
-        workspace_reference = re.search(rf"(?m)^\s*{re.escape(name)}\.workspace\s*=\s*true\s*$", manifest_text)
+        workspace_reference = re.search(
+            rf"(?m)^\s*{re.escape(name)}\.workspace\s*=\s*true\s*$",
+            manifest_text,
+        ) or re.search(
+            rf"(?m)^\s*{re.escape(name)}\s*=\s*\{{[^\n}}]*\bworkspace\s*=\s*true\b[^\n}}]*\}}\s*$",
+            manifest_text,
+        )
         if not workspace_reference:
             errors.append(f"{manifest_path.relative_to(ROOT)} must inherit centralized dependency {name}")
         if dependency["uses_default_features"]:
