@@ -695,10 +695,10 @@ fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit(
     let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     loop {
         let (status, body) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
-        if status == 429 {
+        if matches!(status, 408 | 429) {
             assert!(
                 Instant::now() < deadline,
-                "blocking work did not release its permits"
+                "timed-out or saturated run inspection did not recover"
             );
             thread::sleep(Duration::from_millis(20));
             continue;
@@ -718,9 +718,6 @@ fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit(
 #[test]
 fn timed_out_start_can_be_retried_with_the_same_idempotency_key() {
     let path = TempDir::new("timed-out-idempotent-start");
-    // Keep this deadline below SQLite's 250 ms busy timeout so the first
-    // request can time out while the test holds the manager database lock.
-    let (mut child, address) = start_with_request_timeout(&path, 200);
     let marker = path.join("started-once");
     let command = [
         "/bin/sh",
@@ -728,10 +725,22 @@ fn timed_out_start_can_be_retried_with_the_same_idempotency_key() {
         &format!("printf x >> '{}'", marker.display()),
     ];
     let job = job_json("timeout-start", &command);
+
+    // Register the job with the normal request budget so setup latency on a
+    // busy CI runner cannot consume the intentionally short timeout used by
+    // the idempotency retry portion of this test.
+    let config = write_config(&path, "all", "127.0.0.1:0", "");
+    let (mut setup, address) = start_config(config, None);
     assert_eq!(
         http(address, "POST", "/v1/jobs", Some("application/json"), &job).0,
         201
     );
+    signal(&setup, "INT");
+    wait_for_exit(&mut setup);
+
+    // Keep this deadline below SQLite's 250 ms busy timeout so the first run
+    // request can time out while the test holds the manager database lock.
+    let (mut child, address) = start_with_request_timeout(&path, 200);
 
     let lock = Connection::open(path.join("manager/manager.sqlite3")).unwrap();
     lock.execute_batch("BEGIN EXCLUSIVE;").unwrap();

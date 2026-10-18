@@ -10,7 +10,7 @@ does not imply equivalent enforcement across operating systems.
 | OS | Architecture | Status | Qualification evidence |
 | --- | --- | --- | --- |
 | Linux | x86_64 | Supported | Required Linux CI builds, lints, runs debug and release suites, and exercises real cgroup v2 and Landlock behavior. |
-| macOS | arm64 (Apple silicon) | Early baseline qualified; final issue #79 qualification pending | On macOS 27.0.1 arm64, dependency policy, formatting, all-target debug build, lint, and workspace debug tests passed (139 tests across 16 suites). Hosted Apple silicon PR CI run [39120735872](https://github.com/conductor-project/conductor/actions/runs/39120735872) passed. Release tests/build and inherited-descriptor qualification run after merge; final integrated runtime evidence follows #61 and #63. |
+| macOS | arm64 (Apple silicon) | Debug runtime qualification passed; post-merge release qualification pending | Apple silicon CI run [39129469759](https://github.com/conductor-project/conductor/actions/runs/39129469759) passed dependency policy, formatting, all-target build, lint, and the full debug workspace suite. The suite starts two separate native worker processes, authenticates them to one manager over HTTPS, checks their distinct state and listeners, verifies shared manager configured host capacity, runs a native job, retrieves its output, and shuts both workers down. Release tests/build and inherited-descriptor qualification run after merge. |
 | macOS | x86_64 (Intel) | Not qualified | Intel macOS CI is outside the current qualification scope. |
 | Linux | arm64 | Not yet qualified | No required CI runner currently exercises this target. |
 
@@ -43,11 +43,11 @@ executable is launched. Resource requests on macOS are not kernel-enforced.
 
 The macOS tests establish local process lifecycle behavior only. They do not
 qualify independent-host failure isolation or cross-host networking; those
-require the separate MVP2 multi-host qualification in issue #77. The manager
-plus two worker authenticated-transport demonstration is tracked with runtime
-composition in issue #61. Host resource inventory and refusal to place work on
-incompatible workers are tracked in issues #66 and #67. These remain explicit
-qualification gaps until their implementation and macOS evidence are complete.
+require the separate MVP2 multi-host qualification in issue #77. The shared
+host budget in the two-worker test is manager configured scheduling capacity,
+not measured machine capacity or kernel enforcement. Host resource inventory
+and refusal to place work on incompatible workers are covered by issues #66
+and #67; actual macOS resource enforcement remains unavailable.
 
 Conductor does not inspect ELF or Mach-O headers before launch. It passes the
 configured command to the native process backend and lets the OS loader decide

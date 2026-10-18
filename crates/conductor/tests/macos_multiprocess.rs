@@ -11,7 +11,8 @@ use axum::routing::get;
 use axum::{Json, Router};
 use conductor_core::{
     JobId, JobSpec, LogStream, ProtocolOffer, ProtocolVersionRange, ReadRunLogs, RunId, RunSpec,
-    RunState, StartRun, WorkerDescriptor, WorkerId, WorkerInventoryPage, WorkerStatus,
+    RunState, StartRun, WorkerDescriptor, WorkerId, WorkerInventoryPage, WorkerMetadata,
+    WorkerResourceCapacity, WorkerStatus,
 };
 use conductor_manager::{SqliteJobRepository, WorkerPort};
 use conductor_process::HostProcessBackend;
@@ -218,6 +219,9 @@ async fn one_manager_authenticates_and_runs_on_two_native_worker_processes() {
     ));
     let hub = WorkerTransportHub::default();
     let offer = protocol_offer();
+    let host_id = WorkerId::new("macos-shared-host").expect("shared host id");
+    let host_capacity = WorkerResourceCapacity::new(16_000, 16 * 1024 * 1024 * 1024)
+        .expect("configured shared host capacity");
 
     let workers = ["mac-worker-a", "mac-worker-b"];
     let mut remote_ports = Vec::new();
@@ -227,8 +231,11 @@ async fn one_manager_authenticates_and_runs_on_two_native_worker_processes() {
     for worker_name in workers {
         let worker_id = WorkerId::new(worker_name).expect("worker id");
         let descriptor = WorkerDescriptor::new(worker_id.clone(), 2, true).with_incarnation(1);
+        let metadata =
+            WorkerMetadata::new(host_id.clone(), Some(host_capacity), Default::default())
+                .expect("manager owned shared-host metadata");
         let remote = hub
-            .register_worker(descriptor, offer.clone())
+            .register_worker_with_metadata(descriptor, offer.clone(), metadata)
             .expect("register remote worker session");
         let worker_directory = directory.0.join(worker_name);
         fs::create_dir_all(&worker_directory).expect("create worker directory");
@@ -333,6 +340,11 @@ async fn one_manager_authenticates_and_runs_on_two_native_worker_processes() {
         helper_pids,
         "reported worker PIDs must identify the spawned helper processes"
     );
+    for port in &remote_ports {
+        let status = port.status().expect("read remote worker status");
+        assert_eq!(status.resource_domain_id(), Some(&host_id));
+        assert_eq!(status.resource_domain_capacity(), Some(host_capacity));
+    }
 
     inject_authenticated_worker_identity_mismatch(
         &helper_configs[0],
