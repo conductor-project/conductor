@@ -5,6 +5,9 @@ ordering. It builds on the identities and allocation states in
 [the MVP2 execution model](mvp2-execution-model.md). It does not define a
 network transport or claim exactly-once execution.
 
+Partition, timeout, and uncertain-allocation decisions are specified in
+[MVP2 disconnect policies](mvp2-disconnect-policies.md).
+
 ## Fencing identities
 
 An assignment is identified by `(allocationId, assignmentGeneration,
