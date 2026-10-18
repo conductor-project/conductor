@@ -3,7 +3,7 @@ type: Runbook
 title: Operate Conductor with the CLI
 description: Select named manager connection contexts, submit and manage jobs and revisions, observe and control runs, follow bounded logs, inspect workers and services, mutate desired state safely, drain workers, and page history.
 status: stable
-source_revision: 23498bc4c3e95665cde4c2e4115c0a5b45aa182d
+source_revision: 122a219e9d6dad1755fb1c5664923e4ece5d27e1
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/operator_cli.rs
@@ -14,6 +14,8 @@ sources:
     title: Run lifecycle and log commands
   - resource: ../src/deployment_cli.rs
     title: Conditional deployment mutations and rollout waiting
+  - resource: ../src/worker_cli.rs
+    title: Worker inspection and drain lifecycle
   - resource: ../src/contexts.rs
     title: Named context configuration
   - resource: ../../conductor-api/src/lib.rs
@@ -24,6 +26,8 @@ sources:
     title: Run lifecycle and log CLI integration coverage
   - resource: ../../conductor/tests/deployment_cli.rs
     title: Deployment CLI integration coverage
+  - resource: ../../conductor/tests/worker_cli.rs
+    title: Worker CLI integration coverage
 ---
 
 # Connect and inspect
@@ -157,23 +161,35 @@ conductor deployment delete frontend --generation 6 \
   --idempotency-key frontend-delete-1 --wait
 ```
 
-# Drain a worker and inspect runs
+# Inspect workers and manage drains
+
+`worker list` and `worker inspect WORKER_ID` report capacity, available slots,
+connectivity freshness, readiness and drain state. A disconnected worker stays
+in the inventory but is marked unavailable or stale. An empty worker inventory
+is a successful empty result.
 
 Draining excludes the worker from new placements and withdraws its service
-catalog endpoints. Completion can be blocked while a service replacement lacks
-capacity or an old run's termination remains unconfirmed. A completed drain
-must be explicitly cleared before the worker can be scheduled again.
+catalog endpoints. Existing runs are not guaranteed to migrate or terminate;
+service replacements may be pending if no eligible capacity is available.
+`drain` acceptance is distinct from completion. Waits are bounded, and timeout
+or Ctrl-C stops observation while leaving the accepted drain in place. A
+completed drain must be explicitly cleared before the worker can be scheduled
+again.
 
 ```sh
-conductor operator --token-file ./operator-token drain start worker-east \
-  --grace-period-seconds 30
-conductor operator --token-file ./operator-token drain status worker-east
-conductor operator --token-file ./operator-token drain clear worker-east
+conductor worker --token-file ./operator-token list
+conductor worker --token-file ./operator-token inspect worker-east
+conductor worker --token-file ./operator-token drain worker-east \
+  --grace-period-seconds 30 --wait --wait-timeout-seconds 300
+conductor worker --token-file ./operator-token drain-status worker-east
+conductor worker --token-file ./operator-token drain-wait worker-east \
+  --timeout-seconds 300
+conductor worker --token-file ./operator-token undrain worker-east
 conductor run list --job-id frontend --state unknown --limit 25
 ```
 
 Run-list pages expose `nextCursor`; pass it with `--cursor` for the next page.
-Use `drain clear` only after status reports `completed`.
+Use `worker undrain` only after drain status reports `completed`.
 
 # Retrieve logs
 

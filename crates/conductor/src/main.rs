@@ -4,6 +4,7 @@ mod job_cli;
 mod operator_cli;
 mod run_cli;
 mod state_lock;
+mod worker_cli;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -58,6 +59,8 @@ enum Commands {
     Run(run_cli::RunArgs),
     /// Apply and manage service deployments.
     Deployment(deployment_cli::DeploymentArgs),
+    /// Inspect workers and manage graceful worker drains.
+    Worker(worker_cli::WorkerArgs),
     /// Generate shell completion scripts for the implemented CLI commands.
     Completions {
         #[arg(value_enum)]
@@ -338,6 +341,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Commands::Job(args) => return Ok(job_cli::run(args)),
         Commands::Run(args) => return Ok(run_cli::run(args)),
         Commands::Deployment(args) => return Ok(deployment_cli::run(args)),
+        Commands::Worker(args) => return Ok(worker_cli::run(args)),
         Commands::Completions { shell } => {
             let mut command = Cli::command();
             clap_complete::generate(shell, &mut command, "conductor", &mut std::io::stdout());
