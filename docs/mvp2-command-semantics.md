@@ -161,3 +161,18 @@ Report records through an acknowledged sequence may be compacted while keeping
 the watermark. Command IDs and report sequence values are never reused after
 compaction. Until a versioned persistence and compaction protocol is defined,
 implementations keep these records; no fixed retention duration is implied.
+
+The worker SQLite store records command acceptance before dispatching the
+operation, then stores its immutable result and per-incarnation report sequence
+in one transaction. A repeated command ID with identical contents returns the
+stored result; changed contents are rejected. The report remains pending until
+the manager acknowledges its sequence. Worker restart advances the incarnation
+and recovers accepted commands before polling: an existing run record is
+returned as evidence, while an accepted start with no run record is reported
+unavailable and is never blindly relaunched under its old incarnation. Reports
+from prior incarnations are replayed before the worker polls for new commands.
+
+`JobSpec.executableDigest` is an optional, operator-provisioned SHA-256 digest.
+The worker streams the executable through a fixed-size buffer immediately
+before launch. A mismatch produces a failed observation without calling the
+execution backend. When the digest is absent, legacy MVP1 behavior remains.

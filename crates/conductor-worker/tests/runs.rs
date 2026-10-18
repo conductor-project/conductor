@@ -9,7 +9,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use conductor_core::{
-    JobId, JobSpec, RunFailureReason, RunId, RunSpec, RunState, StartRun, WorkerId,
+    CommandEnvelope, CommandId, JobId, JobSpec, RunFailureReason, RunId, RunSpec, RunState,
+    StartRun, WorkerCommand, WorkerId,
 };
 use conductor_worker::{ExecutionBackend, WorkerError, WorkerService};
 use rusqlite::Connection;
@@ -189,7 +190,7 @@ fn version_one_schema_migration_preserves_run_history_and_log_metadata() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
         )
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     assert_eq!(migrated_spec, spec_json);
     assert_eq!(migrated_observation, observation_json);
     assert_eq!((state.as_str(), revision), ("succeeded", 2));
@@ -227,7 +228,7 @@ fn future_worker_schema_fails_with_version_and_keeps_existing_data() {
     .unwrap();
     assert_eq!(
         error.to_string(),
-        "worker database schema version 77 is newer than supported version 3"
+        "worker database schema version 77 is newer than supported version 4"
     );
     let connection = Connection::open(database).unwrap();
     let value: String = connection
@@ -402,6 +403,203 @@ fn worker_acceptance_is_deduplicated_and_terminal_observations_survive_reopen() 
     assert_eq!(persisted, terminal);
     assert_eq!(persisted.worker_incarnation(), first_incarnation);
     assert_eq!(persisted.revision(), 4);
+}
+
+#[test]
+fn command_ids_persist_acceptance_results_report_order_and_acknowledgements() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 2, Arc::clone(&backend));
+    let spec = run("journaled", job("journaled", vec!["/bin/true".into()]));
+    let envelope = CommandEnvelope {
+        command_id: CommandId::new("command-journaled").unwrap(),
+        target_worker_id: service.descriptor().worker_id().clone(),
+        target_worker_incarnation: service.descriptor().incarnation(),
+        command: WorkerCommand::StartRun(Box::new(StartRun::new(spec.clone()))),
+    };
+
+    assert_eq!(service.accept_command(&envelope), Ok(None));
+    assert_eq!(service.accept_command(&envelope), Ok(None));
+    let observation = service.start(StartRun::new(spec)).unwrap();
+    let result_json = serde_json::to_string(&observation).unwrap();
+    let report = service.complete_command(&envelope, &result_json).unwrap();
+    assert_eq!(report.report_sequence, 1);
+    assert_eq!(
+        service.complete_command(&envelope, &result_json),
+        Ok(report.clone())
+    );
+    assert_eq!(service.accept_command(&envelope), Ok(Some(report.clone())));
+    let inspection = CommandEnvelope {
+        command_id: CommandId::new("command-inspection").unwrap(),
+        target_worker_id: service.descriptor().worker_id().clone(),
+        target_worker_incarnation: service.descriptor().incarnation(),
+        command: WorkerCommand::InspectRun(conductor_core::InspectRun::new(
+            RunId::new("journaled").unwrap(),
+        )),
+    };
+    service.accept_command(&inspection).unwrap();
+    let second_report = service
+        .complete_command(&inspection, r#"{"kind":"inspection","payload":null}"#)
+        .unwrap();
+    assert_eq!(second_report.report_sequence, 2);
+    assert_eq!(
+        service.pending_reports(),
+        Ok(vec![report.clone(), second_report.clone()])
+    );
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
+
+    let changed = CommandEnvelope {
+        command: WorkerCommand::StartRun(Box::new(StartRun::new(run(
+            "different-run",
+            job("different-run", vec!["/bin/true".into()]),
+        )))),
+        ..envelope.clone()
+    };
+    assert_eq!(
+        service.accept_command(&changed),
+        Err(WorkerError::RunConflict)
+    );
+    service
+        .acknowledge_report(
+            &report.command_id,
+            report.worker_incarnation,
+            report.report_sequence,
+        )
+        .unwrap();
+    assert_eq!(
+        service.pending_reports().unwrap(),
+        vec![second_report.clone()]
+    );
+    service
+        .acknowledge_report(
+            &second_report.command_id,
+            second_report.worker_incarnation,
+            second_report.report_sequence,
+        )
+        .unwrap();
+    assert!(service.pending_reports().unwrap().is_empty());
+    drop(service);
+
+    let reopened = open_worker(&directory, 2, backend);
+    let connection = Connection::open(directory.0.join("worker.sqlite3")).unwrap();
+    let (state, sequence): (String, i64) = connection
+        .query_row(
+            "SELECT state, report_sequence FROM worker_commands WHERE command_id = 'command-journaled'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(state, "acknowledged");
+    assert_eq!(sequence, 1);
+    let second_state: String = connection
+        .query_row(
+            "SELECT state FROM worker_commands WHERE command_id = 'command-inspection'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(second_state, "acknowledged");
+    assert!(reopened.pending_reports().unwrap().is_empty());
+}
+
+#[test]
+fn accepted_command_without_a_run_is_not_replayed_after_worker_restart() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 1, Arc::clone(&backend));
+    let spec = run(
+        "not-launched",
+        job("not-launched", vec!["/bin/true".into()]),
+    );
+    let envelope = CommandEnvelope {
+        command_id: CommandId::new("command-before-launch").unwrap(),
+        target_worker_id: service.descriptor().worker_id().clone(),
+        target_worker_incarnation: service.descriptor().incarnation(),
+        command: WorkerCommand::StartRun(Box::new(StartRun::new(spec))),
+    };
+    service.accept_command(&envelope).unwrap();
+    drop(service);
+
+    let restarted = open_worker(&directory, 1, Arc::clone(&backend));
+    assert_ne!(
+        restarted.descriptor().incarnation(),
+        envelope.target_worker_incarnation
+    );
+    assert_eq!(
+        restarted.accept_command(&envelope),
+        Err(WorkerError::WorkerMismatch)
+    );
+    assert_eq!(restarted.accepted_commands().unwrap(), vec![envelope]);
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 0);
+    let run_count: i64 = Connection::open(directory.0.join("worker.sqlite3"))
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM runs", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(run_count, 0);
+}
+
+#[test]
+fn unacknowledged_reports_survive_a_worker_restart_with_their_original_incarnation() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 1, Arc::clone(&backend));
+    let envelope = CommandEnvelope {
+        command_id: CommandId::new("command-unacknowledged").unwrap(),
+        target_worker_id: service.descriptor().worker_id().clone(),
+        target_worker_incarnation: service.descriptor().incarnation(),
+        command: WorkerCommand::InspectRun(conductor_core::InspectRun::new(
+            RunId::new("missing-run").unwrap(),
+        )),
+    };
+    service.accept_command(&envelope).unwrap();
+    let report = service
+        .complete_command(&envelope, r#"{"kind":"inspection","payload":null}"#)
+        .unwrap();
+    drop(service);
+
+    let restarted = open_worker(&directory, 1, backend);
+    assert_ne!(
+        restarted.descriptor().incarnation(),
+        report.worker_incarnation
+    );
+    assert_eq!(restarted.pending_reports().unwrap(), vec![report.clone()]);
+    restarted
+        .acknowledge_report(
+            &report.command_id,
+            report.worker_incarnation,
+            report.report_sequence,
+        )
+        .unwrap();
+    assert!(restarted.pending_reports().unwrap().is_empty());
+}
+
+#[test]
+fn executable_digest_mismatch_fails_without_spawning_the_workload() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 1, Arc::clone(&backend));
+    let marker = directory.0.join("must-not-exist");
+    let job = job(
+        "digest-mismatch",
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("printf launched > {}", marker.display()),
+        ],
+    )
+    .with_executable_digest(Some(
+        conductor_core::ExecutableDigest::sha256("0".repeat(64)).unwrap(),
+    ));
+    let observation = service
+        .start(StartRun::new(run("digest-mismatch", job)))
+        .unwrap();
+    assert_eq!(observation.state(), RunState::Failed);
+    assert_eq!(
+        observation.failure_reason(),
+        Some(RunFailureReason::ExecutableDigestMismatch)
+    );
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 0);
+    assert!(!marker.exists());
 }
 
 #[test]

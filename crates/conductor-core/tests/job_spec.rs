@@ -38,6 +38,24 @@ fn job_spec_applies_defaults_and_serializes_canonically() {
 }
 
 #[test]
+fn job_spec_accepts_and_preserves_an_operator_provisioned_executable_digest() {
+    let digest = "a".repeat(64);
+    let input = format!(
+        r#"{{"id":"verified","command":["/usr/bin/true"],"cwd":"/tmp","executableDigest":{{"algorithm":"sha256","value":"{digest}"}}}}"#
+    );
+    let job: JobSpec = serde_json::from_str(&input).expect("valid executable digest");
+    assert_eq!(job.executable_digest().unwrap().value(), digest);
+    let serialized = serde_json::to_string(&job).expect("serialize executable digest");
+    assert!(serialized.contains(&format!(
+        r#""executableDigest":{{"algorithm":"sha256","value":"{digest}"}}"#
+    )));
+    assert_eq!(serde_json::from_str::<JobSpec>(&serialized).unwrap(), job);
+
+    let invalid = input.replace(&digest, &"A".repeat(64));
+    assert!(serde_json::from_str::<JobSpec>(&invalid).is_err());
+}
+
+#[test]
 fn job_spec_validates_all_process_inputs_and_numeric_bounds() {
     let valid = r#"{"id":"job","command":["/usr/bin/true"],"cwd":"/tmp"}"#;
     let cases = [

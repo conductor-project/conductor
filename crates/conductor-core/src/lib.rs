@@ -351,6 +351,7 @@ pub enum RunFailureReason {
     SignalTerminated,
     CapacityRejected,
     BackendFailure,
+    ExecutableDigestMismatch,
     OutcomeUnknown,
 }
 
@@ -769,6 +770,8 @@ pub struct JobSpec {
     resource_limits: ResourceLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     filesystem_policy: Option<FilesystemPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    executable_digest: Option<ExecutableDigest>,
 }
 
 #[derive(Deserialize)]
@@ -789,6 +792,8 @@ struct RawJobSpec {
     resource_limits: ResourceLimits,
     #[serde(default)]
     filesystem_policy: Option<FilesystemPolicy>,
+    #[serde(default)]
+    executable_digest: Option<ExecutableDigest>,
 }
 
 /// An immutable selection of administrator-approved filesystem grants.
@@ -945,6 +950,7 @@ impl JobSpec {
             termination_grace_ms,
             resource_limits: ResourceLimits::default(),
             filesystem_policy: None,
+            executable_digest: None,
         })
     }
 
@@ -998,6 +1004,17 @@ impl JobSpec {
     pub fn filesystem_policy(&self) -> Option<&FilesystemPolicy> {
         self.filesystem_policy.as_ref()
     }
+
+    /// Attach an operator-provisioned executable digest. Workers verify it
+    /// immediately before launching the configured executable.
+    pub fn with_executable_digest(mut self, digest: Option<ExecutableDigest>) -> Self {
+        self.executable_digest = digest;
+        self
+    }
+
+    pub fn executable_digest(&self) -> Option<&ExecutableDigest> {
+        self.executable_digest.as_ref()
+    }
 }
 
 impl TryFrom<RawJobSpec> for JobSpec {
@@ -1015,6 +1032,7 @@ impl TryFrom<RawJobSpec> for JobSpec {
         )?
         .with_resource_limits(raw.resource_limits)?
         .with_filesystem_policy(raw.filesystem_policy)
+        .map(|job| job.with_executable_digest(raw.executable_digest))
     }
 }
 
