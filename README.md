@@ -125,6 +125,47 @@ deletion requires no active or unresolved runs and keeps the ID reserved.
 `run logs --follow` writes exact log bytes to stdout. Add `--output json` to
 emit base64 JSON lines with offsets and truncation metadata instead.
 
+## Deploy and manage a service
+
+Register a job definition, create immutable service revisions, then apply a
+deployment request. The checked-in example uses `/bin/sleep` to keep each
+replica alive; it does not serve application traffic. A rollout wait confirms
+the manager reports the requested state, but does not guarantee that every
+external client has observed the change. Before creating either checked-in
+service revision, set its `executableDigest.value` to the SHA-256 digest of
+`/bin/sleep` on the target worker (for example, get it with
+`shasum -a 256 /bin/sleep`).
+
+```sh
+./target/debug/conductor job register examples/cli-service-job.json
+./target/debug/conductor job revision create mvp3-demo-service \
+  examples/cli-service-revision.json --idempotency-key service-revision-1
+./target/debug/conductor job revision create mvp3-demo-service \
+  examples/cli-service-revision-v2.json --idempotency-key service-revision-2
+./target/debug/conductor deployment apply mvp3-demo-service \
+  examples/cli-deployment.json --idempotency-key service-deploy-1 \
+  --wait --wait-timeout-seconds 120 --output json
+./target/debug/conductor deployment inspect mvp3-demo-service --output json
+./target/debug/conductor deployment apply mvp3-demo-service \
+  examples/cli-deployment-v2.json --generation 1 \
+  --idempotency-key service-deploy-2 --wait --wait-timeout-seconds 120
+./target/debug/conductor deployment rollback mvp3-demo-service \
+  --revision 1 --generation 2 --idempotency-key service-rollback-1 \
+  --wait --wait-timeout-seconds 120
+./target/debug/conductor deployment scale mvp3-demo-service \
+  --replicas 1 --generation 3 --idempotency-key service-scale-1 --wait
+./target/debug/conductor deployment delete mvp3-demo-service \
+  --generation 4 --idempotency-key service-delete-1 --wait
+```
+
+Each mutation requires a fresh idempotency key and an expected generation for
+updates. Read the generation returned by the preceding command or inspection
+before the next mutation; stale generations return a conflict and require
+operator review. A rollout timeout or Ctrl-C leaves the accepted desired state
+in place. Repeat the wait or inspect status to continue observing it. Rollback
+selects a revision number explicitly; suspension retains the desired replica
+count, and delete keeps deployment history after stopping instances.
+
 Deletion preserves an ID reservation and does not delete persistent manager or
 worker state. Do not delete the state directories as a routine cleanup step.
 

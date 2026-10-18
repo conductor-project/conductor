@@ -1,0 +1,27 @@
+{
+  "definition": {
+    "id": "mvp3-demo-service",
+    "command": ["/bin/sleep", "300"],
+    "cwd": "/tmp",
+    "env": {},
+    "inheritEnv": false,
+    "timeoutMs": null,
+    "terminationGraceMs": 5000
+  },
+  "workload": {
+    "kind": "service",
+    "identity": {
+      "namespace": "default",
+      "name": "mvp3-demo-service"
+    }
+  },
+  "executableDigest": {
+    "algorithm": "sha256",
+    "value": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "executionRequirements": {},
+  "resourceRequest": {
+    "cpuMillis": 250,
+    "memoryBytes": 268435456
+  }
+}
