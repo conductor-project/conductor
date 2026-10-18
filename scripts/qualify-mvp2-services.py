@@ -224,7 +224,8 @@ def wait_manager(binary, config, log_path, cwd):
     deadline = time.monotonic() + READY_TIMEOUT
     while time.monotonic() < deadline:
         if process.child.poll() is not None:
-            raise RuntimeError(f"manager exited early; see {log_path}")
+            detail = startup_failure_detail(log_path)
+            raise RuntimeError(f"manager exited early: {detail}")
         try:
             lines = Path(log_path).read_text(errors="replace").splitlines()
             event = next((json.loads(line) for line in lines if '"event":"agent_started"' in line), None)
@@ -237,7 +238,30 @@ def wait_manager(binary, config, log_path, cwd):
             pass
         time.sleep(0.05)
     process.terminate()
-    raise TimeoutError(f"manager did not become ready within {READY_TIMEOUT:g}s; see {log_path}")
+    detail = startup_failure_detail(log_path)
+    raise TimeoutError(f"manager did not become ready within {READY_TIMEOUT:g}s: {detail}")
+
+
+def startup_failure_detail(log_path):
+    try:
+        lines = Path(log_path).read_text(errors="replace").splitlines()
+    except OSError:
+        return "no process log was written"
+    for line in reversed(lines):
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("severity") == "error" or event.get("event") == "startup_failed":
+            return json.dumps(
+                {
+                    "component": event.get("component"),
+                    "event": event.get("event"),
+                    "message": event.get("message"),
+                },
+                sort_keys=True,
+            )
+    return "no structured startup failure was logged"
 
 
 def wait_workers(base, wanted, timings=None):
