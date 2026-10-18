@@ -192,6 +192,56 @@ run history persist. A daemon restart can leave an ambiguous run in `unknown`;
 Conductor does not automatically replay it. See
 [operations and recovery](okf/operations-and-recovery.md).
 
+## Configure operator connections
+
+The operator CLI supports named connection contexts. Contexts store the manager
+URL and references to optional token and CA files; token contents are never
+copied into the context store. Context files live below
+`$XDG_CONFIG_HOME/conductor` or `$HOME/.config/conductor` and are restricted to
+the current user.
+
+For local loopback access, create and select a context without a token:
+
+```sh
+./target/debug/conductor context create local --server http://127.0.0.1:8080
+./target/debug/conductor context use local
+./target/debug/conductor context list
+```
+
+Context commands use concise human output by default. Add `--output json` to
+any context subcommand to get machine-readable results, for example:
+
+```sh
+./target/debug/conductor context list --output json
+./target/debug/conductor context show local --output json
+```
+
+For a remote TLS endpoint, provide a protected token file and, when needed, a
+CA certificate file:
+
+```sh
+./target/debug/conductor context create production \
+  --server https://manager.example.net \
+  --token-file /etc/conductor/operator-token \
+  --ca-file /etc/conductor/manager-ca.pem \
+  --timeout-seconds 10
+./target/debug/conductor context show production
+./target/debug/conductor operator --context production workers list
+./target/debug/conductor operator --context production --output json workers list
+./target/debug/conductor completions zsh
+```
+
+The `--context` selection can be overridden field by field with explicit
+`--server`, `--token-file`, `--ca-file`, and `--timeout-seconds` options.
+Without an explicit context, Conductor uses the selected default; without a
+stored default, `operator` uses local loopback and does not require a dummy
+token. Plain HTTP to non-loopback hosts is rejected. Use
+`conductor context delete NAME` to remove a saved context. The existing
+`operator` command remains available while resource-oriented CLI commands are
+added incrementally. Operator responses default to concise human text; use
+`--output json` for JSON output. `conductor completions SHELL` generates
+completion scripts for Bash, Elvish, Fish, PowerShell, and Zsh.
+
 ## Next steps
 
 - [Keep Conductor running and configure separate roles](okf/self-hosting.md)

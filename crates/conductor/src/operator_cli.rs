@@ -15,16 +15,33 @@ use zeroize::{Zeroize, Zeroizing};
 #[derive(Debug, Args)]
 pub struct OperatorArgs {
     /// Manager API URL. Plain HTTP is allowed only for loopback addresses.
-    #[arg(long, default_value = "http://127.0.0.1:8080")]
-    server: String,
+    #[arg(long)]
+    server: Option<String>,
+    /// Named connection context (otherwise the selected default context is used).
+    #[arg(long)]
+    context: Option<String>,
     /// Protected file containing the operator bearer token.
     #[arg(long)]
-    token_file: PathBuf,
+    token_file: Option<PathBuf>,
+    /// PEM CA certificate used to verify the server TLS certificate.
+    #[arg(long)]
+    ca_file: Option<PathBuf>,
     /// Per-request timeout in seconds.
-    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..=300))]
-    timeout_seconds: u64,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=300))]
+    timeout_seconds: Option<u64>,
+    /// Output format for API responses.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Human)]
+    output: OutputFormat,
     #[command(subcommand)]
     command: OperatorCommand,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+#[value(rename_all = "lower")]
+enum OutputFormat {
+    #[default]
+    Human,
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -183,6 +200,7 @@ impl LogStreamArg {
 struct OperatorClient {
     client: reqwest::Client,
     base_url: Url,
+    output: OutputFormat,
 }
 
 struct ResponseData {
@@ -191,24 +209,88 @@ struct ResponseData {
     body: Vec<u8>,
 }
 
+struct EffectiveConnection {
+    server: String,
+    token_file: Option<PathBuf>,
+    ca_file: Option<PathBuf>,
+    timeout_seconds: u64,
+}
+
+fn effective_connection(
+    server: Option<&str>,
+    token_file: Option<&PathBuf>,
+    ca_file: Option<&PathBuf>,
+    timeout_seconds: Option<u64>,
+    context: Option<crate::contexts::ConnectionContext>,
+) -> EffectiveConnection {
+    EffectiveConnection {
+        server: server
+            .map(str::to_owned)
+            .or_else(|| context.as_ref().map(|context| context.server_url.clone()))
+            .unwrap_or_else(|| "http://127.0.0.1:8080".to_owned()),
+        token_file: token_file.cloned().or_else(|| {
+            context
+                .as_ref()
+                .and_then(|context| context.token_file.clone())
+        }),
+        ca_file: ca_file
+            .cloned()
+            .or_else(|| context.as_ref().and_then(|context| context.ca_file.clone())),
+        timeout_seconds: timeout_seconds
+            .or_else(|| context.map(|context| context.timeout_seconds))
+            .unwrap_or(10),
+    }
+}
+
 impl OperatorClient {
     fn new(args: &OperatorArgs) -> Result<Self, String> {
-        let base_url = parse_server_url(&args.server)?;
-        let mut token = read_operator_token(&args.token_file)?;
-        let token_text = std::str::from_utf8(&token)
-            .map_err(|_| "operator token file contains an invalid token".to_owned())?;
-        let authorization = HeaderValue::from_str(&format!("Bearer {token_text}"))
-            .map_err(|_| "operator token file contains an invalid token".to_owned())?;
-        token.zeroize();
         let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, authorization);
-        let client = reqwest::Client::builder()
+        let context =
+            crate::contexts::resolve(args.context.as_deref())?.map(|(_, context)| context);
+        let effective = effective_connection(
+            args.server.as_deref(),
+            args.token_file.as_ref(),
+            args.ca_file.as_ref(),
+            args.timeout_seconds,
+            context,
+        );
+        let base_url = parse_server_url(&effective.server)?;
+        let token_file = effective.token_file.as_ref();
+        let is_loopback = base_url.host_str().is_some_and(is_loopback_host);
+        if !is_loopback && token_file.is_none() {
+            return Err(
+                "authenticated remote use requires --token-file or a context token file".to_owned(),
+            );
+        }
+        if let Some(token_file) = token_file {
+            let mut token = read_operator_token(token_file)?;
+            let token_text = std::str::from_utf8(&token)
+                .map_err(|_| "operator token file contains an invalid token".to_owned())?;
+            let authorization = HeaderValue::from_str(&format!("Bearer {token_text}"))
+                .map_err(|_| "operator token file contains an invalid token".to_owned())?;
+            token.zeroize();
+            headers.insert(AUTHORIZATION, authorization);
+        }
+        let ca_file = effective.ca_file.as_ref();
+        let mut builder = reqwest::Client::builder()
             .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(args.timeout_seconds))
+            .timeout(Duration::from_secs(effective.timeout_seconds));
+        if let Some(ca_file) = ca_file {
+            let pem = std::fs::read(ca_file)
+                .map_err(|_| "configured CA certificate file could not be read".to_owned())?;
+            let certificate = reqwest::Certificate::from_pem(&pem)
+                .map_err(|_| "configured CA certificate file is invalid".to_owned())?;
+            builder = builder.add_root_certificate(certificate);
+        }
+        let client = builder
             .build()
             .map_err(|_| "operator HTTP client could not be configured".to_owned())?;
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            output: args.output,
+        })
     }
 
     async fn request(
@@ -254,6 +336,25 @@ impl OperatorClient {
             body,
         })
     }
+
+    fn print_response(&self, response: ResponseData) -> Result<(), String> {
+        let value = parse_json_response(response)?;
+        self.write_value(&value)
+    }
+
+    fn write_value(&self, value: &Value) -> Result<(), String> {
+        match self.output {
+            OutputFormat::Json => write_json(value),
+            OutputFormat::Human => {
+                let rendered = format_human(value);
+                let mut stdout = io::stdout().lock();
+                stdout
+                    .write_all(rendered.as_bytes())
+                    .and_then(|()| stdout.write_all(b"\n"))
+                    .map_err(|_| "operator response could not be written to stdout".to_owned())
+            }
+        }
+    }
 }
 
 pub fn run(args: OperatorArgs) -> ExitCode {
@@ -283,7 +384,7 @@ async fn execute(client: &OperatorClient, command: OperatorCommand) -> Result<()
                 let response = client
                     .request(Method::GET, "v1/workers", &[], &[], None)
                     .await?;
-                print_json_response(response)
+                client.print_response(response)
             }
             WorkerCommand::Inspect { worker_id } => {
                 let worker_id =
@@ -297,7 +398,7 @@ async fn execute(client: &OperatorClient, command: OperatorCommand) -> Result<()
                         None,
                     )
                     .await?;
-                print_json_response(response)
+                client.print_response(response)
             }
         },
         OperatorCommand::Service { command } => match command {
@@ -328,7 +429,7 @@ async fn execute(client: &OperatorClient, command: OperatorCommand) -> Result<()
                     )
                     .await?;
                 let attempts = parse_json_response(attempts)?;
-                write_json(&json!({
+                client.write_value(&json!({
                     "jobId": job_id.as_str(),
                     "etag": etag,
                     "deployment": deployment,
@@ -376,7 +477,7 @@ async fn execute(client: &OperatorClient, command: OperatorCommand) -> Result<()
                     })),
                 )
                 .await?;
-            print_json_response(response)
+            client.print_response(response)
         }
         OperatorCommand::Scale {
             job_id,
@@ -395,7 +496,7 @@ async fn execute(client: &OperatorClient, command: OperatorCommand) -> Result<()
                     Some(json!({ "replicas": replicas })),
                 )
                 .await?;
-            print_json_response(response)
+            client.print_response(response)
         }
         OperatorCommand::Rollback {
             job_id,
@@ -414,7 +515,7 @@ async fn execute(client: &OperatorClient, command: OperatorCommand) -> Result<()
                     Some(json!({ "revision": revision })),
                 )
                 .await?;
-            print_json_response(response)
+            client.print_response(response)
         }
         OperatorCommand::Drain { command } => match command {
             DrainCommand::Start {
@@ -432,7 +533,7 @@ async fn execute(client: &OperatorClient, command: OperatorCommand) -> Result<()
                         Some(json!({ "gracePeriodSeconds": grace_period_seconds })),
                     )
                     .await?;
-                print_json_response(response)
+                client.print_response(response)
             }
             DrainCommand::Status { worker_id } => {
                 let worker_id =
@@ -446,7 +547,7 @@ async fn execute(client: &OperatorClient, command: OperatorCommand) -> Result<()
                         None,
                     )
                     .await?;
-                print_json_response(response)
+                client.print_response(response)
             }
             DrainCommand::Clear { worker_id } => {
                 let worker_id =
@@ -461,9 +562,10 @@ async fn execute(client: &OperatorClient, command: OperatorCommand) -> Result<()
                     )
                     .await?;
                 if response.status.is_success() {
-                    write_json(&json!({ "workerId": worker_id.as_str(), "state": "cleared" }))
+                    client
+                        .write_value(&json!({ "workerId": worker_id.as_str(), "state": "cleared" }))
                 } else {
-                    print_json_response(response)
+                    client.print_response(response)
                 }
             }
         },
@@ -490,7 +592,7 @@ async fn execute(client: &OperatorClient, command: OperatorCommand) -> Result<()
             let response = client
                 .request(Method::GET, "v1/runs", &query, &[], None)
                 .await?;
-            print_json_response(response)
+            client.print_response(response)
         }
         OperatorCommand::Logs {
             run_id,
@@ -583,23 +685,23 @@ fn parse_server_url(raw: &str) -> Result<Url, String> {
                 .to_owned(),
         );
     }
-    if url.scheme() == "http" {
-        let host = url
-            .host_str()
-            .unwrap_or_default()
-            .trim_start_matches('[')
-            .trim_end_matches(']');
-        let loopback = host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<IpAddr>()
-                .is_ok_and(|address| address.is_loopback());
-        if !loopback {
-            return Err(
-                "plain HTTP is allowed only for a loopback server; use HTTPS remotely".to_owned(),
-            );
-        }
+    if url.scheme() == "http" && !url.host_str().is_some_and(is_loopback_host) {
+        return Err(
+            "plain HTTP is allowed only for a loopback server; use HTTPS remotely".to_owned(),
+        );
     }
     Ok(url)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
 }
 
 fn read_operator_token(path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, String> {
@@ -627,11 +729,6 @@ fn read_operator_token(path: &std::path::Path) -> Result<Zeroizing<Vec<u8>>, Str
     conductor_api::BearerTokenAuthenticator::new(&token)
         .map_err(|_| "operator token file contains an invalid token".to_owned())?;
     Ok(token)
-}
-
-fn print_json_response(response: ResponseData) -> Result<(), String> {
-    let value = parse_json_response(response)?;
-    write_json(&value)
 }
 
 fn parse_json_response(response: ResponseData) -> Result<Value, String> {
@@ -663,6 +760,44 @@ fn parse_json_response(response: ResponseData) -> Result<Value, String> {
     ))
 }
 
+fn format_human(value: &Value) -> String {
+    match value {
+        Value::Null => "ok".to_owned(),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| format!("- {}", format_human_item(item)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(object) => object
+            .iter()
+            .map(|(key, value)| format!("{key}: {}", format_human_scalar(value)))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        scalar => format_human_scalar(scalar),
+    }
+}
+
+fn format_human_item(value: &Value) -> String {
+    match value {
+        Value::Object(object) => object
+            .iter()
+            .map(|(key, value)| format!("{key}={}", format_human_scalar(value)))
+            .collect::<Vec<_>>()
+            .join(" "),
+        other => format_human_scalar(other),
+    }
+}
+
+fn format_human_scalar(value: &Value) -> String {
+    match value {
+        Value::String(value) => value.clone(),
+        Value::Null | Value::Bool(_) | Value::Number(_) => value.to_string(),
+        Value::Array(_) | Value::Object(_) => {
+            serde_json::to_string(value).unwrap_or_else(|_| "<unavailable>".to_owned())
+        }
+    }
+}
+
 fn write_json(value: &Value) -> Result<(), String> {
     write_json_to(&mut io::stdout().lock(), value)
 }
@@ -677,7 +812,11 @@ fn write_json_to(writer: &mut impl Write, value: &Value) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_server_url, validate_idempotency_key};
+    use super::{
+        OutputFormat, effective_connection, format_human, parse_server_url,
+        validate_idempotency_key,
+    };
+    use clap::ValueEnum;
 
     #[test]
     fn operator_server_url_requires_tls_off_loopback() {
@@ -695,5 +834,45 @@ mod tests {
         assert!(validate_idempotency_key(&"x".repeat(129)).is_err());
         assert!(validate_idempotency_key("key with spaces").is_err());
         assert!(validate_idempotency_key("bad\rkey").is_err());
+    }
+
+    #[test]
+    fn cli_connection_values_override_context_values() {
+        let context = crate::contexts::ConnectionContext {
+            server_url: "https://context.example.test".to_owned(),
+            token_file: Some("/context/token".into()),
+            ca_file: Some("/context/ca.pem".into()),
+            timeout_seconds: 20,
+        };
+        let explicit_token = std::path::PathBuf::from("/explicit/token");
+        let effective = effective_connection(
+            Some("https://override.example.test"),
+            Some(&explicit_token),
+            None,
+            Some(7),
+            Some(context),
+        );
+        assert_eq!(effective.server, "https://override.example.test");
+        assert_eq!(effective.token_file, Some(explicit_token));
+        assert_eq!(effective.ca_file, Some("/context/ca.pem".into()));
+        assert_eq!(effective.timeout_seconds, 7);
+    }
+
+    #[test]
+    fn no_context_defaults_to_unauthenticated_loopback() {
+        let effective = effective_connection(None, None, None, None, None);
+        assert_eq!(effective.server, "http://127.0.0.1:8080");
+        assert!(effective.token_file.is_none());
+        assert_eq!(effective.timeout_seconds, 10);
+    }
+
+    #[test]
+    fn human_output_is_concise_and_json_output_remains_explicit() {
+        let value = serde_json::json!({"runId":"run-1","state":"succeeded"});
+        assert_eq!(format_human(&value), "runId: run-1\nstate: succeeded");
+        assert_eq!(
+            OutputFormat::Json.to_possible_value().unwrap().get_name(),
+            "json"
+        );
     }
 }

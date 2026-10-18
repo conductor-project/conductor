@@ -1,3 +1,4 @@
+mod contexts;
 mod operator_cli;
 mod state_lock;
 
@@ -14,7 +15,8 @@ use std::sync::{
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
+use clap_complete::aot::Shell;
 use conductor_core::{
     InspectRun, MAX_WORKER_CAPACITY, ProtocolOffer, ProtocolVersionRange, ReadRunLogs, ResolveRun,
     StartRun, StopRun, WorkerDescriptor, WorkerId, WorkerMetadata, WorkerResourceCapacity,
@@ -45,6 +47,13 @@ enum Commands {
     },
     /// Inspect and operate a remote manager through its authenticated HTTP API.
     Operator(OperatorArgs),
+    /// Create and select named operator API connection contexts.
+    Context(contexts::ContextArgs),
+    /// Generate shell completion scripts for the implemented CLI commands.
+    Completions {
+        #[arg(value_enum)]
+        shell: Shell,
+    },
     /// Create a one-time worker enrollment credential in a protected file.
     EnrollWorker {
         /// Manager data directory containing manager.sqlite3.
@@ -316,6 +325,12 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let (config_path, role_override) = match cli.command {
         Commands::Agent { config, role } => (config, role),
         Commands::Operator(args) => return Ok(operator_cli::run(args)),
+        Commands::Context(args) => return Ok(contexts::run(args)),
+        Commands::Completions { shell } => {
+            let mut command = Cli::command();
+            clap_complete::generate(shell, &mut command, "conductor", &mut std::io::stdout());
+            return Ok(ExitCode::SUCCESS);
+        }
         Commands::EnrollWorker {
             manager_data_dir,
             identity_dir,
