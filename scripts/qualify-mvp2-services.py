@@ -530,7 +530,7 @@ def main():
                     for name in services
                 }
                 for service in services:
-                    fqdn = f"{service}.default.service.{SUFFIX}."
+                    fqdn = f"{service}.default.service.{SUFFIX}"
                     try:
                         wait_until(
                             f"host resolver positive answer for {service}",
@@ -586,6 +586,18 @@ def main():
                         timings=result["timingsMs"],
                     )
                 except TimeoutError as error:
+                    attempts_status, _, attempts = request(
+                        base, "GET", "/v1/jobs/unready/service-attempts"
+                    )
+                    endpoints_status, _, endpoints = request(
+                        base, "GET", "/v1/jobs/unready/endpoints"
+                    )
+                    unready_snapshot.update(
+                        attemptsStatus=attempts_status,
+                        attempts=attempts,
+                        endpointsStatus=endpoints_status,
+                        endpoints=endpoints,
+                    )
                     raise TimeoutError(
                         f"{error}; latest unready deployment={unready_snapshot}"
                     ) from error
@@ -722,6 +734,8 @@ def create_service_revision(
                                   {"Idempotency-Key": f"mvp2-{service}-revision-{revision}"})
     if status != 201:
         raise RuntimeError(f"creating {service} revision {revision} returned {status}: {response}")
+    if response.get("workload", {}).get("readinessProbe") != body["workload"]["readinessProbe"]:
+        raise RuntimeError(f"creating {service} revision did not preserve its readiness probe: {response}")
 
 
 def deploy_service(base, service, revision, create, key):
@@ -865,7 +879,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/identity":
             self.send_response(200); self.end_headers(); self.wfile.write(f"{service}:{version}".encode()); return
         if self.path == f"/call/{peer}":
-            socket.getaddrinfo(f"{peer}.default.service.{suffix}.", None, type=socket.SOCK_STREAM)
+            socket.getaddrinfo(f"{peer}.default.service.{suffix}", None, type=socket.SOCK_STREAM)
             socket.getaddrinfo(peer, None, type=socket.SOCK_STREAM)
             answer = subprocess.run([dig, "+short", "SRV", f"_http._tcp.{peer}.default.service.{suffix}.", "@127.0.0.1"],
                                     check=True, capture_output=True, text=True, timeout=3).stdout.splitlines()
