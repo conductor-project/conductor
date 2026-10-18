@@ -44,6 +44,10 @@ static int no_unintended_fds(void) {
 int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--sleep") == 0)
     for (;;) sleep(60);
+  if (argc == 2 && strcmp(argv[1], "--hold") == 0) {
+    sleep(1);
+    return 0;
+  }
   if (argc == 3 && strcmp(argv[1], "--child") == 0)
     return denied(argv[2], O_RDONLY) ? 0 : 21;
   if (argc != 5) return 2;
@@ -76,6 +80,88 @@ int main(int argc, char **argv) {
   if (waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) return 8;
   printf("child_exec_inherited_denial=1\n");
   return 0;
+}
+"""
+
+PRELOAD_SOURCE = r"""
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/auxv.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+static void write_marker(const char *path, const char *value) {
+  int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
+  if (fd >= 0) {
+    const char *cursor = value;
+    size_t remaining = strlen(value);
+    while (remaining > 0) {
+      ssize_t written = write(fd, cursor, remaining);
+      if (written <= 0) break;
+      cursor += written;
+      remaining -= (size_t)written;
+    }
+    close(fd);
+  }
+}
+
+__attribute__((constructor)) static void probe_launcher_environment(void) {
+  const char *role = getenv("CONDUCTOR_TEST_ROLE");
+  if (!role || strcmp(role, "workload") != 0) return;
+  const char *workload = getenv("CONDUCTOR_TEST_WORKLOAD");
+  const char *secret = getenv("CONDUCTOR_TEST_SECRET");
+  const char *output = getenv("CONDUCTOR_TEST_OUTPUT");
+  const char *execfn = (const char *)getauxval(AT_EXECFN);
+  if (!workload || !secret || !output) return;
+
+  if (!execfn || strcmp(execfn, workload) != 0) {
+    int fd = open(secret, O_RDONLY);
+    if (fd >= 0) {
+      close(fd);
+      const char *marker = getenv("CONDUCTOR_TEST_EARLY_READ_MARKER");
+      if (marker) write_marker(marker, "trusted-launcher-read-protected-file\n");
+    }
+    pid_t child = fork();
+    if (child == 0) {
+      sleep(4);
+      _exit(0);
+    }
+    if (child > 0) {
+      char path[4096];
+      if (snprintf(path, sizeof(path), "%s/early-child.pid", output) > 0) {
+        char value[32];
+        int length = snprintf(value, sizeof(value), "%ld\n", (long)child);
+        if (length > 0) write_marker(path, value);
+      }
+    }
+    return;
+  }
+
+  int fd = open(secret, O_RDONLY);
+  if (fd >= 0) {
+    close(fd);
+    const char *marker = getenv("CONDUCTOR_TEST_EARLY_READ_MARKER");
+    if (marker) write_marker(marker, "workload-read-protected-file\n");
+  } else {
+    char path[4096];
+    if (snprintf(path, sizeof(path), "%s/protected-read-denied", output) > 0)
+      write_marker(path, "denied\n");
+  }
+
+  pid_t child = fork();
+  if (child == 0) {
+    char path[4096];
+    if (snprintf(path, sizeof(path), "%s/sandbox-child.pid", output) > 0) {
+      char value[32];
+      int length = snprintf(value, sizeof(value), "%ld\n", (long)getpid());
+      if (length > 0) write_marker(path, value);
+    }
+    sleep(4);
+    _exit(0);
+  }
 }
 """
 
@@ -200,6 +286,13 @@ def main():
         source.write_text(FIXTURE_SOURCE, encoding="utf-8")
         fixture = root / "fixture"
         subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(fixture)], check=True)
+        preload_source = root / "preload.c"
+        preload_source.write_text(PRELOAD_SOURCE, encoding="utf-8")
+        preload = root / "preload.so"
+        subprocess.run(
+            ["cc", "-shared", "-fPIC", "-O2", "-Wall", "-Wextra", "-Werror", str(preload_source), "-o", str(preload)],
+            check=True,
+        )
 
         input_path = root / "input.txt"
         input_path.write_text("approved-input\n", encoding="utf-8")
@@ -210,6 +303,7 @@ def main():
 
         grants = [
             {"id": "fixture", "path": str(fixture), "read": True, "execute": True},
+            {"id": "preload", "path": str(preload), "read": True},
             {"id": "input", "path": str(input_alias), "read": True},
             {"id": "output", "path": str(output_dir), "write": True},
         ]
@@ -246,9 +340,13 @@ def main():
         def launch():
             inherited_secret_fd = os.open(secret, os.O_RDONLY)
             try:
+                environment = os.environ.copy()
+                environment["LD_PRELOAD"] = str(preload)
+                environment["CONDUCTOR_TEST_ROLE"] = "daemon"
                 return subprocess.Popen(
                     [str(args.binary.resolve()), "agent", "--config", str(config_path)],
                     cwd=root,
+                    env=environment,
                     stdout=subprocess.DEVNULL,
                     stderr=agent_log.open("ab"),
                     pass_fds=(inherited_secret_fd,),
@@ -289,6 +387,62 @@ def main():
             assert (output_dir / "result.txt").read_text(encoding="utf-8") == "approved-output\n"
             grant_ids = [grant["id"] for grant in grants]
             worker_root = worker_cgroup_root(delegated_root, config["worker_id"])
+
+            # Explicit and inherited loader variables must reach only the target exec,
+            # after it is already in its cgroup and under Landlock.
+            for job_id, inherit_env in (("preload-explicit", False), ("preload-inherited", True)):
+                preload_output = output_dir
+                for name in ("sandbox-child.pid", "early-child.pid", "protected-read-denied"):
+                    (preload_output / name).unlink(missing_ok=True)
+                early_read = root / f"{job_id}-early-read"
+                env = {
+                    "CONDUCTOR_TEST_ROLE": "workload",
+                    "CONDUCTOR_TEST_WORKLOAD": str(fixture),
+                    "CONDUCTOR_TEST_SECRET": str(secret),
+                    "CONDUCTOR_TEST_OUTPUT": str(preload_output),
+                    "CONDUCTOR_TEST_EARLY_READ_MARKER": str(early_read),
+                }
+                if not inherit_env:
+                    env["LD_PRELOAD"] = str(preload)
+                loader_job = {
+                    "id": job_id,
+                    "command": [str(fixture), "--hold"],
+                    "cwd": str(root),
+                    "inheritEnv": inherit_env,
+                    "env": env,
+                    "filesystemPolicy": {"grants": grant_ids},
+                }
+                status, _ = request(address, "POST", "/v1/jobs", loader_job)
+                assert status == 201, f"{job_id} registration returned HTTP {status}"
+                status, accepted = request(address, "POST", f"/v1/jobs/{job_id}/runs")
+                assert status == 202, f"{job_id} start returned HTTP {status}"
+                run_id = accepted["runId"]
+                child_marker = preload_output / "sandbox-child.pid"
+                deadline = time.monotonic() + 1
+                while time.monotonic() < deadline and not child_marker.exists():
+                    time.sleep(0.01)
+                assert child_marker.is_file(), f"{job_id} preload constructor did not run in the workload"
+                assert (preload_output / "protected-read-denied").read_text(encoding="utf-8") == "denied\n"
+                assert not early_read.exists(), f"{job_id} preload constructor read protected state before enforcement"
+                early_child = preload_output / "early-child.pid"
+                if early_child.exists():
+                    os.kill(int(early_child.read_text(encoding="ascii")), signal.SIGKILL)
+                    raise AssertionError(f"{job_id} preload constructor ran in the trusted launcher")
+                child_pid = child_marker.read_text(encoding="ascii").strip()
+                deadline = time.monotonic() + 1
+                contained = False
+                while time.monotonic() < deadline:
+                    for group in worker_root.glob("run-*"):
+                        if child_pid in (group / "cgroup.procs").read_text(encoding="ascii").splitlines():
+                            contained = True
+                            break
+                    if contained:
+                        break
+                    time.sleep(0.01)
+                assert contained, f"{job_id} preload descendant was not placed in the run cgroup"
+                outcome = wait_run(address, run_id, {"succeeded", "failed"})
+                assert outcome["state"] == "succeeded", f"{job_id} workload failed: {outcome}"
+                wait_cgroups_empty(worker_root)
 
             # Cancellation and deadlines still reap the cgroup while Landlock is active.
             for job_id, extra, expected in (

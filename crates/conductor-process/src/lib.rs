@@ -316,8 +316,17 @@ fn spawn_sandboxed(
     }
     let socket_path = private_directory.join("ready.sock");
     let policy_path = private_directory.join("landlock.json");
+    let environment_path = private_directory.join("environment.json");
     let mut spawned: Option<Child> = None;
     let result = (|| {
+        let environment = encode_workload_environment(job)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&environment_path)?;
+        use std::io::Write;
+        file.write_all(&environment)?;
         if let Some(grants) = &landlock_grants {
             let manifest = serde_json::to_vec(grants)
                 .map_err(|_| io::Error::other("failed to encode Landlock grant manifest"))?;
@@ -343,6 +352,7 @@ fn spawn_sandboxed(
         if landlock_grants.is_some() {
             command.arg("--landlock-policy-file").arg(&policy_path);
         }
+        command.arg("--environment-file").arg(&environment_path);
         command
             .arg("--")
             .args(job.command())
@@ -350,10 +360,8 @@ fn spawn_sandboxed(
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if !job.inherit_env() {
-            command.env_clear();
-        }
-        command.envs(job.env());
+        // Job-controlled loader settings must not affect the trusted launcher.
+        command.env_clear();
         use std::os::unix::process::CommandExt;
         command.process_group(0);
         trace_cgroup_launch(run_id, "spawn_internal_launcher");
@@ -426,6 +434,7 @@ fn spawn_sandboxed(
     })();
     let _ = std::fs::remove_file(&socket_path);
     let _ = std::fs::remove_file(&policy_path);
+    let _ = std::fs::remove_file(&environment_path);
     let _ = std::fs::remove_dir(&private_directory);
     if result.is_err() {
         if let Some(mut child) = spawned.take() {
@@ -438,6 +447,28 @@ fn spawn_sandboxed(
         }
     }
     result
+}
+
+#[cfg(target_os = "linux")]
+fn encode_workload_environment(job: &JobSpec) -> io::Result<Vec<u8>> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut environment: BTreeMap<std::ffi::OsString, std::ffi::OsString> = if job.inherit_env() {
+        std::env::vars_os().collect()
+    } else {
+        BTreeMap::new()
+    };
+    environment.extend(
+        job.env()
+            .iter()
+            .map(|(name, value)| (name.into(), value.into())),
+    );
+    let environment: Vec<(Vec<u8>, Vec<u8>)> = environment
+        .into_iter()
+        .map(|(name, value)| (name.into_vec(), value.into_vec()))
+        .collect();
+    serde_json::to_vec(&environment)
+        .map_err(|_| io::Error::other("failed to encode workload environment"))
 }
 
 #[cfg(target_os = "linux")]
@@ -455,11 +486,49 @@ pub fn internal_launch(
     cgroup_path: Option<&Path>,
     ready_socket: &Path,
     landlock_policy_file: Option<&Path>,
+    workload_environment_file: &Path,
     command: &[String],
 ) -> i32 {
     use std::io::Write;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::net::UnixStream;
     use std::os::unix::process::CommandExt;
+
+    const MAX_ENVIRONMENT_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
+    let environment_bytes = match std::fs::read(workload_environment_file) {
+        Ok(bytes) if bytes.len() <= MAX_ENVIRONMENT_MANIFEST_BYTES => bytes,
+        _ => return 125,
+    };
+    if std::fs::remove_file(workload_environment_file).is_err() {
+        return 125;
+    }
+    let environment: Vec<(Vec<u8>, Vec<u8>)> = match serde_json::from_slice(&environment_bytes) {
+        Ok(environment) => environment,
+        Err(_) => return 125,
+    };
+    let mut environment_size = 0usize;
+    let mut workload_environment = Vec::with_capacity(environment.len());
+    for (name, value) in environment {
+        let Some(next_size) = environment_size
+            .checked_add(name.len())
+            .and_then(|size| size.checked_add(value.len()))
+        else {
+            return 125;
+        };
+        if name.is_empty()
+            || name.contains(&0)
+            || name.contains(&b'=')
+            || value.contains(&0)
+            || next_size > MAX_ENVIRONMENT_MANIFEST_BYTES
+        {
+            return 125;
+        }
+        environment_size = next_size;
+        workload_environment.push((
+            std::ffi::OsString::from_vec(name),
+            std::ffi::OsString::from_vec(value),
+        ));
+    }
 
     let grants = match landlock_policy_file
         .map(landlock::read_launcher_policy)
@@ -490,7 +559,11 @@ pub fn internal_launch(
     if command.is_empty() {
         return 125;
     }
-    let error = Command::new(&command[0]).args(&command[1..]).exec();
+    let error = Command::new(&command[0])
+        .args(&command[1..])
+        .env_clear()
+        .envs(workload_environment)
+        .exec();
     eprintln!("workload exec failed ({:?})", error.kind());
     127
 }
@@ -500,6 +573,7 @@ pub fn internal_launch(
     _cgroup_path: Option<&std::path::Path>,
     _ready_socket: &std::path::Path,
     _landlock_policy_file: Option<&std::path::Path>,
+    _workload_environment_file: &std::path::Path,
     _command: &[String],
 ) -> i32 {
     125
