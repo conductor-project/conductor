@@ -328,6 +328,16 @@ def reserve_service_networks(excluded=()):
     raise RuntimeError("could not reserve two isolated service-port ranges")
 
 
+def host_service_address():
+    """Return the runner's routable IPv4 address without sending a packet."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
+        route.connect(("192.0.2.1", 1))
+        address = route.getsockname()[0]
+    if not address or address.startswith("127.") or address == "0.0.0.0":
+        raise RuntimeError(f"could not determine a non-loopback service address: {address!r}")
+    return address
+
+
 def service_attempt_failed(base, service):
     status, _, response = request(base, "GET", f"/v1/jobs/{service}/service-attempts")
     if status != 200:
@@ -375,6 +385,7 @@ def main():
         transport_port = port()
         api_port = port((transport_port,))
         service_ranges, conflict_socket = reserve_service_networks((transport_port, api_port))
+        service_address = host_service_address()
         cleanup.enter_context(conflict_socket)
         conflict_port = conflict_socket.getsockname()[1]
         manager_data = root / "manager-data"
@@ -395,7 +406,7 @@ def main():
                 "networkDomainId": "mvp2-loopback",
                 "portRangeStart": service_ranges[0],
                 "portRangeEnd": service_ranges[0] + 9,
-                "advertisedAddress": "127.0.0.1",
+                "advertisedAddress": service_address,
             },
             "additional_workers": [
                 {
@@ -407,7 +418,7 @@ def main():
                         "networkDomainId": "mvp2-loopback",
                         "portRangeStart": service_ranges[1],
                         "portRangeEnd": service_ranges[1] + 9,
-                        "advertisedAddress": "127.0.0.1",
+                        "advertisedAddress": service_address,
                     },
                 }
             ],
@@ -427,6 +438,7 @@ def main():
                 result["managerApiAddress"] = started["address"]
                 result["workerTransportAddress"] = started["workerTransportAddress"]
                 result["serviceDnsAddress"] = started.get("serviceDnsAddress", "127.0.0.1:53")
+                result["serviceAddress"] = service_address
                 ca_file = manager_identity / "worker-ca.pem"
                 worker_names = ("mvp2-worker-a", "mvp2-worker-b")
                 for index, worker_name in enumerate(worker_names):
