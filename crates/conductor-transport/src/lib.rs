@@ -44,20 +44,7 @@ const CLIENT_REQUEST_TIMEOUT: Duration = Duration::from_secs(35);
 const BACKOFF_INITIAL: Duration = Duration::from_millis(100);
 const BACKOFF_MAX: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(
-    tag = "kind",
-    content = "payload",
-    rename_all = "snake_case",
-    deny_unknown_fields
-)]
-pub enum WorkerCommand {
-    StartRun(Box<StartRun>),
-    InspectRun(InspectRun),
-    StopRun(StopRun),
-    ResolveRun(ResolveRun),
-    ReadRunLogs(ReadRunLogs),
-}
+pub use conductor_core::{CommandEnvelope, WorkerCommand};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(
@@ -150,15 +137,6 @@ impl From<RemoteWorkerError> for WorkerPortError {
             RemoteWorkerError::Unavailable => Self::Unavailable,
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct CommandEnvelope {
-    pub command_id: CommandId,
-    pub target_worker_id: WorkerId,
-    pub target_worker_incarnation: u64,
-    pub command: WorkerCommand,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -430,13 +408,25 @@ impl WorkerSession {
         command: WorkerCommand,
     ) -> Result<mpsc::Receiver<WorkerResult>, TransportError> {
         let command_id = self.command_id()?;
-        let (sender, receiver) = mpsc::sync_channel(1);
         let envelope = CommandEnvelope {
             command_id: command_id.clone(),
             target_worker_id: self.descriptor.worker_id().clone(),
             target_worker_incarnation: self.descriptor.incarnation(),
             command,
         };
+        self.enqueue_envelope(envelope)
+    }
+
+    fn enqueue_envelope(
+        &self,
+        envelope: CommandEnvelope,
+    ) -> Result<mpsc::Receiver<WorkerResult>, TransportError> {
+        if envelope.target_worker_id != *self.descriptor.worker_id()
+            || envelope.target_worker_incarnation != self.descriptor.incarnation()
+        {
+            return Err(TransportError::WorkerConflict);
+        }
+        let (sender, receiver) = mpsc::sync_channel(1);
         let mut pending = self
             .pending
             .lock()
@@ -444,8 +434,15 @@ impl WorkerSession {
         if pending.len() >= MAX_PENDING_COMMANDS {
             return Err(TransportError::QueueFull);
         }
+        if let Some(existing) = pending.get(&envelope.command_id) {
+            return Err(if existing.envelope == envelope {
+                TransportError::Unavailable
+            } else {
+                TransportError::WorkerConflict
+            });
+        }
         pending.insert(
-            command_id,
+            envelope.command_id.clone(),
             PendingCommand {
                 envelope,
                 response: sender,
@@ -648,6 +645,19 @@ impl RemoteWorkerPort {
             _ => Err(WorkerPortError::Unavailable),
         }
     }
+
+    fn dispatch_envelope(
+        &self,
+        envelope: CommandEnvelope,
+    ) -> Result<WorkerResult, WorkerPortError> {
+        let receiver = self
+            .session
+            .enqueue_envelope(envelope)
+            .map_err(map_transport_error)?;
+        receiver
+            .recv_timeout(COMMAND_RESPONSE_TIMEOUT)
+            .map_err(|_| WorkerPortError::Unavailable)
+    }
 }
 
 impl WorkerPort for RemoteWorkerPort {
@@ -675,6 +685,17 @@ impl WorkerPort for RemoteWorkerPort {
 
     fn start(&self, command: StartRun) -> Result<RunObservation, WorkerPortError> {
         self.observation(WorkerCommand::StartRun(Box::new(command)))
+    }
+
+    fn dispatch_command(
+        &self,
+        envelope: CommandEnvelope,
+    ) -> Result<RunObservation, WorkerPortError> {
+        match self.dispatch_envelope(envelope)? {
+            WorkerResult::Observation(observation) => Ok(observation),
+            WorkerResult::Error(error) => Err(error.into()),
+            _ => Err(WorkerPortError::Unavailable),
+        }
     }
 
     fn inspect(&self, command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError> {
@@ -1131,6 +1152,27 @@ mod tests {
             .await
             .expect("reconnected worker poll");
         assert_eq!(reconnected.command, Some(first_command));
+    }
+
+    #[tokio::test]
+    async fn durable_command_envelope_keeps_its_id_when_queued_for_remote_delivery() {
+        let session = session();
+        let envelope = CommandEnvelope {
+            command_id: CommandId::new("command-persisted").expect("valid command id"),
+            target_worker_id: worker_id("worker-a"),
+            target_worker_incarnation: 9,
+            command: WorkerCommand::InspectRun(InspectRun::new(
+                RunId::new("run-a").expect("valid run id"),
+            )),
+        };
+        let _receiver = session
+            .enqueue_envelope(envelope.clone())
+            .expect("enqueue durable command");
+        let response = session
+            .poll(poll_request("worker-a", 1))
+            .await
+            .expect("compatible worker poll");
+        assert_eq!(response.command, Some(envelope));
     }
 
     #[tokio::test]
