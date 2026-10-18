@@ -18,8 +18,20 @@ attempt. An ambiguous dispatch remains pending and the run stays reserved until
 the result is observed or an operator resolves it.
 
 At most 32 unacknowledged commands are retained per worker across its
-incarnations. Admission fails while that bound is reached. This cap bounds
-pending delivery state; it does not silently discard committed assignments.
+incarnations. Starts and other non-control commands stop at 24, leaving eight
+bounded entries available for stop and resolution commands when start delivery
+is saturated. Control commands can use any remaining entry up to the total
+limit. When all 32 entries are occupied, new commands fail explicitly; the
+manager does not silently discard committed assignments.
+
+The manager persists a run's `stopping` observation and its stop command in one
+SQLite transaction. A storage or capacity failure rolls back both writes, so a
+failed stop request cannot leave a newly accepted stop intent without a
+deliverable command. If an older database already contains a `stopping` run
+without its command, the next stop request inserts the command before returning
+the durable intent. Repeated stop requests find the existing command by its
+contents for that worker incarnation, even when later commands for the same run
+were written afterward.
 
 Acknowledged command rows are kept indefinitely. No automatic time-based
 compaction is performed because delayed retries must not execute a command a

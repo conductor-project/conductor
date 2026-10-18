@@ -1053,6 +1053,65 @@ impl WorkerPort for UncertainWorker {
     }
 }
 
+struct StopRecoveryWorker {
+    worker_id: WorkerId,
+    stopping: RunObservation,
+    delivered: std::sync::Mutex<Vec<CommandId>>,
+}
+
+impl WorkerPort for StopRecoveryWorker {
+    fn descriptor(&self) -> WorkerDescriptor {
+        WorkerDescriptor::new(self.worker_id.clone(), 1, true)
+    }
+
+    fn start(&self, _command: StartRun) -> Result<RunObservation, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
+
+    fn dispatch_command(
+        &self,
+        envelope: CommandEnvelope,
+    ) -> Result<RunObservation, WorkerPortError> {
+        self.delivered
+            .lock()
+            .unwrap()
+            .push(envelope.command_id.clone());
+        match envelope.command {
+            WorkerCommand::StopRun(command) if command.run_id() == self.stopping.run_id() => self
+                .stopping
+                .next_revision(
+                    RunState::Cancelled,
+                    self.stopping.started_at_ms(),
+                    Some(self.stopping.requested_at_ms() + 1),
+                    None,
+                    Some(15),
+                    None,
+                )
+                .map(|observation| {
+                    observation
+                        .with_termination_reason(conductor_core::RunTerminationReason::Cancelled)
+                })
+                .ok_or(WorkerPortError::RunConflict),
+            _ => Err(WorkerPortError::RunConflict),
+        }
+    }
+
+    fn inspect(&self, _command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError> {
+        Ok(None)
+    }
+
+    fn stop(&self, _command: StopRun) -> Result<RunObservation, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
+
+    fn read_logs(
+        &self,
+        _command: ReadRunLogs,
+    ) -> Result<conductor_core::RunLogChunk, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
+}
+
 struct RetryWorker {
     worker_id: WorkerId,
     deliveries: AtomicUsize,
@@ -1498,6 +1557,33 @@ fn stop_intent_is_durable_and_terminal_runs_are_unchanged() {
             .count(),
         1
     );
+    let stop_command_id = pending
+        .iter()
+        .find(|envelope| matches!(envelope.command, WorkerCommand::StopRun(_)))
+        .unwrap()
+        .command_id
+        .clone();
+    repository
+        .command_for_run(
+            spec.id(),
+            &worker_id,
+            0,
+            WorkerCommand::InspectRun(InspectRun::new(spec.id().clone())),
+        )
+        .unwrap();
+    drop(manager);
+    drop(repository);
+
+    let repository = Arc::new(SqliteJobRepository::open(directory.database()).unwrap());
+    let manager = JobService::new(repository.clone());
+    assert_eq!(manager.stop_run(spec.id(), &worker).unwrap(), stopping);
+    let replayed_stop = repository
+        .pending_commands(&worker_id, 0, 32)
+        .unwrap()
+        .into_iter()
+        .find(|envelope| matches!(envelope.command, WorkerCommand::StopRun(_)))
+        .unwrap();
+    assert_eq!(replayed_stop.command_id, stop_command_id);
 
     let terminal = stopping
         .next_revision(
@@ -1512,6 +1598,156 @@ fn stop_intent_is_durable_and_terminal_runs_are_unchanged() {
         .with_termination_reason(conductor_core::RunTerminationReason::Cancelled);
     repository.record_observation(&terminal).unwrap();
     assert_eq!(manager.stop_run(spec.id(), &worker).unwrap(), terminal);
+}
+
+#[test]
+fn stop_command_insert_failure_rolls_back_the_stopping_observation() {
+    let directory = TempDir::new();
+    let repository = Arc::new(SqliteJobRepository::open(directory.database()).unwrap());
+    repository.insert(job("atomic-stop-failure")).unwrap();
+    let worker_id = WorkerId::new("worker").unwrap();
+    let admission = repository
+        .create_run(
+            &JobId::new("atomic-stop-failure").unwrap(),
+            &worker_id,
+            1,
+            None,
+        )
+        .unwrap();
+    let manager = JobService::new(repository.clone());
+    let worker = UncertainWorker(worker_id.clone());
+    let before = repository.get_run(admission.spec.id()).unwrap().unwrap();
+    let connection = Connection::open(directory.database()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TRIGGER reject_stop_command BEFORE INSERT ON manager_commands
+             WHEN instr(NEW.envelope_json, '\"kind\":\"stop_run\"') > 0
+             BEGIN SELECT RAISE(ABORT, 'injected stop outbox failure'); END;",
+        )
+        .unwrap();
+
+    assert_eq!(
+        manager.stop_run(admission.spec.id(), &worker),
+        Err(ManagerError::StorageUnavailable)
+    );
+    assert_eq!(
+        repository.get_run(admission.spec.id()).unwrap(),
+        Some(before)
+    );
+    assert!(
+        repository
+            .pending_commands(&worker_id, 0, 32)
+            .unwrap()
+            .iter()
+            .all(|envelope| !matches!(envelope.command, WorkerCommand::StopRun(_)))
+    );
+}
+
+#[test]
+fn reconciliation_delivers_a_committed_stop_after_manager_restart() {
+    let directory = TempDir::new();
+    let repository = SqliteJobRepository::open(directory.database()).unwrap();
+    repository.insert(job("restart-stop")).unwrap();
+    let worker_id = WorkerId::new("worker").unwrap();
+    let admission = repository
+        .create_run(&JobId::new("restart-stop").unwrap(), &worker_id, 1, None)
+        .unwrap();
+    let start = repository
+        .pending_commands(&worker_id, 0, 32)
+        .unwrap()
+        .into_iter()
+        .find(|envelope| matches!(envelope.command, WorkerCommand::StartRun(_)))
+        .unwrap();
+    repository
+        .acknowledge_command(&start.command_id, &worker_id, 0, r#"{"accepted":true}"#)
+        .unwrap();
+
+    // Simulate manager exit after the atomic commit and before dispatch.
+    let (stopping, stop) = repository
+        .persist_stop_intent(admission.spec.id(), 0)
+        .unwrap();
+    let stop = stop.unwrap();
+    let expected_command_id = stop.command_id.clone();
+    drop(repository);
+
+    let repository = Arc::new(SqliteJobRepository::open(directory.database()).unwrap());
+    let manager = JobService::new(repository.clone());
+    let worker = StopRecoveryWorker {
+        worker_id: worker_id.clone(),
+        stopping,
+        delivered: std::sync::Mutex::new(Vec::new()),
+    };
+    manager.reconcile(&worker).unwrap();
+
+    assert_eq!(*worker.delivered.lock().unwrap(), vec![expected_command_id]);
+    assert_eq!(
+        repository
+            .get_run(admission.spec.id())
+            .unwrap()
+            .unwrap()
+            .state(),
+        RunState::Cancelled
+    );
+    assert!(
+        repository
+            .pending_commands(&worker_id, 0, 32)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn start_saturation_reserves_bounded_stop_and_resolution_capacity() {
+    let directory = TempDir::new();
+    let repository = Arc::new(SqliteJobRepository::open(directory.database()).unwrap());
+    let worker_id = WorkerId::new("worker").unwrap();
+    let mut run_ids = Vec::new();
+    for index in 0..24 {
+        let job_id = JobId::new(format!("reserved-control-{index}")).unwrap();
+        repository.insert(job(job_id.as_str())).unwrap();
+        let admission = repository
+            .create_run(&job_id, &worker_id, 64, None)
+            .unwrap();
+        run_ids.push(admission.spec.id().clone());
+    }
+    let overflow_job_id = JobId::new("reserved-control-overflow").unwrap();
+    repository.insert(job(overflow_job_id.as_str())).unwrap();
+    assert_eq!(
+        repository.create_run(&overflow_job_id, &worker_id, 64, None),
+        Err(RunStoreError::PendingDeliveryLimit)
+    );
+    let manager = JobService::new(repository.clone());
+    let worker = UncertainWorker(worker_id.clone());
+    assert_eq!(
+        manager.stop_run(&run_ids[0], &worker).unwrap().state(),
+        RunState::Stopping
+    );
+    for index in 0..7 {
+        repository
+            .command_for_run(
+                &run_ids[0],
+                &worker_id,
+                0,
+                WorkerCommand::ResolveRun(ResolveRun::new(
+                    run_ids[0].clone(),
+                    format!("reserved-control-{index}"),
+                )),
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        repository
+            .pending_commands(&worker_id, 0, 32)
+            .unwrap()
+            .len(),
+        32
+    );
+    let before = repository.get_run(&run_ids[1]).unwrap().unwrap();
+    assert_eq!(
+        manager.stop_run(&run_ids[1], &worker),
+        Err(ManagerError::WorkerUnavailable)
+    );
+    assert_eq!(repository.get_run(&run_ids[1]).unwrap(), Some(before));
 }
 
 #[test]
