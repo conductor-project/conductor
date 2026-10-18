@@ -1293,9 +1293,13 @@ mod tests {
     }
 
     fn request(body: impl Into<Body>) -> Request<Body> {
+        request_at("/v1/worker/poll", body)
+    }
+
+    fn request_at(path: &str, body: impl Into<Body>) -> Request<Body> {
         Request::builder()
             .method("POST")
-            .uri("/v1/worker/poll")
+            .uri(path)
             .header("content-type", "application/json")
             .body(body.into())
             .expect("valid request")
@@ -1330,6 +1334,43 @@ mod tests {
             .await
             .expect("oversized route response");
         assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn authenticated_worker_cannot_poll_or_report_for_another_worker() {
+        let hub = WorkerTransportHub::default();
+        hub.register_worker(
+            WorkerDescriptor::new(worker_id("worker-a"), 4, true).with_incarnation(9),
+            offer(1),
+        )
+        .expect("register authenticated worker");
+        let router = hub.router(Arc::new(TestAuthenticator(Some(worker_id("worker-a")))));
+
+        let poll = serde_json::to_vec(&poll_request("worker-b", 1)).expect("serialize poll");
+        let poll_response = router
+            .clone()
+            .oneshot(request(poll))
+            .await
+            .expect("cross-worker poll response");
+        assert_eq!(poll_response.status(), StatusCode::FORBIDDEN);
+
+        let report = WorkerReportRequest {
+            worker_id: worker_id("worker-a"),
+            worker_incarnation: 9,
+            report: WorkerReport {
+                command_id: CommandId::new("command-a").expect("valid command id"),
+                worker_id: worker_id("worker-b"),
+                worker_incarnation: 9,
+                report_sequence: 1,
+                result: WorkerResult::Inspection(None),
+            },
+        };
+        let body = serde_json::to_vec(&report).expect("serialize report");
+        let report_response = router
+            .oneshot(request_at("/v1/worker/report", body))
+            .await
+            .expect("cross-worker report response");
+        assert_eq!(report_response.status(), StatusCode::FORBIDDEN);
     }
 
     #[test]

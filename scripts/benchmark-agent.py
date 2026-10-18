@@ -76,6 +76,7 @@ def main():
             "worker_data_dir": str(root / "worker"),
             "worker_id": "benchmark-worker",
             "worker_concurrency": 4,
+            "api_access": {"mode": "local"},
             "request_timeout_ms": 10000,
         }
         config_path = root / "agent.json"

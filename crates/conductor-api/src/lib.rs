@@ -25,6 +25,8 @@ use conductor_manager::{
     DEFAULT_PAGE_SIZE, JobService, MAX_PAGE_SIZE, ManagerError, QueryError, WorkerPort,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
 
 const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
@@ -105,6 +107,72 @@ struct ApiState {
     recovery_ready: Arc<AtomicBool>,
 }
 
+/// Authentication policy for the manager-facing HTTP API.
+///
+/// Local mode is intended for loopback-only development and combined deployments.
+/// Remote mode requires an operator principal on every `/v1` route.
+#[derive(Clone)]
+pub enum ApiAccessPolicy {
+    LocalMode,
+    AuthenticatedOperator(Arc<dyn OperatorAuthenticator>),
+}
+
+/// Verifies operator credentials from HTTP headers without trusting request bodies.
+pub trait OperatorAuthenticator: Send + Sync + 'static {
+    fn authenticate(&self, headers: &HeaderMap) -> bool;
+}
+
+/// Authenticates a 256-bit URL-safe bearer token while retaining only its SHA-256 digest.
+pub struct BearerTokenAuthenticator {
+    token_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidOperatorToken;
+
+impl std::fmt::Display for InvalidOperatorToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("operator token must be a 32-byte URL-safe token")
+    }
+}
+
+impl std::error::Error for InvalidOperatorToken {}
+
+impl BearerTokenAuthenticator {
+    pub fn new(token: &[u8]) -> Result<Self, InvalidOperatorToken> {
+        if token.len() != 43
+            || !token
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(InvalidOperatorToken);
+        }
+        Ok(Self {
+            token_digest: Sha256::digest(token).into(),
+        })
+    }
+}
+
+impl OperatorAuthenticator for BearerTokenAuthenticator {
+    fn authenticate(&self, headers: &HeaderMap) -> bool {
+        let mut values = headers.get_all(header::AUTHORIZATION).iter();
+        let Some(value) = values.next() else {
+            return false;
+        };
+        if values.next().is_some() {
+            return false;
+        }
+        let Some(token) = value.as_bytes().strip_prefix(b"Bearer ") else {
+            return false;
+        };
+        if token.len() != 43 {
+            return false;
+        }
+        let provided_digest: [u8; 32] = Sha256::digest(token).into();
+        bool::from(self.token_digest.ct_eq(&provided_digest))
+    }
+}
+
 #[derive(Serialize)]
 struct ErrorEnvelope {
     error: ErrorDetail,
@@ -130,11 +198,27 @@ fn error(status: StatusCode, code: &'static str, message: &'static str) -> Respo
 
 /// Build the HTTP application served by the combined agent.
 pub fn router(manager: Arc<JobService>, worker: Arc<dyn WorkerPort>) -> Router {
+    router_with_access_policy(
+        manager,
+        worker,
+        DEFAULT_REQUEST_TIMEOUT,
+        ApiAccessPolicy::LocalMode,
+    )
+}
+
+/// Build the manager-facing HTTP application with an explicit local or operator policy.
+pub fn router_with_access_policy(
+    manager: Arc<JobService>,
+    worker: Arc<dyn WorkerPort>,
+    request_timeout: Duration,
+    access_policy: ApiAccessPolicy,
+) -> Router {
     router_with_recovery(
         manager,
         worker,
         Arc::new(AtomicBool::new(true)),
-        DEFAULT_REQUEST_TIMEOUT,
+        request_timeout,
+        access_policy,
     )
 }
 
@@ -143,6 +227,7 @@ fn router_with_recovery(
     worker: Arc<dyn WorkerPort>,
     recovery_ready: Arc<AtomicBool>,
     request_timeout: Duration,
+    access_policy: ApiAccessPolicy,
 ) -> Router {
     let descriptor = worker.descriptor();
     let state = Arc::new(ApiState {
@@ -155,9 +240,7 @@ fn router_with_recovery(
         control_admission: Arc::new(Semaphore::new(MAX_PENDING_CONTROL_OPERATIONS)),
         recovery_ready,
     });
-    Router::new()
-        .route("/healthz", get(healthz))
-        .route("/readyz", get(readyz))
+    let mut manager_routes = Router::new()
         .route("/v1/jobs", post(create_job).get(list_jobs))
         .route("/v1/jobs/{id}", get(get_job).delete(delete_job))
         .route("/v1/jobs/{id}/runs", post(start_run))
@@ -167,7 +250,17 @@ fn router_with_recovery(
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/logs", get(get_run_logs))
         .route("/v1/runs/{id}/stop", post(stop_run))
-        .route("/v1/runs/{id}/resolve", post(resolve_run))
+        .route("/v1/runs/{id}/resolve", post(resolve_run));
+    if let ApiAccessPolicy::AuthenticatedOperator(authenticator) = access_policy {
+        manager_routes = manager_routes.layer(middleware::from_fn_with_state(
+            authenticator,
+            authenticate_operator,
+        ));
+    }
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
+        .merge(manager_routes)
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
             request_timeout,
@@ -257,6 +350,26 @@ async fn request_bounds(
             "the request exceeded the configured processing deadline",
         ),
     }
+}
+
+async fn authenticate_operator(
+    State(authenticator): State<Arc<dyn OperatorAuthenticator>>,
+    request: axum::extract::Request,
+    next: Next,
+) -> Response {
+    if !authenticator.authenticate(request.headers()) {
+        let mut response = error(
+            StatusCode::UNAUTHORIZED,
+            "operator_authentication_required",
+            "a valid operator bearer token is required",
+        );
+        response.headers_mut().insert(
+            header::WWW_AUTHENTICATE,
+            HeaderValue::from_static("Bearer realm=\"conductor\""),
+        );
+        return response;
+    }
+    next.run(request).await
 }
 
 async fn healthz() -> impl IntoResponse {
@@ -1000,6 +1113,32 @@ pub async fn serve(
     worker: Arc<dyn WorkerPort>,
     request_timeout: Duration,
 ) -> io::Result<()> {
+    serve_with_access_policy(
+        listener,
+        shutdown,
+        manager,
+        worker,
+        request_timeout,
+        ApiAccessPolicy::LocalMode,
+    )
+    .await
+}
+
+/// Serve the manager-facing API with the selected local or authenticated-operator policy.
+pub async fn serve_with_access_policy(
+    listener: tokio::net::TcpListener,
+    shutdown: Arc<AtomicBool>,
+    manager: Arc<JobService>,
+    worker: Arc<dyn WorkerPort>,
+    request_timeout: Duration,
+    access_policy: ApiAccessPolicy,
+) -> io::Result<()> {
+    if !listener.local_addr()?.ip().is_loopback() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "HTTP API listener must use loopback; terminate TLS at a trusted proxy",
+        ));
+    }
     let recovery_ready = Arc::new(AtomicBool::new(false));
     let ready_for_recovery = Arc::clone(&recovery_ready);
     let recovery_manager = Arc::clone(&manager);
@@ -1026,7 +1165,13 @@ pub async fn serve(
     let server_shutdown = Arc::clone(&shutdown);
     let server = axum::serve(
         listener,
-        router_with_recovery(manager, worker, recovery_ready, request_timeout),
+        router_with_recovery(
+            manager,
+            worker,
+            recovery_ready,
+            request_timeout,
+            access_policy,
+        ),
     )
     .with_graceful_shutdown(wait_for_shutdown(server_shutdown))
     .into_future();
@@ -1059,4 +1204,184 @@ fn timestamp_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod access_tests {
+    use std::path::PathBuf;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use conductor_core::{
+        InspectRun, ReadRunLogs, ResolveRun, RunLogChunk, StartRun, StopRun, WorkerDescriptor,
+        WorkerStatus,
+    };
+    use conductor_manager::WorkerPortError;
+    use tower::ServiceExt;
+
+    use super::*;
+
+    struct TestWorker;
+
+    impl WorkerPort for TestWorker {
+        fn descriptor(&self) -> WorkerDescriptor {
+            WorkerDescriptor::new(WorkerId::new("worker-a").expect("valid worker id"), 1, true)
+        }
+
+        fn start(
+            &self,
+            _command: StartRun,
+        ) -> Result<conductor_core::RunObservation, WorkerPortError> {
+            Err(WorkerPortError::Unavailable)
+        }
+
+        fn inspect(
+            &self,
+            _command: InspectRun,
+        ) -> Result<Option<conductor_core::RunObservation>, WorkerPortError> {
+            Err(WorkerPortError::Unavailable)
+        }
+
+        fn stop(
+            &self,
+            _command: StopRun,
+        ) -> Result<conductor_core::RunObservation, WorkerPortError> {
+            Err(WorkerPortError::Unavailable)
+        }
+
+        fn resolve(
+            &self,
+            _command: ResolveRun,
+        ) -> Result<conductor_core::RunObservation, WorkerPortError> {
+            Err(WorkerPortError::Unavailable)
+        }
+
+        fn read_logs(&self, _command: ReadRunLogs) -> Result<RunLogChunk, WorkerPortError> {
+            Err(WorkerPortError::Unavailable)
+        }
+
+        fn status(&self) -> Result<WorkerStatus, WorkerPortError> {
+            Ok(WorkerStatus::new(self.descriptor(), 0, 0, true, false, 0))
+        }
+    }
+
+    struct TestDatabase(PathBuf);
+
+    impl TestDatabase {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            Self(std::env::temp_dir().join(format!(
+                "conductor-api-access-{}-{nonce}.sqlite3",
+                std::process::id()
+            )))
+        }
+
+        fn manager(&self) -> Arc<JobService> {
+            Arc::new(JobService::open_sqlite(&self.0).expect("open test manager database"))
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(self.0.with_extension("sqlite3-shm"));
+            let _ = std::fs::remove_file(self.0.with_extension("sqlite3-wal"));
+        }
+    }
+
+    const TOKEN: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVabcdefghijk";
+
+    fn token_policy() -> ApiAccessPolicy {
+        ApiAccessPolicy::AuthenticatedOperator(Arc::new(
+            BearerTokenAuthenticator::new(TOKEN).expect("valid 256-bit URL-safe token"),
+        ))
+    }
+
+    fn request(method: &str, path: &str, token: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(path);
+        if let Some(token) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder.body(Body::empty()).expect("valid request")
+    }
+
+    fn router(database: &TestDatabase) -> Router {
+        router_with_access_policy(
+            database.manager(),
+            Arc::new(TestWorker),
+            Duration::from_secs(1),
+            token_policy(),
+        )
+    }
+
+    #[tokio::test]
+    async fn operator_policy_protects_reads_writes_and_sensitive_worker_diagnostics() {
+        let database = TestDatabase::new();
+        let router = router(&database);
+
+        for (method, path) in [
+            ("GET", "/v1/jobs"),
+            ("POST", "/v1/jobs"),
+            ("DELETE", "/v1/jobs/job-a"),
+            ("GET", "/v1/workers"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(request(method, path, None))
+                .await
+                .expect("unauthenticated API response");
+            assert_eq!(
+                response.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}"
+            );
+            assert_eq!(
+                response.headers().get(header::WWW_AUTHENTICATE),
+                Some(&HeaderValue::from_static("Bearer realm=\"conductor\""))
+            );
+        }
+
+        let invalid = router
+            .clone()
+            .oneshot(request("GET", "/v1/jobs", Some("wrong")))
+            .await
+            .expect("invalid token response");
+        assert_eq!(invalid.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = router
+            .oneshot(request(
+                "GET",
+                "/v1/workers",
+                Some(std::str::from_utf8(TOKEN).unwrap()),
+            ))
+            .await
+            .expect("authorized diagnostics response");
+        assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_endpoints_remain_public_under_operator_policy() {
+        let database = TestDatabase::new();
+        let router = router(&database);
+
+        for path in ["/healthz", "/readyz"] {
+            let response = router
+                .clone()
+                .oneshot(request("GET", path, None))
+                .await
+                .expect("public health response");
+            assert_eq!(response.status(), StatusCode::OK, "GET {path}");
+        }
+    }
+
+    #[test]
+    fn operator_token_requires_fixed_length_url_safe_encoding() {
+        assert!(BearerTokenAuthenticator::new(b"short").is_err());
+        assert!(
+            BearerTokenAuthenticator::new(b"0123456789ABCDEFGHIJKLMNOPQRSTUVabcdefghij=").is_err()
+        );
+    }
 }

@@ -105,6 +105,7 @@ def main():
             "worker_data_dir": str(root / "worker"),
             "worker_id": "capacity-worker",
             "worker_concurrency": args.runs,
+            "api_access": {"mode": "local"},
             "request_timeout_ms": 10_000,
             "log_max_bytes_per_stream": 65_536,
             "log_retention_runs": args.runs,

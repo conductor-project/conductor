@@ -353,10 +353,13 @@ dependencies = [
  "conductor-transport",
  "conductor-worker",
  "ctrlc",
+ "getrandom 0.4.3",
+ "nix",
  "rusqlite",
  "serde",
  "serde_json",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -367,8 +370,12 @@ dependencies = [
  "base64 0.22.1",
  "conductor-core",
  "conductor-manager",
+ "rusqlite",
  "serde",
+ "sha2",
+ "subtle",
  "tokio",
+ "tower",
 ]
 
 [[package]]

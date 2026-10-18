@@ -369,6 +369,7 @@ def main():
             "worker_data_dir": str(worker),
             "worker_id": "landlock-test",
             "worker_concurrency": 2,
+            "api_access": {"mode": "local"},
             "cgroup_v2": {
                 "enabled": True,
                 "delegatedRoot": str(delegated_root),

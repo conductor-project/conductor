@@ -5,6 +5,9 @@
   "worker_data_dir": "./state/worker",
   "worker_id": "local-worker",
   "worker_concurrency": 2,
+  "api_access": {
+    "mode": "local"
+  },
   "log_max_bytes_per_stream": 8388608,
   "log_retention_runs": 100,
   "request_timeout_ms": 10000,
