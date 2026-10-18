@@ -8,7 +8,7 @@ runner. It restores the previous resolver configuration before returning.
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from datetime import datetime, timezone
 import hashlib
 import http.client
@@ -300,6 +300,29 @@ def port(excluded=()):
     raise RuntimeError("could not reserve a unique loopback port")
 
 
+def dns_port(excluded=()):
+    """Choose a loopback port available for both TCP and UDP DNS."""
+    for _ in range(16):
+        candidate = port(excluded)
+        listeners = []
+        try:
+            for kind in (socket.SOCK_DGRAM, socket.SOCK_STREAM):
+                listener = socket.socket(socket.AF_INET, kind)
+                listener.bind(("127.0.0.1", candidate))
+                listeners.append(listener)
+            return candidate
+        except OSError:
+            pass
+        finally:
+            for listener in listeners:
+                listener.close()
+    raise RuntimeError("could not reserve a loopback port for DNS")
+
+
+def dig_server_args(host, port_number):
+    return [f"@{host}", "-p", str(port_number)]
+
+
 def reserve_service_networks(excluded=()):
     for start in range(24000, 44000, 32):
         second = start + 20
@@ -357,6 +380,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--profile", choices=("debug", "release"), required=True)
+    parser.add_argument(
+        "--resolver-mode", choices=("host", "direct"), default="host",
+        help="host changes the disposable runner resolver; direct uses explicit DNS queries",
+    )
     args = parser.parse_args()
     binary = args.binary.resolve()
     if not binary.is_file():
@@ -377,7 +404,12 @@ def main():
         "dnsSuffix": SUFFIX,
         "namespace": "default",
         "topology": "one manager process and two standalone worker processes on one host",
-        "serviceNameCommunication": "system resolver FQDN and search-domain short names; SRV dynamic ports",
+        "resolverMode": args.resolver_mode,
+        "serviceNameCommunication": (
+            "system resolver FQDN and search-domain short names; SRV dynamic ports"
+            if args.resolver_mode == "host"
+            else "explicit DNS FQDN and search-domain queries; SRV dynamic ports"
+        ),
         "timingsMs": {},
         "scenarios": [],
     }
@@ -391,7 +423,11 @@ def main():
         conflict_port = conflict_socket.getsockname()[1]
         manager_data = root / "manager-data"
         manager_identity = root / "manager-identity"
-        dns_port = 53
+        dns_address = "127.0.0.1"
+        dns_port_number = (
+            53 if args.resolver_mode == "host"
+            else dns_port((transport_port, api_port))
+        )
         manager_config = {
             "role": "manager",
             "listen": f"127.0.0.1:{api_port}",
@@ -426,19 +462,22 @@ def main():
             "host_resource_domains": [
                 {"id": "mvp2-host", "cpu_millis": 2000, "memory_bytes": 2147483648}
             ],
-            "service_dns": {"listen": f"127.0.0.1:{dns_port}", "suffix": SUFFIX},
+            "service_dns": {"listen": f"{dns_address}:{dns_port_number}", "suffix": SUFFIX},
             "api_access": {"mode": "local"},
         }
         manager_path = root / "manager.json"
         manager_path.write_text(json.dumps(manager_config), encoding="utf-8")
 
-        with Resolver():
+        resolver = Resolver() if args.resolver_mode == "host" else nullcontext()
+        with resolver:
             manager, base, started = wait_manager(binary, manager_path, root / "manager.log", root)
             processes = [manager]
             try:
                 result["managerApiAddress"] = started["address"]
                 result["workerTransportAddress"] = started["workerTransportAddress"]
-                result["serviceDnsAddress"] = started.get("serviceDnsAddress", "127.0.0.1:53")
+                result["serviceDnsAddress"] = started.get(
+                    "serviceDnsAddress", f"{dns_address}:{dns_port_number}"
+                )
                 result["serviceAddress"] = service_address
                 ca_file = manager_identity / "worker-ca.pem"
                 worker_names = ("mvp2-worker-a", "mvp2-worker-b")
@@ -489,11 +528,11 @@ def main():
                 result["scenarios"].append("two enrolled standalone workers report fresh status")
 
                 unknown = f"uncreated.default.service.{SUFFIX}"
-                if system_resolves(unknown):
+                if args.resolver_mode == "host" and system_resolves(unknown):
                     raise RuntimeError(f"uncreated service unexpectedly resolves: {unknown}")
                 negative = subprocess.run(
                     [dig, "+time=1", "+tries=1", "+noall", "+answer", "+authority",
-                     "A", f"{unknown}.", "@127.0.0.1"],
+                     "A", f"{unknown}.", *dig_server_args(dns_address, dns_port_number)],
                     capture_output=True, text=True, timeout=3,
                 )
                 negative_records = [line.split() for line in negative.stdout.splitlines()]
@@ -520,14 +559,20 @@ def main():
                         f"{negative.stdout.strip()} {negative.stderr.strip()}"
                     )
                 result["scenarios"].append(
-                    "host resolver rejects an uncreated service and authoritative DNS returns a 1-second negative SOA"
+                    ("host resolver rejects an uncreated service and authoritative DNS returns a 1-second negative SOA"
+                     if args.resolver_mode == "host" else
+                     "direct DNS rejects an uncreated service with a 1-second negative SOA")
                 )
 
                 service_program = root / "service.py"
                 service_program.write_text(SERVICE_PROGRAM, encoding="utf-8")
                 if conflict_port != service_ranges[0] + 1:
                     raise RuntimeError("the reserved port does not match the first worker allocation")
-                create_service_revision(root, base, service_program, "port-conflict", "backend", 1)
+                create_service_revision(
+                    root, base, service_program, "port-conflict", "backend", 1,
+                    dns_host=dns_address, dns_port_number=dns_port_number,
+                    resolver_mode=args.resolver_mode,
+                )
                 deploy_service(base, "port-conflict", 1, create=True, key="mvp2-port-conflict-deploy")
                 latest_attempts = {}
                 try:
@@ -552,7 +597,9 @@ def main():
 
                 services = ("frontend", "backend")
                 for service, peer in (("frontend", "backend"), ("backend", "frontend")):
-                    create_service_revision(root, base, service_program, service, peer, 1)
+                    create_service_revision(root, base, service_program, service, peer, 1,
+                                            dns_host=dns_address, dns_port_number=dns_port_number,
+                                            resolver_mode=args.resolver_mode)
                     deploy_service(base, service, 1, create=True, key=f"mvp2-{service}-deploy-1")
                 endpoints = {
                     name: wait_service(base, name, timings=result["timingsMs"])
@@ -560,27 +607,38 @@ def main():
                 }
                 for service in services:
                     fqdn = f"{service}.default.service.{SUFFIX}"
-                    try:
+                    if args.resolver_mode == "host":
+                        try:
+                            wait_until(
+                                f"host resolver positive answer for {service}",
+                                lambda fqdn=fqdn: system_resolves(fqdn),
+                                timeout=8,
+                                interval=0.1,
+                                timings=result["timingsMs"],
+                            )
+                        except TimeoutError as error:
+                            raise TimeoutError(
+                                f"{error}; resolver diagnostics={resolver_diagnostics(fqdn, dig, dns_address, dns_port_number)}"
+                            ) from error
                         wait_until(
-                            f"host resolver positive answer for {service}",
-                            lambda fqdn=fqdn: system_resolves(fqdn),
+                            f"host resolver search answer for {service}",
+                            lambda service=service: system_resolves(service),
                             timeout=8,
                             interval=0.1,
                             timings=result["timingsMs"],
                         )
-                    except TimeoutError as error:
-                        raise TimeoutError(
-                            f"{error}; resolver diagnostics={resolver_diagnostics(fqdn, dig)}"
-                        ) from error
-                    wait_until(
-                        f"host resolver search answer for {service}",
-                        lambda service=service: system_resolves(service),
-                        timeout=8,
-                        interval=0.1,
-                        timings=result["timingsMs"],
-                    )
+                    else:
+                        wait_until(
+                            f"direct DNS FQDN and search answer for {service}",
+                            lambda service=service: direct_service_answers(
+                                dig, dns_address, dns_port_number, service
+                            ),
+                            timeout=8, interval=0.1, timings=result["timingsMs"],
+                        )
                 result["scenarios"].append(
-                    "host resolver resolves deployed service FQDNs and search-name short names"
+                    ("host resolver resolves deployed service FQDNs and search-name short names"
+                     if args.resolver_mode == "host" else
+                     "direct DNS queries resolve deployed service FQDNs and search-name short names")
                 )
                 worker_ids = {name: endpoints[name][0]["workerId"] for name in services}
                 if worker_ids["frontend"] == worker_ids["backend"]:
@@ -598,12 +656,15 @@ def main():
                     if response != expected:
                         raise RuntimeError(f"{service} received {response!r}; expected {expected!r}")
                 result["scenarios"].append(
-                    "bidirectional application requests resolved FQDNs and short names through the host resolver and connected using SRV targets"
+                    ("bidirectional application requests resolved FQDNs and short names through the host resolver and connected using SRV targets"
+                     if args.resolver_mode == "host" else
+                     "bidirectional application requests resolved service DNS names and connected using SRV targets")
                 )
 
                 create_service_revision(
                     root, base, service_program, "unready", "backend", 1,
-                    version="v1-unhealthy",
+                    version="v1-unhealthy", dns_host=dns_address,
+                    dns_port_number=dns_port_number, resolver_mode=args.resolver_mode,
                 )
                 deploy_service(base, "unready", 1, create=True, key="mvp2-unready-deploy")
                 unready_snapshot = {}
@@ -654,7 +715,8 @@ def main():
 
                 create_service_revision(
                     root, base, service_program, "pressure", "backend", 1,
-                    cpu_millis=3000,
+                    cpu_millis=3000, dns_host=dns_address,
+                    dns_port_number=dns_port_number, resolver_mode=args.resolver_mode,
                 )
                 deploy_service(base, "pressure", 1, create=True, key="mvp2-pressure-deploy")
                 wait_until(
@@ -670,7 +732,9 @@ def main():
                 )
 
                 old_backend = endpoints["backend"][0]
-                create_service_revision(root, base, service_program, "backend", "frontend", 2)
+                create_service_revision(root, base, service_program, "backend", "frontend", 2,
+                                        dns_host=dns_address, dns_port_number=dns_port_number,
+                                        resolver_mode=args.resolver_mode)
                 deploy_service(base, "backend", 2, create=False, key="mvp2-backend-deploy-2")
                 new_backend = wait_service(base, "backend", revision=2, timings=result["timingsMs"])[0]
                 if new_backend["port"] == old_backend["port"]:
@@ -683,7 +747,8 @@ def main():
                 restart_started = time.monotonic()
                 dns_during_outage = subprocess.run(
                     [dig, "+time=1", "+tries=1", "A",
-                     f"frontend.default.service.{SUFFIX}.", "@127.0.0.1"],
+                     f"frontend.default.service.{SUFFIX}.",
+                     *dig_server_args(dns_address, dns_port_number)],
                     capture_output=True, text=True, timeout=3,
                 )
                 if "ANSWER SECTION" in dns_during_outage.stdout:
@@ -717,7 +782,14 @@ def main():
                     lambda: endpoint_if_on_other_worker(base, "backend", drained_worker),
                     timings=result["timingsMs"],
                 )
-                if call_service(endpoints["frontend"][0], "backend") != "backend:v2":
+                surviving_frontend = wait_service(
+                    base, "frontend", revision=1, timings=result["timingsMs"]
+                )[0]
+                if surviving_frontend["workerId"] == drained_worker:
+                    raise RuntimeError(
+                        "frontend endpoint remained on the drained worker after readiness"
+                    )
+                if call_service(surviving_frontend, "backend") != "backend:v2":
                     raise RuntimeError("frontend did not discover backend after worker drain")
                 result["scenarios"].append(
                     f"draining {drained_worker} moved backend to {moved_backend[0]['workerId']} without changing its service name"
@@ -737,13 +809,16 @@ def main():
 
 
 def create_service_revision(
-    root, base, script, service, peer, revision, version=None, cpu_millis=100
+    root, base, script, service, peer, revision, version=None, cpu_millis=100,
+    dns_host="127.0.0.1", dns_port_number=53, resolver_mode="host",
 ):
     digest = binary_sha256(sys.executable)
     body = {
         "definition": {
             "id": service,
-            "command": [sys.executable, "-u", str(script), service, peer, version or f"v{revision}", SUFFIX, SEARCH_DOMAIN, shutil.which("dig")],
+            "command": [sys.executable, "-u", str(script), service, peer,
+                        version or f"v{revision}", SUFFIX, SEARCH_DOMAIN,
+                        shutil.which("dig"), resolver_mode, dns_host, str(dns_port_number)],
             "cwd": str(root),
             "terminationGraceMs": 1000,
         },
@@ -851,7 +926,7 @@ def deployment_deleted(base, service):
     return status == 200 and isinstance(deployment, dict) and deployment.get("status") == "deleted"
 
 
-def resolver_diagnostics(name, dig):
+def resolver_diagnostics(name, dig, dns_host="127.0.0.1", dns_port_number=53):
     details = {"name": name}
     try:
         details["getaddrinfo"] = [item[4][0] for item in socket.getaddrinfo(
@@ -860,7 +935,8 @@ def resolver_diagnostics(name, dig):
     except socket.gaierror as error:
         details["getaddrinfoError"] = str(error)
     direct = subprocess.run(
-        [dig, "+time=1", "+tries=1", "+noall", "+answer", "+authority", "A", name, "@127.0.0.1"],
+        [dig, "+time=1", "+tries=1", "+noall", "+answer", "+authority", "A", name,
+         *dig_server_args(dns_host, dns_port_number)],
         capture_output=True, text=True, timeout=3,
     )
     details["directDns"] = {
@@ -892,6 +968,25 @@ def system_resolves(name):
         return False
 
 
+def direct_service_answers(dig, host, port_number, service):
+    common = [dig, "+time=1", "+tries=1", "+short", "A"]
+    fqdn_result = subprocess.run(
+        [*common, f"{service}.default.service.{SUFFIX}.",
+         *dig_server_args(host, port_number)],
+        capture_output=True, text=True, timeout=3,
+    )
+    short_result = subprocess.run(
+        [dig, "+time=1", "+tries=1", "+short", "+search",
+         f"+domain={SEARCH_DOMAIN}", "A", service,
+         *dig_server_args(host, port_number)],
+        capture_output=True, text=True, timeout=3,
+    )
+    return (
+        fqdn_result.returncode == 0 and bool(fqdn_result.stdout.strip())
+        and short_result.returncode == 0 and bool(short_result.stdout.strip())
+    )
+
+
 def call_service(endpoint, peer):
     address = endpoint["advertisedAddress"]
     port_number = endpoint["port"]
@@ -914,7 +1009,7 @@ import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-service, peer, version, suffix, search_domain, dig = sys.argv[1:]
+service, peer, version, suffix, search_domain, dig, resolver_mode, dns_host, dns_port = sys.argv[1:]
 port = int(os.environ["CONDUCTOR_PORT_HTTP"])
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -924,14 +1019,24 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/identity":
             self.send_response(200); self.end_headers(); self.wfile.write(f"{service}:{version}".encode()); return
         if self.path == f"/call/{peer}":
-            socket.getaddrinfo(f"{peer}.default.service.{suffix}", None, type=socket.SOCK_STREAM)
-            socket.getaddrinfo(peer, None, type=socket.SOCK_STREAM)
-            answer = subprocess.run([dig, "+short", "SRV", f"_http._tcp.{peer}.default.service.{suffix}.", "@127.0.0.1"],
+            if resolver_mode == "host":
+                socket.getaddrinfo(f"{peer}.default.service.{suffix}", None, type=socket.SOCK_STREAM)
+                socket.getaddrinfo(peer, None, type=socket.SOCK_STREAM)
+            answer = subprocess.run([dig, "+short", "SRV", f"_http._tcp.{peer}.default.service.{suffix}.",
+                                    f"@{dns_host}", "-p", dns_port],
                                     check=True, capture_output=True, text=True, timeout=3).stdout.splitlines()
             if not answer:
                 self.send_error(503, "SRV record unavailable"); return
             _, _, peer_port, target = answer[0].split()
             target = target.rstrip(".")
+            if resolver_mode == "direct":
+                addresses = subprocess.run(
+                    [dig, "+short", "A", f"{target}.", f"@{dns_host}", "-p", dns_port],
+                    check=True, capture_output=True, text=True, timeout=3,
+                ).stdout.splitlines()
+                if not addresses:
+                    self.send_error(503, "SRV target address unavailable"); return
+                target = addresses[0]
             with socket.create_connection((target, int(peer_port)), timeout=3) as remote:
                 remote.sendall(f"GET /identity HTTP/1.1\r\nHost: {peer}.default.service.{suffix}\r\nConnection: close\r\n\r\n".encode())
                 chunks = []
