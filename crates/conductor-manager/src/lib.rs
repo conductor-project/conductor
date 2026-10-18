@@ -2,8 +2,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 
 #[cfg(unix)]
@@ -26,7 +29,7 @@ use serde::Serialize;
 
 /// Temporary limit for active jobs. Pagination is a later milestone.
 pub const MAX_JOBS: usize = 1_000;
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_PENDING_COMMANDS_PER_WORKER: usize = 32;
 const MAX_PENDING_NON_CONTROL_COMMANDS_PER_WORKER: usize = 24;
@@ -92,6 +95,59 @@ pub enum WorkerIdentityError {
 pub struct Page<T> {
     pub items: Vec<T>,
     pub next_cursor: Option<String>,
+}
+
+/// An append-only operator or enrollment action. Values contain stable IDs and
+/// a bounded principal/action vocabulary, never request or credential data.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditEvent {
+    pub sequence: u64,
+    pub occurred_at_ms: i64,
+    pub principal: String,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<String>,
+    pub outcome: String,
+    pub status_code: u16,
+}
+
+/// One audit write request. Values are validated against fixed vocabularies and
+/// length bounds before being persisted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditEventInput {
+    pub principal: String,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: Option<String>,
+    pub outcome: String,
+    pub status_code: u16,
+    pub occurred_at_ms: i64,
+}
+
+/// Database-derived operational counts. All fields are aggregate counts; IDs
+/// and user-provided values are intentionally excluded.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct OperationalMetrics {
+    pub deployments_pending: u64,
+    pub deployments_ready: u64,
+    pub deployments_suspended: u64,
+    pub deployments_deleting: u64,
+    pub pending_allocations: u64,
+    pub retried_service_attempts: u64,
+    pub terminal_service_attempts: u64,
+    pub service_catalog_owners: u64,
+    pub pending_reasons: [u64; 12],
+}
+
+/// Fixed-bucket counters for manager reconciliation, which performs service
+/// scheduling and deployment placement work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReconcileMetrics {
+    pub runs: u64,
+    pub failures: u64,
+    pub duration_sum_ns: u64,
+    pub duration_buckets: [u64; 7],
 }
 
 pub const DEFAULT_PAGE_SIZE: usize = 50;
@@ -289,6 +345,9 @@ pub struct CommandRecord {
 
 /// Storage port owned by the manager. Implementations preserve deleted IDs.
 pub trait JobRepository: Send + Sync + CommandJournal {
+    fn record_audit_event(&self, event: &AuditEventInput) -> Result<(), ExecutionStoreError>;
+    fn list_audit_events(&self, limit: usize) -> Result<Vec<AuditEvent>, ExecutionStoreError>;
+    fn operational_metrics(&self) -> Result<OperationalMetrics, ExecutionStoreError>;
     fn insert(&self, job: JobSpec) -> Result<(), JobStoreError>;
     fn get(&self, id: &JobId) -> Result<Option<JobSpec>, JobStoreError>;
     fn list_jobs_page(
@@ -543,12 +602,26 @@ impl SqliteJobRepository {
             .connection
             .lock()
             .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
-        connection
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        transaction
             .execute(
                 "INSERT INTO enrollment_credentials(token_hash, worker_id, expires_at_ms) VALUES (?1, ?2, ?3)",
                 params![token_hash.as_slice(), worker_id.as_str(), expires_at_ms],
             )
-            .map(|_| ())
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)
+            .and_then(|_| {
+                transaction
+                    .execute(
+                        "INSERT INTO audit_events(occurred_at_ms, principal, action, resource_type, resource_id, outcome, status_code)
+                         VALUES (?1, 'local_operator', 'worker.enrollment_credential.create', 'worker', ?2, 'success', 201)",
+                        params![now_ms().map_err(|_| WorkerIdentityError::StorageUnavailable)?, worker_id.as_str()],
+                    )
+                    .map_err(|_| WorkerIdentityError::StorageUnavailable)
+            })?;
+        transaction
+            .commit()
             .map_err(|_| WorkerIdentityError::StorageUnavailable)
     }
 
@@ -641,6 +714,13 @@ impl SqliteJobRepository {
             )
             .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
         transaction
+            .execute(
+                "INSERT INTO audit_events(occurred_at_ms, principal, action, resource_type, resource_id, outcome, status_code)
+                 VALUES (?1, 'worker_enrollment', 'worker.enroll', 'worker', ?2, 'success', 201)",
+                params![now_ms, worker_id.as_str()],
+            )
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        transaction
             .commit()
             .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
         Ok(worker_id)
@@ -691,6 +771,13 @@ impl SqliteJobRepository {
             )
             .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
         transaction
+            .execute(
+                "INSERT INTO audit_events(occurred_at_ms, principal, action, resource_type, resource_id, outcome, status_code)
+                 VALUES (?1, 'worker_enrollment', 'worker.certificate.renew', 'worker', ?2, 'success', 200)",
+                params![now_ms, worker_id],
+            )
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        transaction
             .commit()
             .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
         WorkerId::new(worker_id).map_err(|_| WorkerIdentityError::StorageUnavailable)
@@ -725,6 +812,13 @@ impl SqliteJobRepository {
             .execute(
                 "DELETE FROM enrollment_credentials WHERE worker_id = ?1 AND consumed_at_ms IS NULL",
                 [worker_id.as_str()],
+            )
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO audit_events(occurred_at_ms, principal, action, resource_type, resource_id, outcome, status_code)
+                 VALUES (?1, 'local_operator', 'worker.revoke', 'worker', ?2, 'success', 200)",
+                params![now_ms, worker_id.as_str()],
             )
             .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
         transaction
@@ -858,7 +952,22 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
         connection
             .prepare("SELECT worker_id, requested_at_ms, deadline_at_ms, completed_at_ms FROM worker_drains LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare("SELECT event_sequence, occurred_at_ms, principal, action, resource_type, resource_id, outcome, status_code FROM audit_events LIMIT 0")
+            .map_err(MigrationError::Sqlite)?;
         return Ok(());
+    }
+
+    if version == 11 {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(MigrationError::Sqlite)?;
+        create_audit_schema(&transaction).map_err(MigrationError::Sqlite)?;
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(MigrationError::Sqlite)?;
+        transaction.commit().map_err(MigrationError::Sqlite)?;
+        return migrate(connection);
     }
 
     if version == 10 {
@@ -867,7 +976,7 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
             .map_err(MigrationError::Sqlite)?;
         create_worker_drain_schema(&transaction).map_err(MigrationError::Sqlite)?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 11)
             .map_err(MigrationError::Sqlite)?;
         transaction.commit().map_err(MigrationError::Sqlite)?;
         return migrate(connection);
@@ -1102,10 +1211,29 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
     create_service_port_schema(&transaction).map_err(MigrationError::Sqlite)?;
     create_service_catalog_owner_schema(&transaction).map_err(MigrationError::Sqlite)?;
     create_worker_drain_schema(&transaction).map_err(MigrationError::Sqlite)?;
+    create_audit_schema(&transaction).map_err(MigrationError::Sqlite)?;
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(MigrationError::Sqlite)?;
     transaction.commit().map_err(MigrationError::Sqlite)
+}
+
+fn create_audit_schema(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS audit_events (
+             event_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+             occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms >= 0),
+             principal TEXT NOT NULL CHECK (principal IN ('operator', 'local_operator', 'worker_enrollment')),
+             action TEXT NOT NULL CHECK (length(action) BETWEEN 1 AND 64),
+             resource_type TEXT NOT NULL CHECK (resource_type IN ('job', 'deployment', 'worker', 'run')),
+             resource_id TEXT CHECK (resource_id IS NULL OR length(resource_id) BETWEEN 1 AND 128),
+             outcome TEXT NOT NULL CHECK (outcome IN ('success', 'failure')),
+             status_code INTEGER NOT NULL CHECK (status_code BETWEEN 100 AND 599)
+         );
+         CREATE INDEX IF NOT EXISTS audit_events_by_time ON audit_events(occurred_at_ms DESC, event_sequence DESC);
+         CREATE TRIGGER IF NOT EXISTS audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
+         CREATE TRIGGER IF NOT EXISTS audit_events_no_delete BEFORE DELETE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;",
+    )
 }
 
 fn create_service_port_schema(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
@@ -2519,6 +2647,150 @@ fn decode_cursor(cursor: &str) -> Result<String, QueryError> {
 }
 
 impl JobRepository for SqliteJobRepository {
+    fn record_audit_event(&self, event: &AuditEventInput) -> Result<(), ExecutionStoreError> {
+        if !matches!(
+            event.principal.as_str(),
+            "operator" | "local_operator" | "worker_enrollment"
+        ) || event.action.is_empty()
+            || event.action.len() > 64
+            || !event
+                .action
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.')
+            || !matches!(
+                event.resource_type.as_str(),
+                "job" | "deployment" | "worker" | "run"
+            )
+            || event.resource_id.as_deref().is_some_and(|id| {
+                id.is_empty()
+                    || id.len() > 128
+                    || !id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+                    })
+            })
+            || !matches!(event.outcome.as_str(), "success" | "failure")
+            || !(100..=599).contains(&event.status_code)
+            || event.occurred_at_ms < 0
+        {
+            return Err(ExecutionStoreError::InvalidRequest);
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        connection
+            .execute(
+                "INSERT INTO audit_events(occurred_at_ms, principal, action, resource_type, resource_id, outcome, status_code)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![event.occurred_at_ms, event.principal, event.action, event.resource_type, event.resource_id, event.outcome, event.status_code],
+            )
+            .map(|_| ())
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)
+    }
+
+    fn list_audit_events(&self, limit: usize) -> Result<Vec<AuditEvent>, ExecutionStoreError> {
+        if !(1..=1_000).contains(&limit) {
+            return Err(ExecutionStoreError::InvalidRequest);
+        }
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT event_sequence, occurred_at_ms, principal, action, resource_type, resource_id, outcome, status_code
+                 FROM audit_events ORDER BY event_sequence DESC LIMIT ?1",
+            )
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let rows = statement
+            .query_map([limit as i64], |row| {
+                Ok(AuditEvent {
+                    sequence: row.get::<_, i64>(0)? as u64,
+                    occurred_at_ms: row.get(1)?,
+                    principal: row.get(2)?,
+                    action: row.get(3)?,
+                    resource_type: row.get(4)?,
+                    resource_id: row.get(5)?,
+                    outcome: row.get(6)?,
+                    status_code: row.get(7)?,
+                })
+            })
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)
+    }
+
+    fn operational_metrics(&self) -> Result<OperationalMetrics, ExecutionStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let mut metrics = OperationalMetrics::default();
+        let mut statement = connection
+            .prepare(
+                "SELECT deployment_json FROM job_deployments WHERE deleted_at_ms IS NULL LIMIT ?1",
+            )
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let deployments = statement
+            .query_map([MAX_JOBS as i64], |row| row.get::<_, String>(0))
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        for deployment in deployments {
+            let deployment: JobDeployment = serde_json::from_str(
+                &deployment.map_err(|_| ExecutionStoreError::StorageUnavailable)?,
+            )
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            match deployment.status() {
+                DeploymentStatus::Pending => metrics.deployments_pending += 1,
+                DeploymentStatus::Ready => metrics.deployments_ready += 1,
+                DeploymentStatus::Suspended => metrics.deployments_suspended += 1,
+                DeploymentStatus::Deleting | DeploymentStatus::Deleted => {
+                    metrics.deployments_deleting += 1;
+                }
+            }
+            if let Some(reason) = deployment.pending_reason() {
+                let index = match reason {
+                    DeploymentPendingReason::NoEligibleWorker => 0,
+                    DeploymentPendingReason::WorkerCapacityExhausted => 1,
+                    DeploymentPendingReason::WorkerDisconnected => 2,
+                    DeploymentPendingReason::RequiredProtectionUnavailable => 3,
+                    DeploymentPendingReason::SharedHostCapacityExhausted => 4,
+                    DeploymentPendingReason::PlacementPending => 5,
+                    DeploymentPendingReason::ServiceStarting => 6,
+                    DeploymentPendingReason::ServiceRestartBackoff => 7,
+                    DeploymentPendingReason::ServiceRestartBudgetExhausted => 8,
+                    DeploymentPendingReason::ServiceAttemptUnresolved => 9,
+                    DeploymentPendingReason::ServiceReadinessPending => 10,
+                    DeploymentPendingReason::RolloutProgressDeadlineExceeded => 11,
+                };
+                metrics.pending_reasons[index] += 1;
+            }
+        }
+        (
+            metrics.pending_allocations,
+            metrics.retried_service_attempts,
+            metrics.terminal_service_attempts,
+            metrics.service_catalog_owners,
+        ) = connection
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM allocations WHERE state = 'pending'),
+                    (SELECT COUNT(*) FROM service_attempts WHERE restart_count > 0),
+                    (SELECT COUNT(*) FROM service_attempts WHERE terminal_failure != 0),
+                    (SELECT COUNT(*) FROM service_catalog_owners)",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)? as u64,
+                        row.get::<_, i64>(1)? as u64,
+                        row.get::<_, i64>(2)? as u64,
+                        row.get::<_, i64>(3)? as u64,
+                    ))
+                },
+            )
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        Ok(metrics)
+    }
+
     fn insert(&self, job: JobSpec) -> Result<(), JobStoreError> {
         let spec_json =
             serde_json::to_string(&job).map_err(|_| JobStoreError::StorageUnavailable)?;
@@ -5127,11 +5399,102 @@ pub const MAX_RUNS_RESPONSE: usize = 100;
 /// Manager application service for immutable job definitions.
 pub struct JobService {
     repository: Arc<dyn JobRepository>,
+    telemetry: ManagerTelemetry,
+}
+
+struct ManagerTelemetry {
+    reconcile_runs: AtomicU64,
+    reconcile_failures: AtomicU64,
+    reconcile_duration_sum_ns: AtomicU64,
+    reconcile_duration_buckets: [AtomicU64; 7],
+}
+
+impl Default for ManagerTelemetry {
+    fn default() -> Self {
+        Self {
+            reconcile_runs: AtomicU64::new(0),
+            reconcile_failures: AtomicU64::new(0),
+            reconcile_duration_sum_ns: AtomicU64::new(0),
+            reconcile_duration_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl ManagerTelemetry {
+    fn record_reconcile(&self, elapsed: Duration, failed: bool) {
+        self.reconcile_runs.fetch_add(1, Ordering::Relaxed);
+        if failed {
+            self.reconcile_failures.fetch_add(1, Ordering::Relaxed);
+        }
+        self.reconcile_duration_sum_ns.fetch_add(
+            elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+        let bounds = [
+            Duration::from_millis(5),
+            Duration::from_millis(25),
+            Duration::from_millis(100),
+            Duration::from_millis(500),
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        ];
+        let bucket = bounds
+            .iter()
+            .position(|bound| elapsed <= *bound)
+            .unwrap_or(bounds.len());
+        self.reconcile_duration_buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> ReconcileMetrics {
+        ReconcileMetrics {
+            runs: self.reconcile_runs.load(Ordering::Relaxed),
+            failures: self.reconcile_failures.load(Ordering::Relaxed),
+            duration_sum_ns: self.reconcile_duration_sum_ns.load(Ordering::Relaxed),
+            duration_buckets: std::array::from_fn(|index| {
+                self.reconcile_duration_buckets[index].load(Ordering::Relaxed)
+            }),
+        }
+    }
 }
 
 impl JobService {
     pub fn new(repository: Arc<dyn JobRepository>) -> Self {
-        Self { repository }
+        Self {
+            repository,
+            telemetry: ManagerTelemetry::default(),
+        }
+    }
+
+    pub fn record_audit_event(
+        &self,
+        principal: &str,
+        action: &str,
+        resource_type: &str,
+        resource_id: Option<&str>,
+        outcome: &str,
+        status_code: u16,
+    ) -> Result<(), ExecutionStoreError> {
+        self.repository.record_audit_event(&AuditEventInput {
+            principal: principal.to_owned(),
+            action: action.to_owned(),
+            resource_type: resource_type.to_owned(),
+            resource_id: resource_id.map(str::to_owned),
+            outcome: outcome.to_owned(),
+            status_code,
+            occurred_at_ms: now_ms().map_err(|_| ExecutionStoreError::StorageUnavailable)?,
+        })
+    }
+
+    pub fn list_audit_events(&self, limit: usize) -> Result<Vec<AuditEvent>, ExecutionStoreError> {
+        self.repository.list_audit_events(limit)
+    }
+
+    pub fn operational_metrics(&self) -> Result<OperationalMetrics, ExecutionStoreError> {
+        self.repository.operational_metrics()
+    }
+
+    pub fn reconcile_metrics(&self) -> ReconcileMetrics {
+        self.telemetry.snapshot()
     }
 
     pub fn open_sqlite(path: impl AsRef<Path>) -> Result<Self, RepositoryOpenError> {
@@ -5392,6 +5755,17 @@ impl JobService {
     /// safe: the repository reserves one run ID per service instance before
     /// dispatch, and unresolved worker outcomes are never relaunched.
     pub fn reconcile_services(&self, workers: &[Arc<dyn WorkerPort>]) -> Result<(), ManagerError> {
+        let started = Instant::now();
+        let result = self.reconcile_services_inner(workers);
+        self.telemetry
+            .record_reconcile(started.elapsed(), result.is_err());
+        result
+    }
+
+    fn reconcile_services_inner(
+        &self,
+        workers: &[Arc<dyn WorkerPort>],
+    ) -> Result<(), ManagerError> {
         let statuses = workers
             .iter()
             .filter_map(|worker| self.worker_status(worker.as_ref()).ok())
@@ -6326,6 +6700,185 @@ mod service_retry_tests {
         assert_eq!(
             service_restart_backoff_ms(32),
             SERVICE_RESTART_MAX_BACKOFF_MS
+        );
+    }
+}
+
+#[cfg(test)]
+mod audit_metrics_tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::{AuditEventInput, JobRepository, SqliteJobRepository};
+    use conductor_core::WorkerId;
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestDatabase(std::path::PathBuf);
+
+    impl TestDatabase {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "conductor-audit-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&directory).expect("create temporary repository directory");
+            Self(directory.join("manager.sqlite3"))
+        }
+
+        fn open(&self) -> SqliteJobRepository {
+            SqliteJobRepository::open(&self.0).expect("open test repository")
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            if let Some(directory) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(directory);
+            }
+        }
+    }
+
+    fn audit_input(action: &str, outcome: &str, occurred_at_ms: i64) -> AuditEventInput {
+        AuditEventInput {
+            principal: "operator".to_owned(),
+            action: action.to_owned(),
+            resource_type: "worker".to_owned(),
+            resource_id: Some("worker-a".to_owned()),
+            outcome: outcome.to_owned(),
+            status_code: if outcome == "failure" { 500 } else { 200 },
+            occurred_at_ms,
+        }
+    }
+
+    #[test]
+    fn audit_records_are_bounded_redacted_and_append_only() {
+        let database = TestDatabase::new();
+        let repository = database.open();
+        repository
+            .record_audit_event(&audit_input("worker.drain.request", "failure", 1))
+            .expect("record bounded audit intent");
+        repository
+            .record_audit_event(&audit_input("worker.drain.request", "success", 2))
+            .expect("record bounded audit result");
+        assert!(
+            repository
+                .record_audit_event(&audit_input("rm -rf secret-command", "success", 3))
+                .is_err()
+        );
+        assert!(repository.list_audit_events(1_001).is_err());
+
+        let events = JobRepository::list_audit_events(&repository, 10).expect("read audit events");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 2);
+        assert_eq!(events[0].outcome, "success");
+        assert_eq!(events[1].outcome, "failure");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.resource_id.as_deref() == Some("worker-a"))
+        );
+        let serialized = serde_json::to_string(&events).expect("serialize safe audit fields");
+        assert!(!serialized.contains("secret-command"));
+        assert!(
+            repository
+                .connection
+                .lock()
+                .expect("lock test connection")
+                .execute("DELETE FROM audit_events", [])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn worker_enrollment_and_revocation_are_audited_without_credentials() {
+        let database = TestDatabase::new();
+        let repository = database.open();
+        let worker = WorkerId::new("worker-a").expect("valid worker ID");
+        let credential_hash = [17_u8; 32];
+        let certificate_fingerprint = [23_u8; 32];
+        repository
+            .create_enrollment_credential(&credential_hash, &worker, 10_000)
+            .expect("create enrollment credential");
+        repository
+            .enroll_worker_identity(
+                &credential_hash,
+                &certificate_fingerprint,
+                "certificate-1",
+                1,
+                10_000,
+                2,
+            )
+            .expect("enroll worker");
+        repository
+            .renew_worker_identity(
+                &certificate_fingerprint,
+                &[29_u8; 32],
+                "certificate-2",
+                2,
+                20_000,
+                3,
+            )
+            .expect("renew worker certificate");
+        repository
+            .revoke_worker_identity(&worker, 4)
+            .expect("revoke worker");
+
+        let events = JobRepository::list_audit_events(&repository, 10).expect("read audit events");
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].action, "worker.revoke");
+        assert_eq!(events[1].action, "worker.certificate.renew");
+        assert_eq!(events[1].principal, "worker_enrollment");
+        assert_eq!(events[2].action, "worker.enroll");
+        assert_eq!(events[3].action, "worker.enrollment_credential.create");
+        assert!(events.iter().all(|event| {
+            event.resource_id.as_deref() == Some("worker-a")
+                && event.status_code >= 100
+                && event.status_code <= 599
+        }));
+        let serialized = serde_json::to_string(&events).expect("serialize safe audit fields");
+        assert!(!serialized.contains("111111"));
+        assert!(!serialized.contains("171717"));
+    }
+
+    #[test]
+    fn schema_eleven_migrates_to_audit_storage() {
+        let database = TestDatabase::new();
+        drop(database.open());
+        {
+            let connection = rusqlite::Connection::open(&database.0).expect("open old database");
+            connection
+                .execute_batch(
+                    "DROP TRIGGER audit_events_no_update;
+                     DROP TRIGGER audit_events_no_delete;
+                     DROP INDEX audit_events_by_time;
+                     DROP TABLE audit_events;
+                     PRAGMA user_version = 11;",
+                )
+                .expect("restore schema 11 shape");
+        }
+        let repository = database.open();
+        repository
+            .record_audit_event(&AuditEventInput {
+                principal: "operator".to_owned(),
+                action: "deployment.scale".to_owned(),
+                resource_type: "deployment".to_owned(),
+                resource_id: Some("job-a".to_owned()),
+                outcome: "success".to_owned(),
+                status_code: 202,
+                occurred_at_ms: 10,
+            })
+            .expect("write event after schema migration");
+        assert_eq!(
+            JobRepository::list_audit_events(&repository, 10)
+                .unwrap()
+                .len(),
+            1
         );
     }
 }

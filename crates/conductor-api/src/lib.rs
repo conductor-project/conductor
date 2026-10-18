@@ -1,5 +1,6 @@
 pub mod dns;
 
+use std::fmt::Write as FmtWrite;
 use std::future::IntoFuture;
 use std::io;
 use std::sync::{
@@ -10,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Json;
 use axum::Router;
+use axum::body::{Body, to_bytes};
 use axum::extract::{
     DefaultBodyLimit, Path, Query, State,
     rejection::{JsonRejection, QueryRejection},
@@ -193,7 +195,11 @@ struct ApiState {
     control_admission: Arc<Semaphore>,
     service_watch_admission: Arc<Semaphore>,
     recovery_ready: Arc<AtomicBool>,
+    operator_authenticator: Option<Arc<dyn OperatorAuthenticator>>,
 }
+
+#[derive(Clone)]
+struct AuditResourceId(String);
 
 #[derive(Clone, Copy)]
 enum ApiRole {
@@ -392,6 +398,10 @@ fn router_with_recovery(
     access_policy: ApiAccessPolicy,
     readiness: ApiReadiness,
 ) -> Router {
+    let operator_authenticator = match &access_policy {
+        ApiAccessPolicy::LocalMode => None,
+        ApiAccessPolicy::AuthenticatedOperator(authenticator) => Some(Arc::clone(authenticator)),
+    };
     let descriptor = worker.descriptor();
     let workers = readiness
         .recovery_workers
@@ -410,8 +420,10 @@ fn router_with_recovery(
         control_admission: Arc::new(Semaphore::new(MAX_PENDING_CONTROL_OPERATIONS)),
         service_watch_admission: Arc::new(Semaphore::new(MAX_ACTIVE_SERVICE_WATCHES)),
         recovery_ready,
+        operator_authenticator,
     });
     let mut manager_routes = Router::new()
+        .route("/v1/metrics", get(metrics))
         .route("/v1/jobs", post(create_job).get(list_jobs))
         .route("/v1/jobs/{id}", get(get_job).delete(delete_job))
         .route("/v1/jobs/{id}/revisions", post(create_revision))
@@ -453,12 +465,10 @@ fn router_with_recovery(
         .route("/v1/runs/{id}/logs", get(get_run_logs))
         .route("/v1/runs/{id}/stop", post(stop_run))
         .route("/v1/runs/{id}/resolve", post(resolve_run));
-    if let ApiAccessPolicy::AuthenticatedOperator(authenticator) = access_policy {
-        manager_routes = manager_routes.layer(middleware::from_fn_with_state(
-            authenticator,
-            authenticate_operator,
-        ));
-    }
+    manager_routes = manager_routes.layer(middleware::from_fn_with_state(
+        Arc::clone(&state),
+        authenticate_and_audit,
+    ));
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -1311,24 +1321,313 @@ async fn request_bounds(
     }
 }
 
-async fn authenticate_operator(
-    State(authenticator): State<Arc<dyn OperatorAuthenticator>>,
+async fn authenticate_and_audit(
+    State(state): State<Arc<ApiState>>,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
-    if !authenticator.authenticate(request.headers()) {
-        let mut response = error(
-            StatusCode::UNAUTHORIZED,
-            "operator_authentication_required",
-            "a valid operator bearer token is required",
-        );
-        response.headers_mut().insert(
-            header::WWW_AUTHENTICATE,
-            HeaderValue::from_static("Bearer realm=\"conductor\""),
-        );
-        return response;
+    let principal = if let Some(authenticator) = &state.operator_authenticator {
+        if !authenticator.authenticate(request.headers()) {
+            let mut response = error(
+                StatusCode::UNAUTHORIZED,
+                "operator_authentication_required",
+                "a valid operator bearer token is required",
+            );
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer realm=\"conductor\""),
+            );
+            return response;
+        }
+        "operator"
+    } else {
+        "local_operator"
+    };
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let descriptor = audit_descriptor(&method, &path)
+        .map(|(action, resource_type, id)| (action, resource_type, id.map(str::to_owned)));
+    let Some(descriptor) = descriptor else {
+        return next.run(request).await;
+    };
+    // Buffer only bounded mutation bodies before detaching the operation. This
+    // lets incomplete clients time out cleanly while completed requests retain
+    // the API's existing background-completion behavior.
+    let (parts, body) = request.into_parts();
+    let body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+        Ok(body) => body,
+        Err(_) => {
+            return error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request_body_too_large",
+                "the request body exceeds the configured byte limit",
+            );
+        }
+    };
+    let request = axum::extract::Request::from_parts(parts, Body::from(body));
+    let manager = Arc::clone(&state.manager);
+    // Keep the handler alive after an HTTP timeout so manager operations that
+    // have entered bounded blocking admission can finish and be audited.
+    match tokio::spawn(async move {
+        let response = next.run(request).await;
+        let status = response.status();
+        if status != StatusCode::TOO_MANY_REQUESTS {
+            let outcome = if status.is_success() {
+                "success"
+            } else {
+                "failure"
+            };
+            let resource_id = descriptor.2.or_else(|| {
+                response
+                    .extensions()
+                    .get::<AuditResourceId>()
+                    .map(|target| target.0.clone())
+            });
+            let manager = Arc::clone(&manager);
+            let audit_result = tokio::task::spawn_blocking(move || {
+                manager.record_audit_event(
+                    principal,
+                    descriptor.0,
+                    descriptor.1,
+                    resource_id.as_deref(),
+                    outcome,
+                    status.as_u16(),
+                )
+            })
+            .await;
+            if !matches!(audit_result, Ok(Ok(()))) {
+                eprintln!(
+                    "{{\"timestampMs\":{},\"severity\":\"error\",\"component\":\"audit\",\"event\":\"audit_write_failed\"}}",
+                    timestamp_ms()
+                );
+            }
+        }
+        response
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(_) => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "the request could not be completed",
+        ),
     }
-    next.run(request).await
+}
+
+fn audit_descriptor<'a>(
+    method: &axum::http::Method,
+    path: &'a str,
+) -> Option<(&'static str, &'static str, Option<&'a str>)> {
+    let segments = path.strip_prefix("/v1/")?.split('/').collect::<Vec<_>>();
+    match (segments.as_slice(), method.as_str()) {
+        (["jobs"], "POST") => Some(("job.create", "job", None)),
+        (["jobs", id], "DELETE") => Some(("job.delete", "job", Some(*id))),
+        (["jobs", id, "revisions"], "POST") => Some(("job.revision.create", "job", Some(*id))),
+        (["jobs", id, "deployment"], "PUT") => Some(("deployment.update", "deployment", Some(*id))),
+        (["jobs", id, "deployment"], "DELETE") => {
+            Some(("deployment.delete", "deployment", Some(*id)))
+        }
+        (["jobs", id, "deployment", "scale"], "POST") => {
+            Some(("deployment.scale", "deployment", Some(*id)))
+        }
+        (["jobs", id, "deployment", "suspend"], "POST") => {
+            Some(("deployment.suspend", "deployment", Some(*id)))
+        }
+        (["jobs", id, "deployment", "resume"], "POST") => {
+            Some(("deployment.resume", "deployment", Some(*id)))
+        }
+        (["jobs", id, "deployment", "rollback"], "POST") => {
+            Some(("deployment.rollback", "deployment", Some(*id)))
+        }
+        (["jobs", id, "runs"], "POST") => Some(("run.start", "job", Some(*id))),
+        (["workers", id, "drain"], "POST") => Some(("worker.drain.request", "worker", Some(*id))),
+        (["workers", id, "drain"], "DELETE") => Some(("worker.drain.cancel", "worker", Some(*id))),
+        (["runs", id, "stop"], "POST") => Some(("run.stop", "run", Some(*id))),
+        (["runs", id, "resolve"], "POST") => Some(("run.resolve", "run", Some(*id))),
+        _ => None,
+    }
+}
+
+async fn metrics(State(state): State<Arc<ApiState>>) -> Response {
+    let manager = Arc::clone(&state.manager);
+    let operational = match tokio::task::spawn_blocking(move || manager.operational_metrics()).await
+    {
+        Ok(Ok(metrics)) => metrics,
+        _ => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "metrics_unavailable",
+                "operational metrics are temporarily unavailable",
+            );
+        }
+    };
+    let mut workers_fresh = 0_u64;
+    let mut workers_stale = 0_u64;
+    let mut workers_freshness_unknown = 0_u64;
+    let mut workers_available = 0_u64;
+    let mut workers_unavailable = 0_u64;
+    let mut workers_degraded = 0_u64;
+    let mut workers_draining = 0_u64;
+    for worker in &state.workers {
+        match query_single_worker_status(&state, Arc::clone(worker)).await {
+            Ok(status) => {
+                if status.inventory().is_some() {
+                    workers_fresh += u64::from(status.fresh());
+                    workers_stale += u64::from(!status.fresh());
+                } else {
+                    workers_freshness_unknown += 1;
+                }
+                workers_available += u64::from(status.available());
+                workers_unavailable += u64::from(!status.available());
+                workers_degraded += u64::from(status.degraded());
+                workers_draining += u64::from(status.draining());
+            }
+            Err(_) => workers_unavailable += 1,
+        }
+    }
+    let reconcile = state.manager.reconcile_metrics();
+    let bounds = ["0.005", "0.025", "0.1", "0.5", "1", "5", "+Inf"];
+    let mut cumulative = 0_u64;
+    let mut body = String::with_capacity(1_536);
+    let _ = writeln!(
+        body,
+        "# HELP conductor_deployments Current deployments by lifecycle status."
+    );
+    let _ = writeln!(body, "# TYPE conductor_deployments gauge");
+    for (status, count) in [
+        ("pending", operational.deployments_pending),
+        ("ready", operational.deployments_ready),
+        ("suspended", operational.deployments_suspended),
+        ("deleting", operational.deployments_deleting),
+    ] {
+        let _ = writeln!(body, "conductor_deployments{{status=\"{status}\"}} {count}");
+    }
+    let _ = writeln!(
+        body,
+        "# HELP conductor_pending_work Current durable allocations awaiting placement and deployment blockers."
+    );
+    let _ = writeln!(body, "# TYPE conductor_pending_work gauge");
+    let _ = writeln!(
+        body,
+        "conductor_pending_work{{kind=\"allocations\"}} {}",
+        operational.pending_allocations
+    );
+    let pending_reasons = [
+        "no_eligible_worker",
+        "worker_capacity_exhausted",
+        "worker_disconnected",
+        "required_protection_unavailable",
+        "shared_host_capacity_exhausted",
+        "placement_pending",
+        "service_starting",
+        "service_restart_backoff",
+        "service_restart_budget_exhausted",
+        "service_attempt_unresolved",
+        "service_readiness_pending",
+        "rollout_progress_deadline_exceeded",
+    ];
+    for (reason, count) in pending_reasons.into_iter().zip(operational.pending_reasons) {
+        let _ = writeln!(
+            body,
+            "conductor_pending_work{{kind=\"deployment\",reason=\"{reason}\"}} {count}"
+        );
+    }
+    let _ = writeln!(
+        body,
+        "# HELP conductor_service_attempts Current service instances by retry or terminal-failure state."
+    );
+    let _ = writeln!(body, "# TYPE conductor_service_attempts gauge");
+    let _ = writeln!(
+        body,
+        "conductor_service_attempts{{state=\"retried\"}} {}",
+        operational.retried_service_attempts
+    );
+    let _ = writeln!(
+        body,
+        "conductor_service_attempts{{state=\"terminal_failure\"}} {}",
+        operational.terminal_service_attempts
+    );
+    let _ = writeln!(
+        body,
+        "# HELP conductor_workers Current worker connectivity and discovery snapshot freshness."
+    );
+    let _ = writeln!(body, "# TYPE conductor_workers gauge");
+    for (state_name, count) in [
+        ("fresh", workers_fresh),
+        ("stale", workers_stale),
+        ("freshness_unknown", workers_freshness_unknown),
+        ("available", workers_available),
+        ("unavailable", workers_unavailable),
+        ("degraded", workers_degraded),
+        ("draining", workers_draining),
+    ] {
+        let _ = writeln!(body, "conductor_workers{{state=\"{state_name}\"}} {count}");
+    }
+    let _ = writeln!(
+        body,
+        "# HELP conductor_discovery_service_owners Current allocated service discovery registrations."
+    );
+    let _ = writeln!(body, "# TYPE conductor_discovery_service_owners gauge");
+    let _ = writeln!(
+        body,
+        "conductor_discovery_service_owners {}",
+        operational.service_catalog_owners
+    );
+    let _ = writeln!(
+        body,
+        "# HELP conductor_manager_reconcile_total Service reconciliation passes, including scheduling and placement."
+    );
+    let _ = writeln!(body, "# TYPE conductor_manager_reconcile_total counter");
+    let _ = writeln!(body, "conductor_manager_reconcile_total {}", reconcile.runs);
+    let _ = writeln!(
+        body,
+        "# HELP conductor_manager_reconcile_failures_total Failed service reconciliation passes."
+    );
+    let _ = writeln!(
+        body,
+        "# TYPE conductor_manager_reconcile_failures_total counter"
+    );
+    let _ = writeln!(
+        body,
+        "conductor_manager_reconcile_failures_total {}",
+        reconcile.failures
+    );
+    let _ = writeln!(
+        body,
+        "# HELP conductor_manager_reconcile_duration_seconds Reconciliation pass duration histogram."
+    );
+    let _ = writeln!(
+        body,
+        "# TYPE conductor_manager_reconcile_duration_seconds histogram"
+    );
+    for (index, bucket) in reconcile.duration_buckets.iter().enumerate() {
+        cumulative = cumulative.saturating_add(*bucket);
+        let _ = writeln!(
+            body,
+            "conductor_manager_reconcile_duration_seconds_bucket{{le=\"{}\"}} {cumulative}",
+            bounds[index]
+        );
+    }
+    let _ = writeln!(
+        body,
+        "conductor_manager_reconcile_duration_seconds_sum {:.9}",
+        reconcile.duration_sum_ns as f64 / 1_000_000_000.0
+    );
+    let _ = writeln!(
+        body,
+        "conductor_manager_reconcile_duration_seconds_count {}",
+        reconcile.runs
+    );
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+        )],
+        body,
+    )
+        .into_response()
 }
 
 async fn healthz(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
@@ -1585,7 +1884,13 @@ async fn create_job(
         Err(error_value) => return blocking_error(error_value),
     };
     match result {
-        Ok(()) => (StatusCode::CREATED, Json(job)).into_response(),
+        Ok(()) => {
+            let mut response = (StatusCode::CREATED, Json(job.clone())).into_response();
+            response
+                .extensions_mut()
+                .insert(AuditResourceId(job.id().as_str().to_owned()));
+            response
+        }
         Err(ManagerError::DuplicateJob) => error(
             StatusCode::CONFLICT,
             "duplicate_job",
@@ -2770,6 +3075,87 @@ mod access_tests {
             .await
             .expect("out-of-range drain period response");
         assert_eq!(out_of_range.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn metrics_are_authenticated_aggregated_and_have_bounded_labels() {
+        let database = TestDatabase::new();
+        let app = router(&database);
+        let unauthorized = app
+            .clone()
+            .oneshot(request("GET", "/v1/metrics", None))
+            .await
+            .expect("metrics authentication response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(request(
+                "GET",
+                "/v1/metrics",
+                Some(std::str::from_utf8(TOKEN).unwrap()),
+            ))
+            .await
+            .expect("metrics response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 65_536)
+            .await
+            .expect("bounded metrics body");
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("conductor_manager_reconcile_duration_seconds_bucket"));
+        assert!(text.contains("reason=\"service_attempt_unresolved\""));
+        assert!(text.contains("state=\"freshness_unknown\""));
+        assert!(!text.contains("worker-a"));
+        assert!(!text.contains(std::str::from_utf8(TOKEN).unwrap()));
+        assert!(text.lines().count() < 64);
+    }
+
+    #[tokio::test]
+    async fn operator_mutations_record_outcomes_without_request_contents() {
+        let database = TestDatabase::new();
+        let manager = database.manager();
+        let app = router(&database);
+        let missing = app
+            .clone()
+            .oneshot(authorized_request(
+                "DELETE",
+                "/v1/jobs/job-a",
+                "",
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("failed mutation response");
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let body = r#"{"id":"job-a","command":["/bin/echo","marker-private-command"],"cwd":"/tmp","terminationGraceMs":5000}"#;
+        let created = app
+            .oneshot(authorized_request(
+                "POST", "/v1/jobs", body, None, None, false,
+            ))
+            .await
+            .expect("create job response");
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let events = manager
+            .list_audit_events(10)
+            .expect("audit events persisted");
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].action, "job.create");
+        assert_eq!(events[0].outcome, "success");
+        assert_eq!(events[0].resource_id.as_deref(), Some("job-a"));
+        assert_eq!(events[1].action, "job.delete");
+        assert_eq!(events[1].outcome, "failure");
+        assert_eq!(events[1].status_code, 404);
+        assert!(events.iter().all(|event| event.principal == "operator"));
+        let serialized = serde_json::to_string(&events).expect("serialize audit records");
+        assert!(serialized.contains("job-a"));
+        assert!(!serialized.contains("marker-private-command"));
+        assert!(!serialized.contains(std::str::from_utf8(TOKEN).unwrap()));
     }
 
     #[tokio::test]
