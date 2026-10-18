@@ -27,8 +27,12 @@ jobs:
           key: ${{ runner.os }}-rust-1.99.1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
       - name: Install Rust 1.99.1
         run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+      - name: Check dependency and lint policy
+        run: python3 scripts/check-dependency-policy.py
       - name: Check formatting
         run: cargo +1.99.1 fmt --all -- --check
+      - name: Build all targets
+        run: cargo +1.99.1 build --workspace --locked --all-targets --all-features
       - name: Lint
         run: cargo +1.99.1 clippy --workspace --locked --all-targets --all-features -- -D warnings
       - name: Test debug and portable process lifecycle
