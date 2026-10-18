@@ -1,13 +1,14 @@
 # MVP2 multi-node qualification
 
-## Automated one-host suite
+## One-host qualification harness
 
-CI runs `scripts/qualify-mvp2-services.py` on the Apple silicon macOS and Linux
-hosted runners. It starts one standalone manager binary and two separately
-enrolled standalone worker binaries. Each worker has its own state directory,
-identity, process, and non-overlapping host-port range. The suite creates two
-native service processes, verifies that placement puts them on different
-workers, and sends application requests in both directions.
+The repository retains `scripts/qualify-mvp2-services.py` as a one-host
+qualification harness. It starts one standalone manager binary and two
+separately enrolled standalone worker binaries. Each worker has its own state
+directory, identity, process, and non-overlapping host-port range. The suite
+creates two native service processes, verifies that placement puts them on
+different workers, and sends application requests in both directions. CI does
+not invoke this harness; CI runs release builds and tests only after merge.
 
 The service processes use the sole `default` namespace with a non-default
 `qualification.test` DNS suffix, then resolve fully qualified names and short
@@ -19,11 +20,9 @@ configured for `default.service.qualification.test`; the previous Linux
 are restored during cleanup. The script refuses to change resolver settings
 outside a GitHub-hosted runner running as root.
 
-The CI step summary records the executable SHA-256, profile, OS, architecture,
+When the harness is run on an eligible disposable GitHub-hosted runner, its step
+summary records the executable SHA-256, profile, OS, architecture,
 kernel/platform string, topology, worker placement, and completed scenarios.
-The resolver-changing qualification runs only in the post-merge release
-workflow. The pre-merge jobs run the debug workspace tests without changing the
-host resolver.
 The suite also exercises a real listener port conflict and retry, a failed
 readiness probe, shared-host resource pressure, authoritative negative DNS
 answers, host resolver lookups, service revision replacement, a manager DNS outage and
