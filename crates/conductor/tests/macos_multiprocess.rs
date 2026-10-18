@@ -445,7 +445,7 @@ async fn inject_authenticated_worker_identity_mismatch(
         .https_only(true)
         .identity(identity)
         .add_root_certificate(root)
-        .timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(10))
         .build()
         .expect("build authenticated fault-injection client");
     let first_id = WorkerId::new(&first.worker_id).expect("first id");

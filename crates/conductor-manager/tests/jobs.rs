@@ -12,7 +12,7 @@ use conductor_core::{
     JobId, JobRevisionDraft, JobSpec, LogStream, OperatingSystem, ReadRunLogs, ResolveRun,
     RunFailureReason, RunId, RunLogChunk, RunLogStatus, RunObservation, RunState, StartRun,
     StopRun, WorkerCapabilities, WorkerCommand, WorkerDescriptor, WorkerId, WorkerInventory,
-    WorkerResourceCapacity, WorkerStatus,
+    WorkerResourceCapacity, WorkerServiceNetwork, WorkerStatus,
 };
 use conductor_manager::{
     CommandJournal, CommandStoreError, ExecutionStoreError, JobRepository, JobService, MAX_JOBS,
@@ -198,6 +198,29 @@ fn service_revision_draft(command_arg: &str) -> JobRevisionDraft {
         "a".repeat(64)
     );
     serde_json::from_str(&json).expect("valid service revision draft")
+}
+
+fn service_revision_with_ports(command_arg: &str) -> JobRevisionDraft {
+    let json = format!(
+        r#"{{
+            "definition": {{
+                "id": "web",
+                "command": ["/usr/bin/true", "{command_arg}"],
+                "cwd": "/tmp",
+                "terminationGraceMs": 5000
+            }},
+            "workload": {{
+                "kind": "service",
+                "identity": {{"namespace": "default", "name": "web"}},
+                "ports": [{{"name": "http"}}]
+            }},
+            "executableDigest": {{"algorithm": "sha256", "value": "{}"}},
+            "executionRequirements": {{}},
+            "resourceRequest": {{"cpuMillis": 250, "memoryBytes": 268435456}}
+        }}"#,
+        "a".repeat(64)
+    );
+    serde_json::from_str(&json).expect("valid service revision with named port")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -494,6 +517,112 @@ fn service_reconciliation_starts_each_replica_once_and_keeps_one_shot_semantics(
         .map(ToString::to_string)
         .collect::<BTreeSet<_>>();
     assert_eq!(resumed_instances, original_instances);
+}
+
+#[test]
+fn named_service_ports_are_leased_uniquely_persisted_and_not_ready_without_health_checks() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let revision = manager
+        .create_revision(
+            &service_revision_with_ports("ports"),
+            "named-ports-revision",
+        )
+        .unwrap();
+    let worker_id = WorkerId::new("worker-ports").unwrap();
+    let service_network = WorkerServiceNetwork::new(
+        WorkerId::new("host-ports").unwrap(),
+        31_000,
+        31_001,
+        "192.0.2.11",
+    )
+    .unwrap();
+    let worker_status = scheduling_worker(
+        "worker-ports",
+        "host-ports",
+        2_000,
+        2_147_483_648,
+        2_000,
+        2_147_483_648,
+        BTreeMap::new(),
+        true,
+    )
+    .with_service_network(service_network)
+    .unwrap();
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &deployment_request(2),
+            "named-ports-deploy",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    let worker: Arc<dyn WorkerPort> = Arc::new(ServiceRunner {
+        worker_id,
+        status: worker_status,
+        starts: AtomicUsize::new(0),
+        disconnected: AtomicBool::new(false),
+        runs: Mutex::new(BTreeMap::new()),
+    });
+
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    let attempts = manager
+        .list_service_attempts(revision.id().job_id())
+        .unwrap();
+    assert_eq!(attempts.len(), 2);
+    let ports = attempts
+        .iter()
+        .map(|attempt| {
+            assert_eq!(attempt.service_ports.len(), 1);
+            assert!(!attempt.service_ports_ready);
+            assert_eq!(attempt.service_ports[0].name(), "http");
+            assert_eq!(attempt.service_ports[0].advertised_address(), "192.0.2.11");
+            attempt.service_ports[0].port()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        ports.len(),
+        2,
+        "simultaneous service attempts need unique ports"
+    );
+
+    drop(manager);
+    let reopened = service(&directory);
+    let recovered = reopened
+        .list_service_attempts(revision.id().job_id())
+        .unwrap();
+    assert_eq!(
+        recovered
+            .iter()
+            .map(|attempt| attempt.service_ports[0].port())
+            .collect::<BTreeSet<_>>(),
+        ports,
+        "manager restart must preserve the assigned endpoints"
+    );
+    let status = worker.status().unwrap();
+    reopened
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            Some(1),
+            &DeploymentMutation::Scale { replicas: 3 },
+            "named-ports-scale",
+            std::slice::from_ref(&status),
+        )
+        .unwrap();
+    reopened
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    assert_eq!(
+        reopened
+            .list_runs(Some(revision.id().job_id()), None, 10)
+            .unwrap()
+            .len(),
+        2,
+        "active leases remain unavailable after manager restart"
+    );
 }
 
 #[test]
@@ -1294,7 +1423,7 @@ fn schema_five_migrates_execution_tables_without_losing_jobs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert!(table_exists(&connection, "job_revisions"));
     assert!(table_exists(&connection, "job_deployments"));
     assert!(table_exists(&connection, "execution_idempotency"));
@@ -1321,7 +1450,7 @@ fn schema_six_adds_durable_scheduling_tables() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert!(table_exists(&connection, "service_instances"));
     assert!(table_exists(&connection, "allocations"));
     assert!(table_exists(&connection, "scheduling_sequence"));
@@ -1343,7 +1472,7 @@ fn schema_seven_migrates_service_attempt_state() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert!(table_exists(&connection, "service_attempts"));
 }
 
@@ -1450,7 +1579,7 @@ fn legacy_schema_migrates_transactionally_and_repeated_startup_is_stable() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read migrated schema and fixture");
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert_eq!(created_at, 1234);
     assert_eq!(deleted_at, None);
 }
@@ -1500,7 +1629,7 @@ fn schema_two_migration_adds_idempotency_and_indexed_run_order() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert!(columns.iter().any(|column| column == "idempotency_key"));
     assert!(columns.iter().any(|column| column == "request_fingerprint"));
     assert!(columns.iter().any(|column| column == "run_order"));
@@ -1565,7 +1694,7 @@ fn schema_four_identity_layout_migrates_with_command_outbox_without_losing_token
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     let outbox_exists = table_exists(&connection, "manager_commands");
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert!(outbox_exists);
 }
 
@@ -1606,7 +1735,7 @@ fn schema_four_command_layout_migrates_with_identity_tables_without_resetting_se
         )
         .unwrap();
     let identity_exists = table_exists(&connection, "worker_identities");
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
     assert_eq!(sequence, 17);
     assert!(identity_exists);
 }
@@ -1866,7 +1995,7 @@ fn version_one_manager_database_migrates_runs_and_accepts_timeout_specs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 }
 
 struct FullWorker(WorkerId);

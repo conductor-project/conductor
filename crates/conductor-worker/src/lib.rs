@@ -986,7 +986,19 @@ impl WorkerService {
             }
         }
 
-        let child = match self.backend.spawn(spec.id().as_str(), spec.job()) {
+        let job = match spec.job().clone().with_environment_overrides(
+            spec.service_ports()
+                .iter()
+                .map(|port| (port.environment_name(), port.port().to_string())),
+        ) {
+            Ok(job) => job,
+            Err(_) => {
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stdout);
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stderr);
+                return self.finish_backend_failure(starting);
+            }
+        };
+        let child = match self.backend.spawn(spec.id().as_str(), &job) {
             Ok(child) => child,
             Err(error) => {
                 emit_worker_diagnostic("execution_launch_failed", spec.id().as_str(), &error);
@@ -2502,6 +2514,23 @@ where
     .map_err(io::Error::other)?
 }
 
+async fn run_admitted_blocking<T, F>(admission: &Arc<Semaphore>, operation: F) -> io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> io::Result<T> + Send + 'static,
+{
+    let permit = Arc::clone(admission)
+        .acquire_owned()
+        .await
+        .map_err(io::Error::other)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        operation()
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
 async fn kill_process_group_off_executor(
     backend: &Arc<dyn ExecutionBackend>,
     group_id: u32,
@@ -2744,7 +2773,7 @@ async fn supervise(supervision: RunSupervision) {
                 }
             }
             let close_run_id = reader_run_id.clone();
-            let close_result = run_bounded_blocking(&reader_admission, move || {
+            let close_result = run_admitted_blocking(&reader_admission, move || {
                 let stdout = close_log_stream(&reader_state, &close_run_id, LogStream::Stdout);
                 let stderr = close_log_stream(&reader_state, &close_run_id, LogStream::Stderr);
                 stdout.and(stderr)
@@ -2895,7 +2924,7 @@ async fn supervise(supervision: RunSupervision) {
     if let Some(reader_task) = reader_task {
         let _ = reader_task.await;
     }
-    if let Err(error) = run_bounded_blocking(&persistence_admission, {
+    if let Err(error) = run_admitted_blocking(&persistence_admission, {
         let state = Arc::clone(&state);
         move || prune_completed_logs_shared(&state, &log_directory, retention_runs)
     })

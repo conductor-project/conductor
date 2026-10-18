@@ -8,6 +8,12 @@
   "worker_id": "worker-one",
   "worker_transport_capacity": 2,
   "worker_resource_domain_id": "local-host",
+  "worker_service_network": {
+    "network_domain_id": "local-host-network",
+    "port_range_start": 31000,
+    "port_range_end": 31999,
+    "advertised_address": "192.0.2.10"
+  },
   "host_resource_domains": [
     { "id": "local-host", "cpu_millis": 1000, "memory_bytes": 1073741824 }
   ],
@@ -15,7 +21,13 @@
     {
       "worker_id": "worker-two",
       "capacity": 2,
-      "resource_domain_id": "local-host"
+      "resource_domain_id": "local-host",
+      "service_network": {
+        "network_domain_id": "local-host-network",
+        "port_range_start": 32000,
+        "port_range_end": 32999,
+        "advertised_address": "192.0.2.10"
+      }
     }
   ],
   "api_access": {

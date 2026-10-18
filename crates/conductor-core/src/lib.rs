@@ -1,6 +1,6 @@
 //! Shared, transport-neutral identifiers and contracts for Conductor.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -122,17 +122,17 @@ mod execution;
 mod inventory;
 mod protocol;
 pub use execution::{
-    Allocation, AllocationId, AllocationState, Architecture, AttemptState, DeploymentMutation,
-    DeploymentPendingReason, DeploymentStatus, DigestAlgorithm, EnforcementCapability,
-    ExecutableDigest, ExecutionAttempt, ExecutionAttemptId, ExecutionBackend, ExecutionModelError,
-    ExecutionRequirements, JobDeployment, JobRevision, JobRevisionDraft, JobRevisionId,
-    MAX_DEPLOYMENT_REPLICAS, OperatingSystem, ResourceRequest, ResourceRequestProvenance,
-    ResourceReservation, ServiceIdentity, ServiceInstance, ServiceInstanceId, WorkerCapabilities,
-    Workload,
+    Allocation, AllocationId, AllocationState, Architecture, AssignedServicePort, AttemptState,
+    DeploymentMutation, DeploymentPendingReason, DeploymentStatus, DigestAlgorithm,
+    EnforcementCapability, ExecutableDigest, ExecutionAttempt, ExecutionAttemptId,
+    ExecutionBackend, ExecutionModelError, ExecutionRequirements, JobDeployment, JobRevision,
+    JobRevisionDraft, JobRevisionId, MAX_DEPLOYMENT_REPLICAS, OperatingSystem, ResourceRequest,
+    ResourceRequestProvenance, ResourceReservation, ServiceIdentity, ServiceInstance,
+    ServiceInstanceId, ServicePort, ServicePortProtocol, WorkerCapabilities, Workload,
 };
 pub use inventory::{
     WorkerInventory, WorkerInventoryEntry, WorkerInventoryError, WorkerInventoryPage,
-    WorkerMetadata, WorkerResourceCapacity,
+    WorkerMetadata, WorkerResourceCapacity, WorkerServiceNetwork,
 };
 pub use protocol::{
     CURRENT_PROTOCOL_VERSION, NegotiatedProtocol, ProtocolCapability, ProtocolNegotiationError,
@@ -206,6 +206,8 @@ pub struct WorkerStatus {
     fresh: bool,
     #[serde(default)]
     last_seen_at_ms: Option<i64>,
+    #[serde(default)]
+    service_network: Option<WorkerServiceNetwork>,
 }
 
 impl WorkerStatus {
@@ -239,6 +241,7 @@ impl WorkerStatus {
             labels: BTreeMap::new(),
             fresh: false,
             last_seen_at_ms: None,
+            service_network: None,
         }
     }
 
@@ -250,6 +253,19 @@ impl WorkerStatus {
     pub fn with_freshness(mut self, fresh: bool) -> Self {
         self.fresh = fresh;
         self
+    }
+
+    /// Attach manager-configured, disjoint host-port allocation metadata.
+    pub fn with_service_network(mut self, service_network: WorkerServiceNetwork) -> Option<Self> {
+        if !service_network.is_valid() {
+            return None;
+        }
+        self.service_network = Some(service_network);
+        Some(self)
+    }
+
+    pub fn service_network(&self) -> Option<&WorkerServiceNetwork> {
+        self.service_network.as_ref()
     }
 
     /// Attach manager-controlled labels, resource-domain metadata, and freshness.
@@ -268,6 +284,7 @@ impl WorkerStatus {
         self.resource_domain_id = Some(resource_domain_id);
         self.resource_domain_capacity = Some(resource_domain_capacity);
         self.labels = labels;
+        self.service_network = None;
         self.last_seen_at_ms = Some(last_seen_at_ms);
         self.fresh = fresh;
         Some(self)
@@ -285,6 +302,10 @@ impl WorkerStatus {
             || self.observed_at_ms < 0
             || !valid_worker_labels(&self.labels)
             || self.last_seen_at_ms.is_some_and(|timestamp| timestamp < 0)
+            || self
+                .service_network
+                .as_ref()
+                .is_some_and(|network| !network.is_valid())
         {
             return false;
         }
@@ -400,16 +421,78 @@ pub fn valid_worker_labels(labels: &BTreeMap<String, String>) -> bool {
 
 /// A fixed job-definition snapshot assigned to one worker execution attempt.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", try_from = "RawRunSpec")]
 pub struct RunSpec {
     id: RunId,
     worker_id: WorkerId,
     job: JobSpec,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    service_ports: Vec<AssignedServicePort>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawRunSpec {
+    id: RunId,
+    worker_id: WorkerId,
+    job: JobSpec,
+    #[serde(default)]
+    service_ports: Vec<AssignedServicePort>,
+}
+
+impl TryFrom<RawRunSpec> for RunSpec {
+    type Error = ExecutionModelError;
+
+    fn try_from(raw: RawRunSpec) -> Result<Self, Self::Error> {
+        validate_assigned_service_ports(&raw.job, &raw.service_ports)?;
+        Ok(Self {
+            id: raw.id,
+            worker_id: raw.worker_id,
+            job: raw.job,
+            service_ports: raw.service_ports,
+        })
+    }
+}
+
+fn validate_assigned_service_ports(
+    job: &JobSpec,
+    service_ports: &[AssignedServicePort],
+) -> Result<(), ExecutionModelError> {
+    if service_ports.len() > 32 {
+        return Err(ExecutionModelError::InvalidServicePort);
+    }
+    let mut names = BTreeSet::new();
+    let mut environment_names = BTreeSet::new();
+    for port in service_ports {
+        let environment_name = port.environment_name();
+        if !port.is_valid()
+            || !names.insert(port.name())
+            || !environment_names.insert(environment_name.clone())
+            || job.env().contains_key(&environment_name)
+        {
+            return Err(ExecutionModelError::InvalidServicePort);
+        }
+    }
+    Ok(())
 }
 
 impl RunSpec {
     pub fn new(id: RunId, worker_id: WorkerId, job: JobSpec) -> Self {
-        Self { id, worker_id, job }
+        Self {
+            id,
+            worker_id,
+            job,
+            service_ports: Vec::new(),
+        }
+    }
+
+    pub fn with_service_ports(
+        mut self,
+        service_ports: Vec<AssignedServicePort>,
+    ) -> Result<Self, ExecutionModelError> {
+        validate_assigned_service_ports(&self.job, &service_ports)?;
+        self.service_ports = service_ports;
+        Ok(self)
     }
 
     pub fn id(&self) -> &RunId {
@@ -422,6 +505,10 @@ impl RunSpec {
 
     pub fn job(&self) -> &JobSpec {
         &self.job
+    }
+
+    pub fn service_ports(&self) -> &[AssignedServicePort] {
+        &self.service_ports
     }
 }
 
@@ -1108,6 +1195,23 @@ impl JobSpec {
     }
     pub fn env(&self) -> &BTreeMap<String, String> {
         &self.env
+    }
+
+    /// Return a copy with validated manager-assigned environment values.
+    pub fn with_environment_overrides(
+        mut self,
+        overrides: impl IntoIterator<Item = (String, String)>,
+    ) -> Result<Self, JobValidationError> {
+        for (name, value) in overrides {
+            if !valid_environment_name(&name) {
+                return Err(JobValidationError::InvalidEnvironmentName);
+            }
+            if value.as_bytes().contains(&0) {
+                return Err(JobValidationError::InvalidEnvironmentValue);
+            }
+            self.env.insert(name, value);
+        }
+        Ok(self)
     }
     pub fn inherit_env(&self) -> bool {
         self.inherit_env

@@ -9,8 +9,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use conductor_core::{
-    CommandEnvelope, CommandId, JobId, JobSpec, RunFailureReason, RunId, RunObservation, RunSpec,
-    RunState, StartRun, WorkerCommand, WorkerId,
+    AssignedServicePort, CommandEnvelope, CommandId, JobId, JobSpec, RunFailureReason, RunId,
+    RunObservation, RunSpec, RunState, ServicePortProtocol, StartRun, WorkerCommand, WorkerId,
 };
 use conductor_worker::{ExecutionBackend, WorkerError, WorkerService};
 use rusqlite::Connection;
@@ -46,11 +46,13 @@ struct TestBackend {
     spawns: AtomicUsize,
     kill_failures: AtomicUsize,
     ready_file: Mutex<Option<PathBuf>>,
+    spawned_env: Mutex<Option<BTreeMap<String, String>>>,
 }
 
 impl ExecutionBackend for TestBackend {
     fn spawn(&self, _run_id: &str, job: &JobSpec) -> io::Result<Child> {
         self.spawns.fetch_add(1, Ordering::SeqCst);
+        *self.spawned_env.lock().unwrap() = Some(job.env().clone());
         let mut command = Command::new(&job.command()[0]);
         command
             .args(&job.command()[1..])
@@ -118,6 +120,29 @@ impl ExecutionBackend for TestBackend {
     fn terminate_process_group(&self, _group_id: u32) -> io::Result<()> {
         Ok(())
     }
+}
+
+#[test]
+fn worker_injects_assigned_service_ports_into_the_process_environment() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 1, Arc::clone(&backend));
+    let spec = run(
+        "named-port",
+        job("named-port", vec!["/usr/bin/true".into()]),
+    )
+    .with_service_ports(vec![
+        AssignedServicePort::new("http", ServicePortProtocol::Tcp, 31_234, "192.0.2.10").unwrap(),
+    ])
+    .unwrap();
+
+    service.start(StartRun::new(spec)).unwrap();
+    let environment = backend.spawned_env.lock().unwrap().clone().unwrap();
+    assert_eq!(environment.get("CONDUCTOR_PORT_HTTP").unwrap(), "31234");
+    assert_eq!(
+        wait_for(&service, "named-port").state(),
+        RunState::Succeeded
+    );
 }
 
 fn job(id: &str, command: Vec<String>) -> JobSpec {
@@ -829,7 +854,19 @@ fn process_is_cleaned_up_when_running_observation_cannot_be_persisted() {
     );
     assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
     assert!(!marker.exists());
-    let pid = fs::read_to_string(&descendant_pid).unwrap();
+    let pid_deadline = std::time::Instant::now() + Duration::from_secs(1);
+    let pid = loop {
+        if let Ok(pid) = fs::read_to_string(&descendant_pid)
+            && !pid.trim().is_empty()
+        {
+            break pid;
+        }
+        assert!(
+            std::time::Instant::now() < pid_deadline,
+            "descendant PID file was created but remained empty"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
     #[cfg(unix)]
     {
         let pid = pid.trim().parse::<i32>().unwrap();

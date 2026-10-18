@@ -132,6 +132,8 @@ struct Config {
     worker_resource_domain_id: Option<String>,
     #[serde(default)]
     worker_labels: BTreeMap<String, String>,
+    #[serde(default)]
+    worker_service_network: Option<ServiceNetworkConfig>,
     #[serde(default = "default_log_max_bytes_per_stream")]
     log_max_bytes_per_stream: u64,
     #[serde(default = "default_log_retention_runs")]
@@ -153,6 +155,17 @@ struct RemoteWorkerConfig {
     resource_domain_id: Option<String>,
     #[serde(default)]
     labels: BTreeMap<String, String>,
+    #[serde(default)]
+    service_network: Option<ServiceNetworkConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ServiceNetworkConfig {
+    network_domain_id: String,
+    port_range_start: u16,
+    port_range_end: u16,
+    advertised_address: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -455,6 +468,7 @@ fn run_all(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
         worker.descriptor().worker_id(),
         config.worker_resource_domain_id.as_deref(),
         &config.worker_labels,
+        config.worker_service_network.as_ref(),
     )?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     close_fds::set_fds_cloexec_threadsafe(3, &[]);
@@ -541,6 +555,7 @@ fn run_manager(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
         &worker_id,
         config.worker_resource_domain_id.as_deref(),
         &config.worker_labels,
+        config.worker_service_network.as_ref(),
     )?;
     worker_ports.push(hub.register_worker_with_metadata(descriptor, offer.clone(), metadata)?);
     for additional in &config.additional_workers {
@@ -550,6 +565,7 @@ fn run_manager(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
             &additional_id,
             additional.resource_domain_id.as_deref(),
             &additional.labels,
+            additional.service_network.as_ref(),
         )?;
         worker_ports.push(hub.register_worker_with_metadata(
             WorkerDescriptor::new(additional_id, additional.capacity, true),
@@ -1050,6 +1066,10 @@ impl WorkerPort for LocalWorkerPort {
                 last_seen_at_ms,
                 true,
             )
+            .and_then(|status| match self.metadata.service_network() {
+                Some(network) => status.with_service_network(network.clone()),
+                None => Some(status),
+            })
             .ok_or(WorkerPortError::Unavailable)
     }
 
@@ -1066,6 +1086,7 @@ fn worker_metadata(
     worker_id: &WorkerId,
     configured_domain_id: Option<&str>,
     labels: &BTreeMap<String, String>,
+    service_network: Option<&ServiceNetworkConfig>,
 ) -> Result<WorkerMetadata, Box<dyn std::error::Error>> {
     let domain_id = WorkerId::new(
         configured_domain_id
@@ -1081,8 +1102,20 @@ fn worker_metadata(
                 .ok_or("host resource domain capacity values must be positive")
         })
         .transpose()?;
-    WorkerMetadata::new(domain_id, capacity, labels.clone())
-        .ok_or_else(|| "worker labels exceed supported limits or contain invalid characters".into())
+    let metadata = WorkerMetadata::new(domain_id, capacity, labels.clone())
+        .ok_or("worker labels exceed supported limits or contain invalid characters")?;
+    let Some(network) = service_network else {
+        return Ok(metadata);
+    };
+    let network_domain_id = WorkerId::new(network.network_domain_id.clone())?;
+    let network = conductor_core::WorkerServiceNetwork::new(
+        network_domain_id,
+        network.port_range_start,
+        network.port_range_end,
+        network.advertised_address.clone(),
+    )
+    .ok_or("worker service network configuration is invalid")?;
+    Ok(metadata.with_service_network(network))
 }
 
 fn map_worker_error(error: conductor_worker::WorkerError) -> WorkerPortError {
@@ -1145,6 +1178,7 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 || !config.host_resource_domains.is_empty()
                 || config.worker_resource_domain_id.is_some()
                 || !config.worker_labels.is_empty()
+                || config.worker_service_network.is_some()
             {
                 return Err("manager-only fields cannot be used with role 'worker'".into());
             }
@@ -1333,6 +1367,40 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         return Err("additional_workers is supported only for the manager role".into());
     }
 
+    let mut service_ranges = BTreeMap::<String, Vec<(u16, u16)>>::new();
+    let mut configured_networks = Vec::with_capacity(config.additional_workers.len() + 1);
+    if let Some(network) = &config.worker_service_network {
+        configured_networks.push(network);
+    }
+    configured_networks.extend(
+        config
+            .additional_workers
+            .iter()
+            .filter_map(|worker| worker.service_network.as_ref()),
+    );
+    for network in configured_networks {
+        let id = WorkerId::new(network.network_domain_id.clone())?;
+        if conductor_core::WorkerServiceNetwork::new(
+            id.clone(),
+            network.port_range_start,
+            network.port_range_end,
+            network.advertised_address.clone(),
+        )
+        .is_none()
+        {
+            return Err("worker service network configuration is invalid".into());
+        }
+        let ranges = service_ranges.entry(id.as_str().to_owned()).or_default();
+        if ranges.iter().any(|(start, end)| {
+            network.port_range_start <= *end && *start <= network.port_range_end
+        }) {
+            return Err(
+                format!("worker service port ranges overlap for network domain '{id}'").into(),
+            );
+        }
+        ranges.push((network.port_range_start, network.port_range_end));
+    }
+
     if matches!(config.role, Role::All | Role::Worker)
         && !(100..=120_000).contains(&config.request_timeout_ms)
     {
@@ -1460,6 +1528,7 @@ mod tests {
             host_resource_domains: Vec::new(),
             worker_resource_domain_id: None,
             worker_labels: BTreeMap::new(),
+            worker_service_network: None,
             log_max_bytes_per_stream: conductor_worker::DEFAULT_LOG_MAX_BYTES_PER_STREAM,
             log_retention_runs: conductor_worker::DEFAULT_LOG_RETENTION_RUNS,
             request_timeout_ms: default_request_timeout_ms(),
@@ -1649,6 +1718,7 @@ mod tests {
             capacity: 2,
             resource_domain_id: Some("host-a".to_owned()),
             labels: BTreeMap::new(),
+            service_network: None,
         });
         let error = validate(&config).expect_err("shared host requires a configured budget");
         assert!(error.to_string().contains("host_resource_domains"));
@@ -1659,6 +1729,35 @@ mod tests {
             memory_bytes: 1_000_000,
         });
         validate(&config).expect("shared host has a configured aggregate budget");
+    }
+
+    #[test]
+    fn shared_worker_network_domains_reject_overlapping_port_ranges() {
+        let mut config = manager_config();
+        config.worker_service_network = Some(super::ServiceNetworkConfig {
+            network_domain_id: "host-network".to_owned(),
+            port_range_start: 31_000,
+            port_range_end: 31_999,
+            advertised_address: "192.0.2.10".to_owned(),
+        });
+        config.additional_workers.push(RemoteWorkerConfig {
+            worker_id: "worker-two".to_owned(),
+            capacity: 2,
+            resource_domain_id: None,
+            labels: BTreeMap::new(),
+            service_network: Some(super::ServiceNetworkConfig {
+                network_domain_id: "host-network".to_owned(),
+                port_range_start: 31_999,
+                port_range_end: 32_999,
+                advertised_address: "192.0.2.10".to_owned(),
+            }),
+        });
+        assert!(
+            validate(&config)
+                .expect_err("overlapping worker network ranges must fail")
+                .to_string()
+                .contains("port ranges overlap")
+        );
     }
 
     #[test]

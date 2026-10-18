@@ -11,20 +11,20 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use base64::Engine;
 use conductor_core::{
-    Allocation, AllocationId, AllocationState, CommandEnvelope, CommandId, DeploymentMutation,
-    DeploymentPendingReason, DeploymentStatus, InspectRun, JobDeployment, JobId, JobRevision,
-    JobRevisionDraft, JobRevisionId, JobSpec, MAX_DEPLOYMENT_REPLICAS, MAX_WORKER_CAPACITY,
-    ReadRunLogs, ResolveRun, ResourceReservation, RunFailureReason, RunId, RunLogChunk,
-    RunObservation, RunSpec, RunState, RunTerminationReason, ServiceInstance, ServiceInstanceId,
-    StartRun, StopRun, WorkerCommand, WorkerDescriptor, WorkerId, WorkerInventoryEntry,
-    WorkerResourceCapacity, WorkerStatus,
+    Allocation, AllocationId, AllocationState, AssignedServicePort, CommandEnvelope, CommandId,
+    DeploymentMutation, DeploymentPendingReason, DeploymentStatus, InspectRun, JobDeployment,
+    JobId, JobRevision, JobRevisionDraft, JobRevisionId, JobSpec, MAX_DEPLOYMENT_REPLICAS,
+    MAX_WORKER_CAPACITY, ReadRunLogs, ResolveRun, ResourceReservation, RunFailureReason, RunId,
+    RunLogChunk, RunObservation, RunSpec, RunState, RunTerminationReason, ServiceInstance,
+    ServiceInstanceId, StartRun, StopRun, WorkerCommand, WorkerDescriptor, WorkerId,
+    WorkerInventoryEntry, WorkerResourceCapacity, WorkerServiceNetwork, WorkerStatus, Workload,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 
 /// Temporary limit for active jobs. Pagination is a later milestone.
 pub const MAX_JOBS: usize = 1_000;
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_PENDING_COMMANDS_PER_WORKER: usize = 32;
 const MAX_PENDING_NON_CONTROL_COMMANDS_PER_WORKER: usize = 24;
@@ -123,6 +123,8 @@ pub struct ServiceAttemptRecord {
     pub restart_count: u32,
     pub next_start_at_ms: i64,
     pub terminal_failure: bool,
+    pub service_ports: Vec<AssignedServicePort>,
+    pub service_ports_ready: bool,
 }
 
 impl AllocationRecord {
@@ -289,6 +291,7 @@ pub trait JobRepository: Send + Sync + CommandJournal {
         worker_id: &WorkerId,
         worker_incarnation: u64,
         worker_capacity: usize,
+        service_network: Option<&WorkerServiceNetwork>,
     ) -> Result<Option<RunAdmission>, RunStoreError>;
     fn finish_service_attempt(
         &self,
@@ -769,7 +772,22 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
         connection
             .prepare("SELECT service_instance_id, allocation_id, current_run_id, restart_count, next_start_at_ms, terminal_failure FROM service_attempts LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare("SELECT network_domain_id, protocol, port, allocation_id, run_id FROM service_port_leases LIMIT 0")
+            .map_err(MigrationError::Sqlite)?;
         return Ok(());
+    }
+
+    if version == 8 {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(MigrationError::Sqlite)?;
+        create_service_port_schema(&transaction).map_err(MigrationError::Sqlite)?;
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(MigrationError::Sqlite)?;
+        transaction.commit().map_err(MigrationError::Sqlite)?;
+        return migrate(connection);
     }
 
     if version == 7 {
@@ -778,7 +796,7 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
             .map_err(MigrationError::Sqlite)?;
         create_service_attempt_schema(&transaction).map_err(MigrationError::Sqlite)?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 8)
             .map_err(MigrationError::Sqlite)?;
         transaction.commit().map_err(MigrationError::Sqlite)?;
         return migrate(connection);
@@ -973,10 +991,110 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
     create_execution_schema(&transaction).map_err(MigrationError::Sqlite)?;
     create_scheduling_schema(&transaction).map_err(MigrationError::Sqlite)?;
     create_service_attempt_schema(&transaction).map_err(MigrationError::Sqlite)?;
+    create_service_port_schema(&transaction).map_err(MigrationError::Sqlite)?;
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(MigrationError::Sqlite)?;
     transaction.commit().map_err(MigrationError::Sqlite)
+}
+
+fn create_service_port_schema(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS service_port_leases (
+             network_domain_id TEXT NOT NULL,
+             protocol TEXT NOT NULL CHECK (protocol = 'tcp'),
+             port INTEGER NOT NULL CHECK (port BETWEEN 1 AND 65535),
+             allocation_id TEXT NOT NULL,
+             run_id TEXT NOT NULL,
+             name TEXT NOT NULL,
+             advertised_address TEXT NOT NULL,
+             PRIMARY KEY (network_domain_id, protocol, port),
+             UNIQUE (run_id, name)
+         );
+         CREATE INDEX IF NOT EXISTS service_port_leases_by_allocation ON service_port_leases(allocation_id);
+         CREATE INDEX IF NOT EXISTS service_port_leases_by_run ON service_port_leases(run_id);",
+    )
+}
+
+fn lease_service_ports(
+    transaction: &rusqlite::Transaction<'_>,
+    allocation_id: &AllocationId,
+    run_id: &RunId,
+    sequence: i64,
+    network: &WorkerServiceNetwork,
+    declared: &[conductor_core::ServicePort],
+) -> Result<Vec<AssignedServicePort>, RunStoreError> {
+    if declared.is_empty() {
+        return Ok(Vec::new());
+    }
+    let start = usize::from(network.port_range_start());
+    let end = usize::from(network.port_range_end());
+    let range_size = end - start + 1;
+    let mut occupied = {
+        let mut statement = transaction
+            .prepare(
+                "SELECT port FROM service_port_leases
+                 WHERE network_domain_id = ?1 AND protocol = 'tcp' AND port BETWEEN ?2 AND ?3",
+            )
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let rows = statement
+            .query_map(
+                params![
+                    network.network_domain_id().as_str(),
+                    start as i64,
+                    end as i64
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        rows.map(|row| {
+            u16::try_from(row.map_err(|_| RunStoreError::StorageUnavailable)?)
+                .map_err(|_| RunStoreError::StorageUnavailable)
+        })
+        .collect::<Result<BTreeSet<_>, _>>()?
+    };
+    let mut assigned = Vec::with_capacity(declared.len());
+    for (index, declared_port) in declared.iter().enumerate() {
+        let offset = usize::try_from(sequence).unwrap_or(0).wrapping_add(index) % range_size;
+        let lease = (0..range_size)
+            .map(|step| (start + (offset + step) % range_size) as u16)
+            .find(|port| !occupied.contains(port));
+        let Some(port) = lease else {
+            transaction
+                .execute(
+                    "DELETE FROM service_port_leases WHERE run_id = ?1",
+                    [run_id.as_str()],
+                )
+                .map_err(|_| RunStoreError::StorageUnavailable)?;
+            return Ok(Vec::new());
+        };
+        transaction
+            .execute(
+                "INSERT INTO service_port_leases
+                 (network_domain_id, protocol, port, allocation_id, run_id, name, advertised_address)
+                 VALUES (?1, 'tcp', ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    network.network_domain_id().as_str(),
+                    i64::from(port),
+                    allocation_id.as_str(),
+                    run_id.as_str(),
+                    declared_port.name(),
+                    network.advertised_address(),
+                ],
+            )
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        occupied.insert(port);
+        assigned.push(
+            AssignedServicePort::new(
+                declared_port.name(),
+                declared_port.protocol(),
+                port,
+                network.advertised_address(),
+            )
+            .map_err(|_| RunStoreError::StorageUnavailable)?,
+        );
+    }
+    Ok(assigned)
 }
 
 fn create_command_schema(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
@@ -1577,6 +1695,18 @@ fn choose_worker(
         .into_iter()
         .filter(|worker| requirements.labels_are_satisfied_by(worker.labels()))
         .collect::<Vec<_>>();
+    if label_matches.is_empty() {
+        return Err(DeploymentPendingReason::NoEligibleWorker);
+    }
+    let label_matches = if matches!(revision.workload(), Workload::Service { ports, .. } if !ports.is_empty())
+    {
+        label_matches
+            .into_iter()
+            .filter(|worker| worker.service_network().is_some())
+            .collect::<Vec<_>>()
+    } else {
+        label_matches
+    };
     if label_matches.is_empty() {
         return Err(DeploymentPendingReason::NoEligibleWorker);
     }
@@ -2605,7 +2735,7 @@ impl JobRepository for SqliteJobRepository {
                         sa.allocation_id, a.allocation_json, a.resource_domain_id,
                         sa.current_run_id, COALESCE(sa.restart_count, 0),
                         COALESCE(sa.next_start_at_ms, 0), COALESCE(sa.terminal_failure, 0),
-                        r.observation_json
+                        r.observation_json, r.job_spec_json
                  FROM service_instances si
                  LEFT JOIN service_attempts sa ON sa.service_instance_id = si.instance_id
                  LEFT JOIN allocations a ON a.allocation_id = COALESCE(sa.allocation_id, si.current_allocation_id)
@@ -2629,6 +2759,7 @@ impl JobRepository for SqliteJobRepository {
                     row.get::<_, i64>(8)?,
                     row.get::<_, i64>(9)?,
                     row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
                 ))
             })
             .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
@@ -2645,7 +2776,14 @@ impl JobRepository for SqliteJobRepository {
                 next_start,
                 terminal,
                 observation,
+                run_spec_json,
             ) = row.map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            let service_ports = run_spec_json
+                .map(|json| serde_json::from_str::<RunSpec>(&json))
+                .transpose()
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?
+                .map(|spec| spec.service_ports().to_vec())
+                .unwrap_or_default();
             Ok(ServiceAttemptRecord {
                 service_instance_id: ServiceInstanceId::new(instance)
                     .map_err(|_| ExecutionStoreError::StorageUnavailable)?,
@@ -2688,6 +2826,8 @@ impl JobRepository for SqliteJobRepository {
                     .map_err(|_| ExecutionStoreError::StorageUnavailable)?,
                 next_start_at_ms: next_start,
                 terminal_failure: terminal != 0,
+                service_ports,
+                service_ports_ready: false,
             })
         })
         .collect()
@@ -2700,6 +2840,7 @@ impl JobRepository for SqliteJobRepository {
         worker_id: &WorkerId,
         worker_incarnation: u64,
         worker_capacity: usize,
+        service_network: Option<&WorkerServiceNetwork>,
     ) -> Result<Option<RunAdmission>, RunStoreError> {
         let mut connection = self
             .connection
@@ -2827,7 +2968,36 @@ impl JobRepository for SqliteJobRepository {
             .map_err(|_| RunStoreError::StorageUnavailable)?;
         let run_id =
             RunId::new(format!("run-{sequence}")).map_err(|_| RunStoreError::StorageUnavailable)?;
-        let spec = RunSpec::new(run_id, worker_id.clone(), revision.definition().clone());
+        let declared_ports: &[conductor_core::ServicePort] = match revision.workload() {
+            Workload::Service { ports, .. } => ports,
+            Workload::OneShot => &[],
+        };
+        if !declared_ports.is_empty() && service_network.is_none() {
+            transaction
+                .commit()
+                .map_err(|_| RunStoreError::StorageUnavailable)?;
+            return Ok(None);
+        }
+        let assigned_ports = match service_network {
+            Some(network) => lease_service_ports(
+                &transaction,
+                allocation_id,
+                &run_id,
+                sequence,
+                network,
+                declared_ports,
+            )?,
+            None => Vec::new(),
+        };
+        if !declared_ports.is_empty() && assigned_ports.is_empty() {
+            transaction
+                .commit()
+                .map_err(|_| RunStoreError::StorageUnavailable)?;
+            return Ok(None);
+        }
+        let spec = RunSpec::new(run_id, worker_id.clone(), revision.definition().clone())
+            .with_service_ports(assigned_ports)
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
         let command_id =
             next_command_id(&transaction).map_err(|_| RunStoreError::StorageUnavailable)?;
         let envelope = CommandEnvelope {
@@ -2886,11 +3056,14 @@ impl JobRepository for SqliteJobRepository {
         next_start_at_ms: i64,
         terminal_failure: bool,
     ) -> Result<(), RunStoreError> {
-        let connection = self
+        let mut connection = self
             .connection
             .lock()
             .map_err(|_| RunStoreError::StorageUnavailable)?;
-        let changed = connection
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let changed = transaction
             .execute(
                 "UPDATE service_attempts SET current_run_id = NULL, restart_count = ?1,
                      next_start_at_ms = ?2, terminal_failure = ?3
@@ -2907,7 +3080,15 @@ impl JobRepository for SqliteJobRepository {
         if changed == 0 {
             return Err(RunStoreError::JobConflict);
         }
-        Ok(())
+        transaction
+            .execute(
+                "DELETE FROM service_port_leases WHERE run_id = ?1",
+                [run_id.as_str()],
+            )
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| RunStoreError::StorageUnavailable)
     }
 
     fn release_service_allocation(
@@ -2931,6 +3112,12 @@ impl JobRepository for SqliteJobRepository {
                 .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
             persist_allocation(&transaction, &record)?;
         }
+        transaction
+            .execute(
+                "DELETE FROM service_port_leases WHERE allocation_id = ?1",
+                [allocation_id.as_str()],
+            )
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
         transaction
             .commit()
             .map_err(|_| ExecutionStoreError::StorageUnavailable)
@@ -4094,12 +4281,17 @@ impl JobService {
                     continue;
                 }
                 let descriptor = worker.descriptor();
+                let service_network = statuses
+                    .iter()
+                    .find(|status| status.worker_id() == descriptor.worker_id())
+                    .and_then(WorkerStatus::service_network);
                 let admission = match self.repository.begin_service_run(
                     &job_id,
                     allocation.allocation().id(),
                     descriptor.worker_id(),
                     descriptor.incarnation(),
                     descriptor.capacity(),
+                    service_network,
                 ) {
                     Ok(Some(admission)) => admission,
                     Ok(None)

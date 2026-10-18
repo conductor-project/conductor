@@ -208,6 +208,85 @@ pub struct WorkerMetadata {
     resource_domain_id: WorkerId,
     capacity: Option<WorkerResourceCapacity>,
     labels: std::collections::BTreeMap<String, String>,
+    service_network: Option<WorkerServiceNetwork>,
+}
+
+/// Manager-configured network namespace identity and disjoint host-port range
+/// for one native worker. Workers sharing a host network must share the domain
+/// ID and use non-overlapping ranges.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkerServiceNetwork {
+    network_domain_id: WorkerId,
+    port_range_start: u16,
+    port_range_end: u16,
+    advertised_address: String,
+}
+
+impl WorkerServiceNetwork {
+    pub fn new(
+        network_domain_id: WorkerId,
+        port_range_start: u16,
+        port_range_end: u16,
+        advertised_address: impl Into<String>,
+    ) -> Option<Self> {
+        let advertised_address = advertised_address.into();
+        if port_range_start == 0
+            || port_range_start > port_range_end
+            || !valid_advertised_address(&advertised_address)
+        {
+            return None;
+        }
+        Some(Self {
+            network_domain_id,
+            port_range_start,
+            port_range_end,
+            advertised_address,
+        })
+    }
+
+    pub fn network_domain_id(&self) -> &WorkerId {
+        &self.network_domain_id
+    }
+    pub fn port_range_start(&self) -> u16 {
+        self.port_range_start
+    }
+    pub fn port_range_end(&self) -> u16 {
+        self.port_range_end
+    }
+    pub fn advertised_address(&self) -> &str {
+        &self.advertised_address
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.port_range_start > 0
+            && self.port_range_start <= self.port_range_end
+            && valid_advertised_address(&self.advertised_address)
+    }
+}
+
+pub(crate) fn valid_advertised_address(value: &str) -> bool {
+    if value.is_empty() || value.len() > 253 {
+        return false;
+    }
+    if let Ok(address) = value.parse::<std::net::IpAddr>() {
+        return !address.is_loopback() && !address.is_unspecified() && !address.is_multicast();
+    }
+    if value.contains(['/', ':', '@', '?', '#'])
+        || value.eq_ignore_ascii_case("localhost")
+        || value.to_ascii_lowercase().ends_with(".localhost")
+    {
+        return false;
+    }
+    value.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label.as_bytes()[0].is_ascii_alphanumeric()
+            && label
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            && !label.ends_with('-')
+    })
 }
 
 impl WorkerMetadata {
@@ -216,6 +295,7 @@ impl WorkerMetadata {
             resource_domain_id,
             capacity: None,
             labels: std::collections::BTreeMap::new(),
+            service_network: None,
         }
     }
 
@@ -228,6 +308,7 @@ impl WorkerMetadata {
             resource_domain_id,
             capacity,
             labels,
+            service_network: None,
         })
     }
 
@@ -241,6 +322,15 @@ impl WorkerMetadata {
 
     pub fn labels(&self) -> &std::collections::BTreeMap<String, String> {
         &self.labels
+    }
+
+    pub fn with_service_network(mut self, service_network: WorkerServiceNetwork) -> Self {
+        self.service_network = Some(service_network);
+        self
+    }
+
+    pub fn service_network(&self) -> Option<&WorkerServiceNetwork> {
+        self.service_network.as_ref()
     }
 }
 
