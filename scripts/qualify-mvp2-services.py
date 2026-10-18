@@ -338,8 +338,9 @@ def host_service_address():
     return address
 
 
-def service_attempt_failed(base, service):
+def service_attempt_failed(base, service, latest):
     status, _, response = request(base, "GET", f"/v1/jobs/{service}/service-attempts")
+    latest.update(status=status, body=response)
     if status != 200:
         return None
     return next(
@@ -405,7 +406,7 @@ def main():
             "worker_service_network": {
                 "networkDomainId": "mvp2-loopback",
                 "portRangeStart": service_ranges[0],
-                "portRangeEnd": service_ranges[0] + 9,
+                "portRangeEnd": service_ranges[0] + 3,
                 "advertisedAddress": service_address,
             },
             "additional_workers": [
@@ -497,12 +498,18 @@ def main():
                 service_program.write_text(SERVICE_PROGRAM, encoding="utf-8")
                 create_service_revision(root, base, service_program, "port-conflict", "backend", 1)
                 deploy_service(base, "port-conflict", 1, create=True, key="mvp2-port-conflict-deploy")
-                wait_until(
-                    "first service attempt to report the reserved port conflict",
-                    lambda: service_attempt_failed(base, "port-conflict"),
-                    timeout=8,
-                    timings=result["timingsMs"],
-                )
+                latest_attempts = {}
+                try:
+                    wait_until(
+                        "first service attempt to report the reserved port conflict",
+                        lambda: service_attempt_failed(base, "port-conflict", latest_attempts),
+                        timeout=8,
+                        timings=result["timingsMs"],
+                    )
+                except TimeoutError as error:
+                    raise TimeoutError(
+                        f"{error}; latest service-attempt snapshot={latest_attempts}"
+                    ) from error
                 conflict_endpoint = wait_service(
                     base, "port-conflict", timings=result["timingsMs"]
                 )[0]
