@@ -1,4 +1,5 @@
-use std::net::{IpAddr, SocketAddr};
+use std::fmt::Write as _;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -141,7 +142,7 @@ impl RequestHandler for ServiceDnsHandler {
             }
         };
         let qname = request_info.query.name().to_string().to_ascii_lowercase();
-        let Some((identity, port_name)) = parse_service_query_name(&qname, &self.suffix) else {
+        let Some(query) = parse_service_query_name(&qname, &self.suffix) else {
             let service_zone = format!("service.{}.", self.suffix);
             let code = if qname.ends_with(&format!(".{service_zone}")) || qname == service_zone {
                 ResponseCode::NXDomain
@@ -173,7 +174,7 @@ impl RequestHandler for ServiceDnsHandler {
         };
         let manager = Arc::clone(&self.manager);
         let workers = Arc::clone(&self.workers);
-        let identity_for_query = identity.clone();
+        let identity_for_query = query.identity.clone();
         let result = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let statuses = workers
@@ -209,15 +210,14 @@ impl RequestHandler for ServiceDnsHandler {
             )
             .await;
         }
-        let endpoint_name = service_fqdn(&identity, &self.suffix);
         let mut answers = Vec::new();
         for endpoint in endpoints.into_iter().filter(|endpoint| endpoint.eligible) {
-            if let Some(record) = service_endpoint_record(
+            if let Some(record) = service_endpoint_record_for_query(
                 &qname,
                 request_info.query.query_type(),
-                port_name.as_deref(),
+                &query,
+                &self.suffix,
                 DnsEndpoint {
-                    target_name: &endpoint_name,
                     port_name: endpoint.port.name(),
                     protocol: endpoint.port.protocol(),
                     advertised_address: endpoint.port.advertised_address(),
@@ -243,32 +243,137 @@ impl RequestHandler for ServiceDnsHandler {
     }
 }
 
+#[derive(Clone, Copy)]
 struct DnsEndpoint<'a> {
-    target_name: &'a str,
     port_name: &'a str,
     protocol: ServicePortProtocol,
     advertised_address: &'a str,
     port: u16,
 }
 
-fn service_endpoint_record(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ServiceEndpointKey {
+    address: IpAddr,
+    port: u16,
+}
+
+impl ServiceEndpointKey {
+    fn from_advertised_endpoint(address: &str, port: u16) -> Option<Self> {
+        Some(Self {
+            address: address.parse().ok()?,
+            port,
+        })
+    }
+
+    fn from_label(label: &str) -> Option<Self> {
+        let (family, encoded) = if let Some(encoded) = label.strip_prefix("v4-") {
+            (4, encoded)
+        } else {
+            (6, label.strip_prefix("v6-")?)
+        };
+        let expected_length = if family == 4 { 12 } else { 36 };
+        if encoded.len() != expected_length {
+            return None;
+        }
+        let mut bytes = [0_u8; 18];
+        let (pairs, []) = encoded.as_bytes().as_chunks::<2>() else {
+            return None;
+        };
+        for (index, pair) in pairs.iter().enumerate() {
+            bytes[index] = decode_hex_byte(pair)?;
+        }
+        let (address, port_bytes) = if family == 4 {
+            (
+                IpAddr::V4(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])),
+                [bytes[4], bytes[5]],
+            )
+        } else {
+            let address_bytes: [u8; 16] = bytes[..16].try_into().ok()?;
+            (
+                IpAddr::V6(Ipv6Addr::from(address_bytes)),
+                [bytes[16], bytes[17]],
+            )
+        };
+        Some(Self {
+            address,
+            port: u16::from_be_bytes(port_bytes),
+        })
+    }
+
+    fn label(self) -> String {
+        let mut label = String::with_capacity(match self.address {
+            IpAddr::V4(_) => 15,
+            IpAddr::V6(_) => 39,
+        });
+        match self.address {
+            IpAddr::V4(address) => {
+                label.push_str("v4-");
+                for byte in address.octets() {
+                    write!(label, "{byte:02x}").expect("writing to String cannot fail");
+                }
+            }
+            IpAddr::V6(address) => {
+                label.push_str("v6-");
+                for byte in address.octets() {
+                    write!(label, "{byte:02x}").expect("writing to String cannot fail");
+                }
+            }
+        }
+        for byte in self.port.to_be_bytes() {
+            write!(label, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        label
+    }
+}
+
+fn decode_hex_byte(pair: &[u8]) -> Option<u8> {
+    let [high, low] = pair else {
+        return None;
+    };
+    Some(hex_nibble(*high)? << 4 | hex_nibble(*low)?)
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+struct ParsedServiceQueryName {
+    identity: ServiceIdentity,
+    port_name: Option<String>,
+    endpoint_key: Option<ServiceEndpointKey>,
+}
+
+fn service_endpoint_record_for_query(
     query_name: &str,
     query_type: RecordType,
-    requested_port_name: Option<&str>,
+    query: &ParsedServiceQueryName,
+    suffix: &str,
     endpoint: DnsEndpoint<'_>,
 ) -> Option<Record> {
-    match (query_type, requested_port_name) {
-        (RecordType::A, None) => match endpoint.advertised_address.parse::<IpAddr>().ok()? {
+    let endpoint_key =
+        ServiceEndpointKey::from_advertised_endpoint(endpoint.advertised_address, endpoint.port)?;
+    if query
+        .endpoint_key
+        .is_some_and(|requested_key| requested_key != endpoint_key)
+    {
+        return None;
+    }
+    match (query_type, query.port_name.as_deref()) {
+        (RecordType::A, None) => match endpoint_key.address {
             IpAddr::V4(address) => Some(Record::from_rdata(
-                dns_name(endpoint.target_name),
+                Name::from_ascii(query_name).ok()?,
                 DNS_TTL_SECONDS,
                 RData::A(A(address)),
             )),
             IpAddr::V6(_) => None,
         },
-        (RecordType::AAAA, None) => match endpoint.advertised_address.parse::<IpAddr>().ok()? {
+        (RecordType::AAAA, None) => match endpoint_key.address {
             IpAddr::V6(address) => Some(Record::from_rdata(
-                dns_name(endpoint.target_name),
+                Name::from_ascii(query_name).ok()?,
                 DNS_TTL_SECONDS,
                 RData::AAAA(AAAA(address)),
             )),
@@ -278,14 +383,15 @@ fn service_endpoint_record(
             if endpoint.port_name == requested_name
                 && endpoint.protocol == ServicePortProtocol::Tcp =>
         {
+            let target_name = endpoint_target_fqdn(&query.identity, suffix, endpoint_key);
             Some(Record::from_rdata(
-                dns_name(query_name),
+                Name::from_ascii(query_name).ok()?,
                 DNS_TTL_SECONDS,
                 RData::SRV(SRV::new(
                     0,
                     1,
                     endpoint.port,
-                    dns_name(endpoint.target_name),
+                    Name::from_ascii(&target_name).ok()?,
                 )),
             ))
         }
@@ -293,30 +399,43 @@ fn service_endpoint_record(
     }
 }
 
-fn parse_service_query_name(
-    query_name: &str,
-    suffix: &str,
-) -> Option<(ServiceIdentity, Option<String>)> {
+fn parse_service_query_name(query_name: &str, suffix: &str) -> Option<ParsedServiceQueryName> {
     let query_name = query_name.trim_end_matches('.');
     let suffix = suffix.trim_end_matches('.');
     let local_name = query_name.strip_suffix(suffix)?.strip_suffix('.')?;
     let mut labels = local_name.split('.');
     let first = labels.next()?;
-    let (service_part, port_name) = if let Some(port_name) = first.strip_prefix('_') {
-        let transport = labels.next()?;
-        if !transport.eq_ignore_ascii_case("_tcp") || port_name.is_empty() {
-            return None;
-        }
-        (labels.next()?, Some(port_name.to_owned()))
-    } else {
-        (first, None)
-    };
-    let namespace = labels.next()?;
-    if labels.next()? != "service" || labels.next().is_some() {
-        return None;
-    }
-    let identity = ServiceIdentity::in_namespace(namespace, service_part).ok()?;
-    Some((identity, port_name))
+    let (service_part, namespace, port_name, endpoint_key) =
+        if let Some(port_name) = first.strip_prefix('_') {
+            let transport = labels.next()?;
+            if !transport.eq_ignore_ascii_case("_tcp") || port_name.is_empty() {
+                return None;
+            }
+            let service = labels.next()?;
+            let namespace = labels.next()?;
+            if labels.next()? != "service" || labels.next().is_some() {
+                return None;
+            }
+            (service, namespace, Some(port_name.to_owned()), None)
+        } else {
+            let second = labels.next()?;
+            let third = labels.next()?;
+            match labels.next() {
+                None if third == "service" => (first, second, None, None),
+                Some("service") if labels.next().is_none() => (
+                    second,
+                    third,
+                    None,
+                    Some(ServiceEndpointKey::from_label(first)?),
+                ),
+                _ => return None,
+            }
+        };
+    Some(ParsedServiceQueryName {
+        identity: ServiceIdentity::in_namespace(namespace, service_part).ok()?,
+        port_name,
+        endpoint_key,
+    })
 }
 
 fn service_fqdn(identity: &ServiceIdentity, suffix: &str) -> String {
@@ -326,6 +445,14 @@ fn service_fqdn(identity: &ServiceIdentity, suffix: &str) -> String {
         identity.namespace(),
         suffix
     )
+}
+
+fn endpoint_target_fqdn(
+    identity: &ServiceIdentity,
+    suffix: &str,
+    endpoint: ServiceEndpointKey,
+) -> String {
+    format!("{}.{}", endpoint.label(), service_fqdn(identity, suffix))
 }
 
 fn dns_name(value: &str) -> Name {
@@ -426,14 +553,35 @@ mod tests {
 
     #[test]
     fn parses_stable_fqdn_and_named_tcp_srv_contract() {
-        let (identity, port) = parse_service_query_name(
+        let query = parse_service_query_name(
             "_http._tcp.backend.default.service.conductor.internal.",
             "conductor.internal",
         )
         .expect("valid SRV query name");
-        assert_eq!(identity.name(), "backend");
-        assert_eq!(identity.namespace(), "default");
-        assert_eq!(port.as_deref(), Some("http"));
+        assert_eq!(query.identity.name(), "backend");
+        assert_eq!(query.identity.namespace(), "default");
+        assert_eq!(query.port_name.as_deref(), Some("http"));
+        assert_eq!(query.endpoint_key, None);
+
+        let endpoint_key = ServiceEndpointKey::from_advertised_endpoint("192.0.2.10", 31_001)
+            .expect("valid endpoint tuple");
+        let endpoint_name = format!(
+            "{}.backend.default.service.conductor.internal.",
+            endpoint_key.label()
+        );
+        let endpoint_query = parse_service_query_name(&endpoint_name, "conductor.internal")
+            .expect("valid endpoint target");
+        assert_eq!(endpoint_query.identity.name(), "backend");
+        assert_eq!(endpoint_query.identity.namespace(), "default");
+        assert_eq!(endpoint_query.endpoint_key, Some(endpoint_key));
+        assert!(endpoint_query.port_name.is_none());
+
+        assert_eq!(
+            ServiceEndpointKey::from_label(&endpoint_key.label()),
+            Some(endpoint_key),
+            "endpoint labels round-trip without ambiguity"
+        );
+        assert!(ServiceEndpointKey::from_label("v4-not-hex").is_none());
         assert!(
             parse_service_query_name(
                 "_http._udp.backend.default.service.conductor.internal.",
@@ -453,54 +601,220 @@ mod tests {
     #[test]
     fn maps_two_replica_addresses_and_dynamic_named_ports_to_dns_records() {
         let owner = "_http._tcp.backend.default.service.conductor.internal.";
-        let target = "backend.default.service.conductor.internal.";
-        let endpoint = |address, port| DnsEndpoint {
-            target_name: target,
+        let service_name = "backend.default.service.conductor.internal.";
+        let suffix = "conductor.internal";
+        let srv_query = parse_service_query_name(owner, suffix).expect("valid SRV owner");
+        let service_query =
+            parse_service_query_name(service_name, suffix).expect("valid service owner");
+        let ipv4_endpoint = DnsEndpoint {
             port_name: "http",
             protocol: ServicePortProtocol::Tcp,
-            advertised_address: address,
-            port,
+            advertised_address: "192.0.2.10",
+            port: 31_001,
         };
-        let ipv4 =
-            service_endpoint_record(owner, RecordType::A, None, endpoint("192.0.2.10", 31_001))
-                .expect("IPv4 A record");
-        assert!(matches!(ipv4.data, RData::A(_)));
+        let ipv6_endpoint = DnsEndpoint {
+            port_name: "http",
+            protocol: ServicePortProtocol::Tcp,
+            advertised_address: "2001:db8::10",
+            port: 31_002,
+        };
+        let ipv4 = service_endpoint_record_for_query(
+            service_name,
+            RecordType::A,
+            &service_query,
+            suffix,
+            ipv4_endpoint,
+        )
+        .expect("IPv4 A record at service-wide target");
+        let RData::A(ipv4_data) = ipv4.data else {
+            panic!("expected A record");
+        };
+        assert_eq!(ipv4_data.0, Ipv4Addr::new(192, 0, 2, 10));
         assert_eq!(ipv4.ttl, DNS_TTL_SECONDS);
 
-        let ipv6 = service_endpoint_record(
-            owner,
+        let ipv6 = service_endpoint_record_for_query(
+            service_name,
             RecordType::AAAA,
-            None,
-            endpoint("2001:db8::10", 31_002),
+            &service_query,
+            suffix,
+            ipv6_endpoint,
         )
-        .expect("IPv6 AAAA record");
-        assert!(matches!(ipv6.data, RData::AAAA(_)));
-        assert!(
-            service_endpoint_record(owner, RecordType::A, None, endpoint("2001:db8::10", 31_002),)
-                .is_none()
-        );
-
-        let srv = service_endpoint_record(
-            owner,
-            RecordType::SRV,
-            Some("http"),
-            endpoint("192.0.2.10", 31_001),
-        )
-        .expect("named SRV record");
-        let RData::SRV(srv_data) = srv.data else {
-            panic!("expected SRV data");
+        .expect("IPv6 AAAA record at service-wide target");
+        let RData::AAAA(ipv6_data) = ipv6.data else {
+            panic!("expected AAAA record");
         };
-        assert_eq!(srv_data.port, 31_001);
-        assert_eq!(srv_data.target.to_ascii(), target);
+        assert_eq!(ipv6_data.0, "2001:db8::10".parse::<Ipv6Addr>().unwrap());
         assert!(
-            service_endpoint_record(
-                owner,
-                RecordType::SRV,
-                Some("admin"),
-                endpoint("192.0.2.10", 31_001),
+            service_endpoint_record_for_query(
+                service_name,
+                RecordType::A,
+                &service_query,
+                suffix,
+                ipv6_endpoint,
             )
             .is_none()
         );
+
+        let srv_ipv4 = service_endpoint_record_for_query(
+            owner,
+            RecordType::SRV,
+            &srv_query,
+            suffix,
+            ipv4_endpoint,
+        )
+        .expect("named SRV record for IPv4 replica");
+        let RData::SRV(srv_ipv4_data) = srv_ipv4.data else {
+            panic!("expected SRV data");
+        };
+        assert_eq!(srv_ipv4_data.port, 31_001);
+        let ipv4_target = srv_ipv4_data.target.to_ascii();
+        let ipv4_target_query =
+            parse_service_query_name(&ipv4_target, suffix).expect("parse IPv4 SRV target");
+        assert_eq!(
+            ipv4_target_query.endpoint_key,
+            Some(ServiceEndpointKey {
+                address: "192.0.2.10".parse().unwrap(),
+                port: 31_001,
+            })
+        );
+        let ipv4_target_answer = service_endpoint_record_for_query(
+            &ipv4_target,
+            RecordType::A,
+            &ipv4_target_query,
+            suffix,
+            ipv4_endpoint,
+        )
+        .expect("IPv4 SRV target resolves to its replica address");
+        let RData::A(ipv4_target_data) = ipv4_target_answer.data else {
+            panic!("expected endpoint-specific A record");
+        };
+        assert_eq!(ipv4_target_data.0, Ipv4Addr::new(192, 0, 2, 10));
+        assert!(
+            service_endpoint_record_for_query(
+                &ipv4_target,
+                RecordType::A,
+                &ipv4_target_query,
+                suffix,
+                ipv6_endpoint,
+            )
+            .is_none()
+        );
+
+        let srv_ipv6 = service_endpoint_record_for_query(
+            owner,
+            RecordType::SRV,
+            &srv_query,
+            suffix,
+            ipv6_endpoint,
+        )
+        .expect("named SRV record for IPv6 replica");
+        let RData::SRV(srv_ipv6_data) = srv_ipv6.data else {
+            panic!("expected SRV data");
+        };
+        assert_eq!(srv_ipv6_data.port, 31_002);
+        let ipv6_target = srv_ipv6_data.target.to_ascii();
+        assert_ne!(ipv6_target, ipv4_target);
+        let ipv6_target_query =
+            parse_service_query_name(&ipv6_target, suffix).expect("parse IPv6 SRV target");
+        let ipv6_target_answer = service_endpoint_record_for_query(
+            &ipv6_target,
+            RecordType::AAAA,
+            &ipv6_target_query,
+            suffix,
+            ipv6_endpoint,
+        )
+        .expect("IPv6 SRV target resolves to its replica address");
+        let RData::AAAA(ipv6_target_data) = ipv6_target_answer.data else {
+            panic!("expected endpoint-specific AAAA record");
+        };
+        assert_eq!(ipv6_target_data.0, ipv6_data.0);
+        assert!(
+            service_endpoint_record_for_query(
+                owner,
+                RecordType::SRV,
+                &ParsedServiceQueryName {
+                    identity: srv_query.identity.clone(),
+                    port_name: Some("admin".to_owned()),
+                    endpoint_key: None,
+                },
+                suffix,
+                ipv4_endpoint,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn withdrawn_endpoint_targets_stop_resolving_after_replacement() {
+        let suffix = "conductor.internal";
+        let identity = ServiceIdentity::in_namespace("default", "backend").unwrap();
+        let old_endpoint = DnsEndpoint {
+            port_name: "http",
+            protocol: ServicePortProtocol::Tcp,
+            advertised_address: "192.0.2.10",
+            port: 31_001,
+        };
+        let replacement = DnsEndpoint {
+            port_name: "http",
+            protocol: ServicePortProtocol::Tcp,
+            advertised_address: "192.0.2.11",
+            port: 32_001,
+        };
+        let srv_query = parse_service_query_name(
+            "_http._tcp.backend.default.service.conductor.internal.",
+            suffix,
+        )
+        .unwrap();
+        let old_srv = service_endpoint_record_for_query(
+            "_http._tcp.backend.default.service.conductor.internal.",
+            RecordType::SRV,
+            &srv_query,
+            suffix,
+            old_endpoint,
+        )
+        .unwrap();
+        let RData::SRV(old_srv_data) = old_srv.data else {
+            panic!("expected SRV data");
+        };
+        let old_target = old_srv_data.target.to_ascii();
+        let old_target_query = parse_service_query_name(&old_target, suffix).unwrap();
+
+        // The next lookup receives a fresh eligible catalog containing only
+        // the replacement. The withdrawn endpoint's tuple no longer matches.
+        assert!(
+            service_endpoint_record_for_query(
+                &old_target,
+                RecordType::A,
+                &old_target_query,
+                suffix,
+                replacement,
+            )
+            .is_none()
+        );
+
+        let replacement_target = endpoint_target_fqdn(
+            &identity,
+            suffix,
+            ServiceEndpointKey::from_advertised_endpoint(
+                replacement.advertised_address,
+                replacement.port,
+            )
+            .unwrap(),
+        );
+        assert_ne!(replacement_target, old_target);
+        let replacement_query = parse_service_query_name(&replacement_target, suffix).unwrap();
+        let replacement_answer = service_endpoint_record_for_query(
+            &replacement_target,
+            RecordType::A,
+            &replacement_query,
+            suffix,
+            replacement,
+        )
+        .expect("replacement target resolves to the replacement address");
+        let RData::A(replacement_address) = replacement_answer.data else {
+            panic!("expected replacement A record");
+        };
+        assert_eq!(replacement_address.0, Ipv4Addr::new(192, 0, 2, 11));
     }
 
     #[test]
