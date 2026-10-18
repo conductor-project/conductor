@@ -37,8 +37,9 @@ python3 scripts/check-dependency-policy.py
 cargo fmt --all -- --check
 cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
 cargo test --workspace --locked --all-targets --all-features
-cargo test --release --workspace --locked --all-targets --all-features
-cargo build --workspace --locked --release
 ```
+
+Release tests and release builds run only after merge in CI. Run them locally
+only to reproduce a specific CI issue.
 
 Integration tests must use isolated temporary state, an ephemeral loopback listener, bounded readiness polling, and cleanup on failure. Test real binary behavior for lifecycle changes. The release test suite must exercise the release profile's overflow and debug assertions.

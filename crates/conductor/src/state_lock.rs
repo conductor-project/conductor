@@ -7,8 +7,8 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
 /// Holds OS-backed locks for both local state directories for the agent lifetime.
 pub struct StateLocks {
-    _manager: File,
-    _worker: File,
+    _manager: Option<File>,
+    _worker: Option<File>,
 }
 
 impl StateLocks {
@@ -24,8 +24,26 @@ impl StateLocks {
         let manager = acquire_directory_lock(&manager_dir)?;
         let worker = acquire_directory_lock(&worker_dir)?;
         Ok(Self {
-            _manager: manager,
-            _worker: worker,
+            _manager: Some(manager),
+            _worker: Some(worker),
+        })
+    }
+
+    pub fn acquire_manager(manager_dir: &Path) -> io::Result<Self> {
+        let manager_dir = prepare_directory(manager_dir)?;
+        let manager = acquire_directory_lock(&manager_dir)?;
+        Ok(Self {
+            _manager: Some(manager),
+            _worker: None,
+        })
+    }
+
+    pub fn acquire_worker(worker_dir: &Path) -> io::Result<Self> {
+        let worker_dir = prepare_directory(worker_dir)?;
+        let worker = acquire_directory_lock(&worker_dir)?;
+        Ok(Self {
+            _manager: None,
+            _worker: Some(worker),
         })
     }
 }

@@ -1,0 +1,16 @@
+{
+  "role": "manager",
+  "listen": "127.0.0.1:8080",
+  "worker_transport_listen": "0.0.0.0:9443",
+  "manager_data_dir": "./state/manager",
+  "manager_identity_dir": "./state/manager-identity",
+  "manager_server_name": "localhost",
+  "worker_id": "worker-one",
+  "worker_transport_capacity": 2,
+  "additional_workers": [
+    { "worker_id": "worker-two", "capacity": 2 }
+  ],
+  "api_access": {
+    "mode": "local"
+  }
+}

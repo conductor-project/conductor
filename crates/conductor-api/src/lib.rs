@@ -101,10 +101,65 @@ struct ApiState {
     worker: Arc<dyn WorkerPort>,
     worker_id: WorkerId,
     worker_capacity: usize,
+    role: ApiRole,
+    manager_workers_ready: Option<Arc<AtomicBool>>,
     start_admission: Arc<Semaphore>,
     blocking_admission: Arc<Semaphore>,
     control_admission: Arc<Semaphore>,
     recovery_ready: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Copy)]
+enum ApiRole {
+    All,
+    Manager,
+}
+
+struct ApiReadiness {
+    role: ApiRole,
+    manager_workers_ready: Option<Arc<AtomicBool>>,
+}
+
+impl ApiRole {
+    fn health_body(self) -> &'static str {
+        match self {
+            Self::All => {
+                r#"{"status":"ok","role":"all","capabilities":["local_process_execution"]}"#
+            }
+            Self::Manager => {
+                r#"{"status":"ok","role":"manager","capabilities":["remote_worker_transport"]}"#
+            }
+        }
+    }
+
+    fn readiness_body(self, status: &'static str) -> &'static str {
+        match (self, status) {
+            (Self::All, "ready") => {
+                r#"{"status":"ready","role":"all","capabilities":["local_process_execution"]}"#
+            }
+            (Self::All, "draining") => {
+                r#"{"status":"draining","role":"all","capabilities":["local_process_execution"]}"#
+            }
+            (Self::All, "degraded") => {
+                r#"{"status":"degraded","role":"all","capabilities":["local_process_execution"]}"#
+            }
+            (Self::All, _) => {
+                r#"{"status":"recovering","role":"all","capabilities":["local_process_execution"]}"#
+            }
+            (Self::Manager, "ready") => {
+                r#"{"status":"ready","role":"manager","capabilities":["remote_worker_transport"]}"#
+            }
+            (Self::Manager, "draining") => {
+                r#"{"status":"draining","role":"manager","capabilities":["remote_worker_transport"]}"#
+            }
+            (Self::Manager, "degraded") => {
+                r#"{"status":"degraded","role":"manager","capabilities":["remote_worker_transport"]}"#
+            }
+            (Self::Manager, _) => {
+                r#"{"status":"recovering","role":"manager","capabilities":["remote_worker_transport"]}"#
+            }
+        }
+    }
 }
 
 /// Authentication policy for the manager-facing HTTP API.
@@ -219,6 +274,10 @@ pub fn router_with_access_policy(
         Arc::new(AtomicBool::new(true)),
         request_timeout,
         access_policy,
+        ApiReadiness {
+            role: ApiRole::All,
+            manager_workers_ready: None,
+        },
     )
 }
 
@@ -228,6 +287,7 @@ fn router_with_recovery(
     recovery_ready: Arc<AtomicBool>,
     request_timeout: Duration,
     access_policy: ApiAccessPolicy,
+    readiness: ApiReadiness,
 ) -> Router {
     let descriptor = worker.descriptor();
     let state = Arc::new(ApiState {
@@ -235,6 +295,8 @@ fn router_with_recovery(
         worker,
         worker_id: descriptor.worker_id().clone(),
         worker_capacity: descriptor.capacity(),
+        role: readiness.role,
+        manager_workers_ready: readiness.manager_workers_ready,
         start_admission: Arc::new(Semaphore::new(MAX_PENDING_STARTS)),
         blocking_admission: Arc::new(Semaphore::new(MAX_PENDING_BLOCKING_OPERATIONS)),
         control_admission: Arc::new(Semaphore::new(MAX_PENDING_CONTROL_OPERATIONS)),
@@ -372,40 +434,42 @@ async fn authenticate_operator(
     next.run(request).await
 }
 
-async fn healthz() -> impl IntoResponse {
+async fn healthz(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
     (
         StatusCode::OK,
         [(
             header::CONTENT_TYPE,
             HeaderValue::from_static("application/json"),
         )],
-        r#"{"status":"ok","role":"all","capabilities":["local_process_execution"]}"#,
+        state.role.health_body(),
     )
 }
 
 async fn readyz(State(state): State<Arc<ApiState>>) -> impl IntoResponse {
+    let workers_ready = state
+        .manager_workers_ready
+        .as_ref()
+        .is_none_or(|ready| ready.load(Ordering::SeqCst));
     if state.recovery_ready.load(Ordering::SeqCst)
+        && workers_ready
         && !state.worker.is_draining()
         && !state.worker.is_degraded()
     {
-        (
-            StatusCode::OK,
-            r#"{"status":"ready","role":"all","capabilities":["local_process_execution"]}"#,
-        )
+        (StatusCode::OK, state.role.readiness_body("ready"))
     } else if state.worker.is_draining() {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"status":"draining","role":"all","capabilities":["local_process_execution"]}"#,
+            state.role.readiness_body("draining"),
         )
-    } else if state.worker.is_degraded() {
+    } else if !workers_ready || state.worker.is_degraded() {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"status":"degraded","role":"all","capabilities":["local_process_execution"]}"#,
+            state.role.readiness_body("degraded"),
         )
     } else {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            r#"{"status":"recovering","role":"all","capabilities":["local_process_execution"]}"#,
+            state.role.readiness_body("recovering"),
         )
     }
 }
@@ -1133,6 +1197,55 @@ pub async fn serve_with_access_policy(
     request_timeout: Duration,
     access_policy: ApiAccessPolicy,
 ) -> io::Result<()> {
+    serve_with_role_and_access_policy(
+        listener,
+        shutdown,
+        manager,
+        worker,
+        request_timeout,
+        access_policy,
+        ApiReadiness {
+            role: ApiRole::All,
+            manager_workers_ready: None,
+        },
+    )
+    .await
+}
+
+/// Serve the standalone manager API with role-accurate health and readiness responses.
+pub async fn serve_manager_with_access_policy(
+    listener: tokio::net::TcpListener,
+    shutdown: Arc<AtomicBool>,
+    manager: Arc<JobService>,
+    worker: Arc<dyn WorkerPort>,
+    request_timeout: Duration,
+    access_policy: ApiAccessPolicy,
+    manager_workers_ready: Arc<AtomicBool>,
+) -> io::Result<()> {
+    serve_with_role_and_access_policy(
+        listener,
+        shutdown,
+        manager,
+        worker,
+        request_timeout,
+        access_policy,
+        ApiReadiness {
+            role: ApiRole::Manager,
+            manager_workers_ready: Some(manager_workers_ready),
+        },
+    )
+    .await
+}
+
+async fn serve_with_role_and_access_policy(
+    listener: tokio::net::TcpListener,
+    shutdown: Arc<AtomicBool>,
+    manager: Arc<JobService>,
+    worker: Arc<dyn WorkerPort>,
+    request_timeout: Duration,
+    access_policy: ApiAccessPolicy,
+    readiness: ApiReadiness,
+) -> io::Result<()> {
     if !listener.local_addr()?.ip().is_loopback() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1143,7 +1256,47 @@ pub async fn serve_with_access_policy(
     let ready_for_recovery = Arc::clone(&recovery_ready);
     let recovery_manager = Arc::clone(&manager);
     let recovery_worker = Arc::clone(&worker);
+    let manager_workers_ready = readiness.manager_workers_ready.clone();
+    let recovery_shutdown = Arc::clone(&shutdown);
     tokio::spawn(async move {
+        if let Some(workers_ready) = manager_workers_ready {
+            let mut backoff = Duration::from_millis(100);
+            loop {
+                if recovery_shutdown.load(Ordering::Acquire) {
+                    return;
+                }
+                if !workers_ready.load(Ordering::Acquire) || recovery_worker.is_degraded() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                let manager = Arc::clone(&recovery_manager);
+                let worker = Arc::clone(&recovery_worker);
+                let result =
+                    tokio::task::spawn_blocking(move || manager.reconcile(worker.as_ref())).await;
+                match result {
+                    Ok(Ok(())) => {
+                        ready_for_recovery.store(true, Ordering::Release);
+                        return;
+                    }
+                    result => {
+                        let reason = match result {
+                            Ok(Err(conductor_manager::ManagerError::WorkerUnavailable)) => {
+                                "worker_unavailable"
+                            }
+                            Ok(Err(_)) => "manager_reconcile_failed",
+                            Err(_) => "reconcile_task_failed",
+                            Ok(Ok(())) => "unknown",
+                        };
+                        eprintln!(
+                            "{{\"timestampMs\":{},\"severity\":\"warn\",\"component\":\"manager\",\"event\":\"manager_recovery_retry\",\"reason\":\"{reason}\"}}",
+                            timestamp_ms()
+                        );
+                    }
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(5));
+            }
+        }
         for attempt in 0..4 {
             let manager = Arc::clone(&recovery_manager);
             let worker = Arc::clone(&recovery_worker);
@@ -1171,6 +1324,7 @@ pub async fn serve_with_access_policy(
             recovery_ready,
             request_timeout,
             access_policy,
+            readiness,
         ),
     )
     .with_graceful_shutdown(wait_for_shutdown(server_shutdown))

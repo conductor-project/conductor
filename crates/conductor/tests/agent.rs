@@ -8,6 +8,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use rusqlite::Connection;
 
 const ASYNC_TEST_WATCHDOG: Duration = Duration::from_secs(30);
@@ -153,7 +154,7 @@ fn start_config(config: PathBuf, role_override: Option<&str>) -> (Agent, SocketA
         let mut reader = BufReader::new(stderr);
         let mut line = String::new();
         let _ = reader.read_line(&mut line);
-        let _ = sender.send(line);
+        let _ = sender.send(line.clone());
         // Keep draining diagnostics after the startup event. Closing this
         // pipe early can make later eprintln! calls panic in the child.
         let _ = std::io::copy(&mut reader, &mut std::io::sink());
@@ -175,22 +176,108 @@ fn start_config(config: PathBuf, role_override: Option<&str>) -> (Agent, SocketA
     (child, address)
 }
 
+fn start_without_api_readiness(config: &Path) -> (Agent, serde_json::Value) {
+    let child = command(config, None)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start manager agent");
+    let mut child = Agent(child);
+    let stderr = child.0.stderr.take().expect("stderr");
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        let _ = sender.send(line.clone());
+        loop {
+            line.clear();
+            if reader
+                .read_line(&mut line)
+                .ok()
+                .filter(|read| *read > 0)
+                .is_none()
+            {
+                break;
+            }
+            if line.contains("manager_recovery_retry") {
+                eprintln!("{line}");
+            }
+        }
+    });
+    let line = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("manager startup event before readiness deadline");
+    let event: serde_json::Value = serde_json::from_str(&line).expect("startup event JSON");
+    assert_eq!(event["event"], "agent_started", "{line}");
+    assert_eq!(event["role"], "manager", "{line}");
+    (child, event)
+}
+
+fn start_worker_process(config: &Path) -> Agent {
+    let child = command(config, None)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start worker agent");
+    let mut child = Agent(child);
+    let stderr = child.0.stderr.take().expect("stderr");
+    thread::spawn(move || {
+        let _ = std::io::copy(&mut BufReader::new(stderr), &mut std::io::sink());
+    });
+    child
+}
+
 fn wait_for_ready(address: SocketAddr) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    wait_for_ready_named(address, "agent");
+}
+
+fn wait_for_ready_named(address: SocketAddr, description: &str) {
+    wait_for_ready_with_timeout(address, description, Duration::from_secs(5));
+}
+
+fn wait_for_ready_with_timeout(address: SocketAddr, description: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let mut last_response = String::new();
     loop {
         if let Ok(mut stream) = TcpStream::connect(address) {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
             let _ = stream
                 .write_all(b"GET /readyz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
             let mut response = String::new();
-            if stream.read_to_string(&mut response).is_ok() && response.starts_with("HTTP/1.1 200")
+            if stream.read_to_string(&mut response).is_ok() {
+                if response.starts_with("HTTP/1.1 200") {
+                    return;
+                }
+                last_response = response;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{description} did not become ready before deadline; last response: {last_response}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_http_status(address: SocketAddr, path: &str, expected: u16, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(mut stream) = TcpStream::connect(address) {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+            let request =
+                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(request.as_bytes());
+            let mut response = String::new();
+            if stream.read_to_string(&mut response).is_ok()
+                && response.starts_with(&format!("HTTP/1.1 {expected}"))
             {
                 return;
             }
         }
         assert!(
             Instant::now() < deadline,
-            "agent did not become ready before deadline"
+            "HTTP {path} did not return status {expected} before deadline"
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -874,18 +961,439 @@ fn actual_binary_keeps_serving_after_shutdown_grace_period() {
 }
 
 #[test]
-fn role_override_can_enable_combined_mode_and_standalone_roles_fail() {
+fn role_override_can_enable_combined_mode_and_standalone_roles_report_configuration_errors() {
     let path = TempDir::new("roles");
     let (mut child, _) = start(&path, "manager", Some("all"));
     signal(&child, "INT");
     wait_for_exit(&mut child);
 
-    for role in ["manager", "worker"] {
-        let config = write_config(&path, "all", "127.0.0.1:0", "");
-        let result = failed(&config, Some(role));
-        assert!(!result.status.success());
-        assert!(String::from_utf8_lossy(&result.stderr).contains("unsupported"));
+    let manager_config = path.join("manager-invalid.json");
+    fs::write(
+        &manager_config,
+        serde_json::to_vec(&serde_json::json!({
+            "role":"manager",
+            "listen":"127.0.0.1:0",
+            "manager_data_dir":path.join("manager-state"),
+            "api_access":{"mode":"local"},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let result = failed(&manager_config, None);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("worker_transport_listen"));
+
+    let worker_config = path.join("worker-invalid.json");
+    fs::write(
+        &worker_config,
+        serde_json::to_vec(&serde_json::json!({
+            "role":"worker",
+            "worker_data_dir":path.join("worker-state"),
+            "worker_id":"worker-a",
+            "worker_concurrency":1,
+            "worker_identity_file":path.join("worker-state/identity.pem"),
+            "manager_ca_file":path.join("manager-ca.pem"),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let result = failed(&worker_config, None);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("manager_endpoint"));
+}
+
+#[test]
+fn standalone_manager_and_worker_run_an_authenticated_remote_one_shot() {
+    let path = TempDir::new("standalone-remote-job");
+    let manager_data_dir = path.join("manager-state");
+    let identity_dir = path.join("manager-identity");
+    let api_config = path.join("manager.json");
+    let reserved_transport_listener =
+        TcpListener::bind("127.0.0.1:0").expect("reserve transport port");
+    let configured_transport_address = reserved_transport_listener.local_addr().unwrap();
+    drop(reserved_transport_listener);
+    fs::write(
+        &api_config,
+        serde_json::to_vec(&serde_json::json!({
+            "role":"manager",
+            "listen":"127.0.0.1:0",
+            "worker_transport_listen":configured_transport_address.to_string(),
+            "manager_data_dir":"manager-state",
+            "manager_identity_dir":"manager-identity",
+            "manager_server_name":"localhost",
+            "worker_id":"remote-worker",
+            "worker_transport_capacity":2,
+            "additional_workers":[{"worker_id":"remote-worker-2","capacity":2}],
+            "api_access":{"mode":"local"},
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (mut manager, event) = start_without_api_readiness(&api_config);
+    let mut api_address: SocketAddr = event["address"]
+        .as_str()
+        .expect("manager API address")
+        .parse()
+        .expect("valid manager API address");
+    let transport_address: SocketAddr = event["workerTransportAddress"]
+        .as_str()
+        .expect("worker transport address")
+        .parse()
+        .expect("valid worker transport address");
+    assert_eq!(
+        transport_address.port(),
+        configured_transport_address.port()
+    );
+
+    wait_for_http_status(api_address, "/healthz", 200, Duration::from_secs(5));
+    let (status, readiness) = http(api_address, "GET", "/readyz", None, &[]);
+    assert_eq!(
+        status, 503,
+        "manager should expose degraded readiness before workers connect: {readiness}"
+    );
+    let readiness: serde_json::Value = serde_json::from_str(&readiness).unwrap();
+    assert_eq!(readiness["role"], "manager");
+    assert_eq!(readiness["status"], "degraded");
+
+    let mut workers = Vec::new();
+    let wrong_host_id = "wrong-host-worker";
+    let wrong_host_credential = path.join("wrong-host-credential");
+    let enrollment = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args([
+            "enroll-worker",
+            "--manager-data-dir",
+            manager_data_dir.to_str().expect("manager path"),
+            "--identity-dir",
+            identity_dir.to_str().expect("identity path"),
+            "--worker-id",
+            wrong_host_id,
+            "--output",
+            wrong_host_credential.to_str().expect("credential path"),
+        ])
+        .output()
+        .expect("create wrong-host worker enrollment credential");
+    assert!(
+        enrollment.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enrollment.stderr)
+    );
+    let wrong_host_identity = path.join("wrong-host-state/identity.pem");
+    let wrong_host_config = path.join("wrong-host.json");
+    fs::write(
+        &wrong_host_config,
+        serde_json::to_vec(&serde_json::json!({
+            "role":"worker",
+            "worker_data_dir":"wrong-host-state",
+            "worker_id":wrong_host_id,
+            "worker_concurrency":1,
+            "manager_endpoint":format!("https://127.0.0.1:{}/", transport_address.port()),
+            "worker_identity_file":"wrong-host-state/identity.pem",
+            "worker_enrollment_credential_file":"wrong-host-credential",
+            "manager_ca_file":"manager-identity/worker-ca.pem",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut wrong_host_worker = start_worker_process(&wrong_host_config);
+    wait_for_failure_exit(&mut wrong_host_worker, Duration::from_secs(12));
+    assert!(
+        !wrong_host_identity.exists(),
+        "worker must not persist an identity when manager hostname verification fails"
+    );
+    assert!(
+        wrong_host_credential.exists(),
+        "worker must retain the unconsumed enrollment credential after TLS failure"
+    );
+
+    let wrong_ca_id = "wrong-ca-worker";
+    let wrong_ca_credential = path.join("wrong-ca-credential");
+    let enrollment = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args([
+            "enroll-worker",
+            "--manager-data-dir",
+            manager_data_dir.to_str().expect("manager path"),
+            "--identity-dir",
+            identity_dir.to_str().expect("identity path"),
+            "--worker-id",
+            wrong_ca_id,
+            "--output",
+            wrong_ca_credential.to_str().expect("credential path"),
+        ])
+        .output()
+        .expect("create wrong-CA worker enrollment credential");
+    assert!(
+        enrollment.status.success(),
+        "{}",
+        String::from_utf8_lossy(&enrollment.stderr)
+    );
+    let untrusted_ca_dir = path.join("untrusted-ca");
+    let untrusted_ca = conductor_transport::CertificateAuthority::open_or_create(&untrusted_ca_dir)
+        .expect("create unrelated test CA");
+    let wrong_ca_file = path.join("wrong-manager-ca.pem");
+    fs::write(&wrong_ca_file, untrusted_ca.certificate_pem()).expect("write unrelated CA");
+    let wrong_ca_identity = path.join("wrong-ca-state/identity.pem");
+    let wrong_ca_config = path.join("wrong-ca.json");
+    fs::write(
+        &wrong_ca_config,
+        serde_json::to_vec(&serde_json::json!({
+            "role":"worker",
+            "worker_data_dir":"wrong-ca-state",
+            "worker_id":wrong_ca_id,
+            "worker_concurrency":1,
+            "manager_endpoint":format!("https://localhost:{}/", transport_address.port()),
+            "worker_identity_file":"wrong-ca-state/identity.pem",
+            "worker_enrollment_credential_file":"wrong-ca-credential",
+            "manager_ca_file":"wrong-manager-ca.pem",
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let mut wrong_ca_worker = start_worker_process(&wrong_ca_config);
+    wait_for_failure_exit(&mut wrong_ca_worker, Duration::from_secs(12));
+    assert!(
+        !wrong_ca_identity.exists(),
+        "worker must not persist an identity when the manager CA is untrusted"
+    );
+    assert!(
+        wrong_ca_credential.exists(),
+        "worker must retain the unconsumed enrollment credential after CA validation fails"
+    );
+
+    for worker_id in ["remote-worker", "remote-worker-2"] {
+        let credential_file = path.join(format!("{worker_id}-credential"));
+        let enrollment = Command::new(env!("CARGO_BIN_EXE_conductor"))
+            .args([
+                "enroll-worker",
+                "--manager-data-dir",
+                manager_data_dir.to_str().expect("manager path"),
+                "--identity-dir",
+                identity_dir.to_str().expect("identity path"),
+                "--worker-id",
+                worker_id,
+                "--output",
+                credential_file.to_str().expect("credential path"),
+            ])
+            .output()
+            .expect("create one-time worker enrollment credential");
+        assert!(
+            enrollment.status.success(),
+            "{}",
+            String::from_utf8_lossy(&enrollment.stderr)
+        );
+        let worker_data_dir = path.join(format!("{worker_id}-state"));
+        let worker_identity = worker_data_dir.join("identity.pem");
+        let worker_config = path.join(format!("{worker_id}.json"));
+        fs::write(
+            &worker_config,
+            serde_json::to_vec(&serde_json::json!({
+                "role":"worker",
+            "worker_data_dir":format!("{worker_id}-state"),
+                "worker_id":worker_id,
+                "worker_concurrency":2,
+                "manager_endpoint":format!("https://localhost:{}/", transport_address.port()),
+            "worker_identity_file":format!("{worker_id}-state/identity.pem"),
+            "worker_enrollment_credential_file":format!("{worker_id}-credential"),
+            "manager_ca_file":"manager-identity/worker-ca.pem",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let worker = start_worker_process(&worker_config);
+        workers.push((worker, worker_identity, credential_file, worker_config));
+        if worker_id == "remote-worker" {
+            wait_for_http_status(api_address, "/v1/workers", 200, Duration::from_secs(5));
+            let (status, body) = http(api_address, "GET", "/v1/workers", None, &[]);
+            assert_eq!(status, 200, "{body}");
+            let observed: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(observed[0]["available"], true);
+            let (status, readiness) = http(api_address, "GET", "/readyz", None, &[]);
+            assert_eq!(
+                status, 503,
+                "second configured worker is still offline: {readiness}"
+            );
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&readiness).unwrap()["status"],
+                "degraded"
+            );
+        }
     }
+    wait_for_ready_named(api_address, "manager after first worker enrollment");
+    let (status, health) = http(api_address, "GET", "/healthz", None, &[]);
+    assert_eq!(status, 200, "{health}");
+    let health: serde_json::Value = serde_json::from_str(&health).unwrap();
+    assert_eq!(health["role"], "manager");
+    assert_eq!(health["capabilities"][0], "remote_worker_transport");
+    let (status, readiness) = http(api_address, "GET", "/readyz", None, &[]);
+    assert_eq!(status, 200, "{readiness}");
+    let readiness: serde_json::Value = serde_json::from_str(&readiness).unwrap();
+    assert_eq!(readiness["role"], "manager");
+    assert_eq!(readiness["status"], "ready");
+    for (_, identity, credential, _) in &workers {
+        assert!(
+            identity.is_file(),
+            "worker should persist its private identity"
+        );
+        assert!(
+            !credential.exists(),
+            "single-use credential should be removed"
+        );
+    }
+
+    let job = serde_json::json!({
+        "id":"remote-one-shot",
+        "command":["/bin/sh", "-c", "printf remote-worker-output"],
+        "cwd":"/tmp",
+    });
+    let (status, body) = http(
+        api_address,
+        "POST",
+        "/v1/jobs",
+        Some("application/json"),
+        &serde_json::to_vec(&job).unwrap(),
+    );
+    assert_eq!(status, 201, "{body}");
+    let (status, accepted) = http(
+        api_address,
+        "POST",
+        "/v1/jobs/remote-one-shot/runs",
+        None,
+        &[],
+    );
+    assert_eq!(status, 202, "{accepted}");
+    let run_id = serde_json::from_str::<serde_json::Value>(&accepted).unwrap()["runId"]
+        .as_str()
+        .expect("accepted run ID")
+        .to_owned();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let (status, body) = http(api_address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
+        assert_eq!(status, 200, "{body}");
+        let observation: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if observation["state"] == "succeeded" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "remote run did not complete: {body}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let (status, logs) = http(
+        api_address,
+        "GET",
+        &format!("/v1/runs/{run_id}/logs?stream=stdout"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "{logs}");
+    let logs: serde_json::Value = serde_json::from_str(&logs).unwrap();
+    let encoded = logs["data"].as_str().expect("base64 run log");
+    let mut output = [0_u8; 64];
+    let length = base64::engine::general_purpose::STANDARD
+        .decode_slice(encoded, &mut output)
+        .expect("decode remote worker output");
+    assert_eq!(&output[..length], b"remote-worker-output");
+    let active_job = serde_json::json!({
+        "id":"active-on-manager-restart",
+        "command":["/bin/sleep", "30"],
+        "cwd":"/tmp",
+    });
+    let (status, body) = http(
+        api_address,
+        "POST",
+        "/v1/jobs",
+        Some("application/json"),
+        &serde_json::to_vec(&active_job).unwrap(),
+    );
+    assert_eq!(status, 201, "{body}");
+    let (status, accepted) = http(
+        api_address,
+        "POST",
+        "/v1/jobs/active-on-manager-restart/runs",
+        None,
+        &[],
+    );
+    assert_eq!(status, 202, "{accepted}");
+    let active_run_id = serde_json::from_str::<serde_json::Value>(&accepted).unwrap()["runId"]
+        .as_str()
+        .expect("accepted active run ID")
+        .to_owned();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let (status, body) = http(
+            api_address,
+            "GET",
+            &format!("/v1/runs/{active_run_id}"),
+            None,
+            &[],
+        );
+        assert_eq!(status, 200, "{body}");
+        if serde_json::from_str::<serde_json::Value>(&body).unwrap()["state"] == "running" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "run did not become active before manager restart: {body}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    signal(&manager, "INT");
+    wait_for_exit_with_timeout(&mut manager, Duration::from_secs(12));
+    let (restarted_manager, restart_event) = start_without_api_readiness(&api_config);
+    manager = restarted_manager;
+    api_address = restart_event["address"]
+        .as_str()
+        .expect("restarted manager API address")
+        .parse()
+        .expect("valid restarted API address");
+    assert_eq!(
+        restart_event["workerTransportAddress"],
+        configured_transport_address.to_string()
+    );
+    wait_for_http_status(api_address, "/healthz", 200, Duration::from_secs(5));
+    let (status, readiness) = http(api_address, "GET", "/readyz", None, &[]);
+    assert_eq!(
+        status, 503,
+        "restarted manager should initially be degraded: {readiness}"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&readiness).unwrap()["status"],
+        "degraded"
+    );
+    wait_for_ready_with_timeout(
+        api_address,
+        "manager after late worker reconnect",
+        Duration::from_secs(15),
+    );
+    for (worker, _, _, _) in &mut workers {
+        assert_eq!(worker.0.try_wait().expect("check reconnected worker"), None);
+    }
+    let (status, recovered) = http(
+        api_address,
+        "GET",
+        &format!("/v1/runs/{active_run_id}"),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "{recovered}");
+    let (status, stopped) = http(
+        api_address,
+        "POST",
+        &format!("/v1/runs/{active_run_id}/stop"),
+        None,
+        &[],
+    );
+    assert!(status == 200 || status == 202, "{stopped}");
+
+    for (worker, _, _, _) in &workers {
+        signal(worker, "INT");
+    }
+    for (worker, _, _, _) in &mut workers {
+        wait_for_exit(worker);
+    }
+    signal(&manager, "INT");
+    wait_for_exit(&mut manager);
 }
 
 #[test]

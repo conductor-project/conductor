@@ -465,15 +465,25 @@ fn worker_reports_spawn_exit_signal_and_capacity_outcomes() {
     assert_eq!(failed.exit_code(), Some(17));
     assert_eq!(failed.failure_reason(), Some(RunFailureReason::NonZeroExit));
 
-    let signaled = service
-        .start(StartRun::new(run(
+    let start_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let signaled = loop {
+        match service.start(StartRun::new(run(
             "signal",
             job(
                 "signal",
                 vec!["/bin/sh".into(), "-c".into(), "kill -TERM $$".into()],
             ),
-        )))
-        .unwrap();
+        ))) {
+            Err(WorkerError::CapacityReached) => {
+                assert!(
+                    std::time::Instant::now() < start_deadline,
+                    "cleanup permit did not become available before signal test"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            result => break result.unwrap(),
+        }
+    };
     assert_eq!(signaled.state(), RunState::Running);
     let signaled = wait_for(&service, "signal");
     assert_eq!(signaled.state(), RunState::Failed);
