@@ -7,7 +7,7 @@ use std::num::NonZeroU16;
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// The protocol version implemented by this MVP2 release.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 2;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 3;
 
 /// An inclusive range of protocol versions a peer can speak compatibly.
 ///
@@ -84,6 +84,7 @@ pub enum ProtocolCapability {
     CommandDeduplication,
     OrderedReports,
     WorkerIncarnations,
+    WorkerResourceInventory,
 }
 
 /// A peer's supported protocol versions and capability requirements.

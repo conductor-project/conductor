@@ -26,8 +26,18 @@ certificate SAN.
   "manager_server_name": "manager.example.test",
   "worker_id": "worker-one",
   "worker_transport_capacity": 2,
+  "worker_resource_domain_id": "shared-host",
+  "worker_labels": { "region": "example", "pool": "general" },
+  "host_resource_domains": [
+    { "id": "shared-host", "cpu_millis": 1000, "memory_bytes": 1073741824 }
+  ],
   "additional_workers": [
-    { "worker_id": "worker-two", "capacity": 2 }
+    {
+      "worker_id": "worker-two",
+      "capacity": 2,
+      "resource_domain_id": "shared-host",
+      "labels": { "region": "example", "pool": "general" }
+    }
   ],
   "api_access": { "mode": "operator_token_file", "token_file": "/etc/conductor/operator-token" }
 }
@@ -42,6 +52,18 @@ work. Capacity-aware placement across workers is tracked by issue #67. Manager
 data and the CA key must be protected and backed up. The operator API accepts
 connections only on loopback; a remote operator reaches it through a trusted
 local TLS proxy.
+
+Worker inventory reports OS, architecture, execution and enforcement capabilities,
+CPU and memory totals and allocatable capacity, plus execution slots. Allocatable
+capacity reserves 20% of the measured host total for the daemon and system. It is
+inventory for placement, not utilization telemetry or a kernel-enforced limit.
+The manager owns worker labels and resource-domain assignments. Use the same
+`resource_domain_id` for workers sharing one physical host and configure one
+aggregate budget for that domain; the manager rejects a shared domain without a
+budget. The configured budget must fit within each worker's reported allocatable
+capacity. For workers on different hosts, leave the domain IDs distinct. `/v1/workers`
+and `/v1/workers/{id}` include the last inventory, manager labels, resource domain,
+and `fresh`/`lastSeenAtMs` fields so stale reports remain visible during disconnects.
 
 Issue a single-use enrollment credential locally for each configured worker:
 

@@ -1,6 +1,6 @@
 mod state_lock;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener};
@@ -16,7 +16,7 @@ use base64::Engine;
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use conductor_core::{
     InspectRun, MAX_WORKER_CAPACITY, ProtocolOffer, ProtocolVersionRange, ReadRunLogs, ResolveRun,
-    StartRun, StopRun, WorkerDescriptor, WorkerId,
+    StartRun, StopRun, WorkerDescriptor, WorkerId, WorkerMetadata, WorkerResourceCapacity,
 };
 use conductor_manager::{WorkerPort, WorkerPortError};
 use serde::Deserialize;
@@ -126,6 +126,12 @@ struct Config {
     worker_transport_capacity: Option<usize>,
     #[serde(default)]
     additional_workers: Vec<RemoteWorkerConfig>,
+    #[serde(default)]
+    host_resource_domains: Vec<HostResourceDomainConfig>,
+    #[serde(default)]
+    worker_resource_domain_id: Option<String>,
+    #[serde(default)]
+    worker_labels: BTreeMap<String, String>,
     #[serde(default = "default_log_max_bytes_per_stream")]
     log_max_bytes_per_stream: u64,
     #[serde(default = "default_log_retention_runs")]
@@ -143,6 +149,18 @@ struct Config {
 struct RemoteWorkerConfig {
     worker_id: String,
     capacity: usize,
+    #[serde(default)]
+    resource_domain_id: Option<String>,
+    #[serde(default)]
+    labels: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HostResourceDomainConfig {
+    id: String,
+    cpu_millis: u32,
+    memory_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -432,9 +450,18 @@ fn run_all(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
         },
         process_backend(&config)?,
     )?);
+    let metadata = worker_metadata(
+        &config,
+        worker.descriptor().worker_id(),
+        config.worker_resource_domain_id.as_deref(),
+        &config.worker_labels,
+    )?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     close_fds::set_fds_cloexec_threadsafe(3, &[]);
-    let worker_port: Arc<dyn WorkerPort> = Arc::new(LocalWorkerPort(Arc::clone(&worker)));
+    let worker_port: Arc<dyn WorkerPort> = Arc::new(LocalWorkerPort {
+        worker: Arc::clone(&worker),
+        metadata,
+    });
     let listener = TcpListener::bind(listen)?;
     listener.set_nonblocking(true)?;
     let address = listener.local_addr()?;
@@ -503,20 +530,31 @@ fn run_manager(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
         BTreeSet::from([
             conductor_core::ProtocolCapability::OrderedReports,
             conductor_core::ProtocolCapability::WorkerIncarnations,
+            conductor_core::ProtocolCapability::WorkerResourceInventory,
         ]),
-        BTreeSet::new(),
+        BTreeSet::from([conductor_core::ProtocolCapability::WorkerResourceInventory]),
     )?;
     let mut worker_ports: Vec<Arc<dyn WorkerPort>> =
         Vec::with_capacity(config.additional_workers.len() + 1);
-    worker_ports.push(hub.register_worker(descriptor, offer.clone())?);
+    let metadata = worker_metadata(
+        &config,
+        &worker_id,
+        config.worker_resource_domain_id.as_deref(),
+        &config.worker_labels,
+    )?;
+    worker_ports.push(hub.register_worker_with_metadata(descriptor, offer.clone(), metadata)?);
     for additional in &config.additional_workers {
-        worker_ports.push(hub.register_worker(
-            WorkerDescriptor::new(
-                WorkerId::new(additional.worker_id.clone())?,
-                additional.capacity,
-                true,
-            ),
+        let additional_id = WorkerId::new(additional.worker_id.clone())?;
+        let metadata = worker_metadata(
+            &config,
+            &additional_id,
+            additional.resource_domain_id.as_deref(),
+            &additional.labels,
+        )?;
+        worker_ports.push(hub.register_worker_with_metadata(
+            WorkerDescriptor::new(additional_id, additional.capacity, true),
             offer.clone(),
+            metadata,
         )?);
     }
     let server_identity = authority
@@ -686,8 +724,9 @@ fn run_worker(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
             BTreeSet::from([
                 conductor_core::ProtocolCapability::OrderedReports,
                 conductor_core::ProtocolCapability::WorkerIncarnations,
+                conductor_core::ProtocolCapability::WorkerResourceInventory,
             ]),
-            BTreeSet::new(),
+            BTreeSet::from([conductor_core::ProtocolCapability::WorkerResourceInventory]),
         )?,
         shutdown_receiver,
     ));
@@ -955,53 +994,95 @@ fn timestamp_ms() -> u128 {
         .unwrap_or_default()
 }
 
-struct LocalWorkerPort(Arc<conductor_worker::WorkerService>);
+struct LocalWorkerPort {
+    worker: Arc<conductor_worker::WorkerService>,
+    metadata: WorkerMetadata,
+}
 
 impl WorkerPort for LocalWorkerPort {
     fn descriptor(&self) -> conductor_core::WorkerDescriptor {
-        self.0.descriptor()
+        self.worker.descriptor()
     }
 
     fn is_draining(&self) -> bool {
-        self.0.is_draining()
+        self.worker.is_draining()
     }
 
     fn is_degraded(&self) -> bool {
-        self.0.is_degraded()
+        self.worker.is_degraded()
     }
 
     fn start(&self, command: StartRun) -> Result<conductor_core::RunObservation, WorkerPortError> {
-        self.0.start(command).map_err(map_worker_error)
+        self.worker.start(command).map_err(map_worker_error)
     }
 
     fn inspect(
         &self,
         command: InspectRun,
     ) -> Result<Option<conductor_core::RunObservation>, WorkerPortError> {
-        self.0.inspect(command).map_err(map_worker_error)
+        self.worker.inspect(command).map_err(map_worker_error)
     }
 
     fn stop(&self, command: StopRun) -> Result<conductor_core::RunObservation, WorkerPortError> {
-        self.0.stop(command).map_err(map_worker_error)
+        self.worker.stop(command).map_err(map_worker_error)
     }
 
     fn resolve(
         &self,
         command: ResolveRun,
     ) -> Result<conductor_core::RunObservation, WorkerPortError> {
-        self.0.resolve_unknown(command).map_err(map_worker_error)
+        self.worker
+            .resolve_unknown(command)
+            .map_err(map_worker_error)
     }
 
     fn status(&self) -> Result<conductor_core::WorkerStatus, WorkerPortError> {
-        self.0.status().map_err(map_worker_error)
+        let status = self.worker.status().map_err(map_worker_error)?;
+        let inventory = status.inventory().ok_or(WorkerPortError::Unavailable)?;
+        let domain_capacity = self.metadata.capacity().unwrap_or(inventory.allocatable());
+        let last_seen_at_ms =
+            i64::try_from(timestamp_ms()).map_err(|_| WorkerPortError::Unavailable)?;
+        status
+            .with_manager_metadata(
+                self.metadata.resource_domain_id().clone(),
+                domain_capacity,
+                self.metadata.labels().clone(),
+                last_seen_at_ms,
+                true,
+            )
+            .ok_or(WorkerPortError::Unavailable)
     }
 
     fn read_logs(
         &self,
         command: ReadRunLogs,
     ) -> Result<conductor_core::RunLogChunk, WorkerPortError> {
-        self.0.read_logs(command).map_err(map_worker_error)
+        self.worker.read_logs(command).map_err(map_worker_error)
     }
+}
+
+fn worker_metadata(
+    config: &Config,
+    worker_id: &WorkerId,
+    configured_domain_id: Option<&str>,
+    labels: &BTreeMap<String, String>,
+) -> Result<WorkerMetadata, Box<dyn std::error::Error>> {
+    let domain_id = WorkerId::new(
+        configured_domain_id
+            .unwrap_or(worker_id.as_str())
+            .to_owned(),
+    )?;
+    let capacity = config
+        .host_resource_domains
+        .iter()
+        .find(|domain| domain.id == domain_id.as_str())
+        .map(|domain| {
+            WorkerResourceCapacity::new(domain.cpu_millis, domain.memory_bytes)
+                .ok_or("host resource domain capacity values must be positive")
+        })
+        .transpose()?;
+    WorkerMetadata::new(domain_id, capacity, labels.clone())
+        .ok_or_else(|| "worker labels exceed supported limits or contain invalid characters".into())
 }
 
 fn map_worker_error(error: conductor_worker::WorkerError) -> WorkerPortError {
@@ -1031,6 +1112,7 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 || config.worker_enrollment_credential_file.is_some()
                 || config.worker_transport_capacity.is_some()
                 || !config.additional_workers.is_empty()
+                || !config.host_resource_domains.is_empty()
             {
                 return Err("standalone-role fields cannot be used with role 'all'".into());
             }
@@ -1060,6 +1142,9 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 || config.manager_server_name.is_some()
                 || config.worker_transport_capacity.is_some()
                 || !config.additional_workers.is_empty()
+                || !config.host_resource_domains.is_empty()
+                || config.worker_resource_domain_id.is_some()
+                || !config.worker_labels.is_empty()
             {
                 return Err("manager-only fields cannot be used with role 'worker'".into());
             }
@@ -1067,6 +1152,14 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     if manager_role {
+        if !conductor_core::valid_worker_labels(&config.worker_labels) {
+            return Err(
+                "worker_labels exceed supported limits or contain invalid characters".into(),
+            );
+        }
+        if let Some(domain_id) = &config.worker_resource_domain_id {
+            WorkerId::new(domain_id.clone())?;
+        }
         let listen = required(&config.listen, "listen")?;
         if !listen.ip().is_loopback() {
             return Err(
@@ -1137,7 +1230,33 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         if capacity == 0 || capacity > MAX_WORKER_CAPACITY {
             return Err("worker_transport_capacity must be between 1 and 64".into());
         }
+        let mut domain_capacities = BTreeMap::new();
+        for domain in &config.host_resource_domains {
+            let id = WorkerId::new(domain.id.clone())?;
+            if domain.cpu_millis == 0 || domain.memory_bytes == 0 {
+                return Err("host resource domain capacities must be positive".into());
+            }
+            if domain_capacities
+                .insert(
+                    id.as_str().to_owned(),
+                    (domain.cpu_millis, domain.memory_bytes),
+                )
+                .is_some()
+            {
+                return Err("host resource domain IDs must be unique".into());
+            }
+        }
+        let mut resource_domains = BTreeMap::<String, usize>::new();
         let mut worker_ids = BTreeSet::from([worker_id.as_str().to_owned()]);
+        let primary_domain = WorkerId::new(
+            config
+                .worker_resource_domain_id
+                .clone()
+                .unwrap_or_else(|| worker_id.clone()),
+        )?;
+        *resource_domains
+            .entry(primary_domain.as_str().to_owned())
+            .or_default() += 1;
         for additional in &config.additional_workers {
             let additional_id = WorkerId::new(additional.worker_id.clone())?;
             if !worker_ids.insert(additional_id.as_str().to_owned()) {
@@ -1145,6 +1264,33 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             }
             if additional.capacity == 0 || additional.capacity > MAX_WORKER_CAPACITY {
                 return Err("additional worker capacity must be between 1 and 64".into());
+            }
+            if !conductor_core::valid_worker_labels(&additional.labels) {
+                return Err("additional worker labels exceed supported limits or contain invalid characters".into());
+            }
+            let domain_id = WorkerId::new(
+                additional
+                    .resource_domain_id
+                    .clone()
+                    .unwrap_or_else(|| additional_id.as_str().to_owned()),
+            )?;
+            *resource_domains
+                .entry(domain_id.as_str().to_owned())
+                .or_default() += 1;
+        }
+        for (domain_id, count) in &resource_domains {
+            if *count > 1 && !domain_capacities.contains_key(domain_id) {
+                return Err(format!(
+                    "shared worker resource domain '{domain_id}' requires a host_resource_domains budget"
+                ).into());
+            }
+        }
+        for domain_id in domain_capacities.keys() {
+            if !resource_domains.contains_key(domain_id) {
+                return Err(format!(
+                    "host resource domain '{domain_id}' is not assigned to a worker"
+                )
+                .into());
             }
         }
         if !(100..=120_000).contains(&config.request_timeout_ms) {
@@ -1283,11 +1429,15 @@ fn api_access_policy(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::panic::catch_unwind;
     use std::path::PathBuf;
 
-    use super::{CgroupV2Config, Config, Role, default_request_timeout_ms, validate};
+    use super::{
+        CgroupV2Config, Config, HostResourceDomainConfig, RemoteWorkerConfig, Role,
+        default_request_timeout_ms, validate,
+    };
 
     fn config(listen: &str) -> Config {
         Config {
@@ -1307,6 +1457,9 @@ mod tests {
             worker_enrollment_credential_file: None,
             worker_transport_capacity: None,
             additional_workers: Vec::new(),
+            host_resource_domains: Vec::new(),
+            worker_resource_domain_id: None,
+            worker_labels: BTreeMap::new(),
             log_max_bytes_per_stream: conductor_worker::DEFAULT_LOG_MAX_BYTES_PER_STREAM,
             log_retention_runs: conductor_worker::DEFAULT_LOG_RETENTION_RUNS,
             request_timeout_ms: default_request_timeout_ms(),
@@ -1314,6 +1467,18 @@ mod tests {
             landlock: super::LandlockConfig::default(),
             source_config_path: PathBuf::new(),
         }
+    }
+
+    fn manager_config() -> Config {
+        let mut config = config("127.0.0.1:8080");
+        config.role = Role::Manager;
+        config.worker_data_dir = None;
+        config.worker_concurrency = None;
+        config.worker_transport_listen = Some("127.0.0.1:9443".parse().unwrap());
+        config.manager_identity_dir = Some(PathBuf::from("identity"));
+        config.manager_server_name = Some("localhost".to_owned());
+        config.worker_transport_capacity = Some(2);
+        config
     }
 
     #[test]
@@ -1472,6 +1637,47 @@ mod tests {
 
         config.cgroup_v2.enabled = false;
         config.cgroup_v2.delegated_root = None;
+        assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn shared_worker_domains_require_one_configured_aggregate_budget() {
+        let mut config = manager_config();
+        config.worker_resource_domain_id = Some("host-a".to_owned());
+        config.additional_workers.push(RemoteWorkerConfig {
+            worker_id: "worker-two".to_owned(),
+            capacity: 2,
+            resource_domain_id: Some("host-a".to_owned()),
+            labels: BTreeMap::new(),
+        });
+        let error = validate(&config).expect_err("shared host requires a configured budget");
+        assert!(error.to_string().contains("host_resource_domains"));
+
+        config.host_resource_domains.push(HostResourceDomainConfig {
+            id: "host-a".to_owned(),
+            cpu_millis: 1_000,
+            memory_bytes: 1_000_000,
+        });
+        validate(&config).expect("shared host has a configured aggregate budget");
+    }
+
+    #[test]
+    fn worker_labels_and_host_domain_configuration_are_validated() {
+        let mut config = manager_config();
+        config
+            .worker_labels
+            .insert("region".to_owned(), "bad\nvalue".to_owned());
+        assert!(validate(&config).is_err());
+
+        config.worker_labels.clear();
+        config.host_resource_domains.push(HostResourceDomainConfig {
+            id: "unassigned-host".to_owned(),
+            cpu_millis: 1_000,
+            memory_bytes: 1_000_000,
+        });
+        assert!(validate(&config).is_err());
+
+        config.host_resource_domains[0].cpu_millis = 0;
         assert!(validate(&config).is_err());
     }
 

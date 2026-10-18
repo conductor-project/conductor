@@ -1023,7 +1023,10 @@ fn standalone_manager_and_worker_run_an_authenticated_remote_one_shot() {
             "manager_server_name":"localhost",
             "worker_id":"remote-worker",
             "worker_transport_capacity":2,
-            "additional_workers":[{"worker_id":"remote-worker-2","capacity":2}],
+            "worker_resource_domain_id":"shared-host",
+            "worker_labels":{"pool":"integration"},
+            "host_resource_domains":[{"id":"shared-host","cpu_millis":1000,"memory_bytes":1073741824}],
+            "additional_workers":[{"worker_id":"remote-worker-2","capacity":2,"resource_domain_id":"shared-host","labels":{"pool":"integration"}}],
             "api_access":{"mode":"local"},
         }))
         .unwrap(),
@@ -1201,11 +1204,23 @@ fn standalone_manager_and_worker_run_an_authenticated_remote_one_shot() {
         let worker = start_worker_process(&worker_config);
         workers.push((worker, worker_identity, credential_file, worker_config));
         if worker_id == "remote-worker" {
-            wait_for_http_status(api_address, "/v1/workers", 200, Duration::from_secs(5));
-            let (status, body) = http(api_address, "GET", "/v1/workers", None, &[]);
-            assert_eq!(status, 200, "{body}");
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let body = loop {
+                let (status, body) = http(api_address, "GET", "/v1/workers", None, &[]);
+                assert_eq!(status, 200, "{body}");
+                let observed: serde_json::Value = serde_json::from_str(&body).unwrap();
+                if observed[0]["fresh"] == true {
+                    assert_eq!(observed[0]["available"], true, "{body}");
+                    break body;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "worker did not report fresh status: {body}"
+                );
+                thread::sleep(Duration::from_millis(20));
+            };
             let observed: serde_json::Value = serde_json::from_str(&body).unwrap();
-            assert_eq!(observed[0]["available"], true);
+            assert!(observed[0]["inventory"].is_object(), "{body}");
             let (status, readiness) = http(api_address, "GET", "/readyz", None, &[]);
             assert_eq!(
                 status, 503,
@@ -1218,6 +1233,29 @@ fn standalone_manager_and_worker_run_an_authenticated_remote_one_shot() {
         }
     }
     wait_for_ready_named(api_address, "manager after first worker enrollment");
+    let (status, body) = http(api_address, "GET", "/v1/workers", None, &[]);
+    assert_eq!(status, 200, "{body}");
+    let workers_status: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(workers_status[0]["resourceDomainId"], "shared-host");
+    assert_eq!(workers_status[1]["resourceDomainId"], "shared-host");
+    assert_eq!(
+        workers_status[0]["resourceDomainCapacity"]["cpuMillis"],
+        1000
+    );
+    assert_eq!(
+        workers_status[1]["resourceDomainCapacity"]["cpuMillis"],
+        1000
+    );
+    assert_eq!(workers_status[0]["fresh"], true);
+    assert_eq!(workers_status[1]["fresh"], true);
+    assert_eq!(workers_status[0]["labels"]["pool"], "integration");
+    assert_eq!(workers_status[1]["labels"]["pool"], "integration");
+    assert_eq!(workers_status[0]["inventory"]["executionSlots"], 2);
+    assert_eq!(workers_status[1]["inventory"]["executionSlots"], 2);
+    assert_eq!(
+        workers_status[0]["inventory"]["backends"][0],
+        "native_process"
+    );
     let (status, health) = http(api_address, "GET", "/healthz", None, &[]);
     assert_eq!(status, 200, "{health}");
     let health: serde_json::Value = serde_json::from_str(&health).unwrap();
@@ -1687,7 +1725,9 @@ fn http_with_custom_headers(
     stream.write_all(body).expect("write request body");
 
     let mut response = String::new();
-    stream.read_to_string(&mut response).expect("read response");
+    stream
+        .read_to_string(&mut response)
+        .unwrap_or_else(|error| panic!("read response for {method} {path}: {error}"));
     let (headers, body) = response.split_once("\r\n\r\n").expect("HTTP response");
     let status = headers
         .lines()

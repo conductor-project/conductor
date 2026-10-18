@@ -56,6 +56,15 @@ pub(crate) struct LauncherGrant {
 }
 
 impl LandlockBackend {
+    pub(crate) fn supports_enforcement(&self) -> bool {
+        self.mode != LandlockMode::Disabled
+            && Ruleset::default()
+                .set_compatibility(CompatLevel::HardRequirement)
+                .handle_access(AccessFs::from_all(ABI::V3))
+                .and_then(|ruleset| ruleset.create())
+                .is_ok()
+    }
+
     pub(crate) fn open(
         mode: LandlockMode,
         grant_configs: Vec<LandlockGrantConfig>,
