@@ -47,159 +47,82 @@ const MAX_SERVICE_WATCH_SECONDS: u64 = 30;
 const DEFAULT_WORKER_DRAIN_GRACE_SECONDS: u64 = 30;
 const MAX_WORKER_DRAIN_GRACE_SECONDS: u64 = 300;
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct JobCollection {
-    jobs: Vec<JobSpec>,
-    next_cursor: Option<String>,
-}
+#[path = "structs/job_collection.rs"]
+mod job_collection;
+use job_collection::JobCollection;
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RunCollection {
-    runs: Vec<conductor_core::RunObservation>,
-    next_cursor: Option<String>,
-}
+#[path = "structs/run_collection.rs"]
+mod run_collection;
+use run_collection::RunCollection;
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ServiceAttemptCollection {
-    service_attempts: Vec<ServiceAttemptRecord>,
-}
+#[path = "structs/service_attempt_collection.rs"]
+mod service_attempt_collection;
+use service_attempt_collection::ServiceAttemptCollection;
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ServiceEndpointCollection {
-    endpoints: Vec<ServiceEndpoint>,
-}
+#[path = "structs/service_endpoint_collection.rs"]
+mod service_endpoint_collection;
+use service_endpoint_collection::ServiceEndpointCollection;
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ServiceWatchResponse {
-    endpoints: Vec<ServiceEndpoint>,
-    changed: bool,
-}
+#[path = "structs/service_watch_response.rs"]
+mod service_watch_response;
+use service_watch_response::ServiceWatchResponse;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ServiceWatchQuery {
-    wait_seconds: Option<u64>,
-}
+#[path = "structs/service_watch_query.rs"]
+mod service_watch_query;
+use service_watch_query::ServiceWatchQuery;
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ServiceEndpoint {
-    job_id: JobId,
-    namespace: String,
-    service_name: String,
-    service_instance_id: conductor_core::ServiceInstanceId,
-    allocation_id: conductor_core::AllocationId,
-    run_id: RunId,
-    worker_id: WorkerId,
-    name: String,
-    protocol: conductor_core::ServicePortProtocol,
-    advertised_address: String,
-    port: u16,
-    ready: bool,
-    worker_fresh: bool,
-    worker_draining: bool,
-}
+#[path = "structs/service_endpoint.rs"]
+mod service_endpoint;
+use service_endpoint::ServiceEndpoint;
 
 enum ServiceCatalogQueryError {
     Storage,
     Blocking(BlockingError),
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct RunLogsResponse {
-    run_id: String,
-    stream: LogStream,
-    offset: u64,
-    next_offset: u64,
-    data_encoding: &'static str,
-    data: String,
-    stream_closed: bool,
-    eof: bool,
-    truncated: bool,
-}
+#[path = "structs/run_logs_response.rs"]
+mod run_logs_response;
+use run_logs_response::RunLogsResponse;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RunFilters {
-    job_id: Option<String>,
-    state: Option<RunState>,
-    limit: Option<usize>,
-    cursor: Option<String>,
-}
+#[path = "structs/run_filters.rs"]
+mod run_filters;
+use run_filters::RunFilters;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct PageFilters {
-    limit: Option<usize>,
-    cursor: Option<String>,
-}
+#[path = "structs/page_filters.rs"]
+mod page_filters;
+use page_filters::PageFilters;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RunLogFilters {
-    stream: LogStream,
-    offset: Option<u64>,
-    limit: Option<usize>,
-}
+#[path = "structs/run_log_filters.rs"]
+mod run_log_filters;
+use run_log_filters::RunLogFilters;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ResolveRunRequest {
-    resolution: String,
-    reason: String,
-}
+#[path = "structs/resolve_run_request.rs"]
+mod resolve_run_request;
+use resolve_run_request::ResolveRunRequest;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct DeployRequest {
-    revision: u64,
-    replicas: u32,
-    #[serde(default)]
-    strategy: DeploymentUpdateStrategy,
-}
+#[path = "structs/deploy_request.rs"]
+mod deploy_request;
+use deploy_request::DeployRequest;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ScaleDeploymentRequest {
-    replicas: u32,
-}
+#[path = "structs/scale_deployment_request.rs"]
+mod scale_deployment_request;
+use scale_deployment_request::ScaleDeploymentRequest;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct RollbackRequest {
-    revision: u64,
-}
+#[path = "structs/rollback_request.rs"]
+mod rollback_request;
+use rollback_request::RollbackRequest;
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct WorkerDrainRequest {
-    grace_period_seconds: Option<u64>,
-}
+#[path = "structs/worker_drain_request.rs"]
+mod worker_drain_request;
+use worker_drain_request::WorkerDrainRequest;
 
-struct ApiState {
-    manager: Arc<JobService>,
-    worker: Arc<dyn WorkerPort>,
-    workers: Vec<Arc<dyn WorkerPort>>,
-    worker_id: WorkerId,
-    worker_capacity: usize,
-    role: ApiRole,
-    manager_workers_ready: Option<Arc<AtomicBool>>,
-    start_admission: Arc<Semaphore>,
-    blocking_admission: Arc<Semaphore>,
-    control_admission: Arc<Semaphore>,
-    service_watch_admission: Arc<Semaphore>,
-    recovery_ready: Arc<AtomicBool>,
-    operator_authenticator: Option<Arc<dyn OperatorAuthenticator>>,
-}
+#[path = "structs/api_state.rs"]
+mod api_state;
+use api_state::ApiState;
 
-#[derive(Clone)]
-struct AuditResourceId(String);
+#[path = "structs/audit_resource_id.rs"]
+mod audit_resource_id;
+use audit_resource_id::AuditResourceId;
 
 #[derive(Clone, Copy)]
 enum ApiRole {
@@ -207,11 +130,9 @@ enum ApiRole {
     Manager,
 }
 
-struct ApiReadiness {
-    role: ApiRole,
-    manager_workers_ready: Option<Arc<AtomicBool>>,
-    recovery_workers: Option<Vec<Arc<dyn WorkerPort>>>,
-}
+#[path = "structs/api_readiness.rs"]
+mod api_readiness;
+use api_readiness::ApiReadiness;
 
 impl ApiRole {
     fn health_body(self) -> &'static str {
@@ -265,88 +186,30 @@ pub enum ApiAccessPolicy {
     AuthenticatedOperator(Arc<dyn OperatorAuthenticator>),
 }
 
-/// Worker set and readiness signal used to recover a standalone manager.
-pub struct ManagerRecovery {
-    workers_ready: Arc<AtomicBool>,
-    workers: Vec<Arc<dyn WorkerPort>>,
-}
-
-impl ManagerRecovery {
-    pub fn new(workers_ready: Arc<AtomicBool>, workers: Vec<Arc<dyn WorkerPort>>) -> Self {
-        Self {
-            workers_ready,
-            workers,
-        }
-    }
-}
+#[path = "structs/manager_recovery.rs"]
+mod manager_recovery;
+pub use manager_recovery::ManagerRecovery;
 
 /// Verifies operator credentials from HTTP headers without trusting request bodies.
 pub trait OperatorAuthenticator: Send + Sync + 'static {
     fn authenticate(&self, headers: &HeaderMap) -> bool;
 }
 
-/// Authenticates a 256-bit URL-safe bearer token while retaining only its SHA-256 digest.
-pub struct BearerTokenAuthenticator {
-    token_digest: [u8; 32],
-}
+#[path = "structs/bearer_token_authenticator.rs"]
+mod bearer_token_authenticator;
+pub use bearer_token_authenticator::BearerTokenAuthenticator;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct InvalidOperatorToken;
+#[path = "structs/invalid_operator_token.rs"]
+mod invalid_operator_token;
+pub use invalid_operator_token::InvalidOperatorToken;
 
-impl std::fmt::Display for InvalidOperatorToken {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("operator token must be a 32-byte URL-safe token")
-    }
-}
+#[path = "structs/error_envelope.rs"]
+mod error_envelope;
+use error_envelope::ErrorEnvelope;
 
-impl std::error::Error for InvalidOperatorToken {}
-
-impl BearerTokenAuthenticator {
-    pub fn new(token: &[u8]) -> Result<Self, InvalidOperatorToken> {
-        if token.len() != 43
-            || !token
-                .iter()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
-            return Err(InvalidOperatorToken);
-        }
-        Ok(Self {
-            token_digest: Sha256::digest(token).into(),
-        })
-    }
-}
-
-impl OperatorAuthenticator for BearerTokenAuthenticator {
-    fn authenticate(&self, headers: &HeaderMap) -> bool {
-        let mut values = headers.get_all(header::AUTHORIZATION).iter();
-        let Some(value) = values.next() else {
-            return false;
-        };
-        if values.next().is_some() {
-            return false;
-        }
-        let Some(token) = value.as_bytes().strip_prefix(b"Bearer ") else {
-            return false;
-        };
-        if token.len() != 43 {
-            return false;
-        }
-        let provided_digest: [u8; 32] = Sha256::digest(token).into();
-        bool::from(self.token_digest.ct_eq(&provided_digest))
-    }
-}
-
-#[derive(Serialize)]
-struct ErrorEnvelope {
-    error: ErrorDetail,
-}
-
-#[derive(Serialize)]
-struct ErrorDetail {
-    code: &'static str,
-    message: &'static str,
-    details: &'static [&'static str],
-}
+#[path = "structs/error_detail.rs"]
+mod error_detail;
+use error_detail::ErrorDetail;
 
 fn error(status: StatusCode, code: &'static str, message: &'static str) -> Response {
     let body = Json(ErrorEnvelope {
@@ -1328,6 +1191,14 @@ async fn authenticate_and_audit(
 ) -> Response {
     let principal = if let Some(authenticator) = &state.operator_authenticator {
         if !authenticator.authenticate(request.headers()) {
+            let (_, body) = request.into_parts();
+            if to_bytes(body, MAX_REQUEST_BODY_BYTES).await.is_err() {
+                return error(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request_body_too_large",
+                    "the request body exceeds the configured byte limit",
+                );
+            }
             let mut response = error(
                 StatusCode::UNAUTHORIZED,
                 "operator_authentication_required",
@@ -2780,8 +2651,7 @@ mod access_tests {
     use tower::ServiceExt;
 
     use super::*;
-
-    struct TestWorker;
+    include!("structs/test_worker.rs");
 
     impl WorkerPort for TestWorker {
         fn descriptor(&self) -> WorkerDescriptor {
@@ -2845,8 +2715,7 @@ mod access_tests {
                 .expect("valid manager metadata"))
         }
     }
-
-    struct TestDatabase(PathBuf);
+    include!("structs/test_database.rs");
 
     static TEMP_DIR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 

@@ -61,47 +61,9 @@ pub enum WorkerResult {
     Error(RemoteWorkerError),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TransportLogChunk {
-    pub run_id: RunId,
-    pub stream: LogStream,
-    pub offset: u64,
-    pub next_offset: u64,
-    pub data_base64: String,
-    pub stream_closed: bool,
-    pub eof: bool,
-    pub truncated: bool,
-}
-
-impl TransportLogChunk {
-    fn from_chunk(chunk: RunLogChunk) -> Self {
-        Self {
-            run_id: chunk.run_id().clone(),
-            stream: chunk.stream(),
-            offset: chunk.offset(),
-            next_offset: chunk.next_offset(),
-            data_base64: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(chunk.data()),
-            stream_closed: chunk.stream_closed(),
-            eof: chunk.eof(),
-            truncated: chunk.truncated(),
-        }
-    }
-
-    fn into_chunk(self) -> Result<RunLogChunk, TransportError> {
-        let data = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(self.data_base64.as_bytes())
-            .map_err(|_| TransportError::MalformedResponse)?;
-        Ok(RunLogChunk::new(
-            self.run_id,
-            self.stream,
-            self.offset,
-            self.next_offset,
-            data,
-            RunLogStatus::new(self.stream_closed, self.eof, self.truncated),
-        ))
-    }
-}
+#[path = "structs/transport_log_chunk.rs"]
+mod transport_log_chunk;
+pub use transport_log_chunk::TransportLogChunk;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -140,57 +102,29 @@ impl From<RemoteWorkerError> for WorkerPortError {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkerReport {
-    pub command_id: CommandId,
-    pub worker_id: WorkerId,
-    pub worker_incarnation: u64,
-    pub report_sequence: u64,
-    pub result: WorkerResult,
-}
+#[path = "structs/worker_report.rs"]
+mod worker_report;
+pub use worker_report::WorkerReport;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkerPollRequest {
-    pub worker_id: WorkerId,
-    pub worker_incarnation: u64,
-    pub status: WorkerStatus,
-    pub inventory_page: WorkerInventoryPage,
-    pub protocol_offer: ProtocolOffer,
-}
+#[path = "structs/worker_poll_request.rs"]
+mod worker_poll_request;
+pub use worker_poll_request::WorkerPollRequest;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkerPollResponse {
-    pub protocol_version: u16,
-    pub capabilities: Vec<ProtocolCapability>,
-    pub inventory_acknowledgement: WorkerInventoryAcknowledgement,
-    pub command: Option<CommandEnvelope>,
-}
+#[path = "structs/worker_poll_response.rs"]
+mod worker_poll_response;
+pub use worker_poll_response::WorkerPollResponse;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkerInventoryAcknowledgement {
-    pub snapshot_generation: u64,
-    pub next_after_sequence: Option<u64>,
-    pub restart_scan: bool,
-}
+#[path = "structs/worker_inventory_acknowledgement.rs"]
+mod worker_inventory_acknowledgement;
+pub use worker_inventory_acknowledgement::WorkerInventoryAcknowledgement;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct ReportAcknowledgement {
-    pub report_sequence: u64,
-    pub duplicate: bool,
-}
+#[path = "structs/report_acknowledgement.rs"]
+mod report_acknowledgement;
+pub use report_acknowledgement::ReportAcknowledgement;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct WorkerReportRequest {
-    pub worker_id: WorkerId,
-    pub worker_incarnation: u64,
-    pub report: WorkerReport,
-}
+#[path = "structs/worker_report_request.rs"]
+mod worker_report_request;
+pub use worker_report_request::WorkerReportRequest;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TransportError {
@@ -231,96 +165,9 @@ impl std::fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
-#[derive(Clone)]
-pub struct WorkerTransportHub {
-    sessions: Arc<RwLock<BTreeMap<WorkerId, Arc<WorkerSession>>>>,
-    journal: Option<Arc<dyn CommandJournal>>,
-}
-
-impl Default for WorkerTransportHub {
-    fn default() -> Self {
-        Self {
-            sessions: Arc::new(RwLock::new(BTreeMap::new())),
-            journal: None,
-        }
-    }
-}
-
-impl WorkerTransportHub {
-    /// Create a transport hub backed by the manager's durable command journal.
-    pub fn with_journal(journal: Arc<dyn CommandJournal>) -> Self {
-        Self {
-            sessions: Arc::new(RwLock::new(BTreeMap::new())),
-            journal: Some(journal),
-        }
-    }
-
-    pub fn register_worker(
-        &self,
-        descriptor: WorkerDescriptor,
-        protocol_offer: ProtocolOffer,
-    ) -> Result<Arc<RemoteWorkerPort>, TransportError> {
-        let metadata = WorkerMetadata::automatic(descriptor.worker_id().clone());
-        self.register_worker_with_metadata(descriptor, protocol_offer, metadata)
-    }
-
-    pub fn register_worker_with_metadata(
-        &self,
-        descriptor: WorkerDescriptor,
-        protocol_offer: ProtocolOffer,
-        metadata: WorkerMetadata,
-    ) -> Result<Arc<RemoteWorkerPort>, TransportError> {
-        let mut sessions = self
-            .sessions
-            .write()
-            .map_err(|_| TransportError::Unavailable)?;
-        let worker_id = descriptor.worker_id().clone();
-        if sessions.contains_key(&worker_id) {
-            return Err(TransportError::WorkerConflict);
-        }
-        if sessions.len() >= MAX_REGISTERED_WORKERS {
-            return Err(TransportError::WorkerLimitReached);
-        }
-        let session = Arc::new(WorkerSession::new_with_metadata(
-            descriptor,
-            protocol_offer,
-            self.journal.clone(),
-            metadata,
-        ));
-        sessions.insert(worker_id, Arc::clone(&session));
-        Ok(Arc::new(RemoteWorkerPort { session }))
-    }
-
-    pub fn unregister_worker(&self, worker_id: &WorkerId) -> Result<bool, TransportError> {
-        self.sessions
-            .write()
-            .map(|mut sessions| sessions.remove(worker_id).is_some())
-            .map_err(|_| TransportError::Unavailable)
-    }
-
-    /// Build routes that always require an identity supplied by the configured
-    /// authenticator. No unauthenticated router constructor is provided.
-    pub fn router(&self, authenticator: Arc<dyn WorkerAuthenticator>) -> Router {
-        Router::new()
-            .route("/v1/worker/poll", post(poll_worker))
-            .route("/v1/worker/report", post(report_worker))
-            .layer(DefaultBodyLimit::max(MAX_TRANSPORT_BODY_BYTES))
-            .layer(middleware::from_fn_with_state(
-                authenticator,
-                authenticate_worker,
-            ))
-            .with_state(HubState(self.clone()))
-    }
-
-    fn session(&self, worker_id: &WorkerId) -> Result<Arc<WorkerSession>, StatusCode> {
-        self.sessions
-            .read()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-            .get(worker_id)
-            .cloned()
-            .ok_or(StatusCode::NOT_FOUND)
-    }
-}
+#[path = "structs/worker_transport_hub.rs"]
+mod worker_transport_hub;
+pub use worker_transport_hub::WorkerTransportHub;
 
 /// Authentication integration point. Implementations must derive the worker
 /// identity from verified transport credentials, not request JSON.
@@ -328,8 +175,9 @@ pub trait WorkerAuthenticator: Send + Sync + 'static {
     fn authenticate(&self, request: &Request<axum::body::Body>) -> Option<WorkerId>;
 }
 
-#[derive(Clone)]
-struct AuthenticatedWorker(WorkerId);
+#[path = "structs/authenticated_worker.rs"]
+mod authenticated_worker;
+use authenticated_worker::AuthenticatedWorker;
 
 async fn authenticate_worker(
     State(authenticator): State<Arc<dyn WorkerAuthenticator>>,
@@ -345,8 +193,9 @@ async fn authenticate_worker(
     next.run(request).await
 }
 
-#[derive(Clone)]
-struct HubState(WorkerTransportHub);
+#[path = "structs/hub_state.rs"]
+mod hub_state;
+use hub_state::HubState;
 
 async fn poll_worker(
     State(state): State<HubState>,
@@ -387,590 +236,17 @@ async fn report_worker(
     }
 }
 
-struct PendingCommand {
-    envelope: CommandEnvelope,
-    responses: Vec<SyncSender<WorkerResult>>,
-    retry_at: Instant,
-}
+#[path = "structs/pending_command.rs"]
+mod pending_command;
+use pending_command::PendingCommand;
 
-struct WorkerSession {
-    descriptor: WorkerDescriptor,
-    metadata: WorkerMetadata,
-    incarnation: AtomicU64,
-    protocol_offer: ProtocolOffer,
-    journal: Option<Arc<dyn CommandJournal>>,
-    inventory_sync: Mutex<Option<WorkerInventorySync>>,
-    status: Mutex<WorkerStatus>,
-    pending: Mutex<BTreeMap<CommandId, PendingCommand>>,
-    restored_incarnation: AtomicU64,
-    last_report_sequence: Mutex<BTreeMap<u64, u64>>,
-    recent_reports: Mutex<VecDeque<WorkerReport>>,
-    changed: Notify,
-    poll_gate: Semaphore,
-    last_seen: Mutex<Instant>,
-    connected: AtomicBool,
-    next_command: AtomicU64,
-}
+#[path = "structs/worker_session.rs"]
+mod worker_session;
+use worker_session::WorkerSession;
 
-struct WorkerInventorySync {
-    worker_incarnation: u64,
-    snapshot_generation: u64,
-    expected_after_sequence: u64,
-    observed_manager_runs: BTreeSet<RunId>,
-}
-
-impl WorkerSession {
-    #[cfg(test)]
-    fn new(
-        descriptor: WorkerDescriptor,
-        protocol_offer: ProtocolOffer,
-        journal: Option<Arc<dyn CommandJournal>>,
-    ) -> Self {
-        let metadata = WorkerMetadata::automatic(descriptor.worker_id().clone());
-        Self::new_with_metadata(descriptor, protocol_offer, journal, metadata)
-    }
-
-    fn new_with_metadata(
-        descriptor: WorkerDescriptor,
-        protocol_offer: ProtocolOffer,
-        journal: Option<Arc<dyn CommandJournal>>,
-        metadata: WorkerMetadata,
-    ) -> Self {
-        let incarnation = descriptor.incarnation();
-        Self {
-            status: Mutex::new(WorkerStatus::new(descriptor.clone(), 0, 0, false, false, 0)),
-            descriptor,
-            metadata,
-            incarnation: AtomicU64::new(incarnation),
-            protocol_offer,
-            journal,
-            inventory_sync: Mutex::new(None),
-            pending: Mutex::new(BTreeMap::new()),
-            restored_incarnation: AtomicU64::new(0),
-            last_report_sequence: Mutex::new(BTreeMap::new()),
-            recent_reports: Mutex::new(VecDeque::new()),
-            changed: Notify::new(),
-            poll_gate: Semaphore::new(1),
-            last_seen: Mutex::new(Instant::now()),
-            connected: AtomicBool::new(false),
-            next_command: AtomicU64::new(0),
-        }
-    }
-
-    fn command_id(&self) -> Result<CommandId, TransportError> {
-        let sequence = self
-            .next_command
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
-            })
-            .map_err(|_| TransportError::Unavailable)?;
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| TransportError::Unavailable)?
-            .as_nanos();
-        let value = format!("cmd-{}-{nanos}-{sequence}", std::process::id());
-        CommandId::new(value).map_err(|_| TransportError::Unavailable)
-    }
-
-    fn descriptor(&self) -> WorkerDescriptor {
-        self.descriptor
-            .clone()
-            .with_incarnation(self.incarnation.load(Ordering::Acquire))
-    }
-
-    fn enqueue(
-        &self,
-        command: WorkerCommand,
-    ) -> Result<mpsc::Receiver<WorkerResult>, TransportError> {
-        let command_id = self.command_id()?;
-        let envelope = CommandEnvelope {
-            command_id: command_id.clone(),
-            target_worker_id: self.descriptor.worker_id().clone(),
-            target_worker_incarnation: self.incarnation.load(Ordering::Acquire),
-            command,
-        };
-        self.enqueue_envelope(envelope)
-    }
-
-    fn enqueue_envelope(
-        &self,
-        envelope: CommandEnvelope,
-    ) -> Result<mpsc::Receiver<WorkerResult>, TransportError> {
-        if envelope.target_worker_id != *self.descriptor.worker_id()
-            || envelope.target_worker_incarnation != self.incarnation.load(Ordering::Acquire)
-        {
-            return Err(TransportError::WorkerConflict);
-        }
-        let (sender, receiver) = mpsc::sync_channel(1);
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| TransportError::Unavailable)?;
-        if pending.len() >= MAX_PENDING_COMMANDS {
-            return Err(TransportError::QueueFull);
-        }
-        if let Some(existing) = pending.get(&envelope.command_id) {
-            if existing.envelope != envelope {
-                return Err(TransportError::WorkerConflict);
-            }
-            if existing.responses.len() >= MAX_PENDING_COMMANDS {
-                return Err(TransportError::QueueFull);
-            }
-            pending
-                .get_mut(&envelope.command_id)
-                .ok_or(TransportError::Unavailable)?
-                .responses
-                .push(sender);
-            return Ok(receiver);
-        }
-        pending.insert(
-            envelope.command_id.clone(),
-            PendingCommand {
-                envelope,
-                responses: vec![sender],
-                retry_at: Instant::now(),
-            },
-        );
-        drop(pending);
-        self.changed.notify_one();
-        Ok(receiver)
-    }
-
-    async fn poll(&self, request: WorkerPollRequest) -> Result<WorkerPollResponse, StatusCode> {
-        let current_incarnation = self.incarnation.load(Ordering::Acquire);
-        let request_incarnation = request.worker_incarnation;
-        if request_incarnation < current_incarnation {
-            return Err(StatusCode::CONFLICT);
-        }
-        if request.status.worker_id() != self.descriptor.worker_id()
-            || request.status.incarnation() != request_incarnation
-            || request.status.capacity() != self.descriptor.capacity()
-            || request.status.supports_process_execution()
-                != self.descriptor.supports_process_execution()
-        {
-            return Err(StatusCode::CONFLICT);
-        }
-        if request.status.inventory().is_none()
-            || !request.status.is_valid()
-            || request.status.resource_domain_id().is_some()
-            || request.status.resource_domain_capacity().is_some()
-            || !request.status.labels().is_empty()
-            || request.status.fresh()
-            || request.status.last_seen_at_ms().is_some()
-        {
-            return Err(StatusCode::CONFLICT);
-        }
-        if request_incarnation == current_incarnation {
-            let current = self
-                .status
-                .lock()
-                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-            if current
-                .inventory()
-                .is_some_and(|inventory| Some(inventory) != request.status.inventory())
-            {
-                return Err(StatusCode::CONFLICT);
-            }
-        }
-        let negotiated = self
-            .protocol_offer
-            .negotiate(&request.protocol_offer)
-            .map_err(|_| StatusCode::UPGRADE_REQUIRED)?;
-        let _poll = self
-            .poll_gate
-            .try_acquire()
-            .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
-        if request_incarnation > current_incarnation {
-            self.adopt_incarnation(request_incarnation)?;
-        }
-        self.restore_pending(request_incarnation)?;
-        let inventory_acknowledgement = self.reconcile_inventory(&request.inventory_page)?;
-        let worker_allocatable = request
-            .status
-            .inventory()
-            .map(|inventory| inventory.allocatable())
-            .ok_or(StatusCode::CONFLICT)?;
-        let domain_capacity = self.metadata.capacity().unwrap_or(worker_allocatable);
-        let mut status = request.status;
-        let last_seen_at_ms = manager_time_ms().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-        status = status
-            .with_manager_metadata(
-                self.metadata.resource_domain_id().clone(),
-                domain_capacity,
-                self.metadata.labels().clone(),
-                last_seen_at_ms,
-                true,
-            )
-            .and_then(|status| match self.metadata.service_network() {
-                Some(network) => status.with_service_network(network.clone()),
-                None => Some(status),
-            })
-            .ok_or(StatusCode::CONFLICT)?;
-        *self
-            .status
-            .lock()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)? = status;
-        self.mark_seen()?;
-
-        let deadline = tokio::time::Instant::now() + POLL_TIMEOUT;
-        let command = loop {
-            let notified = self.changed.notified();
-            let (ready, next_retry) = self.next_poll_command(request_incarnation)?;
-            if let Some(command) = ready {
-                break Some(command);
-            }
-            let now = tokio::time::Instant::now();
-            if now >= deadline {
-                break None;
-            }
-            let wake_at = next_retry
-                .map(tokio::time::Instant::from_std)
-                .unwrap_or(deadline)
-                .min(deadline);
-            tokio::select! {
-                _ = notified => {},
-                _ = tokio::time::sleep_until(wake_at) => {},
-            }
-        };
-
-        let mut capabilities = negotiated
-            .capabilities()
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        capabilities.sort_unstable();
-        Ok(WorkerPollResponse {
-            protocol_version: negotiated.version(),
-            capabilities,
-            inventory_acknowledgement,
-            command,
-        })
-    }
-
-    fn reconcile_inventory(
-        &self,
-        page: &WorkerInventoryPage,
-    ) -> Result<WorkerInventoryAcknowledgement, StatusCode> {
-        if page.worker_id != *self.descriptor.worker_id()
-            || page.worker_incarnation != self.incarnation.load(Ordering::Acquire)
-            || !page.is_valid()
-        {
-            return Err(StatusCode::CONFLICT);
-        }
-        let Some(journal) = &self.journal else {
-            return Ok(WorkerInventoryAcknowledgement {
-                snapshot_generation: page.snapshot_generation,
-                next_after_sequence: page.next_after_sequence,
-                restart_scan: false,
-            });
-        };
-        let mut sync = self
-            .inventory_sync
-            .lock()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        if page.after_sequence == 0 {
-            *sync = Some(WorkerInventorySync {
-                worker_incarnation: page.worker_incarnation,
-                snapshot_generation: page.snapshot_generation,
-                expected_after_sequence: 0,
-                observed_manager_runs: BTreeSet::new(),
-            });
-        }
-        let Some(current) = sync.as_mut() else {
-            return Ok(WorkerInventoryAcknowledgement {
-                snapshot_generation: page.snapshot_generation,
-                next_after_sequence: None,
-                restart_scan: true,
-            });
-        };
-        if current.worker_incarnation != page.worker_incarnation
-            || current.snapshot_generation != page.snapshot_generation
-            || current.expected_after_sequence != page.after_sequence
-        {
-            *sync = None;
-            return Ok(WorkerInventoryAcknowledgement {
-                snapshot_generation: page.snapshot_generation,
-                next_after_sequence: None,
-                restart_scan: true,
-            });
-        }
-        let seen = journal
-            .reconcile_worker_inventory_page(
-                &page.worker_id,
-                page.worker_incarnation,
-                &page.entries,
-            )
-            .map_err(|error| match error {
-                CommandStoreError::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-                CommandStoreError::NotFound
-                | CommandStoreError::Conflict
-                | CommandStoreError::PendingLimit => StatusCode::CONFLICT,
-            })?;
-        current.observed_manager_runs.extend(seen);
-        if current.observed_manager_runs.len() > MAX_WORKER_CAPACITY {
-            *sync = None;
-            return Err(StatusCode::CONFLICT);
-        }
-        if let Some(next_after_sequence) = page.next_after_sequence {
-            current.expected_after_sequence = next_after_sequence;
-        } else {
-            journal
-                .finish_worker_inventory(
-                    &page.worker_id,
-                    page.worker_incarnation,
-                    &current
-                        .observed_manager_runs
-                        .iter()
-                        .cloned()
-                        .collect::<Vec<_>>(),
-                )
-                .map_err(|error| match error {
-                    CommandStoreError::StorageUnavailable => StatusCode::SERVICE_UNAVAILABLE,
-                    CommandStoreError::NotFound
-                    | CommandStoreError::Conflict
-                    | CommandStoreError::PendingLimit => StatusCode::CONFLICT,
-                })?;
-            *sync = None;
-        }
-        Ok(WorkerInventoryAcknowledgement {
-            snapshot_generation: page.snapshot_generation,
-            next_after_sequence: page.next_after_sequence,
-            restart_scan: false,
-        })
-    }
-
-    fn adopt_incarnation(&self, incarnation: u64) -> Result<(), StatusCode> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let stale = pending
-            .iter()
-            .filter(|(_, item)| item.envelope.target_worker_incarnation != incarnation)
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        for command_id in stale {
-            if let Some(item) = pending.remove(&command_id) {
-                for response in item.responses {
-                    let _ = response.send(WorkerResult::Error(RemoteWorkerError::Unavailable));
-                }
-            }
-        }
-        self.incarnation.store(incarnation, Ordering::Release);
-        *self
-            .inventory_sync
-            .lock()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)? = None;
-        Ok(())
-    }
-
-    fn restore_pending(&self, incarnation: u64) -> Result<(), StatusCode> {
-        let Some(journal) = &self.journal else {
-            return Ok(());
-        };
-        if self.restored_incarnation.load(Ordering::Acquire) == incarnation {
-            return Ok(());
-        }
-        let commands = journal
-            .pending_commands(
-                self.descriptor.worker_id(),
-                incarnation,
-                MAX_PENDING_COMMANDS,
-            )
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        for envelope in commands {
-            if pending.contains_key(&envelope.command_id) {
-                continue;
-            }
-            if pending.len() >= MAX_PENDING_COMMANDS {
-                return Err(StatusCode::SERVICE_UNAVAILABLE);
-            }
-            let (response, receiver): (SyncSender<WorkerResult>, Receiver<WorkerResult>) =
-                mpsc::sync_channel(1);
-            drop(receiver);
-            pending.insert(
-                envelope.command_id.clone(),
-                PendingCommand {
-                    envelope,
-                    responses: vec![response],
-                    retry_at: Instant::now(),
-                },
-            );
-        }
-        self.restored_incarnation
-            .store(incarnation, Ordering::Release);
-        Ok(())
-    }
-
-    fn next_poll_command(
-        &self,
-        incarnation: u64,
-    ) -> Result<(Option<CommandEnvelope>, Option<Instant>), StatusCode> {
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let now = Instant::now();
-        if let Some((_, item)) = pending.iter_mut().find(|(_, item)| {
-            item.envelope.target_worker_incarnation == incarnation && item.retry_at <= now
-        }) {
-            item.retry_at = now + COMMAND_REDELIVERY_INTERVAL;
-            Ok((Some(item.envelope.clone()), None))
-        } else {
-            Ok((
-                None,
-                pending
-                    .values()
-                    .filter(|item| item.envelope.target_worker_incarnation == incarnation)
-                    .map(|item| item.retry_at)
-                    .min(),
-            ))
-        }
-    }
-
-    fn mark_seen(&self) -> Result<(), StatusCode> {
-        let mut last_seen = self
-            .last_seen
-            .lock()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        *last_seen = Instant::now();
-        self.connected.store(true, Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn report(&self, report: WorkerReport) -> Result<ReportAcknowledgement, StatusCode> {
-        let mut recent = self
-            .recent_reports
-            .lock()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        if let Some(previous) = recent.iter().find(|previous| {
-            previous.worker_incarnation == report.worker_incarnation
-                && previous.report_sequence == report.report_sequence
-        }) {
-            return if previous == &report {
-                Ok(ReportAcknowledgement {
-                    report_sequence: report.report_sequence,
-                    duplicate: true,
-                })
-            } else {
-                Err(StatusCode::CONFLICT)
-            };
-        }
-        let mut last_sequences = self
-            .last_report_sequence
-            .lock()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let last_sequence = last_sequences
-            .get(&report.worker_incarnation)
-            .copied()
-            .unwrap_or_default();
-        let first_report = last_sequence == 0;
-        if report.report_sequence == 0
-            || (!first_report && report.report_sequence != last_sequence.saturating_add(1))
-        {
-            return Err(StatusCode::CONFLICT);
-        }
-        let acknowledgement_json =
-            serde_json::to_string(&report).map_err(|_| StatusCode::CONFLICT)?;
-        let durable_record = if let Some(journal) = &self.journal {
-            journal
-                .command_record(&report.command_id)
-                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
-        } else {
-            None
-        };
-        if let Some(record) = &durable_record {
-            if record.envelope.target_worker_id != report.worker_id
-                || record.envelope.target_worker_incarnation != report.worker_incarnation
-                || !result_matches(&record.envelope.command, &report.result)
-            {
-                return Err(StatusCode::CONFLICT);
-            }
-            if let Some(previous) = &record.acknowledgement_json {
-                if previous != &acknowledgement_json {
-                    return Err(StatusCode::CONFLICT);
-                }
-                self.mark_seen()?;
-                return Ok(ReportAcknowledgement {
-                    report_sequence: report.report_sequence,
-                    duplicate: true,
-                });
-            }
-        }
-        let mut pending = self
-            .pending
-            .lock()
-            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        let item = pending.get(&report.command_id);
-        if item.is_none() && durable_record.is_none() {
-            return Err(StatusCode::CONFLICT);
-        }
-        if let Some(item) = item
-            && (item.envelope.target_worker_id != report.worker_id
-                || item.envelope.target_worker_incarnation != report.worker_incarnation
-                || !result_matches(&item.envelope.command, &report.result))
-        {
-            return Err(StatusCode::CONFLICT);
-        }
-        if let Some(journal) = &self.journal
-            && durable_record.is_some()
-        {
-            journal
-                .acknowledge_command(
-                    &report.command_id,
-                    &report.worker_id,
-                    report.worker_incarnation,
-                    &acknowledgement_json,
-                )
-                .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        }
-        let Some(item) = pending.remove(&report.command_id) else {
-            last_sequences.insert(report.worker_incarnation, report.report_sequence);
-            recent.push_back(report.clone());
-            while recent.len() > MAX_RECENT_REPORTS {
-                recent.pop_front();
-            }
-            self.mark_seen()?;
-            return Ok(ReportAcknowledgement {
-                report_sequence: report.report_sequence,
-                duplicate: false,
-            });
-        };
-        for response in item.responses {
-            let _ = response.send(report.result.clone());
-        }
-        last_sequences.insert(report.worker_incarnation, report.report_sequence);
-        recent.push_back(report.clone());
-        while recent.len() > MAX_RECENT_REPORTS {
-            recent.pop_front();
-        }
-        self.mark_seen()?;
-        self.changed.notify_waiters();
-        Ok(ReportAcknowledgement {
-            report_sequence: report.report_sequence,
-            duplicate: false,
-        })
-    }
-
-    fn is_fresh(&self) -> bool {
-        self.connected.load(Ordering::Relaxed)
-            && self
-                .last_seen
-                .lock()
-                .is_ok_and(|last_seen| last_seen.elapsed() <= WORKER_FRESHNESS_TIMEOUT)
-    }
-
-    fn status(&self) -> Result<WorkerStatus, WorkerPortError> {
-        self.status
-            .lock()
-            .map(|status| status.clone())
-            .map_err(|_| WorkerPortError::Unavailable)
-    }
-}
+#[path = "structs/worker_inventory_sync.rs"]
+mod worker_inventory_sync;
+use worker_inventory_sync::WorkerInventorySync;
 
 fn manager_time_ms() -> Option<i64> {
     let milliseconds = SystemTime::now()
@@ -992,112 +268,9 @@ fn result_matches(command: &WorkerCommand, result: &WorkerResult) -> bool {
     )
 }
 
-/// Manager-side adapter that makes a connected remote worker usable through
-/// the same explicit `WorkerPort` interface as the local worker.
-pub struct RemoteWorkerPort {
-    session: Arc<WorkerSession>,
-}
-
-impl RemoteWorkerPort {
-    fn dispatch(&self, command: WorkerCommand) -> Result<WorkerResult, WorkerPortError> {
-        let receiver = self.session.enqueue(command).map_err(map_transport_error)?;
-        receiver
-            .recv_timeout(COMMAND_RESPONSE_TIMEOUT)
-            .map_err(|_| WorkerPortError::Unavailable)
-    }
-
-    fn observation(&self, command: WorkerCommand) -> Result<RunObservation, WorkerPortError> {
-        match self.dispatch(command)? {
-            WorkerResult::Observation(observation) => Ok(observation),
-            WorkerResult::Error(error) => Err(error.into()),
-            _ => Err(WorkerPortError::Unavailable),
-        }
-    }
-
-    fn dispatch_envelope(
-        &self,
-        envelope: CommandEnvelope,
-    ) -> Result<WorkerResult, WorkerPortError> {
-        let receiver = self
-            .session
-            .enqueue_envelope(envelope)
-            .map_err(map_transport_error)?;
-        receiver
-            .recv_timeout(COMMAND_RESPONSE_TIMEOUT)
-            .map_err(|_| WorkerPortError::Unavailable)
-    }
-}
-
-impl WorkerPort for RemoteWorkerPort {
-    fn descriptor(&self) -> WorkerDescriptor {
-        self.session.descriptor()
-    }
-
-    fn is_draining(&self) -> bool {
-        self.session
-            .status
-            .lock()
-            .map(|status| status.draining())
-            .unwrap_or(true)
-    }
-
-    fn is_degraded(&self) -> bool {
-        !self.session.is_fresh()
-            || self
-                .session
-                .status
-                .lock()
-                .map(|status| status.degraded())
-                .unwrap_or(true)
-    }
-
-    fn start(&self, command: StartRun) -> Result<RunObservation, WorkerPortError> {
-        self.observation(WorkerCommand::StartRun(Box::new(command)))
-    }
-
-    fn dispatch_command(
-        &self,
-        envelope: CommandEnvelope,
-    ) -> Result<RunObservation, WorkerPortError> {
-        match self.dispatch_envelope(envelope)? {
-            WorkerResult::Observation(observation) => Ok(observation),
-            WorkerResult::Error(error) => Err(error.into()),
-            _ => Err(WorkerPortError::Unavailable),
-        }
-    }
-
-    fn inspect(&self, command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError> {
-        match self.dispatch(WorkerCommand::InspectRun(command))? {
-            WorkerResult::Inspection(observation) => Ok(observation),
-            WorkerResult::Error(error) => Err(error.into()),
-            _ => Err(WorkerPortError::Unavailable),
-        }
-    }
-
-    fn stop(&self, command: StopRun) -> Result<RunObservation, WorkerPortError> {
-        self.observation(WorkerCommand::StopRun(command))
-    }
-
-    fn resolve(&self, command: ResolveRun) -> Result<RunObservation, WorkerPortError> {
-        self.observation(WorkerCommand::ResolveRun(command))
-    }
-
-    fn status(&self) -> Result<WorkerStatus, WorkerPortError> {
-        self.session
-            .status()
-            .map(|status| status.with_freshness(self.session.is_fresh()))
-    }
-
-    fn read_logs(&self, command: ReadRunLogs) -> Result<RunLogChunk, WorkerPortError> {
-        match self.dispatch(WorkerCommand::ReadRunLogs(command))? {
-            WorkerResult::Logs(chunk) => {
-                chunk.into_chunk().map_err(|_| WorkerPortError::Unavailable)
-            }
-            WorkerResult::Error(error) => Err(error.into()),
-            _ => Err(WorkerPortError::Unavailable),
-        }
-    }
-}
+#[path = "structs/remote_worker_port.rs"]
+mod remote_worker_port;
+pub use remote_worker_port::RemoteWorkerPort;
 
 fn map_transport_error(error: TransportError) -> WorkerPortError {
     match error {
@@ -1114,309 +287,9 @@ fn map_transport_error(error: TransportError) -> WorkerPortError {
     }
 }
 
-/// Client certificate credentials and HTTPS endpoint for one worker.
-pub struct WorkerTransportClient {
-    endpoint: Url,
-    client: reqwest::Client,
-}
-
-impl WorkerTransportClient {
-    pub fn from_pem_identity(
-        endpoint: &str,
-        certificate_and_private_key_pem: &[u8],
-    ) -> Result<Self, TransportError> {
-        Self::build(endpoint, certificate_and_private_key_pem, None)
-    }
-
-    /// Construct a worker client using the provided bootstrap CA trust anchor.
-    pub fn from_pem_identity_with_root(
-        endpoint: &str,
-        certificate_and_private_key_pem: &[u8],
-        certificate_authority_pem: &[u8],
-    ) -> Result<Self, TransportError> {
-        let root = reqwest::Certificate::from_pem(certificate_authority_pem)
-            .map_err(|_| TransportError::InvalidIdentity)?;
-        Self::build(endpoint, certificate_and_private_key_pem, Some(root))
-    }
-
-    fn build(
-        endpoint: &str,
-        certificate_and_private_key_pem: &[u8],
-        root: Option<reqwest::Certificate>,
-    ) -> Result<Self, TransportError> {
-        let endpoint = Url::parse(endpoint).map_err(|_| TransportError::InvalidEndpoint)?;
-        if endpoint.scheme() != "https"
-            || endpoint.host_str().is_none()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-        {
-            return Err(TransportError::InvalidEndpoint);
-        }
-        let identity = reqwest::Identity::from_pem(certificate_and_private_key_pem)
-            .map_err(|_| TransportError::InvalidIdentity)?;
-        let mut builder = reqwest::Client::builder()
-            .https_only(true)
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(CLIENT_REQUEST_TIMEOUT)
-            .identity(identity);
-        if let Some(root) = root {
-            builder = builder.tls_certs_only([root]);
-        }
-        let client = builder
-            .build()
-            .map_err(|_| TransportError::InvalidIdentity)?;
-        Ok(Self { endpoint, client })
-    }
-
-    pub async fn poll(
-        &self,
-        worker_id: &WorkerId,
-        worker_incarnation: u64,
-        status: &WorkerStatus,
-        inventory_page: &WorkerInventoryPage,
-        protocol_offer: &ProtocolOffer,
-    ) -> Result<WorkerPollResponse, TransportError> {
-        self.post_json(
-            "v1/worker/poll",
-            &WorkerPollRequest {
-                worker_id: worker_id.clone(),
-                worker_incarnation,
-                status: status.clone(),
-                inventory_page: inventory_page.clone(),
-                protocol_offer: protocol_offer.clone(),
-            },
-        )
-        .await
-    }
-
-    async fn send_report(
-        &self,
-        report: &WorkerReport,
-    ) -> Result<ReportAcknowledgement, TransportError> {
-        let acknowledgement: ReportAcknowledgement = self
-            .post_json(
-                "v1/worker/report",
-                &WorkerReportRequest {
-                    worker_id: report.worker_id.clone(),
-                    worker_incarnation: report.worker_incarnation,
-                    report: report.clone(),
-                },
-            )
-            .await?;
-        if acknowledgement.report_sequence != report.report_sequence {
-            return Err(TransportError::MalformedResponse);
-        }
-        Ok(acknowledgement)
-    }
-
-    async fn post_json<RequestBody, ResponseBody>(
-        &self,
-        path: &str,
-        request: &RequestBody,
-    ) -> Result<ResponseBody, TransportError>
-    where
-        RequestBody: Serialize,
-        ResponseBody: for<'de> Deserialize<'de>,
-    {
-        let url = self
-            .endpoint
-            .join(path)
-            .map_err(|_| TransportError::InvalidEndpoint)?;
-        let mut body = BoundedJsonBody(Vec::new());
-        serde_json::to_writer(&mut body, request).map_err(|_| TransportError::InvalidCommand)?;
-        let mut response = self
-            .client
-            .post(url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body.0)
-            .send()
-            .await
-            .map_err(|_| TransportError::Http)?;
-        if !response.status().is_success() {
-            return Err(TransportError::Http);
-        }
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_TRANSPORT_BODY_BYTES as u64)
-        {
-            return Err(TransportError::MalformedResponse);
-        }
-        let mut bytes = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(|_| TransportError::Http)? {
-            if bytes.len().saturating_add(chunk.len()) > MAX_TRANSPORT_BODY_BYTES {
-                return Err(TransportError::MalformedResponse);
-            }
-            bytes.extend_from_slice(&chunk);
-        }
-        serde_json::from_slice(&bytes).map_err(|_| TransportError::MalformedResponse)
-    }
-
-    /// Polls, executes, and reports worker commands until shutdown or until a
-    /// permanent transport/configuration error occurs. Temporary network
-    /// errors use bounded exponential reconnect backoff.
-    pub async fn run(
-        self: Arc<Self>,
-        worker: Arc<WorkerService>,
-        protocol_offer: ProtocolOffer,
-        mut shutdown: watch::Receiver<bool>,
-    ) -> Result<(), TransportError> {
-        let descriptor = worker.descriptor();
-        let worker_id = descriptor.worker_id().clone();
-        let incarnation = descriptor.incarnation();
-        let recovery_worker = Arc::clone(&worker);
-        tokio::task::spawn_blocking(move || recover_accepted_commands(&recovery_worker))
-            .await
-            .map_err(|_| TransportError::Unavailable)??;
-        let mut failures = 0_u32;
-        let mut inventory_snapshot = None;
-        let mut inventory_after_sequence = 0;
-        loop {
-            if *shutdown.borrow() {
-                return Ok(());
-            }
-            let pending = worker
-                .pending_reports()
-                .map_err(|_| TransportError::Unavailable)?;
-            if let Some(stored) = pending.into_iter().next() {
-                let report = report_from_stored(stored)?;
-                loop {
-                    tokio::select! {
-                        changed = shutdown.changed() => {
-                            if changed.is_err() || *shutdown.borrow() {
-                                return Ok(());
-                            }
-                        }
-                        result = self.send_report(&report) => match result {
-                            Ok(_) => {
-                                worker.acknowledge_report(
-                                    &report.command_id,
-                                    report.worker_incarnation,
-                                    report.report_sequence,
-                                ).map_err(|_| TransportError::Unavailable)?;
-                                failures = 0;
-                                break;
-                            }
-                            Err(_) => {
-                                failures = failures.saturating_add(1);
-                                tokio::time::sleep(backoff(failures)).await;
-                            }
-                        }
-                    }
-                }
-                continue;
-            }
-            let polled = tokio::select! {
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        return Ok(());
-                    }
-                    continue;
-                }
-                result = async {
-                    let status = worker.status().map_err(|_| TransportError::Unavailable)?;
-                    let inventory_worker = Arc::clone(&worker);
-                    let snapshot = inventory_snapshot;
-                    let after = inventory_after_sequence;
-                    let inventory_page = tokio::task::spawn_blocking(move || {
-                        inventory_worker.inventory_page(
-                            snapshot,
-                            after,
-                            conductor_core::MAX_WORKER_INVENTORY_PAGE_SIZE,
-                        )
-                    })
-                    .await
-                    .map_err(|_| TransportError::Unavailable)?
-                    .map_err(|_| TransportError::Unavailable)?;
-                    let response = self
-                        .poll(&worker_id, incarnation, &status, &inventory_page, &protocol_offer)
-                        .await?;
-                    Ok::<_, TransportError>((response, inventory_page))
-                } => result,
-            };
-            match polled {
-                Ok((response, inventory_page)) => {
-                    failures = 0;
-                    let acknowledgement = response.inventory_acknowledgement;
-                    if acknowledgement.restart_scan {
-                        inventory_snapshot = None;
-                        inventory_after_sequence = 0;
-                    } else if acknowledgement.snapshot_generation
-                        != inventory_page.snapshot_generation
-                        || acknowledgement.next_after_sequence != inventory_page.next_after_sequence
-                    {
-                        return Err(TransportError::MalformedResponse);
-                    } else if let Some(next_after_sequence) = inventory_page.next_after_sequence {
-                        inventory_snapshot = Some(inventory_page.snapshot_generation);
-                        inventory_after_sequence = next_after_sequence;
-                    } else {
-                        inventory_snapshot = None;
-                        inventory_after_sequence = 0;
-                    }
-                    let Some(command) = response.command else {
-                        continue;
-                    };
-                    if command.target_worker_id != worker_id
-                        || command.target_worker_incarnation != incarnation
-                    {
-                        return Err(TransportError::WorkerConflict);
-                    }
-                    let worker_for_command = Arc::clone(&worker);
-                    let report = tokio::task::spawn_blocking(move || {
-                        let accepted = worker_for_command.accept_command(&command)?;
-                        if let Some(stored) = accepted {
-                            return Ok::<_, WorkerError>(stored);
-                        }
-                        let result =
-                            execute_command(worker_for_command.as_ref(), command.command.clone());
-                        let result_json = serde_json::to_string(&result)
-                            .map_err(|_| WorkerError::StorageUnavailable)?;
-                        worker_for_command.complete_command(&command, &result_json)
-                    })
-                    .await
-                    .map_err(|_| TransportError::Unavailable)?
-                    .map_err(|_| TransportError::Unavailable)?;
-                    let report = report_from_stored(report)?;
-                    loop {
-                        tokio::select! {
-                            changed = shutdown.changed() => {
-                                if changed.is_err() || *shutdown.borrow() {
-                                    return Ok(());
-                                }
-                            }
-                            result = self.send_report(&report) => match result {
-                                Ok(_) => {
-                                    worker.acknowledge_report(
-                                        &report.command_id,
-                                        report.worker_incarnation,
-                                        report.report_sequence,
-                                    ).map_err(|_| TransportError::Unavailable)?;
-                                    break;
-                                }
-                                Err(_) => {
-                                    failures = failures.saturating_add(1);
-                                    tokio::time::sleep(backoff(failures)).await;
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(_) => {
-                    failures = failures.saturating_add(1);
-                    tokio::select! {
-                        changed = shutdown.changed() => {
-                            if changed.is_err() || *shutdown.borrow() {
-                                return Ok(());
-                            }
-                        }
-                        _ = tokio::time::sleep(backoff(failures)) => {}
-                    }
-                }
-            }
-        }
-    }
-}
+#[path = "structs/worker_transport_client.rs"]
+mod worker_transport_client;
+pub use worker_transport_client::WorkerTransportClient;
 
 fn report_from_stored(stored: StoredWorkerReport) -> Result<WorkerReport, TransportError> {
     Ok(WorkerReport {
@@ -1455,27 +328,9 @@ fn recover_accepted_commands(worker: &WorkerService) -> Result<(), TransportErro
     Ok(())
 }
 
-struct BoundedJsonBody(Vec<u8>);
-
-impl Write for BoundedJsonBody {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let new_len = self
-            .0
-            .len()
-            .checked_add(bytes.len())
-            .filter(|length| *length <= MAX_TRANSPORT_BODY_BYTES)
-            .ok_or_else(|| io::Error::other("transport request exceeds body limit"))?;
-        self.0
-            .try_reserve(new_len - self.0.len())
-            .map_err(io::Error::other)?;
-        self.0.extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
+#[path = "structs/bounded_json_body.rs"]
+mod bounded_json_body;
+use bounded_json_body::BoundedJsonBody;
 
 fn backoff(failures: u32) -> Duration {
     let exponent = failures.saturating_sub(1).min(6);
@@ -1524,8 +379,7 @@ mod tests {
     };
     use conductor_manager::{CommandJournal, JobRepository, SqliteJobRepository};
     use tower::ServiceExt;
-
-    struct TestDatabase(PathBuf);
+    include!("structs/test_database.rs");
 
     impl TestDatabase {
         fn new() -> Self {
@@ -2316,8 +1170,7 @@ mod tests {
         );
         let _ = second_receiver.recv().expect("second command response");
     }
-
-    struct TestAuthenticator(Option<WorkerId>);
+    include!("structs/test_authenticator.rs");
 
     impl WorkerAuthenticator for TestAuthenticator {
         fn authenticate(&self, _request: &Request<Body>) -> Option<WorkerId> {
