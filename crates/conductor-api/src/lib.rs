@@ -20,11 +20,11 @@ use base64::Engine;
 use conductor_core::{
     DEFAULT_LOG_CHUNK_BYTES, DeploymentMutation, DeploymentStatus, JobId, JobRevisionDraft,
     JobRevisionId, JobSpec, LogStream, MAX_DEPLOYMENT_REPLICAS, MAX_LOG_CHUNK_BYTES, ReadRunLogs,
-    RunId, RunState, WorkerId,
+    RunId, RunState, ServiceIdentity, WorkerId, Workload,
 };
 use conductor_manager::{
     DEFAULT_PAGE_SIZE, ExecutionStoreError, JobService, MAX_PAGE_SIZE, ManagerError, QueryError,
-    ServiceAttemptRecord, WorkerPort,
+    ServiceAttemptRecord, ServiceCatalogEndpoint, WorkerPort,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -68,13 +68,25 @@ struct ServiceEndpointCollection {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ServiceEndpoint {
+    job_id: JobId,
+    namespace: String,
+    service_name: String,
     service_instance_id: conductor_core::ServiceInstanceId,
+    allocation_id: conductor_core::AllocationId,
     run_id: RunId,
+    worker_id: WorkerId,
     name: String,
     protocol: conductor_core::ServicePortProtocol,
     advertised_address: String,
     port: u16,
     ready: bool,
+    worker_fresh: bool,
+    worker_draining: bool,
+}
+
+enum ServiceCatalogQueryError {
+    Storage,
+    Blocking(BlockingError),
 }
 
 #[derive(Serialize)]
@@ -391,6 +403,10 @@ fn router_with_recovery(
         .route("/v1/jobs/{id}/runs", post(start_run))
         .route("/v1/jobs/{id}/service-attempts", get(list_service_attempts))
         .route("/v1/jobs/{id}/endpoints", get(list_service_endpoints))
+        .route(
+            "/v1/services/{namespace}/{name}/endpoints",
+            get(list_catalog_endpoints),
+        )
         .route("/v1/workers", get(list_workers))
         .route("/v1/workers/{id}", get(get_worker))
         .route("/v1/runs", get(list_runs))
@@ -644,45 +660,140 @@ async fn list_service_endpoints(
             "the job ID is invalid",
         );
     };
-    let attempts = match run_blocking(&state, BlockingClass::General, {
+    let deployment = match run_blocking(&state, BlockingClass::General, {
         let manager = Arc::clone(&state.manager);
-        move || manager.list_service_attempts(&job_id)
+        let job_id = job_id.clone();
+        move || manager.get_deployment(&job_id)
     })
     .await
     {
-        Ok(Ok(attempts)) => attempts,
+        Ok(Ok(Some(deployment))) => deployment,
+        Ok(Ok(None)) => {
+            return Json(ServiceEndpointCollection { endpoints: vec![] }).into_response();
+        }
         Ok(Err(_)) => {
             return error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "internal_error",
-                "service endpoints could not be read",
+                "service deployment could not be read",
             );
         }
         Err(error_value) => return blocking_error(error_value),
     };
-    let endpoints = attempts
-        .into_iter()
-        .filter_map(|attempt| {
-            let run_id = attempt.current_run_id?;
-            Some(
-                attempt
-                    .service_ports
-                    .into_iter()
-                    .map(|port| ServiceEndpoint {
-                        service_instance_id: attempt.service_instance_id.clone(),
-                        run_id: run_id.clone(),
-                        name: port.name().to_owned(),
-                        protocol: port.protocol(),
-                        advertised_address: port.advertised_address().to_owned(),
-                        port: port.port(),
-                        ready: attempt.service_ports_ready,
-                    })
-                    .collect::<Vec<_>>(),
-            )
+    let revision = match run_blocking(&state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        let revision_id = deployment.revision_id().clone();
+        move || manager.get_revision(&revision_id)
+    })
+    .await
+    {
+        Ok(Ok(Some(revision))) => revision,
+        Ok(Ok(None)) => {
+            return Json(ServiceEndpointCollection { endpoints: vec![] }).into_response();
+        }
+        Ok(Err(_)) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "service revision could not be read",
+            );
+        }
+        Err(error_value) => return blocking_error(error_value),
+    };
+    let Workload::Service { identity, .. } = revision.workload() else {
+        return Json(ServiceEndpointCollection { endpoints: vec![] }).into_response();
+    };
+    match query_service_catalog(&state, identity).await {
+        Ok(catalog) => Json(ServiceEndpointCollection {
+            endpoints: catalog
+                .into_iter()
+                .filter(|endpoint| endpoint.job_id == job_id && endpoint.eligible)
+                .map(service_endpoint_response)
+                .collect(),
         })
-        .flatten()
-        .collect();
-    Json(ServiceEndpointCollection { endpoints }).into_response()
+        .into_response(),
+        Err(error_value) => service_catalog_error_response(error_value),
+    }
+}
+
+async fn list_catalog_endpoints(
+    State(state): State<Arc<ApiState>>,
+    Path((namespace, name)): Path<(String, String)>,
+) -> Response {
+    let identity = match ServiceIdentity::in_namespace(namespace, name) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_service_identity",
+                "the service namespace or name is invalid",
+            );
+        }
+    };
+    match query_service_catalog(&state, &identity).await {
+        Ok(catalog) => Json(ServiceEndpointCollection {
+            endpoints: catalog
+                .into_iter()
+                .filter(|endpoint| endpoint.eligible)
+                .map(service_endpoint_response)
+                .collect(),
+        })
+        .into_response(),
+        Err(error_value) => service_catalog_error_response(error_value),
+    }
+}
+
+async fn query_service_catalog(
+    state: &Arc<ApiState>,
+    identity: &ServiceIdentity,
+) -> Result<Vec<ServiceCatalogEndpoint>, ServiceCatalogQueryError> {
+    let mut statuses = Vec::with_capacity(state.workers.len());
+    for worker in &state.workers {
+        if let Ok(status) = query_single_worker_status(state, Arc::clone(worker)).await {
+            statuses.push(status);
+        }
+    }
+    let identity = identity.clone();
+    match run_blocking(state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        move || manager.list_service_catalog(&identity, &statuses)
+    })
+    .await
+    {
+        Ok(Ok(endpoints)) => Ok(endpoints),
+        Ok(Err(_)) => Err(ServiceCatalogQueryError::Storage),
+        Err(error_value) => Err(ServiceCatalogQueryError::Blocking(error_value)),
+    }
+}
+
+fn service_catalog_error_response(error_value: ServiceCatalogQueryError) -> Response {
+    match error_value {
+        ServiceCatalogQueryError::Storage => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "service catalog could not be read",
+        ),
+        ServiceCatalogQueryError::Blocking(error_value) => blocking_error(error_value),
+    }
+}
+
+fn service_endpoint_response(endpoint: ServiceCatalogEndpoint) -> ServiceEndpoint {
+    ServiceEndpoint {
+        job_id: endpoint.job_id,
+        namespace: endpoint.service_identity.namespace().to_owned(),
+        service_name: endpoint.service_identity.name().to_owned(),
+        service_instance_id: endpoint.service_instance_id,
+        allocation_id: endpoint.allocation_id,
+        run_id: endpoint.run_id,
+        worker_id: endpoint.worker_id,
+        name: endpoint.port.name().to_owned(),
+        protocol: endpoint.port.protocol(),
+        advertised_address: endpoint.port.advertised_address().to_owned(),
+        port: endpoint.port.port(),
+        ready: endpoint.readiness == Some(conductor_core::ReadinessState::Ready),
+        worker_fresh: endpoint.worker_fresh,
+        worker_draining: endpoint.worker_draining,
+    }
 }
 
 async fn deploy_revision(
@@ -2252,6 +2363,7 @@ mod access_tests {
         for (method, path) in [
             ("GET", "/v1/jobs"),
             ("GET", "/v1/jobs/job-a/service-attempts"),
+            ("GET", "/v1/services/default/web/endpoints"),
             ("POST", "/v1/jobs"),
             ("DELETE", "/v1/jobs/job-a"),
             ("GET", "/v1/workers"),
@@ -2406,6 +2518,39 @@ mod access_tests {
             .unwrap();
         let endpoints: serde_json::Value = serde_json::from_slice(&endpoints_bytes).unwrap();
         assert_eq!(endpoints["endpoints"], serde_json::json!([]));
+
+        let catalog = app
+            .clone()
+            .oneshot(authorized_request(
+                "GET",
+                "/v1/services/default/web/endpoints",
+                "",
+                None,
+                None,
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(catalog.status(), StatusCode::OK);
+        let catalog_bytes = axum::body::to_bytes(catalog.into_body(), 65_536)
+            .await
+            .unwrap();
+        let catalog: serde_json::Value = serde_json::from_slice(&catalog_bytes).unwrap();
+        assert_eq!(catalog["endpoints"], serde_json::json!([]));
+
+        let unsupported_namespace = app
+            .clone()
+            .oneshot(authorized_request(
+                "GET",
+                "/v1/services/other/web/endpoints",
+                "",
+                None,
+                None,
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(unsupported_namespace.status(), StatusCode::BAD_REQUEST);
 
         drop(app);
         let restarted_app = router(&database);

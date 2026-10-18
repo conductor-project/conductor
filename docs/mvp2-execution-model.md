@@ -91,11 +91,28 @@ the worker's configured execution capacity.
 
 Readiness is separate from execution and restart state. A process can remain
 `running` while its readiness is `starting` or `unready`; health failures do
-not restart it. The manager publishes service endpoints as ready only after
-the success threshold is reached, and withdraws readiness after the failure
-threshold. Stale observations are rejected by the existing run identity and
-monotonic observation revision checks. Without a configured probe, endpoint
-readiness remains false until a future readiness contract is defined.
+not restart it. The manager catalog exposes an endpoint only when the current
+allocation and run still match the active deployment, the run is `running`,
+readiness is `ready`, and the assigned worker is fresh, available, non-degraded,
+and not draining. Without a configured probe, readiness is not `ready`, so the
+endpoint is not published. A persisted transition to `unready`, allocation/run
+replacement, worker outage, or draining status withdraws the endpoint on the
+next catalog read. Stale observations are rejected by run identity and
+monotonic observation revision checks.
+
+The catalog is a projection over durable deployments, allocations, run
+observations, and port leases rather than a separate registration table. A
+manager restart therefore reconstructs the same registrations from persisted
+state and the current worker-status snapshot; it cannot restore an endpoint for
+a missing, stale, or mismatched worker. Worker freshness is bounded by the
+transport's 45-second last-seen timeout. Service identity is
+`namespace/name`; MVP2 accepts only the `default` namespace. Multiple replicas
+of one job may publish under one identity, but only one non-deleted deployment
+may own that identity. Suspension and scale-to-zero retain ownership. Deletion
+releases it only after allocation cleanup marks the deployment deleted. Catalog
+reads are covered by the operator API authorization policy. HTTP discovery and
+the DNS discovery work that builds on this catalog use the same indexed
+registrations and `eligible` predicate.
 
 Example service workload:
 

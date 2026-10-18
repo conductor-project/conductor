@@ -136,12 +136,26 @@ current allocation and run, retry count, next eligible start time, and
 exhausted from a deployment that is merely waiting for placement. The terminal
 run remains available through the run history endpoint.
 
-`GET /v1/jobs/{jobId}/endpoints` returns endpoint records tied to the current
-service instance and run attempt. Every endpoint currently reports
-`ready: false`; readiness remains false until a health check confirms the
-current attempt is serving traffic. Endpoint addresses are manager-configured
-routable addresses. Loopback addresses are rejected so test listener addresses
-are not published as production endpoints.
+`GET /v1/jobs/{jobId}/endpoints` returns only currently eligible endpoints for
+that job. `GET /v1/services/{namespace}/{name}/endpoints` looks up the same
+catalog by logical service identity. Both return the job, service identity,
+instance, allocation, run, worker, port, readiness, and worker freshness/draining
+state. An endpoint is eligible only when its current allocation and run match
+the active deployment, its run is running and ready, and its worker is fresh,
+available, non-degraded, and not draining. Endpoints without a readiness probe
+are not published. Worker liveness is bounded by the transport's 45-second
+freshness timeout; a worker reporting failure, becoming stale, or draining
+withdraws its endpoints. The catalog is reconstructed from durable manager state
+after restart.
+
+Service identity is `namespace/name`; only `default` is accepted in MVP2.
+Replicas of one job share its identity. Only one non-deleted job deployment may
+own an identity, including while suspended or scaled to zero; deletion releases
+ownership after allocation cleanup is complete. Both catalog paths use the
+manager routes and are protected by the configured operator authorization
+policy. Endpoint addresses are manager-configured routable addresses. Loopback
+addresses are rejected so test listener addresses are not published as
+production endpoints.
 
 `DELETE /v1/jobs/{jobId}/deployment` is conditional and idempotent. It records a
 durable deleting tombstone and returns `202` while active or uncertain
