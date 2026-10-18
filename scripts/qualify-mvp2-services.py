@@ -646,8 +646,8 @@ def main():
                     raise RuntimeError(f"deleting unready deployment returned {status}: {deleted}")
                 result["scenarios"].append("failed readiness probes keep service endpoints unpublished")
                 wait_until(
-                    "unready deployment cleanup",
-                    lambda: request(base, "GET", "/v1/jobs/unready/deployment")[0] == 404,
+                    "unready deployment deletion",
+                    lambda: deployment_deleted(base, "unready"),
                     timeout=8,
                     timings=result["timingsMs"],
                 )
@@ -844,6 +844,11 @@ def deployment_pending_for_reason(base, service, reason, latest=None):
         else None
     )
     return None
+
+
+def deployment_deleted(base, service):
+    status, _, deployment = request(base, "GET", f"/v1/jobs/{service}/deployment")
+    return status == 200 and isinstance(deployment, dict) and deployment.get("status") == "deleted"
 
 
 def resolver_diagnostics(name, dig):
