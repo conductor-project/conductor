@@ -717,7 +717,14 @@ def main():
                     lambda: endpoint_if_on_other_worker(base, "backend", drained_worker),
                     timings=result["timingsMs"],
                 )
-                if call_service(endpoints["frontend"][0], "backend") != "backend:v2":
+                surviving_frontend = wait_service(
+                    base, "frontend", revision=1, timings=result["timingsMs"]
+                )[0]
+                if surviving_frontend["workerId"] == drained_worker:
+                    raise RuntimeError(
+                        "frontend endpoint remained on the drained worker after readiness"
+                    )
+                if call_service(surviving_frontend, "backend") != "backend:v2":
                     raise RuntimeError("frontend did not discover backend after worker drain")
                 result["scenarios"].append(
                     f"draining {drained_worker} moved backend to {moved_backend[0]['workerId']} without changing its service name"
