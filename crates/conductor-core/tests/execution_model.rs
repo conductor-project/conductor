@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use conductor_core::{
     Allocation, AllocationId, AllocationState, Architecture, AssignedServicePort, AttemptState,
-    DeploymentPendingReason, DeploymentStatus, DigestAlgorithm, EnforcementCapability,
-    ExecutableDigest, ExecutionAttempt, ExecutionAttemptId, ExecutionBackend, ExecutionModelError,
-    ExecutionRequirements, FilesystemPolicy, JobDeployment, JobId, JobRevision, JobRevisionDraft,
-    JobRevisionId, JobSpec, OperatingSystem, ReadinessProbe, ReadinessProbeProtocol,
-    ResourceLimits, ResourceRequest, ResourceReservation, RunId, RunSpec, ServiceIdentity,
-    ServiceInstance, ServiceInstanceId, ServicePort, ServicePortProtocol, WorkerCapabilities,
-    WorkerId, Workload,
+    DeploymentMutation, DeploymentPendingReason, DeploymentStatus, DeploymentUpdateStrategy,
+    DigestAlgorithm, EnforcementCapability, ExecutableDigest, ExecutionAttempt, ExecutionAttemptId,
+    ExecutionBackend, ExecutionModelError, ExecutionRequirements, FilesystemPolicy, JobDeployment,
+    JobId, JobRevision, JobRevisionDraft, JobRevisionId, JobSpec, OperatingSystem, ReadinessProbe,
+    ReadinessProbeProtocol, ResourceLimits, ResourceRequest, ResourceReservation, RunId, RunSpec,
+    ServiceIdentity, ServiceInstance, ServiceInstanceId, ServicePort, ServicePortProtocol,
+    WorkerCapabilities, WorkerId, Workload,
 };
 
 fn job_spec(id: &str) -> JobSpec {
@@ -204,6 +204,33 @@ fn deployment_intent_is_mutable_separate_from_immutable_revisions() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn rollout_strategy_is_bounded_and_rejects_unsupported_surge() {
+    let default = DeploymentUpdateStrategy::default();
+    assert_eq!(default.max_surge(), 0);
+    assert_eq!(default.max_unavailable(), 1);
+    assert_eq!(default.progress_deadline_seconds(), 300);
+    assert!(DeploymentUpdateStrategy::new(0, 1, 86_400).is_ok());
+    assert!(DeploymentUpdateStrategy::new(0, 0, 300).is_err());
+    assert!(DeploymentUpdateStrategy::new(1, 1, 300).is_err());
+    assert!(DeploymentUpdateStrategy::new(0, 1, 86_401).is_err());
+    let legacy_shape = serde_json::to_value(DeploymentMutation::Deploy {
+        revision: 1,
+        replicas: 2,
+        strategy: default,
+    })
+    .unwrap();
+    assert_eq!(legacy_shape["operation"], "deploy");
+    assert!(legacy_shape.get("strategy").is_none());
+    let custom_shape = serde_json::to_value(DeploymentMutation::Deploy {
+        revision: 2,
+        replicas: 2,
+        strategy: DeploymentUpdateStrategy::new(0, 2, 30).unwrap(),
+    })
+    .unwrap();
+    assert_eq!(custom_shape["strategy"]["maxUnavailable"], 2);
 }
 
 #[test]

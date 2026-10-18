@@ -12,13 +12,14 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use base64::Engine;
 use conductor_core::{
     Allocation, AllocationId, AllocationState, AssignedServicePort, CommandEnvelope, CommandId,
-    DeploymentMutation, DeploymentPendingReason, DeploymentStatus, InspectRun, JobDeployment,
-    JobId, JobRevision, JobRevisionDraft, JobRevisionId, JobSpec, MAX_DEPLOYMENT_REPLICAS,
-    MAX_WORKER_CAPACITY, ReadRunLogs, ReadinessState, ResolveRun, ResourceReservation,
-    RunFailureReason, RunId, RunLogChunk, RunObservation, RunSpec, RunState, RunTerminationReason,
-    ServiceIdentity, ServiceInstance, ServiceInstanceId, ServicePortProtocol, StartRun, StopRun,
-    WorkerCommand, WorkerDescriptor, WorkerId, WorkerInventoryEntry, WorkerResourceCapacity,
-    WorkerServiceNetwork, WorkerStatus, Workload,
+    DeploymentMutation, DeploymentPendingReason, DeploymentRollout, DeploymentStatus,
+    DeploymentUpdateStrategy, InspectRun, JobDeployment, JobId, JobRevision, JobRevisionDraft,
+    JobRevisionId, JobSpec, MAX_DEPLOYMENT_REPLICAS, MAX_WORKER_CAPACITY, ReadRunLogs,
+    ReadinessState, ResolveRun, ResourceReservation, RunFailureReason, RunId, RunLogChunk,
+    RunObservation, RunSpec, RunState, RunTerminationReason, ServiceIdentity, ServiceInstance,
+    ServiceInstanceId, ServicePortProtocol, StartRun, StopRun, WorkerCommand, WorkerDescriptor,
+    WorkerId, WorkerInventoryEntry, WorkerResourceCapacity, WorkerServiceNetwork, WorkerStatus,
+    Workload,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
@@ -1593,6 +1594,79 @@ fn service_runtime_pending_reason(
     Ok(None)
 }
 
+fn service_rollout_pending_reason(
+    transaction: &rusqlite::Transaction<'_>,
+    job_id: &JobId,
+    deployment: &JobDeployment,
+) -> Result<Option<DeploymentPendingReason>, ExecutionStoreError> {
+    if deployment.rollout().is_none()
+        || deployment.suspended()
+        || deployment.desired_replicas() == 0
+    {
+        return Ok(None);
+    }
+    let mut statement = transaction
+        .prepare(
+            "SELECT a.revision, a.state, si.current_allocation_id,
+                    sa.allocation_id, r.observation_json
+             FROM service_instances si
+             LEFT JOIN allocations a ON a.allocation_id = si.current_allocation_id
+             LEFT JOIN service_attempts sa ON sa.service_instance_id = si.instance_id
+             LEFT JOIN runs r ON r.run_id = sa.current_run_id
+             WHERE si.job_id = ?1 AND si.replica_index < ?2
+             ORDER BY si.replica_index",
+        )
+        .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+    let rows = statement
+        .query_map(
+            params![job_id.as_str(), i64::from(deployment.desired_replicas())],
+            |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        )
+        .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+    let target_revision = i64::try_from(deployment.revision_id().revision())
+        .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+    let mut pending = None;
+    for row in rows {
+        let (revision, allocation_state, current_allocation_id, attempt_allocation_id, observation) =
+            row.map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        if revision != Some(target_revision) || allocation_state.as_deref() != Some("assigned") {
+            pending.get_or_insert(DeploymentPendingReason::ServiceStarting);
+            continue;
+        }
+        if current_allocation_id != attempt_allocation_id {
+            pending.get_or_insert(DeploymentPendingReason::ServiceStarting);
+            continue;
+        }
+        let Some(observation) = observation else {
+            pending.get_or_insert(DeploymentPendingReason::ServiceStarting);
+            continue;
+        };
+        let observation: RunObservation = serde_json::from_str(&observation)
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        if observation
+            .readiness()
+            .is_some_and(|readiness| readiness != ReadinessState::Ready)
+        {
+            return Ok(Some(DeploymentPendingReason::ServiceReadinessPending));
+        }
+        if observation.state() == RunState::Unknown {
+            return Ok(Some(DeploymentPendingReason::ServiceAttemptUnresolved));
+        }
+        if observation.state() != RunState::Running {
+            pending.get_or_insert(DeploymentPendingReason::ServiceStarting);
+        }
+    }
+    Ok(pending)
+}
+
 #[derive(Clone, Copy, Default)]
 struct ReservedUsage {
     cpu_millis: u64,
@@ -1690,6 +1764,50 @@ fn place_service_slots(
             .map(|allocation_id| load_allocation(transaction, allocation_id))
             .transpose()?
             .flatten();
+
+        if allocation
+            .as_ref()
+            .is_some_and(|record| record.allocation.job_revision_id() != revision.id())
+        {
+            let current_id = current_allocation_id
+                .as_deref()
+                .map(AllocationId::new)
+                .transpose()
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            if let Some(reusable) = load_reusable_service_allocation(
+                transaction,
+                &instance_id,
+                revision.id(),
+                current_id.as_ref(),
+            )? {
+                if let Some(current_id) = current_id.as_ref()
+                    && let Some(mut stale) = load_allocation(transaction, current_id.as_str())?
+                {
+                    let state = stale.allocation.state();
+                    if state != AllocationState::Released
+                        && (state == AllocationState::Pending
+                            || !service_allocation_has_current_run(
+                                transaction,
+                                &instance_id,
+                                stale.allocation.id(),
+                            )?)
+                    {
+                        stale
+                            .allocation
+                            .release()
+                            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+                        persist_allocation(transaction, &stale)?;
+                    }
+                }
+                set_current_allocation(
+                    transaction,
+                    job_id,
+                    replica_index,
+                    reusable.allocation.id(),
+                )?;
+                allocation = Some(reusable);
+            }
+        }
 
         let mut needs_replacement = allocation.as_ref().is_none_or(|record| {
             record.allocation.job_revision_id() != revision.id()
@@ -1847,7 +1965,18 @@ fn place_service_slots(
     } else {
         service_runtime_pending_reason(transaction, job_id, desired_replicas)?
     };
-    let pending_reason = first_pending_reason.or(runtime_pending_reason);
+    let rollout_pending_reason = if desired_replicas == 0 || first_pending_reason.is_some() {
+        None
+    } else {
+        service_rollout_pending_reason(transaction, job_id, deployment)?
+    };
+    let pending_reason = first_pending_reason.or_else(|| {
+        if deployment.rollout().is_some() {
+            rollout_pending_reason.or(runtime_pending_reason)
+        } else {
+            runtime_pending_reason
+        }
+    });
     let (status, pending_reason, pending_message) = if deployment.suspended() {
         (DeploymentStatus::Suspended, None, None)
     } else if desired_replicas == 0 || pending_reason.is_none() {
@@ -1860,6 +1989,11 @@ fn place_service_slots(
             Some(pending_message(reason).to_owned()),
         )
     };
+    let rollout = if pending_reason.is_none() {
+        None
+    } else {
+        deployment.rollout().cloned()
+    };
     JobDeployment::new(
         revision,
         deployment.generation(),
@@ -1869,6 +2003,7 @@ fn place_service_slots(
         pending_reason,
         pending_message,
     )
+    .map(|updated| updated.with_rollout(rollout))
     .map_err(|_| ExecutionStoreError::InvalidRequest)
 }
 
@@ -1991,6 +2126,41 @@ fn load_allocation(
             })
         })
         .transpose()
+}
+
+fn load_reusable_service_allocation(
+    transaction: &rusqlite::Transaction<'_>,
+    instance_id: &ServiceInstanceId,
+    revision_id: &JobRevisionId,
+    current_allocation_id: Option<&AllocationId>,
+) -> Result<Option<AllocationRecord>, ExecutionStoreError> {
+    let revision = i64::try_from(revision_id.revision())
+        .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+    let allocation_id = transaction
+        .query_row(
+            "SELECT a.allocation_id FROM allocations a
+             LEFT JOIN service_attempts sa ON sa.service_instance_id = a.service_instance_id
+             WHERE a.service_instance_id = ?1 AND a.revision = ?2
+               AND a.state IN ('assigned', 'uncertain')
+               AND (?3 IS NULL OR a.allocation_id <> ?3)
+             ORDER BY CASE WHEN sa.allocation_id = a.allocation_id
+                            AND sa.current_run_id IS NOT NULL THEN 0 ELSE 1 END,
+                      a.created_at_ms DESC
+             LIMIT 1",
+            params![
+                instance_id.as_str(),
+                revision,
+                current_allocation_id.map(AllocationId::as_str)
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+    allocation_id
+        .as_deref()
+        .map(|allocation_id| load_allocation(transaction, allocation_id))
+        .transpose()
+        .map(Option::flatten)
 }
 
 fn persist_allocation(
@@ -2218,6 +2388,12 @@ fn pending_message(reason: DeploymentPendingReason) -> &'static str {
         }
         DeploymentPendingReason::ServiceAttemptUnresolved => {
             "one or more service attempts have an unresolved worker outcome"
+        }
+        DeploymentPendingReason::ServiceReadinessPending => {
+            "replacement service is running but has not passed its readiness gate"
+        }
+        DeploymentPendingReason::RolloutProgressDeadlineExceeded => {
+            "revision rollout exceeded its progress deadline and is rolling back"
         }
     }
 }
@@ -2773,6 +2949,16 @@ impl JobRepository for SqliteJobRepository {
         idempotency_key: &str,
         workers: &[WorkerStatus],
     ) -> Result<JobDeployment, ExecutionStoreError> {
+        if let DeploymentMutation::Deploy { strategy, .. } = mutation
+            && DeploymentUpdateStrategy::new(
+                strategy.max_surge(),
+                strategy.max_unavailable(),
+                strategy.progress_deadline_seconds(),
+            )
+            .is_err()
+        {
+            return Err(ExecutionStoreError::InvalidRequest);
+        }
         let request_json = serde_json::to_string(&(expected_generation, mutation))
             .map_err(|_| ExecutionStoreError::InvalidRequest)?;
         let mut connection = self
@@ -2840,14 +3026,31 @@ impl JobRepository for SqliteJobRepository {
         }) {
             return Err(ExecutionStoreError::Conflict);
         }
+        if current.as_ref().and_then(JobDeployment::rollout).is_some()
+            && matches!(
+                (current.as_ref(), mutation),
+                (
+                    Some(existing),
+                    DeploymentMutation::Deploy { revision, .. }
+                ) if *revision != existing.revision_id().revision()
+            )
+        {
+            return Err(ExecutionStoreError::Conflict);
+        }
 
         let (revision_number, replicas, suspended) = match (current.as_ref(), mutation) {
-            (None, DeploymentMutation::Deploy { revision, replicas }) => {
-                (*revision, *replicas, false)
-            }
-            (Some(existing), DeploymentMutation::Deploy { revision, replicas }) => {
-                (*revision, *replicas, existing.suspended())
-            }
+            (
+                None,
+                DeploymentMutation::Deploy {
+                    revision, replicas, ..
+                },
+            ) => (*revision, *replicas, false),
+            (
+                Some(existing),
+                DeploymentMutation::Deploy {
+                    revision, replicas, ..
+                },
+            ) => (*revision, *replicas, existing.suspended()),
             (Some(existing), DeploymentMutation::Scale { replicas }) => (
                 existing.revision_id().revision(),
                 *replicas,
@@ -2926,6 +3129,44 @@ impl JobRepository for SqliteJobRepository {
             .as_ref()
             .map_or(Some(1), |value| value.generation().checked_add(1))
             .ok_or(ExecutionStoreError::Conflict)?;
+        let strategy = match mutation {
+            DeploymentMutation::Deploy { strategy, .. } => *strategy,
+            DeploymentMutation::Rollback { .. } => current
+                .as_ref()
+                .and_then(JobDeployment::rollout)
+                .map(DeploymentRollout::strategy)
+                .unwrap_or_default(),
+            _ => current
+                .as_ref()
+                .and_then(JobDeployment::rollout)
+                .map(DeploymentRollout::strategy)
+                .unwrap_or_default(),
+        };
+        let rollout = if replicas == 0 {
+            None
+        } else if let Some(existing) = current.as_ref()
+            && existing.revision_id().revision() != revision_number
+        {
+            let now = now_ms().map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            let rolling_back = matches!(mutation, DeploymentMutation::Rollback { .. });
+            let deadline = if rolling_back {
+                None
+            } else {
+                Some(now.saturating_add(i64::from(strategy.progress_deadline_seconds()) * 1000))
+            };
+            Some(
+                DeploymentRollout::new(
+                    existing.revision_id().clone(),
+                    now,
+                    deadline,
+                    strategy,
+                    rolling_back,
+                )
+                .map_err(|_| ExecutionStoreError::InvalidRequest)?,
+            )
+        } else {
+            current.as_ref().and_then(JobDeployment::rollout).cloned()
+        };
         let deployment = JobDeployment::new(
             &revision,
             generation,
@@ -2935,7 +3176,8 @@ impl JobRepository for SqliteJobRepository {
             pending_reason,
             pending_message,
         )
-        .map_err(|_| ExecutionStoreError::InvalidRequest)?;
+        .map_err(|_| ExecutionStoreError::InvalidRequest)?
+        .with_rollout(rollout);
         let mut deployment = place_service_slots(&transaction, &revision, &deployment, workers)?;
         if matches!(mutation, DeploymentMutation::Delete) {
             let deletion_status = if active_allocations_exist(&transaction, id)? {
@@ -3020,7 +3262,7 @@ impl JobRepository for SqliteJobRepository {
                 .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
             return Ok(None);
         };
-        let current: JobDeployment = serde_json::from_str(&current_json)
+        let mut current: JobDeployment = serde_json::from_str(&current_json)
             .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
         if current.status() == DeploymentStatus::Deleting {
             if active_allocations_exist(&transaction, id)? {
@@ -3077,6 +3319,60 @@ impl JobRepository for SqliteJobRepository {
                 .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
             return Ok(Some(deleted));
         }
+        if !current.suspended()
+            && current.desired_replicas() > 0
+            && let Some(rollout) = current.rollout()
+            && !rollout.rolling_back()
+            && rollout
+                .progress_deadline_at_ms()
+                .is_some_and(|deadline| now_ms().is_ok_and(|now| now >= deadline))
+            && service_rollout_pending_reason(&transaction, id, &current)?.is_some()
+        {
+            let rollout = current
+                .rollout()
+                .cloned()
+                .ok_or(ExecutionStoreError::StorageUnavailable)?;
+            let previous_revision_number = i64::try_from(rollout.previous_revision_id().revision())
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            let previous_revision_json = transaction
+                .query_row(
+                    "SELECT revision_json FROM job_revisions WHERE job_id = ?1 AND revision = ?2",
+                    params![id.as_str(), previous_revision_number],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?
+                .ok_or(ExecutionStoreError::StorageUnavailable)?;
+            let previous_revision: JobRevision = serde_json::from_str(&previous_revision_json)
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            let now = now_ms().map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            let rollback = JobDeployment::new(
+                &previous_revision,
+                current
+                    .generation()
+                    .checked_add(1)
+                    .ok_or(ExecutionStoreError::Conflict)?,
+                current.desired_replicas(),
+                current.suspended(),
+                DeploymentStatus::Pending,
+                Some(DeploymentPendingReason::RolloutProgressDeadlineExceeded),
+                Some(
+                    "rollout progress deadline elapsed; restoring the previous revision".to_owned(),
+                ),
+            )
+            .map_err(|_| ExecutionStoreError::InvalidRequest)?
+            .with_rollout(Some(
+                DeploymentRollout::new(
+                    current.revision_id().clone(),
+                    now,
+                    None,
+                    rollout.strategy(),
+                    true,
+                )
+                .map_err(|_| ExecutionStoreError::InvalidRequest)?,
+            ));
+            current = rollback;
+        }
         if current.suspended() || current.desired_replicas() == 0 {
             transaction
                 .commit()
@@ -3097,13 +3393,15 @@ impl JobRepository for SqliteJobRepository {
         let revision: JobRevision = serde_json::from_str(&revision_json)
             .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
         let placed = place_service_slots(&transaction, &revision, &current, workers)?;
+        upsert_service_catalog_owner(&transaction, id, &revision)?;
         let deployment_json =
             serde_json::to_string(&placed).map_err(|_| ExecutionStoreError::StorageUnavailable)?;
         if deployment_json != current_json {
             transaction
                 .execute(
-                    "UPDATE job_deployments SET deployment_json = ?1 WHERE job_id = ?2 AND generation = ?3",
-                    params![deployment_json, id.as_str(), current.generation() as i64],
+                    "UPDATE job_deployments SET generation = ?1, deployment_json = ?2
+                     WHERE job_id = ?3",
+                    params![placed.generation() as i64, deployment_json, id.as_str()],
                 )
                 .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
         }
@@ -5111,12 +5409,19 @@ impl JobService {
             .repository
             .list_active_deployments()
             .map_err(|_| ManagerError::StorageUnavailable)?;
-        for deployment in deployments {
+        for mut deployment in deployments {
             let job_id = deployment.job_id().clone();
-            if !statuses.is_empty() {
+            if !statuses.is_empty() || deployment.rollout().is_some() {
                 self.repository
                     .reconcile_deployment_placement(&job_id, &statuses)
                     .map_err(|_| ManagerError::StorageUnavailable)?;
+                if let Some(updated) = self
+                    .repository
+                    .get_deployment(&job_id)
+                    .map_err(|_| ManagerError::StorageUnavailable)?
+                {
+                    deployment = updated;
+                }
             }
             let allocations = self
                 .repository
@@ -5126,6 +5431,51 @@ impl JobService {
                 .repository
                 .list_service_attempts(&job_id)
                 .map_err(|_| ManagerError::StorageUnavailable)?;
+            let rollout_wave_slots = if deployment.rollout().is_some() {
+                attempts
+                    .iter()
+                    .filter(|attempt| {
+                        if attempt.replica_index >= deployment.desired_replicas()
+                            || deployment.suspended()
+                        {
+                            return false;
+                        }
+                        let target_allocation = attempt
+                            .current_allocation_id
+                            .as_ref()
+                            .and_then(|allocation_id| {
+                                allocations
+                                    .iter()
+                                    .find(|record| record.allocation().id() == allocation_id)
+                            })
+                            .is_some_and(|record| {
+                                record.allocation().job_revision_id() == deployment.revision_id()
+                            });
+                        if !target_allocation {
+                            return false;
+                        }
+                        match (&attempt.current_run, &attempt.allocation) {
+                            (Some(run), Some(record))
+                                if record.allocation().job_revision_id()
+                                    == deployment.revision_id() =>
+                            {
+                                run.state() != RunState::Running
+                                    || run
+                                        .readiness()
+                                        .is_some_and(|state| state != ReadinessState::Ready)
+                            }
+                            (Some(run), _) => {
+                                run.state().is_terminal() || run.state() == RunState::Unknown
+                            }
+                            (None, _) => true,
+                        }
+                    })
+                    .map(|attempt| attempt.replica_index)
+                    .collect::<BTreeSet<_>>()
+            } else {
+                BTreeSet::new()
+            };
+            let mut rollout_unavailable = rollout_wave_slots.len();
             for attempt in attempts {
                 let slot_desired = !deployment.suspended()
                     && attempt.replica_index < deployment.desired_replicas();
@@ -5143,6 +5493,13 @@ impl JobService {
                         .find(|worker| worker.descriptor().worker_id() == current.worker_id())
                         .map(AsRef::as_ref);
                     if !run_is_desired && !current.state().is_terminal() {
+                        if let Some(rollout) = deployment.rollout()
+                            && run_allocation.job_revision_id() != deployment.revision_id()
+                            && u32::try_from(rollout_unavailable).unwrap_or(u32::MAX)
+                                >= rollout.strategy().max_unavailable()
+                        {
+                            continue;
+                        }
                         let replacement_wait = if slot_desired
                             && attempt.current_allocation_id.as_ref() != Some(run_allocation.id())
                             && statuses.iter().any(|status| {
@@ -5184,6 +5541,11 @@ impl JobService {
                         if let Ok(stopped) = self.stop_run(current.run_id(), worker)
                             && stopped.state().is_terminal()
                         {
+                            if deployment.rollout().is_some()
+                                && run_allocation.job_revision_id() != deployment.revision_id()
+                            {
+                                rollout_unavailable = rollout_unavailable.saturating_add(1);
+                            }
                             self.repository
                                 .finish_service_attempt(
                                     &attempt.service_instance_id,
@@ -5296,6 +5658,11 @@ impl JobService {
                 if allocation.allocation().state() != AllocationState::Assigned {
                     continue;
                 }
+                if deployment.rollout().is_some()
+                    && !rollout_wave_slots.contains(&attempt.replica_index)
+                {
+                    continue;
+                }
                 let Some(worker_id) = allocation.allocation().assigned_worker_id() else {
                     continue;
                 };
@@ -5377,7 +5744,7 @@ impl JobService {
             }
             // Refresh the durable deployment condition after dispatch and
             // observation reconciliation for this pass.
-            if !statuses.is_empty() {
+            if !statuses.is_empty() || deployment.rollout().is_some() {
                 self.repository
                     .reconcile_deployment_placement(&job_id, &statuses)
                     .map_err(|_| ManagerError::StorageUnavailable)?;
