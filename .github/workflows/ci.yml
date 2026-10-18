@@ -37,8 +37,6 @@ jobs:
         run: cargo +1.99.1 clippy --workspace --locked --all-targets --all-features -- -D warnings
       - name: Test debug and portable process lifecycle
         run: cargo +1.99.1 test --workspace --locked --all-targets --all-features
-      - name: Qualify MVP2 service discovery with debug binary
-        run: sudo env GITHUB_ACTIONS=true GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" python3 scripts/qualify-mvp2-services.py --binary target/debug/conductor --profile debug
 
   macos-release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -86,10 +84,6 @@ jobs:
         run: cargo +1.99.1 clippy --workspace --locked --all-targets --all-features -- -D warnings
       - name: Test debug
         run: cargo +1.99.1 test --workspace --locked --all-targets --all-features
-      - name: Install DNS query utility for service qualification
-        run: sudo apt-get update && sudo apt-get install --yes dnsutils
-      - name: Qualify MVP2 service discovery with debug binary
-        run: sudo env GITHUB_ACTIONS=true GITHUB_STEP_SUMMARY="$GITHUB_STEP_SUMMARY" python3 scripts/qualify-mvp2-services.py --binary target/debug/conductor --profile debug
 
   linux-release:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'

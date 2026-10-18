@@ -21,8 +21,9 @@ outside a GitHub-hosted runner running as root.
 
 The CI step summary records the executable SHA-256, profile, OS, architecture,
 kernel/platform string, topology, worker placement, and completed scenarios.
-Debug qualification runs before merge. Release qualification runs only in the
-post-merge workflow, in keeping with the repository's local release policy.
+The resolver-changing qualification runs only in the post-merge release
+workflow. The pre-merge jobs run the debug workspace tests without changing the
+host resolver.
 The suite also exercises a real listener port conflict and retry, a failed
 readiness probe, shared-host resource pressure, authoritative negative DNS
 answers, host resolver lookups, service revision replacement, a manager DNS outage and
