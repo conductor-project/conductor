@@ -73,7 +73,7 @@ fn inventory_rejects_linux_enforcement_on_macos() {
 }
 
 #[test]
-fn manager_metadata_preserves_worker_inventory_and_bounds_shared_budget() {
+fn manager_metadata_preserves_inventory_and_supports_shared_host_capacity() {
     let total = capacity(8_000, 8_000);
     let allocatable = capacity(6_000, 6_000);
     let inventory = WorkerInventory::new(
@@ -112,17 +112,16 @@ fn manager_metadata_preserves_worker_inventory_and_bounds_shared_budget() {
     );
     assert_eq!(status.labels(), &labels);
     assert!(status.fresh());
-    assert!(
-        status
-            .clone()
-            .with_manager_metadata(
-                WorkerId::new("host-a").unwrap(),
-                capacity(6_001, 4_000),
-                BTreeMap::new(),
-                3,
-                true,
-            )
-            .is_none()
-    );
+    let shared_host = status
+        .clone()
+        .with_manager_metadata(
+            WorkerId::new("host-a").unwrap(),
+            capacity(12_000, 12_000),
+            BTreeMap::new(),
+            3,
+            true,
+        )
+        .expect("shared-host budget can exceed one worker's capacity");
+    assert!(shared_host.is_valid());
     assert!(status.is_valid());
 }

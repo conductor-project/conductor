@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use conductor_core::{
     Allocation, AllocationId, AllocationState, Architecture, AttemptState, DeploymentPendingReason,
@@ -390,6 +390,33 @@ fn platform_requirements_are_explicit_and_reservations_are_not_enforcement() {
         r#"{"operatingSystem":"macos","architecture":"aarch64","backends":["native_process"],"unknown":true}"#
     )
     .is_err());
+}
+
+#[test]
+fn worker_label_constraints_match_exact_manager_labels_and_are_bounded() {
+    let constraints = ExecutionRequirements::default()
+        .with_worker_labels(BTreeMap::from([
+            ("pool".to_owned(), "services".to_owned()),
+            ("region".to_owned(), "west".to_owned()),
+        ]))
+        .unwrap();
+    assert!(constraints.labels_are_satisfied_by(&BTreeMap::from([
+        ("pool".to_owned(), "services".to_owned()),
+        ("region".to_owned(), "west".to_owned()),
+        ("extra".to_owned(), "allowed".to_owned()),
+    ])));
+    assert!(
+        !constraints
+            .labels_are_satisfied_by(&BTreeMap::from([("pool".to_owned(), "batch".to_owned(),)]))
+    );
+    assert!(
+        ExecutionRequirements::default()
+            .with_worker_labels(BTreeMap::from([(
+                "invalid key".to_owned(),
+                "value".to_owned(),
+            )]))
+            .is_err()
+    );
 }
 
 #[test]

@@ -264,10 +264,7 @@ impl WorkerStatus {
         if !valid_worker_labels(&labels) || last_seen_at_ms < 0 {
             return None;
         }
-        let inventory = self.inventory.as_ref()?;
-        if !resource_domain_capacity.fits_within(inventory.allocatable()) {
-            return None;
-        }
+        self.inventory.as_ref()?;
         self.resource_domain_id = Some(resource_domain_id);
         self.resource_domain_capacity = Some(resource_domain_capacity);
         self.labels = labels;
@@ -297,10 +294,10 @@ impl WorkerStatus {
             return false;
         }
         match (&self.resource_domain_id, self.resource_domain_capacity) {
-            (Some(_), Some(domain_capacity)) => self
-                .inventory
-                .as_ref()
-                .is_some_and(|inventory| domain_capacity.fits_within(inventory.allocatable())),
+            // A resource domain may represent a physical host shared by
+            // several worker processes, so its aggregate budget need not fit
+            // within any single worker's allocatable capacity.
+            (Some(_), Some(_)) => self.inventory.is_some(),
             (None, None) => self.labels.is_empty() && self.last_seen_at_ms.is_none() && !self.fresh,
             _ => false,
         }

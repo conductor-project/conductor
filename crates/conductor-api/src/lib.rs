@@ -548,9 +548,15 @@ async fn get_deployment(
             "the job ID is invalid",
         );
     };
+    let workers = query_worker_statuses(&state).await.ok();
     let result = match run_blocking(&state, BlockingClass::General, {
         let manager = Arc::clone(&state.manager);
-        move || manager.get_deployment(&job_id)
+        move || match workers {
+            Some(workers) if !workers.is_empty() => {
+                manager.reconcile_deployment_placement(&job_id, &workers)
+            }
+            _ => manager.get_deployment(&job_id),
+        }
     })
     .await
     {
@@ -751,9 +757,27 @@ async fn mutate_deployment(
     mutation: DeploymentMutation,
     idempotency_key: String,
 ) -> Response {
+    let workers = match query_worker_statuses(state).await {
+        Ok(workers) => workers,
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "worker_status_unavailable",
+                "worker status could not be read; deployment intent was not changed",
+            );
+        }
+    };
     let result = match run_blocking(state, BlockingClass::General, {
         let manager = Arc::clone(&state.manager);
-        move || manager.mutate_deployment(&job_id, expected_generation, &mutation, &idempotency_key)
+        move || {
+            manager.mutate_deployment_with_workers(
+                &job_id,
+                expected_generation,
+                &mutation,
+                &idempotency_key,
+                &workers,
+            )
+        }
     })
     .await
     {
