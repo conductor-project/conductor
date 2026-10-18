@@ -59,7 +59,8 @@ executable is launched. Resource requests on macOS are not kernel-enforced.
 
 The macOS tests establish local process lifecycle behavior only. They do not
 qualify independent-host failure isolation or cross-host networking; those
-require the separate MVP2 multi-host qualification in issue #77. The shared
+require the separate [MVP2 multi-node qualification](mvp2-multi-node-qualification.md)
+in issue #77. The shared
 host budget in the two-worker test is manager configured scheduling capacity,
 not measured machine capacity or kernel enforcement. Host resource inventory
 and refusal to place work on incompatible workers are covered by issues #66
