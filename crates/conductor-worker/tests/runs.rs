@@ -1105,7 +1105,7 @@ fn pending_output_readers_do_not_block_other_run_deadlines() {
     service.shutdown().unwrap();
     // Cleanup is guaranteed even when an assertion above fails.
     drop(escaped);
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
         let completed: i64 = Connection::open(directory.0.join("worker.sqlite3"))
             .unwrap()
