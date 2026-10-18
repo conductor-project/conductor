@@ -417,6 +417,37 @@ impl WorkerPort for ServiceRunner {
     }
 }
 
+struct CapacityRejectingWorker {
+    worker_id: WorkerId,
+    status: WorkerStatus,
+}
+
+impl WorkerPort for CapacityRejectingWorker {
+    fn descriptor(&self) -> WorkerDescriptor {
+        WorkerDescriptor::new(self.worker_id.clone(), 4, true)
+    }
+
+    fn start(&self, _command: StartRun) -> Result<RunObservation, WorkerPortError> {
+        Err(WorkerPortError::CapacityReached)
+    }
+
+    fn inspect(&self, _command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError> {
+        Ok(None)
+    }
+
+    fn stop(&self, _command: StopRun) -> Result<RunObservation, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
+
+    fn status(&self) -> Result<WorkerStatus, WorkerPortError> {
+        Ok(self.status.clone())
+    }
+
+    fn read_logs(&self, _command: ReadRunLogs) -> Result<RunLogChunk, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
+}
+
 #[test]
 fn service_reconciliation_starts_each_replica_once_and_keeps_one_shot_semantics() {
     let directory = TempDir::new();
@@ -541,6 +572,115 @@ fn service_reconciliation_starts_each_replica_once_and_keeps_one_shot_semantics(
         .map(ToString::to_string)
         .collect::<BTreeSet<_>>();
     assert_eq!(resumed_instances, original_instances);
+}
+
+#[test]
+fn scale_to_zero_before_first_run_releases_assigned_reservations() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let revision = manager
+        .create_revision(
+            &service_revision_draft("scale-before-start"),
+            "scale-before-start-revision",
+        )
+        .unwrap();
+    let worker_status = scheduling_worker(
+        "worker-before-start",
+        "host-before-start",
+        1_000,
+        1_073_741_824,
+        1_000,
+        1_073_741_824,
+        BTreeMap::new(),
+        true,
+    );
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &DeploymentMutation::Deploy {
+                revision: 1,
+                replicas: 1,
+            },
+            "scale-before-start-deploy",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+
+    let allocated = manager.list_allocations(revision.id().job_id()).unwrap();
+    assert_eq!(allocated.len(), 1);
+    assert_eq!(allocated[0].allocation().state(), AllocationState::Assigned);
+    assert!(
+        manager
+            .list_service_attempts(revision.id().job_id())
+            .unwrap()
+            .iter()
+            .all(|attempt| attempt.current_run_id.is_none()),
+        "placement has not started a worker run yet"
+    );
+
+    let replacement_revision = manager
+        .create_revision(
+            &service_revision_draft("scale-before-start-v2"),
+            "scale-before-start-replacement-revision",
+        )
+        .unwrap();
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            Some(1),
+            &DeploymentMutation::Deploy {
+                revision: replacement_revision.id().revision(),
+                replicas: 1,
+            },
+            "scale-before-start-replace",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    let after_replacement = manager.list_allocations(revision.id().job_id()).unwrap();
+    assert_eq!(after_replacement.len(), 2);
+    assert_eq!(
+        after_replacement[0].allocation().state(),
+        AllocationState::Released,
+        "revision replacement must release the unstarted old reservation"
+    );
+    assert_eq!(
+        after_replacement[1].allocation().state(),
+        AllocationState::Assigned
+    );
+
+    let scaled = manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            Some(2),
+            &DeploymentMutation::Scale { replicas: 0 },
+            "scale-before-start-zero",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    assert_eq!(scaled.desired_replicas(), 0);
+    assert_eq!(scaled.status(), DeploymentStatus::Ready);
+    assert_eq!(
+        manager
+            .list_allocations(revision.id().job_id())
+            .unwrap()
+            .iter()
+            .map(|record| record.allocation().state())
+            .collect::<Vec<_>>(),
+        [AllocationState::Released, AllocationState::Released],
+        "scale-down must release every unstarted assigned reservation"
+    );
+
+    let deleted = manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            Some(3),
+            &DeploymentMutation::Delete,
+            "scale-before-start-delete",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    assert_eq!(deleted.status(), DeploymentStatus::Deleted);
 }
 
 #[test]
@@ -826,6 +966,256 @@ fn service_restart_backoff_survives_manager_restart_and_retries_after_bounded_po
         );
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+#[test]
+fn persisted_terminal_service_result_is_consumed_after_worker_disconnect() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let revision = manager
+        .create_revision(
+            &service_revision_draft("terminal-report"),
+            "terminal-report-revision",
+        )
+        .unwrap();
+    let worker_status = scheduling_worker(
+        "worker-terminal-report",
+        "host-terminal-report",
+        1_000,
+        1_073_741_824,
+        1_000,
+        1_073_741_824,
+        BTreeMap::new(),
+        true,
+    );
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &DeploymentMutation::Deploy {
+                revision: 1,
+                replicas: 1,
+            },
+            "terminal-report-deploy",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    let worker = Arc::new(ServiceRunner {
+        worker_id: WorkerId::new("worker-terminal-report").unwrap(),
+        status: worker_status,
+        starts: AtomicUsize::new(0),
+        disconnected: AtomicBool::new(false),
+        runs: Mutex::new(BTreeMap::new()),
+        stale_inspection: Mutex::new(None),
+    });
+    let worker_port: Arc<dyn WorkerPort> = worker.clone();
+    manager
+        .reconcile_services(std::slice::from_ref(&worker_port))
+        .unwrap();
+    let attempt = manager
+        .list_service_attempts(revision.id().job_id())
+        .unwrap()
+        .pop()
+        .unwrap();
+    let current = attempt.current_run.unwrap();
+    let failed = current
+        .next_revision(RunState::Running, Some(2), None, None, None, None)
+        .unwrap()
+        .next_revision(
+            RunState::Failed,
+            Some(2),
+            Some(3),
+            Some(1),
+            None,
+            Some(RunFailureReason::NonZeroExit),
+        )
+        .unwrap();
+    let connection = Connection::open(directory.database()).unwrap();
+    connection
+        .execute(
+            "UPDATE runs SET observation_json = ?1, revision = ?2, state = ?3 WHERE run_id = ?4",
+            rusqlite::params![
+                serde_json::to_string(&failed).unwrap(),
+                failed.revision() as i64,
+                failed.state().as_str(),
+                failed.run_id().as_str(),
+            ],
+        )
+        .unwrap();
+    drop(connection);
+    drop(manager);
+    worker.disconnect();
+
+    let reopened = service(&directory);
+    reopened.reconcile_services(&[]).unwrap();
+    let attempt = reopened
+        .list_service_attempts(revision.id().job_id())
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(attempt.current_run_id.is_none());
+    assert_eq!(attempt.restart_count, 1);
+    assert!(attempt.next_start_at_ms > 0);
+}
+
+#[test]
+fn capacity_rejection_atomically_clears_the_unaccepted_service_attempt() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let revision = manager
+        .create_revision(
+            &service_revision_draft("capacity-rejection"),
+            "capacity-rejection-revision",
+        )
+        .unwrap();
+    let worker_id = WorkerId::new("worker-capacity-rejection").unwrap();
+    let worker_status = scheduling_worker(
+        "worker-capacity-rejection",
+        "host-capacity-rejection",
+        1_000,
+        1_073_741_824,
+        1_000,
+        1_073_741_824,
+        BTreeMap::new(),
+        true,
+    );
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &DeploymentMutation::Deploy {
+                revision: 1,
+                replicas: 1,
+            },
+            "capacity-rejection-deploy",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    let worker: Arc<dyn WorkerPort> = Arc::new(CapacityRejectingWorker {
+        worker_id,
+        status: worker_status,
+    });
+
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    let attempts = manager
+        .list_service_attempts(revision.id().job_id())
+        .unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert!(attempts[0].current_run_id.is_none());
+    assert!(attempts[0].next_start_at_ms > 0);
+    assert!(
+        manager
+            .list_runs(Some(revision.id().job_id()), None, 10)
+            .unwrap()
+            .is_empty(),
+        "a run rejected before acceptance is removed atomically with attempt cleanup"
+    );
+    let deployment = manager
+        .get_deployment(revision.id().job_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(deployment.status(), DeploymentStatus::Pending);
+    assert_eq!(
+        deployment.pending_reason(),
+        Some(DeploymentPendingReason::ServiceRestartBackoff)
+    );
+}
+
+#[test]
+fn exhausted_service_retry_budget_is_reported_and_stops_relaunching() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let revision = manager
+        .create_revision(
+            &service_revision_draft("retry-budget"),
+            "retry-budget-revision",
+        )
+        .unwrap();
+    let worker_status = scheduling_worker(
+        "worker-retry-budget",
+        "host-retry-budget",
+        1_000,
+        1_073_741_824,
+        1_000,
+        1_073_741_824,
+        BTreeMap::new(),
+        true,
+    );
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &DeploymentMutation::Deploy {
+                revision: 1,
+                replicas: 1,
+            },
+            "retry-budget-deploy",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    let worker = Arc::new(ServiceRunner {
+        worker_id: WorkerId::new("worker-retry-budget").unwrap(),
+        status: worker_status,
+        starts: AtomicUsize::new(0),
+        disconnected: AtomicBool::new(false),
+        runs: Mutex::new(BTreeMap::new()),
+        stale_inspection: Mutex::new(None),
+    });
+    let worker_port: Arc<dyn WorkerPort> = worker.clone();
+
+    for failure_count in 1..=6 {
+        if failure_count > 1 {
+            let instance = manager
+                .list_service_attempts(revision.id().job_id())
+                .unwrap()
+                .pop()
+                .unwrap()
+                .service_instance_id;
+            let connection = Connection::open(directory.database()).unwrap();
+            connection
+                .execute(
+                    "UPDATE service_attempts SET next_start_at_ms = 0 WHERE service_instance_id = ?1",
+                    [instance.as_str()],
+                )
+                .unwrap();
+            drop(connection);
+            manager
+                .reconcile_services(std::slice::from_ref(&worker_port))
+                .unwrap();
+        } else {
+            manager
+                .reconcile_services(std::slice::from_ref(&worker_port))
+                .unwrap();
+        }
+        assert_eq!(worker.starts.load(Ordering::Relaxed), failure_count);
+        worker.fail_all();
+        manager
+            .reconcile_services(std::slice::from_ref(&worker_port))
+            .unwrap();
+        let attempt = manager
+            .list_service_attempts(revision.id().job_id())
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(attempt.restart_count, failure_count as u32);
+        assert_eq!(attempt.terminal_failure, failure_count == 6);
+    }
+
+    manager
+        .reconcile_services(std::slice::from_ref(&worker_port))
+        .unwrap();
+    assert_eq!(worker.starts.load(Ordering::Relaxed), 6);
+    let deployment = manager
+        .get_deployment(revision.id().job_id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(deployment.status(), DeploymentStatus::Pending);
+    assert_eq!(
+        deployment.pending_reason(),
+        Some(DeploymentPendingReason::ServiceRestartBudgetExhausted)
+    );
 }
 
 #[test]
@@ -1123,7 +1513,11 @@ fn placement_spreads_replicas_deterministically_and_honors_worker_labels() {
             &workers,
         )
         .unwrap();
-    assert_eq!(deployment.status(), DeploymentStatus::Ready);
+    assert_eq!(deployment.status(), DeploymentStatus::Pending);
+    assert_eq!(
+        deployment.pending_reason(),
+        Some(DeploymentPendingReason::ServiceStarting)
+    );
     let assignments = manager
         .list_allocations(revision.id().job_id())
         .unwrap()
@@ -1263,8 +1657,19 @@ fn uncertain_allocations_keep_reservations_during_replacement_placement() {
             None,
             &deployment_request(1),
             "deploy",
-            &[initial_worker],
+            std::slice::from_ref(&initial_worker),
         )
+        .unwrap();
+    let worker_port: Arc<dyn WorkerPort> = Arc::new(ServiceRunner {
+        worker_id: WorkerId::new("worker-a").unwrap(),
+        status: initial_worker,
+        starts: AtomicUsize::new(0),
+        disconnected: AtomicBool::new(false),
+        runs: Mutex::new(BTreeMap::new()),
+        stale_inspection: Mutex::new(None),
+    });
+    manager
+        .reconcile_services(std::slice::from_ref(&worker_port))
         .unwrap();
 
     let pending = manager
@@ -1330,7 +1735,7 @@ fn uncertain_allocations_keep_reservations_during_replacement_placement() {
 }
 
 #[test]
-fn deleting_deployment_with_assigned_allocations_retains_ownership() {
+fn deleting_deployment_releases_allocations_without_started_runs() {
     let directory = TempDir::new();
     let manager = service(&directory);
     let revision = manager
@@ -1365,13 +1770,13 @@ fn deleting_deployment_with_assigned_allocations_retains_ownership() {
             &[],
         )
         .unwrap();
-    assert_eq!(deleting.status(), DeploymentStatus::Deleting);
+    assert_eq!(deleting.status(), DeploymentStatus::Deleted);
     assert_eq!(deleting.desired_replicas(), 0);
     assert_eq!(
         manager.list_allocations(revision.id().job_id()).unwrap()[0]
             .allocation()
             .state(),
-        AllocationState::Assigned
+        AllocationState::Released
     );
     assert_eq!(
         manager
@@ -1379,7 +1784,7 @@ fn deleting_deployment_with_assigned_allocations_retains_ownership() {
             .unwrap()
             .unwrap()
             .status(),
-        DeploymentStatus::Deleting
+        DeploymentStatus::Deleted
     );
 }
 
@@ -1445,7 +1850,8 @@ fn concurrent_deployments_cannot_oversubscribe_a_shared_resource_domain() {
     assert_eq!(
         deployments
             .iter()
-            .filter(|deployment| deployment.status() == DeploymentStatus::Ready)
+            .filter(|deployment| deployment.pending_reason()
+                == Some(DeploymentPendingReason::ServiceStarting))
             .count(),
         1
     );

@@ -301,6 +301,12 @@ pub trait JobRepository: Send + Sync + CommandJournal {
         next_start_at_ms: i64,
         terminal_failure: bool,
     ) -> Result<(), RunStoreError>;
+    fn reject_unaccepted_service_run(
+        &self,
+        instance_id: &ServiceInstanceId,
+        run_id: &RunId,
+        next_start_at_ms: i64,
+    ) -> Result<(), RunStoreError>;
     fn release_service_allocation(
         &self,
         allocation_id: &AllocationId,
@@ -1214,6 +1220,97 @@ fn active_allocations_exist(
         .map_err(|_| ExecutionStoreError::StorageUnavailable)
 }
 
+fn service_allocation_has_current_run(
+    transaction: &rusqlite::Transaction<'_>,
+    instance_id: &ServiceInstanceId,
+    allocation_id: &AllocationId,
+) -> Result<bool, ExecutionStoreError> {
+    transaction
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM service_attempts
+                 WHERE service_instance_id = ?1 AND allocation_id = ?2
+                   AND current_run_id IS NOT NULL
+             )",
+            params![instance_id.as_str(), allocation_id.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|_| ExecutionStoreError::StorageUnavailable)
+}
+
+fn service_runtime_pending_reason(
+    transaction: &rusqlite::Transaction<'_>,
+    job_id: &JobId,
+    desired_replicas: u32,
+) -> Result<Option<DeploymentPendingReason>, ExecutionStoreError> {
+    let now = now_ms().map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+    let mut statement = transaction
+        .prepare(
+            "SELECT si.current_allocation_id, a.state, sa.allocation_id,
+                    sa.current_run_id, sa.next_start_at_ms, sa.terminal_failure,
+                    r.state
+             FROM service_instances si
+             LEFT JOIN allocations a ON a.allocation_id = si.current_allocation_id
+             LEFT JOIN service_attempts sa ON sa.service_instance_id = si.instance_id
+             LEFT JOIN runs r ON r.run_id = sa.current_run_id
+             WHERE si.job_id = ?1 AND si.replica_index < ?2
+             ORDER BY si.replica_index",
+        )
+        .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+    let rows = statement
+        .query_map(
+            params![job_id.as_str(), i64::from(desired_replicas)],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<bool>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+    for row in rows {
+        let (
+            current_allocation_id,
+            allocation_state,
+            attempt_allocation_id,
+            current_run_id,
+            next_start_at_ms,
+            terminal_failure,
+            run_state,
+        ) = row.map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        if current_allocation_id.is_none() || allocation_state.as_deref() != Some("assigned") {
+            continue;
+        }
+        if terminal_failure == Some(true) {
+            return Ok(Some(DeploymentPendingReason::ServiceRestartBudgetExhausted));
+        }
+        if current_run_id.is_some() {
+            if attempt_allocation_id != current_allocation_id {
+                return Ok(Some(DeploymentPendingReason::ServiceAttemptUnresolved));
+            }
+            let reason = match run_state.as_deref() {
+                Some("running") => continue,
+                Some("succeeded" | "failed" | "cancelled" | "timed_out" | "abandoned") => {
+                    DeploymentPendingReason::ServiceRestartBackoff
+                }
+                Some("requested" | "starting") => DeploymentPendingReason::ServiceStarting,
+                _ => DeploymentPendingReason::ServiceAttemptUnresolved,
+            };
+            return Ok(Some(reason));
+        }
+        if next_start_at_ms.is_some_and(|next_start| next_start > now) {
+            return Ok(Some(DeploymentPendingReason::ServiceRestartBackoff));
+        }
+        return Ok(Some(DeploymentPendingReason::ServiceStarting));
+    }
+    Ok(None)
+}
+
 #[derive(Clone, Copy, Default)]
 struct ReservedUsage {
     cpu_millis: u64,
@@ -1341,14 +1438,22 @@ fn place_service_slots(
         }
 
         if needs_replacement {
-            if let Some(record) = allocation.as_mut()
-                && record.allocation.state() == AllocationState::Pending
-            {
-                record
-                    .allocation
-                    .release()
-                    .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
-                persist_allocation(transaction, record)?;
+            if let Some(record) = allocation.as_mut() {
+                let state = record.allocation.state();
+                if state != AllocationState::Released
+                    && (state == AllocationState::Pending
+                        || !service_allocation_has_current_run(
+                            transaction,
+                            &instance_id,
+                            record.allocation.id(),
+                        )?)
+                {
+                    record
+                        .allocation
+                        .release()
+                        .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+                    persist_allocation(transaction, record)?;
+                }
             }
             let pending =
                 new_pending_allocation(transaction, revision, &instance_id, replica_index)?;
@@ -1390,12 +1495,21 @@ fn place_service_slots(
         }
     }
 
-    // Slots above the desired replica count retain stable identity. Pending
-    // allocations never reached a worker and can be released immediately;
-    // assigned or uncertain reservations remain held for explicit cleanup.
+    // Slots above the desired replica count retain stable identity. Release
+    // allocations that have no run attached to them, even if they were already
+    // assigned: the scheduler may be scaled down after placement but before
+    // `begin_service_run` creates a service-attempt row. Keep a reservation
+    // only while its own allocation has an unresolved run.
     let mut statement = transaction
         .prepare(
-            "SELECT replica_index, instance_id, current_allocation_id FROM service_instances
+            "SELECT si.replica_index, si.instance_id, si.current_allocation_id,
+                    EXISTS(
+                        SELECT 1 FROM service_attempts sa
+                        WHERE sa.service_instance_id = si.instance_id
+                          AND sa.allocation_id = si.current_allocation_id
+                          AND sa.current_run_id IS NOT NULL
+                    )
+             FROM service_instances si
              WHERE job_id = ?1 AND replica_index >= ?2",
         )
         .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
@@ -1407,6 +1521,7 @@ fn place_service_slots(
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, bool>(3)?,
                 ))
             },
         )
@@ -1414,16 +1529,19 @@ fn place_service_slots(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
     drop(statement);
-    for (replica_index, _, current_allocation_id) in retired {
+    for (replica_index, _, current_allocation_id, has_current_run) in retired {
         if let Some(allocation_id) = current_allocation_id {
-            if let Some(mut record) = load_allocation(transaction, &allocation_id)?
-                && record.allocation.state() == AllocationState::Pending
-            {
-                record
-                    .allocation
-                    .release()
-                    .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
-                persist_allocation(transaction, &record)?;
+            if let Some(mut record) = load_allocation(transaction, &allocation_id)? {
+                let state = record.allocation.state();
+                if state != AllocationState::Released
+                    && (state == AllocationState::Pending || !has_current_run)
+                {
+                    record
+                        .allocation
+                        .release()
+                        .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+                    persist_allocation(transaction, &record)?;
+                }
             }
             transaction
                 .execute(
@@ -1435,12 +1553,18 @@ fn place_service_slots(
         }
     }
 
+    let runtime_pending_reason = if desired_replicas == 0 || first_pending_reason.is_some() {
+        None
+    } else {
+        service_runtime_pending_reason(transaction, job_id, desired_replicas)?
+    };
+    let pending_reason = first_pending_reason.or(runtime_pending_reason);
     let (status, pending_reason, pending_message) = if deployment.suspended() {
         (DeploymentStatus::Suspended, None, None)
-    } else if desired_replicas == 0 || first_pending_reason.is_none() {
+    } else if desired_replicas == 0 || pending_reason.is_none() {
         (DeploymentStatus::Ready, None, None)
     } else {
-        let reason = first_pending_reason.ok_or(ExecutionStoreError::StorageUnavailable)?;
+        let reason = pending_reason.ok_or(ExecutionStoreError::StorageUnavailable)?;
         (
             DeploymentStatus::Pending,
             Some(reason),
@@ -1793,6 +1917,18 @@ fn pending_message(reason: DeploymentPendingReason) -> &'static str {
         }
         DeploymentPendingReason::PlacementPending => {
             "deployment placement has not been evaluated yet"
+        }
+        DeploymentPendingReason::ServiceStarting => {
+            "one or more assigned service replicas have not reached the running state"
+        }
+        DeploymentPendingReason::ServiceRestartBackoff => {
+            "one or more service replicas are waiting for their restart backoff"
+        }
+        DeploymentPendingReason::ServiceRestartBudgetExhausted => {
+            "one or more service replicas exhausted their restart retry budget"
+        }
+        DeploymentPendingReason::ServiceAttemptUnresolved => {
+            "one or more service attempts have an unresolved worker outcome"
         }
     }
 }
@@ -3105,6 +3241,55 @@ impl JobRepository for SqliteJobRepository {
             .map_err(|_| RunStoreError::StorageUnavailable)
     }
 
+    fn reject_unaccepted_service_run(
+        &self,
+        instance_id: &ServiceInstanceId,
+        run_id: &RunId,
+        next_start_at_ms: i64,
+    ) -> Result<(), RunStoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "DELETE FROM manager_commands WHERE run_id = ?1 AND state = 'pending'",
+                [run_id.as_str()],
+            )
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let deleted = transaction
+            .execute(
+                "DELETE FROM runs WHERE run_id = ?1 AND state = 'requested'",
+                [run_id.as_str()],
+            )
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        if deleted != 1 {
+            return Err(RunStoreError::JobConflict);
+        }
+        let changed = transaction
+            .execute(
+                "UPDATE service_attempts SET current_run_id = NULL, next_start_at_ms = ?1
+                 WHERE service_instance_id = ?2 AND current_run_id = ?3",
+                params![next_start_at_ms, instance_id.as_str(), run_id.as_str()],
+            )
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        if changed != 1 {
+            return Err(RunStoreError::JobConflict);
+        }
+        transaction
+            .execute(
+                "DELETE FROM service_port_leases WHERE run_id = ?1",
+                [run_id.as_str()],
+            )
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| RunStoreError::StorageUnavailable)
+    }
+
     fn release_service_allocation(
         &self,
         allocation_id: &AllocationId,
@@ -4127,9 +4312,6 @@ impl JobService {
     /// safe: the repository reserves one run ID per service instance before
     /// dispatch, and unresolved worker outcomes are never relaunched.
     pub fn reconcile_services(&self, workers: &[Arc<dyn WorkerPort>]) -> Result<(), ManagerError> {
-        if workers.is_empty() {
-            return Ok(());
-        }
         let statuses = workers
             .iter()
             .filter_map(|worker| worker.status().ok())
@@ -4141,9 +4323,11 @@ impl JobService {
             .map_err(|_| ManagerError::StorageUnavailable)?;
         for deployment in deployments {
             let job_id = deployment.job_id().clone();
-            self.repository
-                .reconcile_deployment_placement(&job_id, &statuses)
-                .map_err(|_| ManagerError::StorageUnavailable)?;
+            if !statuses.is_empty() {
+                self.repository
+                    .reconcile_deployment_placement(&job_id, &statuses)
+                    .map_err(|_| ManagerError::StorageUnavailable)?;
+            }
             let allocations = self
                 .repository
                 .list_allocations(&job_id)
@@ -4163,14 +4347,15 @@ impl JobService {
                     let run_is_desired = slot_desired
                         && attempt.current_allocation_id.as_ref() == Some(run_allocation.id())
                         && run_allocation.job_revision_id() == deployment.revision_id();
-                    let Some(worker) = workers
+                    let worker = workers
                         .iter()
                         .find(|worker| worker.descriptor().worker_id() == current.worker_id())
-                    else {
-                        continue;
-                    };
+                        .map(AsRef::as_ref);
                     if !run_is_desired && !current.state().is_terminal() {
-                        if let Ok(stopped) = self.stop_run(current.run_id(), worker.as_ref())
+                        let Some(worker) = worker else {
+                            continue;
+                        };
+                        if let Ok(stopped) = self.stop_run(current.run_id(), worker)
                             && stopped.state().is_terminal()
                         {
                             self.repository
@@ -4188,18 +4373,29 @@ impl JobService {
                         }
                         continue;
                     }
-                    let observed = match worker.inspect(InspectRun::new(current.run_id().clone())) {
-                        Ok(Some(observed))
-                            if observed.run_id() == current.run_id()
-                                && observed.job_id() == current.job_id()
-                                && observed.worker_id() == current.worker_id()
-                                && observed.revision() > current.revision() =>
-                        {
-                            observed
+                    // A persisted terminal observation is durable evidence that
+                    // the old process has ended. Consume it without requiring
+                    // the worker to still be reachable (including after a
+                    // manager restart between recording the result and
+                    // updating the service-attempt row).
+                    let observed = if current.state().is_terminal() {
+                        current.clone()
+                    } else {
+                        let Some(worker) = worker else {
+                            continue;
+                        };
+                        match worker.inspect(InspectRun::new(current.run_id().clone())) {
+                            Ok(Some(observed))
+                                if observed.run_id() == current.run_id()
+                                    && observed.job_id() == current.job_id()
+                                    && observed.worker_id() == current.worker_id()
+                                    && observed.revision() > current.revision() =>
+                            {
+                                observed
+                            }
+                            Ok(Some(_)) => current.clone(),
+                            Ok(None) | Err(_) => continue,
                         }
-                        Ok(Some(_)) => current.clone(),
-                        Ok(None) => continue,
-                        Err(_) => continue,
                     };
                     if observed != current {
                         self.repository
@@ -4335,13 +4531,9 @@ impl JobService {
                     }
                     Err(WorkerPortError::CapacityReached) => {
                         self.repository
-                            .delete_unaccepted_run(admission.spec.id())
-                            .map_err(map_run_error)?;
-                        self.repository
-                            .finish_service_attempt(
+                            .reject_unaccepted_service_run(
                                 &attempt.service_instance_id,
                                 admission.spec.id(),
-                                attempt.restart_count,
                                 now_ms()
                                     .map_err(|_| ManagerError::StorageUnavailable)?
                                     .saturating_add(
@@ -4350,12 +4542,18 @@ impl JobService {
                                         ))
                                         .unwrap_or(i64::MAX),
                                     ),
-                                false,
                             )
                             .map_err(map_run_error)?;
                     }
                     _ => {}
                 }
+            }
+            // Refresh the durable deployment condition after dispatch and
+            // observation reconciliation for this pass.
+            if !statuses.is_empty() {
+                self.repository
+                    .reconcile_deployment_placement(&job_id, &statuses)
+                    .map_err(|_| ManagerError::StorageUnavailable)?;
             }
         }
         Ok(())

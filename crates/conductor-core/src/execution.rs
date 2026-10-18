@@ -624,6 +624,10 @@ pub enum DeploymentPendingReason {
     RequiredProtectionUnavailable,
     SharedHostCapacityExhausted,
     PlacementPending,
+    ServiceStarting,
+    ServiceRestartBackoff,
+    ServiceRestartBudgetExhausted,
+    ServiceAttemptUnresolved,
 }
 
 /// Mutable service intent. Revision contents remain immutable; scaling and
