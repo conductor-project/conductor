@@ -556,6 +556,110 @@ fn worker_diagnostics_report_capacity_identity_and_restart_incarnation() {
 }
 
 #[test]
+fn actual_binary_drains_worker_runs_with_deadline_and_allows_reuse_after_clear() {
+    let path = TempDir::new("worker-drain");
+    let (mut child, address) = start_with_capacity(&path, "all", None, 1);
+    let job = job_json("drain-process", &["/bin/sh", "-c", "exec /bin/sleep 60"]);
+    assert_eq!(
+        http(address, "POST", "/v1/jobs", Some("application/json"), &job).0,
+        201
+    );
+    let (status, accepted) = http(address, "POST", "/v1/jobs/drain-process/runs", None, &[]);
+    assert_eq!(status, 202, "{accepted}");
+    let run_id = serde_json::from_str::<serde_json::Value>(&accepted).unwrap()["runId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (status, body) = http(
+        address,
+        "POST",
+        "/v1/workers/test-worker/drain",
+        Some("application/json"),
+        br#"{"gracePeriodSeconds":1}"#,
+    );
+    assert_eq!(status, 202, "{body}");
+    let draining: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(draining["state"], "draining");
+    assert_eq!(draining["activeRuns"], 1);
+    assert_eq!(
+        http(address, "POST", "/v1/jobs/drain-process/runs", None, &[]).0,
+        503,
+        "new work is rejected while the manager-owned drain is active"
+    );
+
+    wait_for_run_state(address, &run_id, &["cancelled"], Duration::from_secs(5));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let completed = loop {
+        let (status, body) = http(address, "GET", "/v1/workers/test-worker/drain", None, &[]);
+        assert_eq!(status, 200, "{body}");
+        let progress: serde_json::Value = serde_json::from_str(&body).unwrap();
+        if progress["state"] == "completed" {
+            break progress;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker drain did not complete: {progress}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(completed["activeRuns"], 0);
+    let (status, worker) = http(address, "GET", "/v1/workers/test-worker", None, &[]);
+    assert_eq!(status, 200, "{worker}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&worker).unwrap()["draining"],
+        true
+    );
+
+    assert_eq!(
+        http(
+            address,
+            "DELETE",
+            "/v1/workers/test-worker/drain",
+            None,
+            &[]
+        )
+        .0,
+        204
+    );
+    let (status, worker) = http(address, "GET", "/v1/workers/test-worker", None, &[]);
+    assert_eq!(status, 200, "{worker}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&worker).unwrap()["draining"],
+        false
+    );
+
+    let (status, accepted) = http(address, "POST", "/v1/jobs/drain-process/runs", None, &[]);
+    assert_eq!(
+        status, 202,
+        "completed worker can be reused after clearing drain"
+    );
+    let resumed_run_id = serde_json::from_str::<serde_json::Value>(&accepted).unwrap()["runId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        http(
+            address,
+            "POST",
+            &format!("/v1/runs/{resumed_run_id}/stop"),
+            None,
+            &[]
+        )
+        .0,
+        202
+    );
+    wait_for_run_state(
+        address,
+        &resumed_run_id,
+        &["cancelled"],
+        Duration::from_secs(3),
+    );
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
+}
+
+#[test]
 fn request_header_and_processing_time_bounds_are_enforced() {
     let path = TempDir::new("request-bounds");
     let config = write_config(&path, "all", "127.0.0.1:0", ",\"request_timeout_ms\":100");

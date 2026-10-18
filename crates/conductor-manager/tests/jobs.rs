@@ -987,6 +987,263 @@ fn schema_nine_migration_backfills_indexed_service_owners() {
 }
 
 #[test]
+fn worker_drain_intent_persists_and_completed_workers_stay_out_of_placement() {
+    let directory = TempDir::new();
+    let worker_id = WorkerId::new("worker-drain").unwrap();
+    let store = SqliteJobRepository::open(directory.database()).unwrap();
+    store.insert(job("drain-admission")).unwrap();
+    let first = store.request_worker_drain(&worker_id, 30_000).unwrap();
+    assert_eq!(
+        store.create_run_for_worker(
+            &JobId::new("drain-admission").unwrap(),
+            &worker_id,
+            0,
+            4,
+            None,
+        ),
+        Err(RunStoreError::WorkerDraining),
+        "the storage transaction must reject a start after drain intent commits"
+    );
+    assert_eq!(
+        store.request_worker_drain(&worker_id, 1_000).unwrap(),
+        first,
+        "repeated drain requests must preserve the original deadline"
+    );
+    assert!(!store.cancel_worker_drain(&worker_id).unwrap());
+    drop(store);
+
+    let manager = service(&directory);
+    let worker_status = scheduling_worker(
+        "worker-drain",
+        "host-drain",
+        1_000,
+        1_000_000,
+        1_000,
+        1_000_000,
+        BTreeMap::new(),
+        true,
+    );
+    let worker = CapacityRejectingWorker {
+        worker_id: worker_id.clone(),
+        status: worker_status.clone(),
+    };
+    let drain = manager
+        .worker_drain_status(&worker_id)
+        .unwrap()
+        .expect("drain intent survives manager restart");
+    assert_eq!(drain.state, "completed");
+    let effective = manager.worker_status(&worker).unwrap();
+    assert!(effective.draining());
+    assert!(!effective.available());
+    drop(manager);
+
+    let reopened = service(&directory);
+    assert!(reopened.worker_status(&worker).unwrap().draining());
+    let status = reopened.worker_drain_status(&worker_id).unwrap().unwrap();
+    assert_eq!(status.active_runs, 0);
+    assert_eq!(status.state, "completed");
+    assert!(reopened.cancel_worker_drain(&worker_id).unwrap());
+    assert!(!reopened.worker_status(&worker).unwrap().draining());
+}
+
+#[test]
+fn service_drain_withdraws_catalog_and_waits_for_replacement_capacity() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let revision = manager
+        .create_revision(&service_revision_with_ports("drain"), "drain-revision")
+        .unwrap();
+    let source_id = WorkerId::new("worker-drain-source").unwrap();
+    let source_network = WorkerServiceNetwork::new(
+        WorkerId::new("host-drain-source").unwrap(),
+        31_000,
+        31_000,
+        "192.0.2.21",
+    )
+    .unwrap();
+    let source_status = scheduling_worker(
+        "worker-drain-source",
+        "host-drain-source",
+        1_000,
+        1_000_000_000,
+        1_000,
+        1_000_000_000,
+        BTreeMap::new(),
+        true,
+    )
+    .with_service_network(source_network)
+    .unwrap();
+    let source: Arc<dyn WorkerPort> = Arc::new(ServiceRunner {
+        worker_id: source_id.clone(),
+        status: source_status.clone(),
+        starts: AtomicUsize::new(0),
+        disconnected: AtomicBool::new(false),
+        runs: Mutex::new(BTreeMap::new()),
+        stale_inspection: Mutex::new(None),
+    });
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &deployment_request(1),
+            "drain-deploy",
+            std::slice::from_ref(&source_status),
+        )
+        .unwrap();
+    manager
+        .reconcile_services(std::slice::from_ref(&source))
+        .unwrap();
+    let identity = match revision.workload() {
+        conductor_core::Workload::Service { identity, .. } => identity,
+        _ => unreachable!("service revision"),
+    };
+    manager.request_worker_drain(&source_id, 30_000).unwrap();
+    let withdrawn_status = manager.worker_status(source.as_ref()).unwrap();
+    assert!(withdrawn_status.draining());
+    let withdrawn = manager
+        .list_service_catalog(identity, &[withdrawn_status])
+        .unwrap();
+    assert_eq!(withdrawn.len(), 1);
+    assert!(withdrawn[0].worker_draining);
+    assert!(!withdrawn[0].eligible);
+
+    manager
+        .reconcile_services(std::slice::from_ref(&source))
+        .unwrap();
+    let blocked = manager.worker_drain_status(&source_id).unwrap().unwrap();
+    assert_eq!(blocked.state, "blocked");
+    assert_eq!(blocked.blocked_reason, Some("replacement_capacity"));
+    assert_eq!(
+        blocked.active_runs, 1,
+        "keep the source run alive without capacity"
+    );
+
+    let destination_id = WorkerId::new("worker-drain-destination").unwrap();
+    let destination_network = WorkerServiceNetwork::new(
+        WorkerId::new("host-drain-destination").unwrap(),
+        32_000,
+        32_000,
+        "192.0.2.22",
+    )
+    .unwrap();
+    let destination_status = scheduling_worker(
+        "worker-drain-destination",
+        "host-drain-destination",
+        1_000,
+        1_000_000_000,
+        1_000,
+        1_000_000_000,
+        BTreeMap::new(),
+        true,
+    )
+    .with_service_network(destination_network)
+    .unwrap();
+    let destination: Arc<dyn WorkerPort> = Arc::new(ServiceRunner {
+        worker_id: destination_id.clone(),
+        status: destination_status.clone(),
+        starts: AtomicUsize::new(0),
+        disconnected: AtomicBool::new(false),
+        runs: Mutex::new(BTreeMap::new()),
+        stale_inspection: Mutex::new(None),
+    });
+    let workers = [Arc::clone(&source), Arc::clone(&destination)];
+    manager.reconcile_services(&workers).unwrap();
+    manager.reconcile_services(&workers).unwrap();
+    let attempt = manager
+        .list_service_attempts(revision.id().job_id())
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(attempt.current_run.unwrap().worker_id(), &destination_id);
+    assert_eq!(
+        manager
+            .worker_drain_status(&source_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        "completed"
+    );
+    let statuses = [
+        manager.worker_status(source.as_ref()).unwrap(),
+        manager.worker_status(destination.as_ref()).unwrap(),
+    ];
+    let endpoints = manager.list_service_catalog(identity, &statuses).unwrap();
+    assert!(
+        endpoints
+            .iter()
+            .all(|endpoint| endpoint.worker_id == destination_id)
+    );
+}
+
+#[test]
+fn drain_deadline_stops_remaining_one_shot_runs_and_completes() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let spec = job("drain-one-shot");
+    let job_id = spec.id().clone();
+    manager.register(spec).unwrap();
+    let worker_id = WorkerId::new("worker-drain-run").unwrap();
+    let worker_status = scheduling_worker(
+        "worker-drain-run",
+        "host-drain-run",
+        1_000,
+        1_000_000,
+        1_000,
+        1_000_000,
+        BTreeMap::new(),
+        true,
+    );
+    let worker: Arc<dyn WorkerPort> = Arc::new(ServiceRunner {
+        worker_id: worker_id.clone(),
+        status: worker_status,
+        starts: AtomicUsize::new(0),
+        disconnected: AtomicBool::new(false),
+        runs: Mutex::new(BTreeMap::new()),
+        stale_inspection: Mutex::new(None),
+    });
+    let run = manager
+        .start_run_with_key(&job_id, &worker_id, 4, None, worker.as_ref())
+        .unwrap();
+    let drain = manager.request_worker_drain(&worker_id, 30_000).unwrap();
+    Connection::open(directory.database())
+        .unwrap()
+        .execute(
+            "UPDATE worker_drains SET deadline_at_ms = requested_at_ms WHERE worker_id = ?1",
+            [worker_id.as_str()],
+        )
+        .unwrap();
+
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    let stopped = manager
+        .get_run(run.run_id(), worker.as_ref())
+        .unwrap()
+        .unwrap();
+    assert!(stopped.state().is_terminal());
+    let status = manager.worker_drain_status(&worker_id).unwrap().unwrap();
+    assert_eq!(status.state, "completed");
+    assert_eq!(status.active_runs, 0);
+    assert!(drain.deadline_at_ms > drain.requested_at_ms);
+}
+
+#[test]
+fn schema_ten_migration_creates_persistent_worker_drains() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    drop(manager);
+    Connection::open(directory.database())
+        .unwrap()
+        .execute_batch("DROP TABLE worker_drains; PRAGMA user_version = 10;")
+        .unwrap();
+    let migrated = SqliteJobRepository::open(directory.database()).unwrap();
+    let worker_id = WorkerId::new("worker-migrated-drain").unwrap();
+    assert!(migrated.get_worker_drain(&worker_id).unwrap().is_none());
+    migrated.request_worker_drain(&worker_id, 1_000).unwrap();
+    assert!(migrated.get_worker_drain(&worker_id).unwrap().is_some());
+}
+
+#[test]
 fn service_restart_backoff_survives_manager_restart_and_retries_after_bounded_polling() {
     let directory = TempDir::new();
     let manager = service(&directory);
@@ -2052,7 +2309,7 @@ fn schema_five_migrates_execution_tables_without_losing_jobs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert!(table_exists(&connection, "job_revisions"));
     assert!(table_exists(&connection, "job_deployments"));
     assert!(table_exists(&connection, "execution_idempotency"));
@@ -2079,7 +2336,7 @@ fn schema_six_adds_durable_scheduling_tables() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert!(table_exists(&connection, "service_instances"));
     assert!(table_exists(&connection, "allocations"));
     assert!(table_exists(&connection, "scheduling_sequence"));
@@ -2101,7 +2358,7 @@ fn schema_seven_migrates_service_attempt_state() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert!(table_exists(&connection, "service_attempts"));
 }
 
@@ -2208,7 +2465,7 @@ fn legacy_schema_migrates_transactionally_and_repeated_startup_is_stable() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read migrated schema and fixture");
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert_eq!(created_at, 1234);
     assert_eq!(deleted_at, None);
 }
@@ -2258,7 +2515,7 @@ fn schema_two_migration_adds_idempotency_and_indexed_run_order() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert!(columns.iter().any(|column| column == "idempotency_key"));
     assert!(columns.iter().any(|column| column == "request_fingerprint"));
     assert!(columns.iter().any(|column| column == "run_order"));
@@ -2323,7 +2580,7 @@ fn schema_four_identity_layout_migrates_with_command_outbox_without_losing_token
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     let outbox_exists = table_exists(&connection, "manager_commands");
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert!(outbox_exists);
 }
 
@@ -2364,7 +2621,7 @@ fn schema_four_command_layout_migrates_with_identity_tables_without_resetting_se
         )
         .unwrap();
     let identity_exists = table_exists(&connection, "worker_identities");
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
     assert_eq!(sequence, 17);
     assert!(identity_exists);
 }
@@ -2624,7 +2881,7 @@ fn version_one_manager_database_migrates_runs_and_accepts_timeout_specs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 }
 
 struct FullWorker(WorkerId);

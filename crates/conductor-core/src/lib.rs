@@ -256,6 +256,13 @@ impl WorkerStatus {
         self
     }
 
+    /// Overlay manager-owned drain intent on the worker's reported snapshot.
+    pub fn with_draining(mut self) -> Self {
+        self.draining = true;
+        self.available = false;
+        self
+    }
+
     /// Attach manager-configured, disjoint host-port allocation metadata.
     pub fn with_service_network(mut self, service_network: WorkerServiceNetwork) -> Option<Self> {
         if !service_network.is_valid() {
