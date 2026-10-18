@@ -4,7 +4,6 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::{Args, Subcommand, ValueEnum};
 use conductor_api::client::{Client as ApiClient, ClientError};
@@ -14,6 +13,8 @@ use conductor_core::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+
+use crate::run_cli::{WaitFailure, wait_for_run};
 
 #[derive(Debug, Args)]
 pub struct JobArgs {
@@ -265,21 +266,39 @@ async fn execute(
                 "reusedRegistration": reused_registration,
             });
             if wait {
-                let completed =
-                    match wait_for_run(client, run.run_id().as_str(), wait_timeout_seconds).await {
-                        Ok(completed) => completed,
-                        Err(error) => {
-                            let mut partial = error.partial.unwrap_or_else(|| json!({}));
-                            partial["jobId"] = json!(job_id.as_str());
-                            partial["runId"] = json!(run.run_id().as_str());
-                            partial["remoteRunStopped"] = json!(false);
-                            return Err(CommandError {
-                                code: error.code,
-                                message: error.message,
-                                partial: Some(partial),
-                            });
-                        }
-                    };
+                let completed = match wait_for_run(
+                    client,
+                    run.run_id().as_str(),
+                    wait_timeout_seconds,
+                )
+                .await
+                {
+                    Ok(completed) => completed,
+                    Err(failure) => {
+                        let error = match failure {
+                                WaitFailure::Timeout { run_id, state } => CommandError::new(
+                                    "wait_timeout",
+                                    format!("timed out waiting for run {run_id}; the remote run was not stopped"),
+                                )
+                                .partial(json!({"runId":run_id,"runState":state.map(conductor_core::RunState::as_str)})),
+                                WaitFailure::Unknown(run) => CommandError::new(
+                                    "run_outcome_unknown",
+                                    format!("run {} has an unknown outcome and requires operator resolution", run.run_id().as_str()),
+                                )
+                                .partial(json!({"run":run})),
+                                WaitFailure::Api(error) => api_error(error),
+                            };
+                        let mut partial = error.partial.unwrap_or_else(|| json!({}));
+                        partial["jobId"] = json!(job_id.as_str());
+                        partial["runId"] = json!(run.run_id().as_str());
+                        partial["remoteRunStopped"] = json!(false);
+                        return Err(CommandError {
+                            code: error.code,
+                            message: error.message,
+                            partial: Some(partial),
+                        });
+                    }
+                };
                 result["run"] = serde_json::to_value(&completed).map_err(|_| {
                     CommandError::new(
                         "api_decode_error",
@@ -395,55 +414,6 @@ async fn execute(
                 )
             }
         },
-    }
-}
-
-async fn wait_for_run(
-    client: &ApiClient,
-    run_id: &str,
-    timeout_seconds: u64,
-) -> Result<RunObservation, CommandError> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_seconds);
-    loop {
-        let run: RunObservation =
-            match tokio::time::timeout_at(deadline, client.get(&format!("v1/runs/{run_id}"))).await
-            {
-                Ok(Ok(run)) => run,
-                Ok(Err(error)) => return Err(api_error(error)),
-                Err(_) => {
-                    return Err(CommandError::new(
-                        "wait_timeout",
-                        format!(
-                            "timed out waiting for run {run_id}; the remote run was not stopped"
-                        ),
-                    )
-                    .partial(json!({"runId": run_id})));
-                }
-            };
-        if run.state() == conductor_core::RunState::Unknown {
-            return Err(CommandError::new(
-                "run_outcome_unknown",
-                format!("run {run_id} has an unknown outcome and requires operator resolution"),
-            )
-            .partial(json!({
-                "runId": run_id,
-                "runState": run.state().as_str(),
-            })));
-        }
-        if run.state().is_terminal() {
-            return Ok(run);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(CommandError::new(
-                "wait_timeout",
-                format!("timed out waiting for run {run_id}; the remote run was not stopped"),
-            )
-            .partial(json!({
-                "runId": run_id,
-                "runState": run.state().as_str(),
-            })));
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 

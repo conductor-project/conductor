@@ -45,23 +45,12 @@ jq -n --arg manager "$data_dir/manager" --arg worker "$data_dir/worker" \
   --config "${XDG_CONFIG_HOME:-$HOME/.config}/conductor/agent.json"
 ```
 
-Keep this terminal open. **Terminal B:** wait up to five seconds for readiness
-and confirm the daemon responds. A full worker can still be ready; run admission
+Keep this terminal open. **Terminal B:** confirm that the manager responds and
+list the configured worker. A full worker can still be ready; run admission
 checks capacity separately.
 
 ```sh
-ready=0
-deadline=$(( $(date +%s) + 5 ))
-while [ "$(date +%s)" -lt "$deadline" ]; do
-  if curl --silent --fail --max-time 1 \
-    http://127.0.0.1:8080/readyz >/dev/null; then
-    ready=1
-    break
-  fi
-  sleep 0.1
-done
-[ "$ready" -eq 1 ] || { echo "Conductor did not become ready" >&2; exit 1; }
-curl --fail --max-time 1 http://127.0.0.1:8080/healthz
+./target/debug/conductor operator workers list
 ```
 
 The config and state directories above persist across restarts. See
@@ -88,8 +77,8 @@ same accepted run is returned instead of starting another. A successful
 ```sh
 ./target/debug/conductor job list --output json
 ./target/debug/conductor job inspect mvp3-first-job --output json
-./target/debug/conductor operator --output json runs --job-id mvp3-first-job
-./target/debug/conductor operator logs RUN_ID --stream stdout --offset 0 --limit 4096
+./target/debug/conductor run list --job-id mvp3-first-job --output json
+./target/debug/conductor run logs RUN_ID --stream stdout --offset 0 --limit 4096
 ```
 
 The final command prints `hello conductor`. The executable and working
@@ -99,56 +88,42 @@ register FILE` to store a definition without starting a run; input `-` reads
 JSON from stdin. See [job and service behavior](okf/jobs-and-services.md) for
 revision, deployment, retries, IDs, and API contracts.
 
-If the daemon is unavailable, confirm Terminal A is still running and check
-`/readyz`. Registering an already-used ID returns `409`; deleted IDs stay
-reserved, so choose a new ID. If run start returns `429`, the worker has no
+If the daemon is unavailable, confirm Terminal A is still running; the
+`operator workers list` command below confirms the API is reachable. Registering
+a different definition under an existing ID returns `409`; registering the
+same definition is safe. Deleted IDs stay reserved, so choose a new ID. If run
+start returns `429`, the worker has no
 available slot; wait for a run to finish or increase configured concurrency
 within the supported limit. A `failed` run caused by a missing executable
 means that path does not exist on the executing worker. For an ambiguous client
-timeout while starting a run, retry the same request with the `Idempotency-Key`
-saved before the original request to recover its run ID; adding a key only on
-the retry cannot recover an unkeyed start. This does not make the job's
+timeout while submitting, retry the same `job submit` command with the same
+`--idempotency-key` to recover its run ID. This does not make the job's
 external side effects exactly once.
 
-## Stop a job and shut down
+## Inspect and stop a run
 
-Use a separate long-running definition to try cancellation. This creates a
-fresh ID each time, starts `/bin/sleep`, asks Conductor to stop the returned
-run, and polls for a terminal result:
-
-```sh
-JOB_ID="sleep-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
-jq -n --arg id "$JOB_ID" \
-  '{id:$id,command:["/bin/sleep","30"],cwd:"/tmp",env:{},inheritEnv:false,
-    timeoutMs:null,terminationGraceMs:1000}' > /tmp/conductor-sleep-job.json
-curl --fail-with-body --max-time 5 -H 'Content-Type: application/json' \
-  --data-binary @/tmp/conductor-sleep-job.json http://127.0.0.1:8080/v1/jobs
-IDEMPOTENCY_KEY="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
-run_response=$(curl --fail-with-body --max-time 5 -X POST \
-  -H "Idempotency-Key: $IDEMPOTENCY_KEY" \
-  "http://127.0.0.1:8080/v1/jobs/$JOB_ID/runs")
-RUN_ID=$(printf '%s' "$run_response" | jq -r .runId)
-curl --fail-with-body --max-time 5 -X POST \
-  "http://127.0.0.1:8080/v1/runs/$RUN_ID/stop"
-deadline=$(( $(date +%s) + 10 ))
-while [ "$(date +%s)" -lt "$deadline" ]; do
-  run=$(curl --fail-with-body --max-time 1 \
-    "http://127.0.0.1:8080/v1/runs/$RUN_ID")
-  state=$(printf '%s' "$run" | jq -r .state)
-  [ "$state" = cancelled ] && break
-  sleep 0.1
-done
-[ "$state" = cancelled ] || { echo "Run did not cancel within 10 seconds" >&2; exit 1; }
-printf '%s\n' "$run" | jq '{runId,state,terminationReason}'
-```
-
-Delete the definition only after its active run has finished or been resolved.
-This does not free its ID for reuse:
+The checked-in long-running example can be registered and started directly.
+Choose a fresh idempotency key when starting a new run; reuse that key only to
+recover the same run after an ambiguous response.
 
 ```sh
-curl --fail --max-time 5 -X DELETE \
-  "http://127.0.0.1:8080/v1/jobs/$JOB_ID"
+./target/debug/conductor job register examples/cli-sleep-job.json
+./target/debug/conductor run start mvp3-sleep-job \
+  --idempotency-key mvp3-sleep-run-1 --output json
+./target/debug/conductor run inspect RUN_ID --output json
+./target/debug/conductor run stop RUN_ID --output json
+./target/debug/conductor run wait RUN_ID
+./target/debug/conductor run logs RUN_ID --stream stdout --follow
+./target/debug/conductor job delete mvp3-sleep-job
 ```
+
+`run wait` returns a nonzero exit status when the run fails, is cancelled,
+times out, or has an unknown outcome. A wait timeout or Ctrl-C leaves the
+remote run alone; use `run stop` to request cancellation. Resolve an unknown
+run only after an operator determines that it should be abandoned. Job
+deletion requires no active or unresolved runs and keeps the ID reserved.
+`run logs --follow` writes exact log bytes to stdout. Add `--output json` to
+emit base64 JSON lines with offsets and truncation metadata instead.
 
 Deletion preserves an ID reservation and does not delete persistent manager or
 worker state. Do not delete the state directories as a routine cleanup step.

@@ -1,6 +1,7 @@
 mod contexts;
 mod job_cli;
 mod operator_cli;
+mod run_cli;
 mod state_lock;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -52,6 +53,8 @@ enum Commands {
     Context(contexts::ContextArgs),
     /// Register, submit, and inspect one-shot jobs and immutable revisions.
     Job(job_cli::JobArgs),
+    /// Start, inspect, wait for, stop, resolve, or read logs from runs.
+    Run(run_cli::RunArgs),
     /// Generate shell completion scripts for the implemented CLI commands.
     Completions {
         #[arg(value_enum)]
@@ -330,6 +333,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Commands::Operator(args) => return Ok(operator_cli::run(args)),
         Commands::Context(args) => return Ok(contexts::run(args)),
         Commands::Job(args) => return Ok(job_cli::run(args)),
+        Commands::Run(args) => return Ok(run_cli::run(args)),
         Commands::Completions { shell } => {
             let mut command = Cli::command();
             clap_complete::generate(shell, &mut command, "conductor", &mut std::io::stdout());

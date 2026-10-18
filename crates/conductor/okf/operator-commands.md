@@ -1,21 +1,25 @@
 ---
 type: Runbook
 title: Operate Conductor with the CLI
-description: Select named manager connection contexts, submit and manage jobs and revisions, inspect workers and services, mutate desired state safely, drain workers, page run history, and retrieve bounded logs.
+description: Select named manager connection contexts, submit and manage jobs and revisions, observe and control runs, follow bounded logs, inspect workers and services, mutate desired state safely, drain workers, and page history.
 status: stable
-source_revision: 4108a1c0f4eec94945ac91869fd9d2f73f3c9c67
+source_revision: 260db332e2ba3eedad6a59a203e769dd65a2e4be
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/operator_cli.rs
     title: Operator command parsing and requests
   - resource: ../src/job_cli.rs
     title: Job and revision commands
+  - resource: ../src/run_cli.rs
+    title: Run lifecycle and log commands
   - resource: ../src/contexts.rs
     title: Named context configuration
   - resource: ../../conductor-api/src/lib.rs
     title: Routes invoked by the CLI
   - resource: ../../conductor/tests/agent.rs
     title: Operator CLI integration coverage
+  - resource: ../../conductor/tests/run_cli.rs
+    title: Run lifecycle and log CLI integration coverage
 ---
 
 # Connect and inspect
@@ -66,9 +70,34 @@ service revision and use the deployment commands to select it; do not submit a
 service workload as a one-shot job. Job deletion keeps the ID reserved and
 fails while a run is active or unresolved.
 
+# Observe and control runs
+
+`conductor run start JOB_ID --idempotency-key KEY` starts one run of a
+registered job. Reuse the key only when retrying an ambiguous request. `run
+list` supports job and state filters with `--limit` and `--cursor`; `run
+inspect` returns one run. `run stop` explicitly requests cancellation.
+
+`run wait RUN_ID --timeout-seconds N` polls until a terminal result or the
+bounded deadline. Success exits zero; failure, cancellation, timeout, and
+unknown outcomes exit nonzero with a machine-readable error code in JSON mode.
+Timeout or Ctrl-C only ends local observation and never stops the remote run.
+An unknown outcome requires operator judgment; `run resolve RUN_ID --reason
+TEXT` records an explicit decision to abandon it. Resolution is not a retry.
+`job submit --wait` uses this same polling and terminal-state behavior.
+
+```sh
+conductor run start mvp3-first-job --idempotency-key first-job-run
+conductor run list --job-id mvp3-first-job --state failed --limit 25
+conductor run inspect RUN_ID --output json
+conductor run wait RUN_ID --timeout-seconds 30
+conductor run stop RUN_ID
+conductor run resolve RUN_ID --reason "verified the process cannot continue"
+```
+
 The default output is concise human text; use `--output json` for structured
-output. Errors are written to stderr with a nonzero exit code. Log bytes are
-written to stdout and log metadata to stderr so binary log data stays intact.
+output. Errors are written to stderr with a nonzero exit code. In human mode,
+`run logs` writes raw bytes to stdout and retention warnings to stderr; in JSON
+mode, base64 log data and its metadata are written together to stdout.
 
 ```sh
 conductor operator --server https://manager.example.net \
@@ -115,8 +144,7 @@ conductor operator --token-file ./operator-token drain start worker-east \
   --grace-period-seconds 30
 conductor operator --token-file ./operator-token drain status worker-east
 conductor operator --token-file ./operator-token drain clear worker-east
-conductor operator --token-file ./operator-token runs \
-  --job-id frontend --state unknown --limit 25
+conductor run list --job-id frontend --state unknown --limit 25
 ```
 
 Run-list pages expose `nextCursor`; pass it with `--cursor` for the next page.
@@ -124,12 +152,18 @@ Use `drain clear` only after status reports `completed`.
 
 # Retrieve logs
 
-Each `logs` request fetches one chunk between 1 and 65,536 bytes. It writes
-decoded bytes to stdout and `nextOffset`, `eof`, and `truncated` metadata to
-stderr. Request another chunk using the returned offset. Log content can
-contain workload-generated data; save it to a protected destination.
+Each `run logs` request fetches one chunk between 1 and 65,536 bytes. Human
+mode writes exact decoded bytes to stdout, including non-UTF-8 data. JSON mode
+writes one base64 JSON record per fetched chunk with its offset, `nextOffset`,
+`eof`, and `truncated` metadata. `--follow` resumes from each returned byte
+offset until the stream reaches EOF; it does not duplicate bytes. Retention
+truncation is reported on stderr in human mode and in every JSON record. Log
+content can contain workload-generated data; save it to a protected destination.
 
 ```sh
-conductor operator --token-file ./operator-token logs run-42 \
-  --stream stderr --offset 0 --limit 8192 > run-42.stderr
+conductor run logs run-42 --stream stderr --offset 0 --limit 8192 \
+  > run-42.stderr
+conductor run logs run-42 --stream stderr --offset 0 --limit 8192 --follow
+conductor run logs run-42 --stream stderr --offset 0 --limit 8192 \
+  --follow --output json
 ```
