@@ -1,0 +1,9 @@
+{
+  "id": "mvp3-first-job",
+  "command": ["/usr/bin/printf", "hello conductor\n"],
+  "cwd": "/tmp",
+  "env": {},
+  "inheritEnv": false,
+  "timeoutMs": null,
+  "terminationGraceMs": 5000
+}

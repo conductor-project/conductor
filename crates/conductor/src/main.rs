@@ -1,4 +1,5 @@
 mod contexts;
+mod job_cli;
 mod operator_cli;
 mod state_lock;
 
@@ -49,6 +50,8 @@ enum Commands {
     Operator(OperatorArgs),
     /// Create and select named operator API connection contexts.
     Context(contexts::ContextArgs),
+    /// Register, submit, and inspect one-shot jobs and immutable revisions.
+    Job(job_cli::JobArgs),
     /// Generate shell completion scripts for the implemented CLI commands.
     Completions {
         #[arg(value_enum)]
@@ -326,6 +329,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Commands::Agent { config, role } => (config, role),
         Commands::Operator(args) => return Ok(operator_cli::run(args)),
         Commands::Context(args) => return Ok(contexts::run(args)),
+        Commands::Job(args) => return Ok(job_cli::run(args)),
         Commands::Completions { shell } => {
             let mut command = Cli::command();
             clap_complete::generate(shell, &mut command, "conductor", &mut std::io::stdout());
