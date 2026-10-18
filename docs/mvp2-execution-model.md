@@ -59,7 +59,12 @@ job can run concurrently. It polls durable run observations and restarts a
 service after any terminal exit with exponential backoff starting at 250 ms,
 capped at 30 seconds, for at most five retries. After the retry budget is
 exhausted, it retains the terminal run as failure evidence and stops relaunching
-that slot. MVP1 one-shot completion never enters this restart loop.
+that slot. The deployment remains pending with an explicit exhausted-retry
+reason until the desired replica count is restored. Pending reasons also
+distinguish replicas that have not started, retries in backoff, and unresolved
+worker outcomes. A deployment is ready when each desired replica has a running
+process, or when the desired replica count is zero. MVP1 one-shot completion
+never enters this restart loop.
 
 An unresolved or disconnected service run remains attached to its durable slot;
 the manager does not relaunch it until reconciliation establishes a terminal

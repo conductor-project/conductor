@@ -122,9 +122,13 @@ scale, update, suspend, resume, and rollback requests cannot overwrite one
 another silently.
 
 `GET /v1/jobs/{jobId}/revisions/{revision}` returns immutable revision history.
-`pending` means placement has not reached the requested state; `ready` means
-the current desired state is satisfied, including a desired replica count of
-zero. Service health probes remain separate from deployment convergence.
+`pending` means the requested replica state has not converged. This includes
+unplaced replicas, assigned replicas that have not started, retries waiting for
+backoff, exhausted retry budgets, and unresolved worker outcomes. `ready` means
+every desired replica has a running process, or the desired replica count is
+zero. Service health probes remain separate from deployment convergence: an
+unready probe does not stop a running process from satisfying deployment
+convergence.
 
 `GET /v1/jobs/{jobId}/service-attempts` returns each known service slot's
 current allocation and run, retry count, next eligible start time, and
