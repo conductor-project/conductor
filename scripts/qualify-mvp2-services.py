@@ -241,14 +241,21 @@ def wait_manager(binary, config, log_path, cwd):
 
 
 def wait_workers(base, wanted, timings=None):
+    latest = {}
+
     def observed():
         status, _, body = request(base, "GET", "/v1/workers")
+        latest["status"] = status
+        latest["body"] = body
         if status != 200 or not isinstance(body, list):
             return None
         workers = {item.get("workerId"): item for item in body}
         return workers if all(name in workers and workers[name].get("fresh") for name in wanted) else None
 
-    return wait_until("both standalone workers to enroll", observed, timings=timings)
+    try:
+        return wait_until("both standalone workers to enroll", observed, timings=timings)
+    except TimeoutError as error:
+        raise TimeoutError(f"{error}; latest worker API snapshot={latest}") from error
 
 
 def binary_sha256(path):
@@ -359,6 +366,27 @@ def main():
             "worker_id": "mvp2-worker-a",
             "worker_transport_capacity": 4,
             "worker_resource_domain_id": "mvp2-host",
+            "worker_labels": {"suite": "mvp2"},
+            "worker_service_network": {
+                "network_domain_id": "mvp2-loopback",
+                "port_range_start": service_ranges[0],
+                "port_range_end": service_ranges[0] + 9,
+                "advertised_address": "127.0.0.1",
+            },
+            "additional_workers": [
+                {
+                    "worker_id": "mvp2-worker-b",
+                    "capacity": 4,
+                    "resource_domain_id": "mvp2-host",
+                    "labels": {"suite": "mvp2"},
+                    "service_network": {
+                        "network_domain_id": "mvp2-loopback",
+                        "port_range_start": service_ranges[1],
+                        "port_range_end": service_ranges[1] + 9,
+                        "advertised_address": "127.0.0.1",
+                    },
+                }
+            ],
             "host_resource_domains": [
                 {"id": "mvp2-host", "cpu_millis": 2000, "memory_bytes": 2147483648}
             ],
@@ -394,15 +422,6 @@ def main():
                         "worker_data_dir": str(worker_dir),
                         "worker_id": worker_name,
                         "worker_concurrency": 4,
-                        "worker_resource_domain_id": "mvp2-host",
-                        "host_resource_domains": manager_config["host_resource_domains"],
-                        "worker_labels": {"suite": "mvp2"},
-                        "worker_service_network": {
-                            "network_domain_id": "mvp2-loopback",
-                            "port_range_start": start,
-                            "port_range_end": start + 9,
-                            "advertised_address": "127.0.0.1",
-                        },
                         "manager_endpoint": f"https://localhost:{transport_port}/",
                         "worker_identity_file": str(worker_dir / "identity.pem"),
                         "worker_enrollment_credential_file": str(credential),
