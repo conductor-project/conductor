@@ -501,7 +501,9 @@ fn request_header_and_processing_time_bounds_are_enforced() {
 #[test]
 fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit() {
     let path = TempDir::new("blocking-storage");
-    let (mut child, address) = start_with_request_timeout(&path, 100);
+    // Keep the deadline below SQLite's 250 ms busy timeout, with headroom for
+    // the liveness probes when this test runs alongside the release suite.
+    let (mut child, address) = start_with_request_timeout(&path, 200);
     let job = job_json("stop-me", &["/bin/sh", "-c", "exec /bin/sleep 60"]);
     assert_eq!(
         http(address, "POST", "/v1/jobs", Some("application/json"), &job).0,
@@ -553,14 +555,24 @@ fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit(
             })
         })
         .collect::<Vec<_>>();
-    thread::sleep(Duration::from_millis(50));
-
+    // Observe admission saturation directly instead of guessing how long the
+    // parallel request threads need to reach the server.
+    let saturation_deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
+    loop {
+        let body = job_json("saturated", &["/usr/bin/true"]);
+        let (status, response) = http(address, "POST", "/v1/jobs", Some("application/json"), &body);
+        if status == 429 {
+            assert!(response.contains("blocking_admission_saturated"));
+            break;
+        }
+        assert_eq!(status, 408, "{response}");
+        assert!(
+            Instant::now() < saturation_deadline,
+            "blocking admission did not reach its configured capacity"
+        );
+    }
     assert_eq!(http(address, "GET", "/healthz", None, &[]).0, 200);
     assert_eq!(http(address, "GET", "/readyz", None, &[]).0, 200);
-    let body = job_json("saturated", &["/usr/bin/true"]);
-    let (status, response) = http(address, "POST", "/v1/jobs", Some("application/json"), &body);
-    assert_eq!(status, 429, "{response}");
-    assert!(response.contains("blocking_admission_saturated"));
     let (status, response) = http(
         address,
         "POST",
@@ -575,10 +587,24 @@ fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit(
 
     lock.execute_batch("ROLLBACK;")
         .expect("release manager write lock");
+    let mut timed_out_requests = 0;
+    let mut rejected_requests = 0;
     for handle in handles {
         let (status, body) = handle.join().expect("request thread");
-        assert_eq!(status, 408, "{body}");
+        match status {
+            408 => timed_out_requests += 1,
+            429 => {
+                assert!(body.contains("blocking_admission_saturated"), "{body}");
+                rejected_requests += 1;
+            }
+            _ => panic!("unexpected response while storage remained locked: {status} {body}"),
+        }
     }
+    assert!(timed_out_requests > 0, "no admitted request timed out");
+    assert!(
+        rejected_requests > 0,
+        "bounded admission did not reject excess work"
+    );
     let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     loop {
         let (status, body) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
