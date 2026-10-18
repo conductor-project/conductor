@@ -25,7 +25,7 @@ use serde::Serialize;
 
 /// Temporary limit for active jobs. Pagination is a later milestone.
 pub const MAX_JOBS: usize = 1_000;
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_PENDING_COMMANDS_PER_WORKER: usize = 32;
 const MAX_PENDING_NON_CONTROL_COMMANDS_PER_WORKER: usize = 24;
@@ -46,6 +46,7 @@ pub enum RunStoreError {
     JobNotFound,
     RunNotFound,
     JobConflict,
+    WorkerDraining,
     CapacityReached,
     IdempotencyConflict,
     PendingDeliveryLimit,
@@ -126,6 +127,29 @@ pub struct ServiceAttemptRecord {
     pub terminal_failure: bool,
     pub service_ports: Vec<AssignedServicePort>,
     pub service_ports_ready: bool,
+}
+
+/// Durable intent to stop scheduling and drain work from one worker.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerDrainRecord {
+    pub worker_id: WorkerId,
+    pub requested_at_ms: i64,
+    pub deadline_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+}
+
+/// Current worker drain progress derived from durable runs and allocations.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerDrainStatus {
+    pub worker_id: WorkerId,
+    pub state: &'static str,
+    pub requested_at_ms: i64,
+    pub deadline_at_ms: i64,
+    pub completed_at_ms: Option<i64>,
+    pub active_runs: usize,
+    pub blocked_reason: Option<&'static str>,
 }
 
 /// A manager-derived catalog registration for one persisted allocation/run port.
@@ -314,6 +338,22 @@ pub trait JobRepository: Send + Sync + CommandJournal {
         &self,
         identity: &ServiceIdentity,
     ) -> Result<bool, ExecutionStoreError>;
+    fn request_worker_drain(
+        &self,
+        worker_id: &WorkerId,
+        grace_period_ms: i64,
+    ) -> Result<WorkerDrainRecord, ExecutionStoreError>;
+    fn get_worker_drain(
+        &self,
+        worker_id: &WorkerId,
+    ) -> Result<Option<WorkerDrainRecord>, ExecutionStoreError>;
+    fn list_worker_drains(&self) -> Result<Vec<WorkerDrainRecord>, ExecutionStoreError>;
+    fn complete_worker_drain(
+        &self,
+        worker_id: &WorkerId,
+        completed_at_ms: i64,
+    ) -> Result<(), ExecutionStoreError>;
+    fn cancel_worker_drain(&self, worker_id: &WorkerId) -> Result<bool, ExecutionStoreError>;
     fn begin_service_run(
         &self,
         job_id: &JobId,
@@ -814,7 +854,22 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
         connection
             .prepare("SELECT namespace, service_name, job_id, revision FROM service_catalog_owners LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare("SELECT worker_id, requested_at_ms, deadline_at_ms, completed_at_ms FROM worker_drains LIMIT 0")
+            .map_err(MigrationError::Sqlite)?;
         return Ok(());
+    }
+
+    if version == 10 {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(MigrationError::Sqlite)?;
+        create_worker_drain_schema(&transaction).map_err(MigrationError::Sqlite)?;
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(MigrationError::Sqlite)?;
+        transaction.commit().map_err(MigrationError::Sqlite)?;
+        return migrate(connection);
     }
 
     if version == 9 {
@@ -824,7 +879,7 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
         create_service_catalog_owner_schema(&transaction).map_err(MigrationError::Sqlite)?;
         backfill_service_catalog_owners(&transaction)?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 10)
             .map_err(MigrationError::Sqlite)?;
         transaction.commit().map_err(MigrationError::Sqlite)?;
         return migrate(connection);
@@ -1045,6 +1100,7 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
     create_service_attempt_schema(&transaction).map_err(MigrationError::Sqlite)?;
     create_service_port_schema(&transaction).map_err(MigrationError::Sqlite)?;
     create_service_catalog_owner_schema(&transaction).map_err(MigrationError::Sqlite)?;
+    create_worker_drain_schema(&transaction).map_err(MigrationError::Sqlite)?;
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(MigrationError::Sqlite)?;
@@ -1266,6 +1322,43 @@ fn create_service_catalog_owner_schema(
          CREATE UNIQUE INDEX IF NOT EXISTS service_catalog_owner_by_identity
              ON service_catalog_owners(namespace, service_name);",
     )
+}
+
+fn create_worker_drain_schema(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS worker_drains (
+             worker_id TEXT PRIMARY KEY NOT NULL,
+             requested_at_ms INTEGER NOT NULL CHECK (requested_at_ms >= 0),
+             deadline_at_ms INTEGER NOT NULL CHECK (deadline_at_ms >= requested_at_ms),
+             completed_at_ms INTEGER CHECK (completed_at_ms IS NULL OR completed_at_ms >= requested_at_ms)
+         );",
+    )
+}
+
+fn worker_drain_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerDrainRecord> {
+    let raw_worker_id: String = row.get(0)?;
+    let worker_id = WorkerId::new(raw_worker_id).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    Ok(WorkerDrainRecord {
+        worker_id,
+        requested_at_ms: row.get(1)?,
+        deadline_at_ms: row.get(2)?,
+        completed_at_ms: row.get(3)?,
+    })
+}
+
+fn load_worker_drain(
+    connection: &Connection,
+    worker_id: &WorkerId,
+) -> Result<Option<WorkerDrainRecord>, ExecutionStoreError> {
+    connection
+        .query_row(
+            "SELECT worker_id, requested_at_ms, deadline_at_ms, completed_at_ms
+             FROM worker_drains WHERE worker_id = ?1",
+            [worker_id.as_str()],
+            worker_drain_from_row,
+        )
+        .optional()
+        .map_err(|_| ExecutionStoreError::StorageUnavailable)
 }
 
 fn backfill_service_catalog_owners(
@@ -1605,10 +1698,11 @@ fn place_service_slots(
         if let Some(record) = allocation.as_mut()
             && record.allocation.state() == AllocationState::Assigned
         {
-            let worker_is_fresh = record
+            let assigned_worker = record
                 .allocation
                 .assigned_worker_id()
-                .and_then(|id| workers.iter().find(|worker| worker.worker_id() == id))
+                .and_then(|id| workers.iter().find(|worker| worker.worker_id() == id));
+            let worker_is_fresh = assigned_worker
                 .is_some_and(|worker| worker.is_valid() && worker.fresh() && !worker.degraded());
             if !worker_is_fresh {
                 record
@@ -1616,6 +1710,12 @@ fn place_service_slots(
                     .mark_uncertain()
                     .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
                 persist_allocation(transaction, record)?;
+                needs_replacement = true;
+            } else if assigned_worker.is_some_and(WorkerStatus::draining) {
+                // A draining worker is still known to be alive, so retain the
+                // old allocation until replacement placement succeeds. The
+                // service reconciler will stop its run only after it sees an
+                // assigned replacement (or the recorded drain deadline).
                 needs_replacement = true;
             }
         }
@@ -3407,6 +3507,91 @@ impl JobRepository for SqliteJobRepository {
             .map_err(|_| ExecutionStoreError::StorageUnavailable)
     }
 
+    fn request_worker_drain(
+        &self,
+        worker_id: &WorkerId,
+        grace_period_ms: i64,
+    ) -> Result<WorkerDrainRecord, ExecutionStoreError> {
+        let requested_at_ms = now_ms().map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let deadline_at_ms = requested_at_ms.saturating_add(grace_period_ms);
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO worker_drains
+                 (worker_id, requested_at_ms, deadline_at_ms, completed_at_ms)
+                 VALUES (?1, ?2, ?3, NULL)",
+                params![worker_id.as_str(), requested_at_ms, deadline_at_ms],
+            )
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let record = load_worker_drain(&transaction, worker_id)?
+            .ok_or(ExecutionStoreError::StorageUnavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        Ok(record)
+    }
+
+    fn get_worker_drain(
+        &self,
+        worker_id: &WorkerId,
+    ) -> Result<Option<WorkerDrainRecord>, ExecutionStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        load_worker_drain(&connection, worker_id)
+    }
+
+    fn list_worker_drains(&self) -> Result<Vec<WorkerDrainRecord>, ExecutionStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let mut statement = connection
+            .prepare("SELECT worker_id, requested_at_ms, deadline_at_ms, completed_at_ms FROM worker_drains ORDER BY requested_at_ms, worker_id")
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let rows = statement
+            .query_map([], worker_drain_from_row)
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        rows.map(|row| row.map_err(|_| ExecutionStoreError::StorageUnavailable))
+            .collect()
+    }
+
+    fn complete_worker_drain(
+        &self,
+        worker_id: &WorkerId,
+        completed_at_ms: i64,
+    ) -> Result<(), ExecutionStoreError> {
+        self.connection
+            .lock()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?
+            .execute(
+                "UPDATE worker_drains SET completed_at_ms = COALESCE(completed_at_ms, ?2)
+                 WHERE worker_id = ?1",
+                params![worker_id.as_str(), completed_at_ms],
+            )
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        Ok(())
+    }
+
+    fn cancel_worker_drain(&self, worker_id: &WorkerId) -> Result<bool, ExecutionStoreError> {
+        self.connection
+            .lock()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?
+            .execute(
+                "DELETE FROM worker_drains WHERE worker_id = ?1 AND completed_at_ms IS NOT NULL",
+                [worker_id.as_str()],
+            )
+            .map(|changed| changed != 0)
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)
+    }
+
     fn begin_service_run(
         &self,
         job_id: &JobId,
@@ -3423,6 +3608,16 @@ impl JobRepository for SqliteJobRepository {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let worker_draining: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM worker_drains WHERE worker_id = ?1)",
+                [worker_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        if worker_draining {
+            return Err(RunStoreError::WorkerDraining);
+        }
         let row = transaction
             .query_row(
                 "SELECT si.instance_id, a.allocation_json, d.deployment_json
@@ -3817,6 +4012,16 @@ impl JobRepository for SqliteJobRepository {
                     command,
                 });
             }
+        }
+        let worker_draining: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM worker_drains WHERE worker_id = ?1)",
+                [worker_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        if worker_draining {
+            return Err(RunStoreError::WorkerDraining);
         }
         let job_json = transaction
             .query_row(
@@ -4612,6 +4817,7 @@ pub enum ManagerError {
     RunNotFound,
     WorkerUnavailable,
     WorkerDraining,
+    InvalidDrainRequest,
     ResolutionConflict,
     LogsNotFound,
     LogsPruned,
@@ -4654,10 +4860,138 @@ impl JobService {
             .status()
             .map_err(|_| ManagerError::WorkerUnavailable)?;
         if status.is_valid() {
-            Ok(status)
+            let worker_id = status.worker_id().clone();
+            let manager_drain = self
+                .repository
+                .get_worker_drain(&worker_id)
+                .map_err(|_| ManagerError::StorageUnavailable)?
+                .is_some();
+            Ok(if manager_drain {
+                status.with_draining()
+            } else {
+                status
+            })
         } else {
             Err(ManagerError::WorkerUnavailable)
         }
+    }
+
+    pub fn request_worker_drain(
+        &self,
+        worker_id: &WorkerId,
+        grace_period_ms: i64,
+    ) -> Result<WorkerDrainStatus, ManagerError> {
+        if grace_period_ms <= 0 {
+            return Err(ManagerError::InvalidDrainRequest);
+        }
+        self.repository
+            .request_worker_drain(worker_id, grace_period_ms)
+            .map_err(|_| ManagerError::StorageUnavailable)?;
+        self.worker_drain_status(worker_id)?
+            .ok_or(ManagerError::StorageUnavailable)
+    }
+
+    pub fn worker_drain_status(
+        &self,
+        worker_id: &WorkerId,
+    ) -> Result<Option<WorkerDrainStatus>, ManagerError> {
+        let Some(mut record) = self
+            .repository
+            .get_worker_drain(worker_id)
+            .map_err(|_| ManagerError::StorageUnavailable)?
+        else {
+            return Ok(None);
+        };
+        let active_runs = self
+            .repository
+            .list_active_runs(worker_id, MAX_WORKER_CAPACITY)
+            .map_err(map_run_error)?;
+        let mut replacement_pending = false;
+        if !active_runs.is_empty() {
+            let deployments = self
+                .repository
+                .list_active_deployments()
+                .map_err(|_| ManagerError::StorageUnavailable)?;
+            for deployment in deployments {
+                let attempts = self
+                    .repository
+                    .list_service_attempts(deployment.job_id())
+                    .map_err(|_| ManagerError::StorageUnavailable)?;
+                let allocations = self
+                    .repository
+                    .list_allocations(deployment.job_id())
+                    .map_err(|_| ManagerError::StorageUnavailable)?;
+                for attempt in attempts {
+                    let is_draining_run = attempt.current_run.as_ref().is_some_and(|run| {
+                        run.worker_id() == worker_id && !run.state().is_terminal()
+                    });
+                    let replacement_is_pending = attempt
+                        .current_allocation_id
+                        .as_ref()
+                        .and_then(|current_id| {
+                            allocations
+                                .iter()
+                                .find(|allocation| allocation.allocation().id() == current_id)
+                        })
+                        .is_some_and(|allocation| {
+                            allocation.allocation().state() == AllocationState::Pending
+                        });
+                    if is_draining_run
+                        && attempt.current_allocation_id.as_ref()
+                            != attempt
+                                .allocation
+                                .as_ref()
+                                .map(|allocation| allocation.allocation().id())
+                        && replacement_is_pending
+                    {
+                        replacement_pending = true;
+                    }
+                }
+            }
+        }
+        if active_runs.is_empty() && record.completed_at_ms.is_none() {
+            self.repository
+                .complete_worker_drain(
+                    worker_id,
+                    now_ms().map_err(|_| ManagerError::StorageUnavailable)?,
+                )
+                .map_err(|_| ManagerError::StorageUnavailable)?;
+            record = self
+                .repository
+                .get_worker_drain(worker_id)
+                .map_err(|_| ManagerError::StorageUnavailable)?
+                .ok_or(ManagerError::StorageUnavailable)?;
+        }
+        let deadline_elapsed =
+            now_ms().map_err(|_| ManagerError::StorageUnavailable)? >= record.deadline_at_ms;
+        let blocked_reason = if replacement_pending {
+            Some("replacement_capacity")
+        } else if deadline_elapsed && !active_runs.is_empty() {
+            Some("termination_pending")
+        } else {
+            None
+        };
+        Ok(Some(WorkerDrainStatus {
+            worker_id: record.worker_id,
+            state: if record.completed_at_ms.is_some() {
+                "completed"
+            } else if blocked_reason.is_some() {
+                "blocked"
+            } else {
+                "draining"
+            },
+            requested_at_ms: record.requested_at_ms,
+            deadline_at_ms: record.deadline_at_ms,
+            completed_at_ms: record.completed_at_ms,
+            active_runs: active_runs.len(),
+            blocked_reason,
+        }))
+    }
+
+    pub fn cancel_worker_drain(&self, worker_id: &WorkerId) -> Result<bool, ManagerError> {
+        self.repository
+            .cancel_worker_drain(worker_id)
+            .map_err(|_| ManagerError::StorageUnavailable)
     }
 
     pub fn list_page(
@@ -4762,9 +5096,17 @@ impl JobService {
     pub fn reconcile_services(&self, workers: &[Arc<dyn WorkerPort>]) -> Result<(), ManagerError> {
         let statuses = workers
             .iter()
-            .filter_map(|worker| worker.status().ok())
+            .filter_map(|worker| self.worker_status(worker.as_ref()).ok())
             .filter(WorkerStatus::is_valid)
             .collect::<Vec<_>>();
+        let drain_records = self
+            .repository
+            .list_worker_drains()
+            .map_err(|_| ManagerError::StorageUnavailable)?
+            .into_iter()
+            .filter(|record| record.completed_at_ms.is_none())
+            .collect::<Vec<_>>();
+        let mut service_run_ids = BTreeSet::new();
         let deployments = self
             .repository
             .list_active_deployments()
@@ -4788,6 +5130,7 @@ impl JobService {
                 let slot_desired = !deployment.suspended()
                     && attempt.replica_index < deployment.desired_replicas();
                 if let Some(current) = attempt.current_run {
+                    service_run_ids.insert(current.run_id().clone());
                     let Some(run_allocation) = attempt.allocation.as_ref() else {
                         continue;
                     };
@@ -4800,6 +5143,41 @@ impl JobService {
                         .find(|worker| worker.descriptor().worker_id() == current.worker_id())
                         .map(AsRef::as_ref);
                     if !run_is_desired && !current.state().is_terminal() {
+                        let replacement_wait = if slot_desired
+                            && attempt.current_allocation_id.as_ref() != Some(run_allocation.id())
+                            && statuses.iter().any(|status| {
+                                status.worker_id() == current.worker_id() && status.draining()
+                            }) {
+                            let replacement_is_assigned = attempt
+                                .current_allocation_id
+                                .as_ref()
+                                .and_then(|allocation_id| {
+                                    allocations
+                                        .iter()
+                                        .find(|record| record.allocation().id() == allocation_id)
+                                })
+                                .is_some_and(|record| {
+                                    record.allocation().state() == AllocationState::Assigned
+                                });
+                            let manager_drain = self
+                                .repository
+                                .get_worker_drain(current.worker_id())
+                                .map_err(|_| ManagerError::StorageUnavailable)?;
+                            match manager_drain {
+                                Some(drain) if drain.completed_at_ms.is_none() => {
+                                    let deadline_elapsed = now_ms()
+                                        .map_err(|_| ManagerError::StorageUnavailable)?
+                                        >= drain.deadline_at_ms;
+                                    !replacement_is_assigned && !deadline_elapsed
+                                }
+                                _ => false,
+                            }
+                        } else {
+                            false
+                        };
+                        if replacement_wait {
+                            continue;
+                        }
                         let Some(worker) = worker else {
                             continue;
                         };
@@ -4955,6 +5333,7 @@ impl JobService {
                     Ok(None)
                     | Err(
                         RunStoreError::CapacityReached
+                        | RunStoreError::WorkerDraining
                         | RunStoreError::JobConflict
                         | RunStoreError::PendingDeliveryLimit,
                     ) => {
@@ -5004,6 +5383,46 @@ impl JobService {
                     .map_err(|_| ManagerError::StorageUnavailable)?;
             }
         }
+        for drain in drain_records {
+            let Some(worker) = workers
+                .iter()
+                .find(|worker| worker.descriptor().worker_id() == &drain.worker_id)
+            else {
+                continue;
+            };
+            let now = now_ms().map_err(|_| ManagerError::StorageUnavailable)?;
+            let active = self
+                .repository
+                .list_active_runs(&drain.worker_id, MAX_WORKER_CAPACITY)
+                .map_err(map_run_error)?;
+            if active.is_empty() {
+                self.repository
+                    .complete_worker_drain(&drain.worker_id, now)
+                    .map_err(|_| ManagerError::StorageUnavailable)?;
+                continue;
+            }
+            if now < drain.deadline_at_ms {
+                continue;
+            }
+            for run in active {
+                if service_run_ids.contains(run.run_id()) || run.state() == RunState::Unknown {
+                    continue;
+                }
+                if !run.state().is_terminal() {
+                    let _ = self.stop_run(run.run_id(), worker.as_ref());
+                }
+            }
+            if self
+                .repository
+                .list_active_runs(&drain.worker_id, MAX_WORKER_CAPACITY)
+                .map_err(map_run_error)?
+                .is_empty()
+            {
+                self.repository
+                    .complete_worker_drain(&drain.worker_id, now)
+                    .map_err(|_| ManagerError::StorageUnavailable)?;
+            }
+        }
         Ok(())
     }
 
@@ -5033,7 +5452,12 @@ impl JobService {
         if !worker.descriptor().supports_process_execution() {
             return Err(ManagerError::WorkerUnavailable);
         }
-        if worker.is_draining() {
+        let manager_draining = self
+            .repository
+            .get_worker_drain(worker_id)
+            .map_err(|_| ManagerError::StorageUnavailable)?
+            .is_some();
+        if worker.is_draining() || manager_draining {
             return Err(ManagerError::WorkerDraining);
         }
         let active = self
@@ -5500,6 +5924,7 @@ fn map_run_error(error: RunStoreError) -> ManagerError {
         RunStoreError::JobNotFound => ManagerError::JobNotFound,
         RunStoreError::RunNotFound => ManagerError::RunNotFound,
         RunStoreError::JobConflict => ManagerError::JobConflict,
+        RunStoreError::WorkerDraining => ManagerError::WorkerDraining,
         RunStoreError::CapacityReached => ManagerError::CapacityReached,
         RunStoreError::IdempotencyConflict => ManagerError::IdempotencyConflict,
         RunStoreError::PendingDeliveryLimit => ManagerError::WorkerUnavailable,

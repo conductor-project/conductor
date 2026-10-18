@@ -42,6 +42,8 @@ const MAX_PENDING_BLOCKING_OPERATIONS: usize = 64;
 const MAX_PENDING_CONTROL_OPERATIONS: usize = 8;
 const MAX_ACTIVE_SERVICE_WATCHES: usize = 16;
 const MAX_SERVICE_WATCH_SECONDS: u64 = 30;
+const DEFAULT_WORKER_DRAIN_GRACE_SECONDS: u64 = 30;
+const MAX_WORKER_DRAIN_GRACE_SECONDS: u64 = 300;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -168,6 +170,12 @@ struct ScaleDeploymentRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RollbackRequest {
     revision: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorkerDrainRequest {
+    grace_period_seconds: Option<u64>,
 }
 
 struct ApiState {
@@ -432,6 +440,12 @@ fn router_with_recovery(
         )
         .route("/v1/workers", get(list_workers))
         .route("/v1/workers/{id}", get(get_worker))
+        .route(
+            "/v1/workers/{id}/drain",
+            get(get_worker_drain)
+                .post(request_worker_drain)
+                .delete(cancel_worker_drain),
+        )
         .route("/v1/runs", get(list_runs))
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/logs", get(get_run_logs))
@@ -1373,6 +1387,143 @@ async fn get_worker(State(state): State<Arc<ApiState>>, Path(raw_id): Path<Strin
     }
 }
 
+async fn request_worker_drain(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+    payload: Result<Json<WorkerDrainRequest>, JsonRejection>,
+) -> Response {
+    let Ok(worker_id) = WorkerId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_worker_id",
+            "the worker ID is invalid",
+        );
+    };
+    if !state
+        .workers
+        .iter()
+        .any(|worker| worker.descriptor().worker_id() == &worker_id)
+    {
+        return error(
+            StatusCode::NOT_FOUND,
+            "worker_not_found",
+            "the worker does not exist",
+        );
+    }
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return json_rejection(rejection),
+    };
+    let grace_period_seconds = payload
+        .grace_period_seconds
+        .unwrap_or(DEFAULT_WORKER_DRAIN_GRACE_SECONDS);
+    if !(1..=MAX_WORKER_DRAIN_GRACE_SECONDS).contains(&grace_period_seconds) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_drain_grace_period",
+            "gracePeriodSeconds must be between 1 and 300",
+        );
+    }
+    let Ok(grace_period_ms) = i64::try_from(grace_period_seconds.saturating_mul(1_000)) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_drain_grace_period",
+            "gracePeriodSeconds must be between 1 and 300",
+        );
+    };
+    match run_blocking(&state, BlockingClass::Control, {
+        let manager = Arc::clone(&state.manager);
+        move || manager.request_worker_drain(&worker_id, grace_period_ms)
+    })
+    .await
+    {
+        Ok(Ok(status)) => (StatusCode::ACCEPTED, Json(status)).into_response(),
+        Ok(Err(error_value)) => manager_error(error_value),
+        Err(error_value) => blocking_error(error_value),
+    }
+}
+
+async fn get_worker_drain(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+) -> Response {
+    let Ok(worker_id) = WorkerId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_worker_id",
+            "the worker ID is invalid",
+        );
+    };
+    match run_blocking(&state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        move || manager.worker_drain_status(&worker_id)
+    })
+    .await
+    {
+        Ok(Ok(Some(status))) => Json(status).into_response(),
+        Ok(Ok(None)) => error(
+            StatusCode::NOT_FOUND,
+            "worker_drain_not_found",
+            "no drain has been requested for this worker",
+        ),
+        Ok(Err(error_value)) => manager_error(error_value),
+        Err(error_value) => blocking_error(error_value),
+    }
+}
+
+async fn cancel_worker_drain(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+) -> Response {
+    let Ok(worker_id) = WorkerId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_worker_id",
+            "the worker ID is invalid",
+        );
+    };
+    let status = match run_blocking(&state, BlockingClass::Control, {
+        let manager = Arc::clone(&state.manager);
+        let worker_id = worker_id.clone();
+        move || manager.worker_drain_status(&worker_id)
+    })
+    .await
+    {
+        Ok(Ok(Some(status))) => status,
+        Ok(Ok(None)) => {
+            return error(
+                StatusCode::NOT_FOUND,
+                "worker_drain_not_found",
+                "no drain has been requested for this worker",
+            );
+        }
+        Ok(Err(error_value)) => return manager_error(error_value),
+        Err(error_value) => return blocking_error(error_value),
+    };
+    if status.state != "completed" {
+        return error(
+            StatusCode::CONFLICT,
+            "worker_drain_in_progress",
+            "a worker drain can be cleared only after it completes",
+        );
+    }
+    match run_blocking(&state, BlockingClass::Control, {
+        let manager = Arc::clone(&state.manager);
+        move || manager.cancel_worker_drain(&worker_id)
+    })
+    .await
+    {
+        Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(false)) => error(
+            StatusCode::CONFLICT,
+            "worker_drain_in_progress",
+            "the worker drain is still active",
+        ),
+        Ok(Err(error_value)) => manager_error(error_value),
+        Err(error_value) => blocking_error(error_value),
+    }
+}
+
 async fn query_worker_statuses(
     state: &Arc<ApiState>,
 ) -> Result<Vec<conductor_core::WorkerStatus>, ManagerError> {
@@ -2013,6 +2164,11 @@ fn manager_error(error_value: ManagerError) -> Response {
             "worker_draining",
             "the local worker is shutting down and no longer accepts runs",
         ),
+        ManagerError::InvalidDrainRequest => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_worker_drain_request",
+            "the worker drain request is invalid",
+        ),
         ManagerError::StorageUnavailable => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
@@ -2467,6 +2623,7 @@ mod access_tests {
             ("POST", "/v1/jobs"),
             ("DELETE", "/v1/jobs/job-a"),
             ("GET", "/v1/workers"),
+            ("POST", "/v1/workers/worker-a/drain"),
         ] {
             let response = router
                 .clone()
@@ -2500,6 +2657,102 @@ mod access_tests {
             .await
             .expect("authorized diagnostics response");
         assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn worker_drain_is_authenticated_persistent_and_reusable_after_completion() {
+        let database = TestDatabase::new();
+        let router = router(&database);
+        let accepted = router
+            .clone()
+            .oneshot(authorized_request(
+                "POST",
+                "/v1/workers/worker-a/drain",
+                r#"{"gracePeriodSeconds":30}"#,
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("worker drain request response");
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+        let payload = axum::body::to_bytes(accepted.into_body(), 65_536)
+            .await
+            .unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(status["state"], "completed");
+        assert_eq!(status["activeRuns"], 0);
+
+        let worker = router
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/v1/workers/worker-a",
+                Some(std::str::from_utf8(TOKEN).unwrap()),
+            ))
+            .await
+            .expect("worker status response");
+        assert_eq!(worker.status(), StatusCode::OK);
+        let payload = axum::body::to_bytes(worker.into_body(), 65_536)
+            .await
+            .unwrap();
+        let worker: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(worker["draining"], true);
+        assert_eq!(worker["available"], false);
+
+        let cleared = router
+            .clone()
+            .oneshot(authorized_request(
+                "DELETE",
+                "/v1/workers/worker-a/drain",
+                "",
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("completed drain can be cleared");
+        assert_eq!(cleared.status(), StatusCode::NO_CONTENT);
+        let resumed = router
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/v1/workers/worker-a",
+                Some(std::str::from_utf8(TOKEN).unwrap()),
+            ))
+            .await
+            .expect("worker status after clearing drain");
+        let payload = axum::body::to_bytes(resumed.into_body(), 65_536)
+            .await
+            .unwrap();
+        let resumed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(resumed["draining"], false);
+
+        let invalid = router
+            .clone()
+            .oneshot(authorized_request(
+                "POST",
+                "/v1/workers/worker-a/drain",
+                r#"{"gracePeriodSeconds":301,"unexpected":true}"#,
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("invalid drain request response");
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let out_of_range = router
+            .oneshot(authorized_request(
+                "POST",
+                "/v1/workers/worker-a/drain",
+                r#"{"gracePeriodSeconds":301}"#,
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("out-of-range drain period response");
+        assert_eq!(out_of_range.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
