@@ -9,10 +9,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use conductor_core::{
     AllocationState, Architecture, CommandEnvelope, CommandId, DeploymentMutation,
     DeploymentPendingReason, DeploymentStatus, EnforcementCapability, ExecutionBackend, InspectRun,
-    JobId, JobRevisionDraft, JobSpec, LogStream, OperatingSystem, ReadRunLogs, ResolveRun,
-    RunFailureReason, RunId, RunLogChunk, RunLogStatus, RunObservation, RunState, StartRun,
-    StopRun, WorkerCapabilities, WorkerCommand, WorkerDescriptor, WorkerId, WorkerInventory,
-    WorkerResourceCapacity, WorkerServiceNetwork, WorkerStatus,
+    JobId, JobRevisionDraft, JobSpec, LogStream, OperatingSystem, ReadRunLogs, ReadinessState,
+    ResolveRun, RunFailureReason, RunId, RunLogChunk, RunLogStatus, RunObservation, RunState,
+    StartRun, StopRun, WorkerCapabilities, WorkerCommand, WorkerDescriptor, WorkerId,
+    WorkerInventory, WorkerResourceCapacity, WorkerServiceNetwork, WorkerStatus,
 };
 use conductor_manager::{
     CommandJournal, CommandStoreError, ExecutionStoreError, JobRepository, JobService, MAX_JOBS,
@@ -223,6 +223,20 @@ fn service_revision_with_ports(command_arg: &str) -> JobRevisionDraft {
     serde_json::from_str(&json).expect("valid service revision with named port")
 }
 
+fn service_revision_with_probe(command_arg: &str) -> JobRevisionDraft {
+    let mut value = serde_json::to_value(service_revision_with_ports(command_arg)).unwrap();
+    value["workload"]["readinessProbe"] = serde_json::json!({
+        "portName": "http",
+        "protocol": "tcp",
+        "intervalMs": 100,
+        "timeoutMs": 50,
+        "startupGraceMs": 0,
+        "successThreshold": 2,
+        "failureThreshold": 3
+    });
+    serde_json::from_value(value).expect("valid service readiness probe revision")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn scheduling_worker(
     worker_id: &str,
@@ -305,6 +319,7 @@ struct ServiceRunner {
     starts: AtomicUsize,
     disconnected: AtomicBool,
     runs: Mutex<BTreeMap<RunId, RunObservation>>,
+    stale_inspection: Mutex<Option<RunObservation>>,
 }
 
 impl ServiceRunner {
@@ -353,6 +368,14 @@ impl WorkerPort for ServiceRunner {
     fn inspect(&self, command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError> {
         if self.disconnected.load(Ordering::Acquire) {
             return Err(WorkerPortError::Unavailable);
+        }
+        if let Some(stale) = self
+            .stale_inspection
+            .lock()
+            .map_err(|_| WorkerPortError::Unavailable)?
+            .as_ref()
+        {
+            return Ok(Some(stale.clone()));
         }
         Ok(self
             .runs
@@ -431,6 +454,7 @@ fn service_reconciliation_starts_each_replica_once_and_keeps_one_shot_semantics(
         starts: AtomicUsize::new(0),
         disconnected: AtomicBool::new(false),
         runs: Mutex::new(BTreeMap::new()),
+        stale_inspection: Mutex::new(None),
     });
 
     manager
@@ -564,6 +588,7 @@ fn named_service_ports_are_leased_uniquely_persisted_and_not_ready_without_healt
         starts: AtomicUsize::new(0),
         disconnected: AtomicBool::new(false),
         runs: Mutex::new(BTreeMap::new()),
+        stale_inspection: Mutex::new(None),
     });
 
     manager
@@ -626,6 +651,107 @@ fn named_service_ports_are_leased_uniquely_persisted_and_not_ready_without_healt
 }
 
 #[test]
+fn manager_publishes_service_ports_ready_only_after_a_newer_probe_observation() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let revision = manager
+        .create_revision(&service_revision_with_probe("readiness"), "probe-revision")
+        .unwrap();
+    let worker_id = WorkerId::new("worker-probe").unwrap();
+    let service_network = WorkerServiceNetwork::new(
+        WorkerId::new("host-probe").unwrap(),
+        31_000,
+        31_000,
+        "192.0.2.12",
+    )
+    .unwrap();
+    let worker_status = scheduling_worker(
+        "worker-probe",
+        "host-probe",
+        2_000,
+        2_147_483_648,
+        2_000,
+        2_147_483_648,
+        BTreeMap::new(),
+        true,
+    )
+    .with_service_network(service_network)
+    .unwrap();
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &deployment_request(1),
+            "probe-deploy",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    let worker = Arc::new(ServiceRunner {
+        worker_id,
+        status: worker_status,
+        starts: AtomicUsize::new(0),
+        disconnected: AtomicBool::new(false),
+        runs: Mutex::new(BTreeMap::new()),
+        stale_inspection: Mutex::new(None),
+    });
+    let worker_port: Arc<dyn WorkerPort> = worker.clone();
+
+    manager
+        .reconcile_services(std::slice::from_ref(&worker_port))
+        .unwrap();
+    let attempt = manager
+        .list_service_attempts(revision.id().job_id())
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(!attempt.service_ports_ready);
+    let run_id = attempt.current_run_id.unwrap();
+    let current_run = attempt.current_run.unwrap();
+    let stale_spec = conductor_core::RunSpec::new(
+        RunId::new("old-service-attempt").unwrap(),
+        current_run.worker_id().clone(),
+        revision.definition().clone(),
+    );
+    let stale_ready = RunObservation::requested(&stale_spec, 1)
+        .next_revision(RunState::Running, Some(2), None, None, None, None)
+        .unwrap()
+        .with_readiness(ReadinessState::Ready);
+    *worker.stale_inspection.lock().unwrap() = Some(stale_ready);
+    manager
+        .reconcile_services(std::slice::from_ref(&worker_port))
+        .unwrap();
+    assert!(
+        !manager
+            .list_service_attempts(revision.id().job_id())
+            .unwrap()[0]
+            .service_ports_ready,
+        "a stale attempt observation must not publish the current endpoint"
+    );
+    *worker.stale_inspection.lock().unwrap() = None;
+    {
+        let mut runs = worker.runs.lock().unwrap();
+        let current = runs.get_mut(&run_id).unwrap();
+        let running = current
+            .next_revision(RunState::Running, Some(2), None, None, None, None)
+            .unwrap()
+            .with_readiness(ReadinessState::Starting);
+        *current = running
+            .next_readiness_revision(ReadinessState::Ready)
+            .unwrap();
+    }
+    manager
+        .reconcile_services(std::slice::from_ref(&worker_port))
+        .unwrap();
+    let attempt = manager
+        .list_service_attempts(revision.id().job_id())
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(attempt.service_ports_ready);
+    assert_eq!(attempt.current_run.unwrap().state(), RunState::Running);
+}
+
+#[test]
 fn service_restart_backoff_survives_manager_restart_and_retries_after_bounded_polling() {
     let directory = TempDir::new();
     let manager = service(&directory);
@@ -661,6 +787,7 @@ fn service_restart_backoff_survives_manager_restart_and_retries_after_bounded_po
         starts: AtomicUsize::new(0),
         disconnected: AtomicBool::new(false),
         runs: Mutex::new(BTreeMap::new()),
+        stale_inspection: Mutex::new(None),
     });
     let worker_port: Arc<dyn WorkerPort> = worker.clone();
     manager
@@ -736,6 +863,7 @@ fn unresolved_service_run_is_not_relaunched_during_worker_disconnect() {
         starts: AtomicUsize::new(0),
         disconnected: AtomicBool::new(false),
         runs: Mutex::new(BTreeMap::new()),
+        stale_inspection: Mutex::new(None),
     });
     let worker_port: Arc<dyn WorkerPort> = worker.clone();
     manager

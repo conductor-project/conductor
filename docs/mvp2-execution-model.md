@@ -67,6 +67,51 @@ outcome. This avoids duplicate processes when delivery or worker state is
 uncertain. The restart timer and budget survive manager restart. This MVP2
 policy is fixed per service and does not yet expose per-revision policy knobs.
 
+## Service readiness probes
+
+An immutable service workload may declare one optional `readinessProbe` that
+targets one of its named ports. TCP probes check connection establishment;
+HTTP probes require a successful 2xx response at the configured path. A
+service process must bind that listener on the host loopback or wildcard
+interface so its local worker can probe it. The advertised endpoint address is
+still used for clients and does not change the probe target.
+
+Probe settings include an interval (50 ms to 60 s), timeout (up to 10 s and no
+longer than the interval), startup grace period (up to 10 minutes), and
+success/failure thresholds (1 to 10 consecutive results). HTTP requests do
+not follow redirects, do not use proxy environment settings, reject declared
+response bodies larger than 8 KiB, and do not consume response bodies. Each
+service has at most one in-flight probe, so probe concurrency is bounded by
+the worker's configured execution capacity.
+
+Readiness is separate from execution and restart state. A process can remain
+`running` while its readiness is `starting` or `unready`; health failures do
+not restart it. The manager publishes service endpoints as ready only after
+the success threshold is reached, and withdraws readiness after the failure
+threshold. Stale observations are rejected by the existing run identity and
+monotonic observation revision checks. Without a configured probe, endpoint
+readiness remains false until a future readiness contract is defined.
+
+Example service workload:
+
+```json
+{
+  "kind": "service",
+  "identity": { "namespace": "default", "name": "frontend" },
+  "ports": [{ "name": "http", "protocol": "tcp" }],
+  "readinessProbe": {
+    "portName": "http",
+    "protocol": "http",
+    "path": "/ready",
+    "intervalMs": 1000,
+    "timeoutMs": 500,
+    "startupGraceMs": 5000,
+    "successThreshold": 2,
+    "failureThreshold": 3
+  }
+}
+```
+
 ## Allocation transitions
 
 | Current state | Allowed transition | Meaning |
@@ -101,10 +146,9 @@ stopped.
 ## Compatibility and scope
 
 These types define the durable identities and state vocabulary used by
-protocol, persistence, reconciliation, and scheduler work. They make no
-guarantee about health checks, port ownership, external-resource fencing, or
-manager high availability. Existing MVP1 one-shot JSON contracts and combined
-manager/worker mode remain unchanged.
+protocol, persistence, reconciliation, and scheduler work. They do not
+guarantee external-resource fencing or manager high availability. Existing
+MVP1 one-shot JSON contracts and combined manager/worker mode remain unchanged.
 
 See [MVP2 command and report semantics](mvp2-command-semantics.md) for the
 worker-incarnation, assignment-generation, command-deduplication, and report

@@ -1,16 +1,18 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io;
+use std::io::{self, Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use conductor_core::{
-    AssignedServicePort, CommandEnvelope, CommandId, JobId, JobSpec, RunFailureReason, RunId,
-    RunObservation, RunSpec, RunState, ServicePortProtocol, StartRun, WorkerCommand, WorkerId,
+    AssignedServicePort, CommandEnvelope, CommandId, JobId, JobSpec, ReadinessProbe,
+    ReadinessProbeProtocol, ReadinessState, RunFailureReason, RunId, RunObservation, RunSpec,
+    RunState, ServicePortProtocol, StartRun, StopRun, WorkerCommand, WorkerId,
 };
 use conductor_worker::{ExecutionBackend, WorkerError, WorkerService};
 use rusqlite::Connection;
@@ -143,6 +145,459 @@ fn worker_injects_assigned_service_ports_into_the_process_environment() {
         wait_for(&service, "named-port").state(),
         RunState::Succeeded
     );
+}
+
+#[test]
+fn worker_reports_bounded_tcp_readiness_without_restarting_the_process() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 1, Arc::clone(&backend));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_stop = Arc::new(AtomicBool::new(false));
+    let server_signal = Arc::clone(&server_stop);
+    let server = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        while !server_signal.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((_stream, _)) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let spec = run(
+        "tcp-readiness",
+        job("tcp-readiness", vec!["/bin/sleep".into(), "60".into()]),
+    )
+    .with_service_ports(vec![
+        AssignedServicePort::new("http", ServicePortProtocol::Tcp, port, "192.0.2.10").unwrap(),
+    ])
+    .unwrap()
+    .with_readiness_probe(
+        ReadinessProbe::configured("http", ReadinessProbeProtocol::Tcp, None, 50, 25, 250, 2, 2)
+            .unwrap(),
+    )
+    .unwrap();
+
+    let running = service.start(StartRun::new(spec)).unwrap();
+    assert_eq!(running.readiness(), Some(ReadinessState::Starting));
+    thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        service
+            .inspect(conductor_core::InspectRun::new(running.run_id().clone()))
+            .unwrap()
+            .unwrap()
+            .readiness(),
+        Some(ReadinessState::Starting),
+        "startup grace must suppress early probes"
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let ready = loop {
+        let observation = service
+            .inspect(conductor_core::InspectRun::new(running.run_id().clone()))
+            .unwrap()
+            .unwrap();
+        if observation.readiness() == Some(ReadinessState::Ready) {
+            break observation;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "TCP probe did not become ready"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(ready.state(), RunState::Running);
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
+
+    let _ = service
+        .stop(StopRun::new(running.run_id().clone()))
+        .unwrap();
+    assert_eq!(
+        wait_for(&service, "tcp-readiness").state(),
+        RunState::Cancelled
+    );
+    server_stop.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+}
+
+#[test]
+fn worker_reports_http_readiness_only_for_successful_bounded_responses() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 1, Arc::clone(&backend));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_stop = Arc::new(AtomicBool::new(false));
+    let server_signal = Arc::clone(&server_stop);
+    let server = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        while !server_signal.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0_u8; 1_024];
+                    let _ = stream.read(&mut request);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let spec = run(
+        "http-readiness",
+        job("http-readiness", vec!["/bin/sleep".into(), "60".into()]),
+    )
+    .with_service_ports(vec![
+        AssignedServicePort::new("http", ServicePortProtocol::Tcp, port, "192.0.2.10").unwrap(),
+    ])
+    .unwrap()
+    .with_readiness_probe(ReadinessProbe::http("http", "/ready").unwrap())
+    .unwrap();
+    let running = service.start(StartRun::new(spec)).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let ready = loop {
+        let observation = service
+            .inspect(conductor_core::InspectRun::new(running.run_id().clone()))
+            .unwrap()
+            .unwrap();
+        if observation.readiness() == Some(ReadinessState::Ready) {
+            break observation;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "HTTP probe did not become ready"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(ready.state(), RunState::Running);
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
+    let _ = service
+        .stop(StopRun::new(running.run_id().clone()))
+        .unwrap();
+    assert_eq!(
+        wait_for(&service, "http-readiness").state(),
+        RunState::Cancelled
+    );
+    server_stop.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+}
+
+#[test]
+fn oversized_readiness_response_marks_unready_without_restarting() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 1, Arc::clone(&backend));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server_stop = Arc::new(AtomicBool::new(false));
+    let server_signal = Arc::clone(&server_stop);
+    let server = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        while !server_signal.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0_u8; 1_024];
+                    let _ = stream.read(&mut request);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 8193\r\nConnection: close\r\n\r\n",
+                    );
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let spec = run(
+        "unready-service",
+        job("unready-service", vec!["/bin/sleep".into(), "60".into()]),
+    )
+    .with_service_ports(vec![
+        AssignedServicePort::new("http", ServicePortProtocol::Tcp, port, "192.0.2.10").unwrap(),
+    ])
+    .unwrap()
+    .with_readiness_probe(
+        ReadinessProbe::configured(
+            "http",
+            ReadinessProbeProtocol::Http,
+            Some("/ready".to_owned()),
+            50,
+            25,
+            0,
+            2,
+            2,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let running = service.start(StartRun::new(spec)).unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let unready = loop {
+        let observation = service
+            .inspect(conductor_core::InspectRun::new(running.run_id().clone()))
+            .unwrap()
+            .unwrap();
+        if observation.readiness() == Some(ReadinessState::Unready) {
+            break observation;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "failure threshold was not reached"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
+    assert_eq!(unready.state(), RunState::Running);
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
+    let _ = service
+        .stop(StopRun::new(running.run_id().clone()))
+        .unwrap();
+    assert_eq!(
+        wait_for(&service, "unready-service").state(),
+        RunState::Cancelled
+    );
+    server_stop.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+}
+
+#[test]
+fn readiness_thresholds_handle_flapping_without_restarting() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 1, Arc::clone(&backend));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let healthy = Arc::new(AtomicBool::new(true));
+    let server_healthy = Arc::clone(&healthy);
+    let server_stop = Arc::new(AtomicBool::new(false));
+    let server_signal = Arc::clone(&server_stop);
+    let requests = Arc::new(AtomicUsize::new(0));
+    let server_requests = Arc::clone(&requests);
+    let server = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        while !server_signal.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut request = [0_u8; 1_024];
+                    let _ = stream.read(&mut request);
+                    let response = if server_healthy.load(Ordering::SeqCst) {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .as_slice()
+                    } else {
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
+                    };
+                    let _ = stream.write_all(response);
+                    server_requests.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let spec = run(
+        "flapping-service",
+        job("flapping-service", vec!["/bin/sleep".into(), "60".into()]),
+    )
+    .with_service_ports(vec![
+        AssignedServicePort::new("http", ServicePortProtocol::Tcp, port, "192.0.2.10").unwrap(),
+    ])
+    .unwrap()
+    .with_readiness_probe(
+        ReadinessProbe::configured(
+            "http",
+            ReadinessProbeProtocol::Http,
+            Some("/ready".to_owned()),
+            50,
+            25,
+            0,
+            2,
+            2,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let running = service.start(StartRun::new(spec)).unwrap();
+    wait_for_readiness(
+        &service,
+        &running,
+        ReadinessState::Ready,
+        Duration::from_secs(3),
+    );
+
+    let before_failures = requests.load(Ordering::SeqCst);
+    healthy.store(false, Ordering::SeqCst);
+    wait_for_request_count(&requests, before_failures + 1);
+    assert_eq!(
+        current_readiness(&service, &running),
+        Some(ReadinessState::Ready),
+        "one failure below threshold must not withdraw readiness"
+    );
+    wait_for_request_count(&requests, before_failures + 2);
+    wait_for_readiness(
+        &service,
+        &running,
+        ReadinessState::Unready,
+        Duration::from_secs(3),
+    );
+
+    let before_successes = requests.load(Ordering::SeqCst);
+    healthy.store(true, Ordering::SeqCst);
+    wait_for_request_count(&requests, before_successes + 1);
+    assert_eq!(
+        current_readiness(&service, &running),
+        Some(ReadinessState::Unready),
+        "one success below threshold must not restore readiness"
+    );
+    wait_for_request_count(&requests, before_successes + 2);
+    wait_for_readiness(
+        &service,
+        &running,
+        ReadinessState::Ready,
+        Duration::from_secs(3),
+    );
+    assert_eq!(current_state(&service, &running), RunState::Running);
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
+
+    let _ = service
+        .stop(StopRun::new(running.run_id().clone()))
+        .unwrap();
+    assert_eq!(
+        wait_for(&service, "flapping-service").state(),
+        RunState::Cancelled
+    );
+    server_stop.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+}
+
+#[test]
+fn readiness_http_timeout_is_bounded_and_marks_the_running_process_unready() {
+    let directory = TempDir::new();
+    let backend = Arc::new(TestBackend::default());
+    let service = open_worker(&directory, 1, Arc::clone(&backend));
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let server_accepted = Arc::clone(&accepted);
+    let server_stop = Arc::new(AtomicBool::new(false));
+    let server_signal = Arc::clone(&server_stop);
+    let server = thread::spawn(move || {
+        listener.set_nonblocking(true).unwrap();
+        let mut held = Vec::new();
+        while !server_signal.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    held.push(stream);
+                    server_accepted.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    let spec = run(
+        "timeout-service",
+        job("timeout-service", vec!["/bin/sleep".into(), "60".into()]),
+    )
+    .with_service_ports(vec![
+        AssignedServicePort::new("http", ServicePortProtocol::Tcp, port, "192.0.2.10").unwrap(),
+    ])
+    .unwrap()
+    .with_readiness_probe(
+        ReadinessProbe::configured(
+            "http",
+            ReadinessProbeProtocol::Http,
+            Some("/ready".to_owned()),
+            150,
+            50,
+            0,
+            1,
+            1,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    let running = service.start(StartRun::new(spec)).unwrap();
+    let unready = wait_for_readiness(
+        &service,
+        &running,
+        ReadinessState::Unready,
+        Duration::from_secs(1),
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(accepted.load(Ordering::SeqCst) > 0);
+    assert_eq!(unready.state(), RunState::Running);
+    assert_eq!(backend.spawns.load(Ordering::SeqCst), 1);
+    let _ = service
+        .stop(StopRun::new(running.run_id().clone()))
+        .unwrap();
+    assert_eq!(
+        wait_for(&service, "timeout-service").state(),
+        RunState::Cancelled
+    );
+    server_stop.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+}
+
+fn current_readiness(service: &WorkerService, running: &RunObservation) -> Option<ReadinessState> {
+    service
+        .inspect(conductor_core::InspectRun::new(running.run_id().clone()))
+        .unwrap()
+        .unwrap()
+        .readiness()
+}
+
+fn current_state(service: &WorkerService, running: &RunObservation) -> RunState {
+    service
+        .inspect(conductor_core::InspectRun::new(running.run_id().clone()))
+        .unwrap()
+        .unwrap()
+        .state()
+}
+
+fn wait_for_readiness(
+    service: &WorkerService,
+    running: &RunObservation,
+    expected: ReadinessState,
+    timeout: Duration,
+) -> RunObservation {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let observation = service
+            .inspect(conductor_core::InspectRun::new(running.run_id().clone()))
+            .unwrap()
+            .unwrap();
+        if observation.readiness() == Some(expected) {
+            return observation;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "readiness did not become {expected:?}"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn wait_for_request_count(requests: &AtomicUsize, expected: usize) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while requests.load(Ordering::SeqCst) < expected {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "probe request was not observed"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
 }
 
 fn job(id: &str, command: Vec<String>) -> JobSpec {

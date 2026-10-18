@@ -126,9 +126,10 @@ pub use execution::{
     DeploymentMutation, DeploymentPendingReason, DeploymentStatus, DigestAlgorithm,
     EnforcementCapability, ExecutableDigest, ExecutionAttempt, ExecutionAttemptId,
     ExecutionBackend, ExecutionModelError, ExecutionRequirements, JobDeployment, JobRevision,
-    JobRevisionDraft, JobRevisionId, MAX_DEPLOYMENT_REPLICAS, OperatingSystem, ResourceRequest,
-    ResourceRequestProvenance, ResourceReservation, ServiceIdentity, ServiceInstance,
-    ServiceInstanceId, ServicePort, ServicePortProtocol, WorkerCapabilities, Workload,
+    JobRevisionDraft, JobRevisionId, MAX_DEPLOYMENT_REPLICAS, OperatingSystem, ReadinessProbe,
+    ReadinessProbeProtocol, ResourceRequest, ResourceRequestProvenance, ResourceReservation,
+    ServiceIdentity, ServiceInstance, ServiceInstanceId, ServicePort, ServicePortProtocol,
+    WorkerCapabilities, Workload,
 };
 pub use inventory::{
     WorkerInventory, WorkerInventoryEntry, WorkerInventoryError, WorkerInventoryPage,
@@ -428,6 +429,8 @@ pub struct RunSpec {
     job: JobSpec,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     service_ports: Vec<AssignedServicePort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    readiness_probe: Option<ReadinessProbe>,
 }
 
 #[derive(Deserialize)]
@@ -438,6 +441,8 @@ struct RawRunSpec {
     job: JobSpec,
     #[serde(default)]
     service_ports: Vec<AssignedServicePort>,
+    #[serde(default)]
+    readiness_probe: Option<ReadinessProbe>,
 }
 
 impl TryFrom<RawRunSpec> for RunSpec {
@@ -445,13 +450,30 @@ impl TryFrom<RawRunSpec> for RunSpec {
 
     fn try_from(raw: RawRunSpec) -> Result<Self, Self::Error> {
         validate_assigned_service_ports(&raw.job, &raw.service_ports)?;
+        validate_readiness_probe(raw.readiness_probe.as_ref(), &raw.service_ports)?;
         Ok(Self {
             id: raw.id,
             worker_id: raw.worker_id,
             job: raw.job,
             service_ports: raw.service_ports,
+            readiness_probe: raw.readiness_probe,
         })
     }
+}
+
+fn validate_readiness_probe(
+    probe: Option<&ReadinessProbe>,
+    service_ports: &[AssignedServicePort],
+) -> Result<(), ExecutionModelError> {
+    if let Some(probe) = probe
+        && (!probe.is_valid()
+            || !service_ports
+                .iter()
+                .any(|port| port.name() == probe.port_name()))
+    {
+        return Err(ExecutionModelError::InvalidReadinessProbe);
+    }
+    Ok(())
 }
 
 fn validate_assigned_service_ports(
@@ -483,6 +505,7 @@ impl RunSpec {
             worker_id,
             job,
             service_ports: Vec::new(),
+            readiness_probe: None,
         }
     }
 
@@ -491,7 +514,24 @@ impl RunSpec {
         service_ports: Vec<AssignedServicePort>,
     ) -> Result<Self, ExecutionModelError> {
         validate_assigned_service_ports(&self.job, &service_ports)?;
+        validate_readiness_probe(self.readiness_probe.as_ref(), &service_ports)?;
         self.service_ports = service_ports;
+        Ok(self)
+    }
+
+    pub fn with_readiness_probe(
+        mut self,
+        readiness_probe: ReadinessProbe,
+    ) -> Result<Self, ExecutionModelError> {
+        if !readiness_probe.is_valid()
+            || !self
+                .service_ports
+                .iter()
+                .any(|port| port.name() == readiness_probe.port_name())
+        {
+            return Err(ExecutionModelError::InvalidReadinessProbe);
+        }
+        self.readiness_probe = Some(readiness_probe);
         Ok(self)
     }
 
@@ -510,6 +550,10 @@ impl RunSpec {
     pub fn service_ports(&self) -> &[AssignedServicePort] {
         &self.service_ports
     }
+
+    pub fn readiness_probe(&self) -> Option<&ReadinessProbe> {
+        self.readiness_probe.as_ref()
+    }
 }
 
 /// The manager's durable view of a run, updated only by increasing revisions.
@@ -526,6 +570,15 @@ pub enum RunState {
     TimedOut,
     Unknown,
     Abandoned,
+}
+
+/// Readiness is independent of process state and restart policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessState {
+    Starting,
+    Ready,
+    Unready,
 }
 
 impl RunState {
@@ -601,6 +654,8 @@ pub struct RunObservation {
     resolution_reason: Option<String>,
     #[serde(default)]
     worker_incarnation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    readiness: Option<ReadinessState>,
 }
 
 impl RunObservation {
@@ -620,6 +675,7 @@ impl RunObservation {
             termination_reason: None,
             resolution_reason: None,
             worker_incarnation: 0,
+            readiness: None,
         }
     }
 
@@ -675,6 +731,15 @@ impl RunObservation {
         self.worker_incarnation
     }
 
+    pub fn readiness(&self) -> Option<ReadinessState> {
+        self.readiness
+    }
+
+    pub fn with_readiness(mut self, readiness: ReadinessState) -> Self {
+        self.readiness = Some(readiness);
+        self
+    }
+
     pub fn with_termination_reason(mut self, reason: RunTerminationReason) -> Self {
         self.termination_reason = Some(reason);
         self
@@ -711,7 +776,21 @@ impl RunObservation {
             termination_reason: self.termination_reason,
             resolution_reason: self.resolution_reason.clone(),
             worker_incarnation: self.worker_incarnation,
+            readiness: self.readiness,
         })
+    }
+
+    pub fn next_readiness_revision(&self, readiness: ReadinessState) -> Option<Self> {
+        let mut next = self.next_revision(
+            self.state,
+            self.started_at_ms,
+            self.finished_at_ms,
+            self.exit_code,
+            self.termination_signal,
+            self.failure_reason,
+        )?;
+        next.readiness = Some(readiness);
+        Some(next)
     }
 
     /// Apply an observation only if it is newer than the currently accepted revision.
