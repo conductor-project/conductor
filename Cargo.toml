@@ -21,7 +21,7 @@ conductor-core = { path = "crates/conductor-core", default-features = false }
 conductor-manager = { path = "crates/conductor-manager", default-features = false }
 conductor-worker = { path = "crates/conductor-worker", default-features = false }
 conductor-process = { path = "crates/conductor-process", default-features = false }
-conductor-api = { path = "crates/conductor-api", default-features = false }
+conductor-api = { path = "crates/conductor-api", default-features = false, features = ["server"] }
 conductor-transport = { path = "crates/conductor-transport", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }

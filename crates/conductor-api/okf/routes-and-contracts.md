@@ -1,13 +1,15 @@
 ---
 type: Reference
 title: HTTP routes and contracts
-description: Routes expose jobs, runs, service revisions/deployments, workers, drains, metrics, and readiness through manager operations.
+description: Routes expose jobs, runs, service revisions/deployments, workers, drains, metrics, and readiness; the feature-gated typed client calls these contracts with bounded JSON responses.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: 663bd0f
 source_reviewed_at: 2026-10-19
 sources:
-  - resource: ../src/lib.rs
+  - resource: ../src/server.rs
     title: Route registration and handlers
+  - resource: ../src/client.rs
+    title: Typed client and response bounds
   - resource: ../src/structs/error_envelope.rs
     title: Error envelope
   - resource: ../src/structs/run_logs_response.rs
@@ -15,6 +17,40 @@ sources:
   - resource: ../../conductor/tests/agent.rs
     title: HTTP integration tests
 ---
+
+# Typed client
+
+Enable the `client` crate feature without defaults for client-only consumers.
+The client accepts an HTTP(S) base URL, optional bearer token, optional PEM CA
+certificate, request timeout, and maximum response size. A bearer token over
+plain HTTP is accepted only for a loopback host. `get`, `post`, `put`,
+`post_conditional`, `post_create`, `put_create`, and `delete` accept serde request/response types.
+`get_bytes` and `get_text`
+support bounded non-JSON endpoints such as metrics, and `delete_empty` handles
+empty successful responses. `post` and `put` accept an
+idempotency key; conditional POST/PUT/DELETE calls accept an `If-Match` value. The client
+does not automatically retry mutations. It disables redirects, enforces the
+response limit on bytes actually read (including error responses), and reports
+typed errors without including response bodies or credentials.
+`get_response` preserves the HTTP status and ETag alongside a decoded body,
+including readiness states returned with HTTP 503.
+
+Common job/run pages, deployment request bodies, service endpoints/watch,
+worker drain and service attempt responses, and run log response contracts live
+in `conductor_api::contracts` and are shared by the client and server.
+
+Example read and mutation:
+
+```rust,ignore
+let mut config = conductor_api::client::ClientConfig::new("https://127.0.0.1:8080/");
+config.bearer_token = Some(token);
+config.ca_certificate_pem = Some(ca_pem);
+let api = conductor_api::client::Client::new(config)?;
+let job: conductor_core::JobSpec = api.get("v1/jobs/example").await?;
+let run: conductor_core::RunObservation = api
+    .post("v1/jobs/example/runs", &serde_json::Value::Null, Some("start-example-once"))
+    .await?;
+```
 
 # Route groups
 
@@ -27,7 +63,7 @@ sources:
 | Workers and operations | worker status, drain/cancel drain, metrics, service attempt and endpoint/catalog reads/watch |
 
 The exact methods, paths, body types, query parameters, and conditions are
-registered in `src/lib.rs`. API tests are closest to the canonical behavior;
+registered in `src/server.rs`. API tests are closest to the canonical behavior;
 the [README](../../../README.md) is a shorter successful one-shot flow.
 
 # Important run semantics
@@ -45,7 +81,7 @@ Service creation requires `If-None-Match: *`; updates and destructive/mutating
 operations require the current quoted generation in `If-Match`. Mutations
 require an idempotency key. A deployment response includes its generation as
 an `ETag`; stale generations fail rather than silently overwriting newer
-intent. The service transition contract is exercised in `src/lib.rs` tests.
+intent. The service transition contract is exercised in `src/server.rs` tests.
 
 ## Service revision example
 
