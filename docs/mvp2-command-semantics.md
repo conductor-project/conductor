@@ -175,8 +175,10 @@ from prior incarnations are replayed before the worker polls for new commands.
 `JobSpec.executableDigest` is an optional, operator-provisioned SHA-256 digest.
 The worker streams the executable through a fixed-size buffer immediately
 before launch. A mismatch produces a failed observation without calling the
-execution backend. Before any launch, the worker also checks that a native
-executable uses the host OS format and architecture; universal Mach-O files
-must include the current worker architecture. Interpreter scripts use their
-shebang interpreter. Incompatible binaries fail without calling the execution
-backend. When the digest is absent, digest verification is skipped.
+execution backend. Conductor does not inspect executable headers: the native
+process backend asks the OS to launch the command, and the OS decides whether
+its format and CPU architecture are supported. On macOS, the OS also selects
+the matching slice of a universal Mach-O executable. An OS launch rejection is
+reported as `spawn_failed`; interpreter scripts are delegated to their
+shebang interpreter. When the digest is absent, digest verification is
+skipped.

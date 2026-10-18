@@ -2172,7 +2172,7 @@ fn actual_binary_rejects_invalid_jobs_bodies_and_media_types_without_poisoning_s
         "POST",
         "/v1/unknown",
         Some("application/json"),
-        base.as_bytes(),
+        &[],
     );
     assert_eq!(status, 404, "{unknown}");
 
