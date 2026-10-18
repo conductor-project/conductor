@@ -44,6 +44,20 @@ static int no_unintended_fds(void) {
 int main(int argc, char **argv) {
   if (argc == 2 && strcmp(argv[1], "--sleep") == 0)
     for (;;) sleep(60);
+  if (argc == 3 && strcmp(argv[1], "--remove-lock-and-hold") == 0) {
+    errno = 0;
+    int removed = unlink(argv[2]);
+    int unlink_denied = removed < 0 && (errno == EACCES || errno == EPERM);
+    printf("ownership_lock_unlink_denied=%d\n", unlink_denied);
+    errno = 0;
+    int replacement = open(argv[2], O_CREAT | O_EXCL | O_WRONLY, 0600);
+    int replacement_denied = replacement < 0 && (errno == EACCES || errno == EPERM || errno == EEXIST);
+    if (replacement >= 0) { close(replacement); unlink(argv[2]); }
+    printf("ownership_lock_replacement_denied=%d\n", replacement_denied);
+    fflush(stdout);
+    if (!unlink_denied || !replacement_denied) return 30;
+    for (;;) sleep(60);
+  }
   if (argc == 2 && strcmp(argv[1], "--hold") == 0) {
     sleep(1);
     return 0;
@@ -214,6 +228,12 @@ def output(address, run_id, stream="stdout"):
     return base64.b64decode(body["data"], validate=True).decode("utf-8")
 
 
+def reserve_address():
+    with socket.socket() as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        return reserved.getsockname()
+
+
 def wait_cgroups_empty(worker_root, timeout=6):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -248,6 +268,15 @@ def worker_cgroup_root(delegated_root, worker_id):
     return delegated_root / f"conductor-{value:016x}"
 
 
+def ownership_lock_file(lock_directory, delegated_root, worker_id):
+    namespace_name = worker_cgroup_root(delegated_root, worker_id).name
+    value = 0xCBF29CE484222325
+    for byte in os.fsencode(str(delegated_root.resolve())) + b"\0" + namespace_name.encode():
+        value ^= byte
+        value = (value * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return lock_directory / f"conductor-cgroup-{value:016x}.lock"
+
+
 def runtime_paths(binary):
     result = subprocess.run(["ldd", str(binary)], check=True, capture_output=True, text=True)
     paths = set()
@@ -273,14 +302,21 @@ def main():
     if not (delegated_root / "cgroup.procs").is_file():
         raise RuntimeError("delegated cgroup control path is unavailable")
 
-    with tempfile.TemporaryDirectory(prefix="conductor-landlock-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="conductor-landlock-") as temporary, tempfile.TemporaryDirectory(
+        prefix="conductor-landlock-locks-"
+    ) as lock_temporary:
         root = Path(temporary)
+        lock_parent = Path(lock_temporary)
+        lock_directory = lock_parent / "ownership-locks"
+        lock_directory.mkdir(mode=0o700)
+        lock_child = lock_directory / "nested"
+        lock_child.mkdir()
+        lock_alias = root / "ownership-lock-alias"
+        lock_alias.symlink_to(lock_directory, target_is_directory=True)
         manager = root / "manager"
         worker = root / "worker"
         manager.mkdir(mode=0o700)
         worker.mkdir(mode=0o700)
-        lock_directory = root / "shared-ownership-locks"
-        lock_directory.mkdir(mode=0o700)
         secret = manager / "credential-fixture"
         secret.write_text("not-for-jobs\n", encoding="utf-8")
         secret.chmod(0o644)
@@ -447,6 +483,70 @@ def main():
                 assert outcome["state"] == "succeeded", f"{job_id} workload failed: {outcome}"
                 wait_cgroups_empty(worker_root)
 
+            lock_file = ownership_lock_file(lock_directory, delegated_root, config["worker_id"])
+            lock_identity = lock_file.stat()
+            lock_job = {
+                "id": "landlock-lock-protection",
+                "command": [str(fixture), "--remove-lock-and-hold", str(lock_file)],
+                "cwd": str(root),
+                "filesystemPolicy": {"grants": grant_ids},
+            }
+            status, _ = request(address, "POST", "/v1/jobs", lock_job)
+            assert status == 201, f"ownership lock job registration returned HTTP {status}"
+            status, accepted = request(address, "POST", "/v1/jobs/landlock-lock-protection/runs")
+            assert status == 202, f"ownership lock run start returned HTTP {status}: {accepted}"
+            lock_run_id = accepted["runId"]
+            wait_run(address, lock_run_id, {"running"})
+            deadline = time.monotonic() + 5
+            evidence = "ownership_lock_unlink_denied=1" in output(address, lock_run_id)
+            while not evidence and time.monotonic() < deadline:
+                time.sleep(0.02)
+                evidence = "ownership_lock_unlink_denied=1" in output(address, lock_run_id)
+            lock_log = output(address, lock_run_id)
+            assert "ownership_lock_unlink_denied=1" in lock_log, lock_log
+            assert "ownership_lock_replacement_denied=1" in lock_log, lock_log
+            wait_run(address, lock_run_id, {"running"})
+            current_lock_identity = lock_file.stat()
+            assert (
+                current_lock_identity.st_dev,
+                current_lock_identity.st_ino,
+            ) == (lock_identity.st_dev, lock_identity.st_ino), "workload changed the active ownership lock inode"
+
+            with socket.socket() as reserved:
+                reserved.bind(("127.0.0.1", 0))
+                contender_address = reserved.getsockname()
+            contender_config = dict(config)
+            contender_config.update(
+                {
+                    "listen": f"127.0.0.1:{contender_address[1]}",
+                    "manager_data_dir": str(root / "contender-manager"),
+                    "worker_data_dir": str(root / "contender-worker"),
+                    "landlock": {"mode": "disabled"},
+                }
+            )
+            contender_path = root / "contender.json"
+            contender_path.write_text(json.dumps(contender_config), encoding="utf-8")
+            contender = subprocess.run(
+                [str(args.binary.resolve()), "agent", "--config", str(contender_path)],
+                cwd=root,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            assert contender.returncode != 0, "competing daemon acquired ownership while the lock was active"
+            assert "startup_failed" in contender.stderr, contender.stderr
+            assert "worker cgroup namespace is already owned" in contender.stderr, contender.stderr
+            assert wait_run(address, lock_run_id, {"running"})["state"] == "running"
+            after_contender_identity = lock_file.stat()
+            assert (
+                after_contender_identity.st_dev,
+                after_contender_identity.st_ino,
+            ) == (lock_identity.st_dev, lock_identity.st_ino), "competing daemon replaced the active ownership lock"
+            status, _ = request(address, "POST", f"/v1/runs/{lock_run_id}/stop")
+            assert status in (200, 202), f"ownership lock workload stop returned HTTP {status}"
+            assert wait_run(address, lock_run_id, {"cancelled"})["state"] == "cancelled"
+            wait_cgroups_empty(worker_root)
+
             # Cancellation and deadlines still reap the cgroup while Landlock is active.
             for job_id, extra, expected in (
                 ("landlock-cancel", {"terminationGraceMs": 100}, "cancelled"),
@@ -543,7 +643,78 @@ def main():
             )
             assert rejected_nested.returncode != 0, "a nested grant widened an ancestor policy"
             assert "nested Landlock grants cannot widen" in rejected_nested.stderr
-            print(json.dumps({"status": "passed", "enforcement": "real Landlock ABI >= 3", "evidence": 9}))
+
+            # The configured ownership directory is protected independently of
+            # manager/worker state and the delegated cgroup hierarchy.
+            for index, (case, grant_path, configured_alias) in enumerate(
+                (
+                    ("direct", lock_directory, False),
+                    ("ancestor", lock_parent, False),
+                    ("descendant", lock_child, False),
+                    ("grant-alias", lock_alias, False),
+                    ("configured-alias", lock_directory, True),
+                )
+            ):
+                protected_config = dict(config)
+                worker_id = f"landlock-lock-{case}"
+                protected_config.update(
+                    {
+                        "worker_id": worker_id,
+                        "manager_data_dir": str(root / f"protected-manager-{index}"),
+                        "worker_data_dir": str(root / f"protected-worker-{index}"),
+                    }
+                )
+                protected_config["cgroup_v2"] = dict(config["cgroup_v2"])
+                if configured_alias:
+                    protected_config["cgroup_v2"]["ownershipLockDir"] = str(lock_alias)
+                protected_config["landlock"] = {
+                    "mode": "required",
+                    "grants": [{"id": "lock-write", "path": str(grant_path), "write": True}],
+                }
+                protected_path = root / f"protected-{case}.json"
+                protected_path.write_text(json.dumps(protected_config), encoding="utf-8")
+                rejected_lock = subprocess.run(
+                    [str(args.binary.resolve()), "agent", "--config", str(protected_path)],
+                    cwd=root,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                assert rejected_lock.returncode != 0, f"{case} ownership lock grant was accepted"
+                assert "overlap Conductor state or control paths" in rejected_lock.stderr, rejected_lock.stderr
+                protected_worker_root = worker_cgroup_root(delegated_root, worker_id)
+                reap_owned_groups(protected_worker_root)
+                if protected_worker_root.exists():
+                    protected_worker_root.rmdir()
+
+            # A cgroups-disabled agent remains compatible with Landlock grants.
+            disabled_address = reserve_address()
+            disabled_config = dict(config)
+            disabled_config.update(
+                {
+                    "listen": f"{disabled_address[0]}:{disabled_address[1]}",
+                    "manager_data_dir": str(root / "disabled-manager"),
+                    "worker_data_dir": str(root / "disabled-worker"),
+                    "worker_id": "landlock-no-cgroups",
+                    "cgroup_v2": {"enabled": False},
+                }
+            )
+            disabled_path = root / "disabled-cgroups.json"
+            disabled_path.write_text(json.dumps(disabled_config), encoding="utf-8")
+            disabled_agent = subprocess.Popen(
+                [str(args.binary.resolve()), "agent", "--config", str(disabled_path)],
+                cwd=root,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                wait_agent(disabled_agent, disabled_address)
+            finally:
+                if disabled_agent.poll() is None:
+                    disabled_agent.send_signal(signal.SIGINT)
+                    disabled_agent.wait(timeout=8)
+            print(json.dumps({"status": "passed", "enforcement": "real Landlock ABI >= 3", "evidence": 15}))
         finally:
             if process.poll() is None:
                 process.send_signal(signal.SIGINT)
