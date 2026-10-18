@@ -11,14 +11,31 @@ different workers, and sends application requests in both directions. CI does
 not invoke this harness; CI runs release builds and tests only after merge.
 
 The service processes use the sole `default` namespace with a non-default
-`qualification.test` DNS suffix, then resolve fully qualified names and short
-names with the host resolver. They query the named-port SRV record, resolve its target through
-the host resolver, and connect to the returned dynamic port. They do not use
-peer addresses from the manager API. The runner's resolver is temporarily
-configured for `default.service.qualification.test`; the previous Linux
+`qualification.test` DNS suffix, then query fully qualified names and short
+names with the configured search domain. They query the named-port SRV record,
+resolve its target, and connect to the returned dynamic port. They do not use
+peer addresses from the manager API.
+
+For a local macOS run that must not touch the developer's resolver, build and
+run the debug binary in direct mode:
+
+```sh
+cargo build --locked -p conductor
+python3 scripts/qualify-mvp2-services.py \
+  --binary target/debug/conductor \
+  --profile debug \
+  --resolver-mode direct
+```
+
+Direct mode binds Conductor DNS to an ephemeral loopback port and sends
+explicit FQDN, search-domain, and SRV queries to it. It verifies real
+cross-service requests and lifecycle scenarios but does not test the operating
+system's resolver integration. The default `host` mode tests system-resolver
+lookups by temporarily configuring the runner for
+`default.service.qualification.test`; it restores the previous Linux
 `/etc/resolv.conf` or macOS supplemental resolver and search-domain settings
-are restored during cleanup. The script refuses to change resolver settings
-outside a GitHub-hosted runner running as root.
+during cleanup. To protect developer machines, the script allows this mode
+only on a root-owned GitHub-hosted runner.
 
 When the harness is run on an eligible disposable GitHub-hosted runner, its step
 summary records the executable SHA-256, profile, OS, architecture,
@@ -27,8 +44,11 @@ The suite also exercises a real listener port conflict and retry, a failed
 readiness probe, shared-host resource pressure, authoritative negative DNS
 answers, host resolver lookups, service revision replacement, a manager DNS outage and
 restart with worker reconnect, and a worker drain that moves a service while
-preserving its name. The report includes measured readiness, resolver,
-application-request, restart, and drain timings for the run.
+preserving its name. It then terminates the remaining worker and verifies that
+its endpoints disappear after the documented 45-second freshness window and
+that DNS returns NODATA with a 1-second negative TTL. The report includes
+measured readiness, resolver, application-request, restart, drain, and stale
+endpoint withdrawal timings for the run.
 
 The workspace test suite separately exercises command/report replay,
 duplicate acknowledgements, report sequencing, worker restart recovery,

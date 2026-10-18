@@ -30,6 +30,7 @@ from pathlib import Path
 SUFFIX = "qualification.test"
 SEARCH_DOMAIN = f"default.service.{SUFFIX}"
 READY_TIMEOUT = 40.0
+WORKER_FRESHNESS_TIMEOUT = 45.0
 
 
 def request(base: str, method: str, route: str, payload=None, headers=None, timeout=5):
@@ -472,6 +473,7 @@ def main():
         with resolver:
             manager, base, started = wait_manager(binary, manager_path, root / "manager.log", root)
             processes = [manager]
+            worker_processes = {}
             try:
                 result["managerApiAddress"] = started["address"]
                 result["workerTransportAddress"] = started["workerTransportAddress"]
@@ -505,8 +507,10 @@ def main():
                     }
                     config_path = root / f"{worker_name}.json"
                     config_path.write_text(json.dumps(worker_config), encoding="utf-8")
-                    processes.append(Process([binary, "agent", "--config", config_path],
-                                             root / f"{worker_name}.log", root))
+                    worker_process = Process([binary, "agent", "--config", config_path],
+                                             root / f"{worker_name}.log", root)
+                    worker_processes[worker_name] = worker_process
+                    processes.append(worker_process)
                 wait_workers(base, worker_names, timings=result["timingsMs"])
                 readiness = {}
 
@@ -794,9 +798,56 @@ def main():
                 result["scenarios"].append(
                     f"draining {drained_worker} moved backend to {moved_backend[0]['workerId']} without changing its service name"
                 )
+
+                disconnected_worker = next(
+                    worker for worker in worker_names if worker != drained_worker
+                )
+                disconnect_started = time.monotonic()
+                worker_processes[disconnected_worker].terminate()
+                for service in services:
+                    wait_until(
+                        f"{service} endpoint withdrawal after worker disconnect",
+                        lambda service=service: service_endpoints_empty(base, service),
+                        timeout=WORKER_FRESHNESS_TIMEOUT + 10,
+                        timings=result["timingsMs"],
+                    )
+                    fqdn = f"{service}.default.service.{SUFFIX}."
+                    withdrawn = subprocess.run(
+                        [dig, "+time=1", "+tries=1", "+noall", "+answer", "+authority",
+                         "A", fqdn, *dig_server_args(dns_address, dns_port_number)],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    records = [line.split() for line in withdrawn.stdout.splitlines()]
+                    soa = next(
+                        (record for record in records
+                         if len(record) >= 4 and record[2:4] == ["IN", "SOA"]),
+                        None,
+                    )
+                    has_address = any(
+                        len(record) >= 4 and record[2:4] == ["IN", "A"]
+                        for record in records
+                    )
+                    if withdrawn.returncode or has_address or soa is None or soa[1] != "1":
+                        raise RuntimeError(
+                            f"disconnected {service} endpoint did not produce authoritative NODATA: "
+                            f"{withdrawn.stdout.strip()} {withdrawn.stderr.strip()}"
+                        )
+                    if args.resolver_mode == "host":
+                        wait_until(
+                            f"host resolver withdrawal after the positive TTL for {service}",
+                            lambda fqdn=fqdn: not system_resolves(fqdn),
+                            timeout=8, interval=0.1, timings=result["timingsMs"],
+                        )
+                result["timingsMs"]["worker disconnect and service withdrawal"] = round(
+                    (time.monotonic() - disconnect_started) * 1000, 1
+                )
+                result["scenarios"].append(
+                    f"disconnecting {disconnected_worker} withdrew its services and authoritative DNS returned one-second negative TTLs"
+                )
             finally:
                 for process in reversed(processes):
                     process.stop()
+                terminate_service_fixtures(root)
     result["durationMs"] = round((time.monotonic() - started_monotonic) * 1000, 1)
     report = json.dumps(result, sort_keys=True)
     print(report)
@@ -813,12 +864,14 @@ def create_service_revision(
     dns_host="127.0.0.1", dns_port_number=53, resolver_mode="host",
 ):
     digest = binary_sha256(sys.executable)
+    pid_file = root / f"service-{service}-revision-{revision}.pid"
     body = {
         "definition": {
             "id": service,
             "command": [sys.executable, "-u", str(script), service, peer,
                         version or f"v{revision}", SUFFIX, SEARCH_DOMAIN,
-                        shutil.which("dig"), resolver_mode, dns_host, str(dns_port_number)],
+                        shutil.which("dig"), resolver_mode, dns_host, str(dns_port_number),
+                        str(pid_file)],
             "cwd": str(root),
             "terminationGraceMs": 1000,
         },
@@ -926,6 +979,29 @@ def deployment_deleted(base, service):
     return status == 200 and isinstance(deployment, dict) and deployment.get("status") == "deleted"
 
 
+def service_endpoints_empty(base, service):
+    status, _, response = request(base, "GET", f"/v1/jobs/{service}/endpoints")
+    return status == 200 and isinstance(response, dict) and not response.get("endpoints")
+
+
+def terminate_service_fixtures(root):
+    for pid_file in root.glob("service-*.pid"):
+        try:
+            process_id = int(pid_file.read_text(encoding="ascii"))
+        except (OSError, ValueError):
+            continue
+        command = subprocess.run(
+            ["ps", "-p", str(process_id), "-o", "command="],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+        if str(root) not in command or "service.py" not in command:
+            continue
+        try:
+            os.killpg(process_id, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
 def resolver_diagnostics(name, dig, dns_host="127.0.0.1", dns_port_number=53):
     details = {"name": name}
     try:
@@ -1009,7 +1085,9 @@ import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-service, peer, version, suffix, search_domain, dig, resolver_mode, dns_host, dns_port = sys.argv[1:]
+service, peer, version, suffix, search_domain, dig, resolver_mode, dns_host, dns_port, pid_file = sys.argv[1:]
+with open(pid_file, "w", encoding="ascii") as pid_output:
+    pid_output.write(str(os.getpid()))
 port = int(os.environ["CONDUCTOR_PORT_HTTP"])
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
