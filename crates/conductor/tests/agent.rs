@@ -631,7 +631,9 @@ fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit(
 #[test]
 fn timed_out_start_can_be_retried_with_the_same_idempotency_key() {
     let path = TempDir::new("timed-out-idempotent-start");
-    let (mut child, address) = start_with_request_timeout(&path, 100);
+    // Keep this deadline below SQLite's 250 ms busy timeout so the first
+    // request can time out while the test holds the manager database lock.
+    let (mut child, address) = start_with_request_timeout(&path, 200);
     let marker = path.join("started-once");
     let command = [
         "/bin/sh",
@@ -658,14 +660,26 @@ fn timed_out_start_can_be_retried_with_the_same_idempotency_key() {
     assert_eq!(status, 408);
     lock.execute_batch("ROLLBACK;").unwrap();
 
-    let (status, _, response) = http_with_custom_headers(
-        address,
-        "POST",
-        "/v1/jobs/timeout-start/runs",
-        None,
-        &headers,
-        &[],
-    );
+    let retry_deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
+    let (status, response) = loop {
+        let (status, _, response) = http_with_custom_headers(
+            address,
+            "POST",
+            "/v1/jobs/timeout-start/runs",
+            None,
+            &headers,
+            &[],
+        );
+        if status == 202 {
+            break (status, response);
+        }
+        assert!(matches!(status, 408 | 429), "{status}: {response}");
+        assert!(
+            Instant::now() < retry_deadline,
+            "idempotent start did not become available after its first timeout"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
     assert_eq!(status, 202, "{response}");
     let run_id = serde_json::from_str::<serde_json::Value>(&response).unwrap()["runId"]
         .as_str()
