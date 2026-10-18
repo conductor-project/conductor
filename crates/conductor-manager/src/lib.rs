@@ -1,5 +1,6 @@
 //! Manager-owned application operations and durable job-definition storage.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,7 +14,7 @@ use conductor_core::{
     CommandEnvelope, CommandId, InspectRun, JobId, JobSpec, MAX_WORKER_CAPACITY, ReadRunLogs,
     ResolveRun, RunFailureReason, RunId, RunLogChunk, RunObservation, RunSpec, RunState,
     RunTerminationReason, StartRun, StopRun, WorkerCommand, WorkerDescriptor, WorkerId,
-    WorkerStatus,
+    WorkerInventoryEntry, WorkerStatus,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
@@ -159,6 +160,18 @@ pub trait CommandJournal: Send + Sync {
         worker_id: &WorkerId,
         incarnation: u64,
         acknowledgement_json: &str,
+    ) -> Result<(), CommandStoreError>;
+    fn reconcile_worker_inventory_page(
+        &self,
+        worker_id: &WorkerId,
+        worker_incarnation: u64,
+        entries: &[WorkerInventoryEntry],
+    ) -> Result<Vec<RunId>, CommandStoreError>;
+    fn finish_worker_inventory(
+        &self,
+        worker_id: &WorkerId,
+        worker_incarnation: u64,
+        observed_run_ids: &[RunId],
     ) -> Result<(), CommandStoreError>;
 }
 
@@ -1662,6 +1675,195 @@ impl CommandJournal for SqliteJobRepository {
             .commit()
             .map_err(|_| CommandStoreError::StorageUnavailable)
     }
+
+    fn reconcile_worker_inventory_page(
+        &self,
+        worker_id: &WorkerId,
+        worker_incarnation: u64,
+        entries: &[WorkerInventoryEntry],
+    ) -> Result<Vec<RunId>, CommandStoreError> {
+        let worker_incarnation =
+            i64::try_from(worker_incarnation).map_err(|_| CommandStoreError::Conflict)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| CommandStoreError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| CommandStoreError::StorageUnavailable)?;
+        let mut observed_ids = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let incoming = &entry.observation;
+            if incoming.worker_id() != worker_id
+                || incoming.worker_incarnation() > worker_incarnation as u64
+            {
+                return Err(CommandStoreError::Conflict);
+            }
+            let stored_json = transaction
+                .query_row(
+                    "SELECT observation_json FROM runs WHERE run_id = ?1 AND worker_id = ?2",
+                    params![incoming.run_id().as_str(), worker_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|_| CommandStoreError::StorageUnavailable)?;
+            let Some(stored_json) = stored_json else {
+                // A worker may retain an orphan after manager state was restored
+                // from an older backup. Keep it on the worker; never adopt or relaunch it.
+                continue;
+            };
+            let stored: RunObservation = serde_json::from_str(&stored_json)
+                .map_err(|_| CommandStoreError::StorageUnavailable)?;
+            if incoming.job_id() != stored.job_id() || incoming.worker_id() != stored.worker_id() {
+                return Err(CommandStoreError::Conflict);
+            }
+            // Only active assignments need to be retained across pages so the
+            // completed-run history can grow without making inventory scans
+            // exceed the worker's live-capacity bound.
+            if stored.state().is_terminal() {
+                continue;
+            }
+            observed_ids.push(incoming.run_id().clone());
+
+            if incoming.revision() < stored.revision() {
+                continue;
+            }
+            if incoming.revision() == stored.revision() {
+                if incoming != &stored {
+                    return Err(CommandStoreError::Conflict);
+                }
+                continue;
+            }
+            if stored.worker_incarnation() != 0
+                && incoming.worker_incarnation() != stored.worker_incarnation()
+            {
+                if incoming.worker_incarnation() < stored.worker_incarnation() {
+                    continue;
+                }
+                return Err(CommandStoreError::Conflict);
+            }
+            let mut newer = stored.clone();
+            if !newer.apply_newer(incoming.clone()) {
+                return Err(CommandStoreError::Conflict);
+            }
+            let serialized =
+                serde_json::to_string(&newer).map_err(|_| CommandStoreError::StorageUnavailable)?;
+            transaction
+                .execute(
+                    "UPDATE runs SET observation_json = ?1, revision = ?2, state = ?3
+                     WHERE run_id = ?4 AND revision < ?2 AND state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
+                    params![serialized, newer.revision() as i64, newer.state().as_str(), newer.run_id().as_str()],
+                )
+                .map_err(|_| CommandStoreError::StorageUnavailable)?;
+        }
+        transaction
+            .commit()
+            .map_err(|_| CommandStoreError::StorageUnavailable)?;
+        Ok(observed_ids)
+    }
+
+    fn finish_worker_inventory(
+        &self,
+        worker_id: &WorkerId,
+        worker_incarnation: u64,
+        observed_run_ids: &[RunId],
+    ) -> Result<(), CommandStoreError> {
+        let incarnation =
+            i64::try_from(worker_incarnation).map_err(|_| CommandStoreError::Conflict)?;
+        let observed = observed_run_ids.iter().collect::<BTreeSet<_>>();
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| CommandStoreError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| CommandStoreError::StorageUnavailable)?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT run_id, observation_json FROM runs
+                 WHERE worker_id = ?1 AND state IN ('requested', 'starting', 'running', 'stopping', 'unknown')",
+            )
+            .map_err(|_| CommandStoreError::StorageUnavailable)?;
+        let rows = statement
+            .query_map([worker_id.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| CommandStoreError::StorageUnavailable)?;
+        let runs = rows
+            .map(|row| {
+                let (id, json) = row.map_err(|_| CommandStoreError::StorageUnavailable)?;
+                let id = RunId::new(id).map_err(|_| CommandStoreError::StorageUnavailable)?;
+                let observation: RunObservation = serde_json::from_str(&json)
+                    .map_err(|_| CommandStoreError::StorageUnavailable)?;
+                Ok((id, observation))
+            })
+            .collect::<Result<Vec<_>, CommandStoreError>>()?;
+        drop(statement);
+
+        for (run_id, stored) in runs {
+            if observed.contains(&run_id) || stored.state() == RunState::Unknown {
+                continue;
+            }
+            if stored.state() == RunState::Requested
+                && has_pending_start_command(&transaction, &run_id, worker_id, incarnation)?
+            {
+                continue;
+            }
+            let unknown = stored
+                .next_revision(
+                    RunState::Unknown,
+                    stored.started_at_ms(),
+                    None,
+                    None,
+                    None,
+                    Some(RunFailureReason::OutcomeUnknown),
+                )
+                .ok_or(CommandStoreError::StorageUnavailable)?;
+            let serialized = serde_json::to_string(&unknown)
+                .map_err(|_| CommandStoreError::StorageUnavailable)?;
+            transaction
+                .execute(
+                    "UPDATE runs SET observation_json = ?1, revision = ?2, state = 'unknown'
+                     WHERE run_id = ?3 AND revision = ?4 AND state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
+                    params![serialized, unknown.revision() as i64, run_id.as_str(), stored.revision() as i64],
+                )
+                .map_err(|_| CommandStoreError::StorageUnavailable)?;
+        }
+        transaction
+            .commit()
+            .map_err(|_| CommandStoreError::StorageUnavailable)
+    }
+}
+
+fn has_pending_start_command(
+    transaction: &rusqlite::Transaction<'_>,
+    run_id: &RunId,
+    worker_id: &WorkerId,
+    worker_incarnation: i64,
+) -> Result<bool, CommandStoreError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT envelope_json FROM manager_commands
+             WHERE run_id = ?1 AND worker_id = ?2 AND worker_incarnation = ?3 AND state = 'pending'",
+        )
+        .map_err(|_| CommandStoreError::StorageUnavailable)?;
+    let rows = statement
+        .query_map(
+            params![run_id.as_str(), worker_id.as_str(), worker_incarnation],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|_| CommandStoreError::StorageUnavailable)?;
+    for row in rows {
+        let json = row.map_err(|_| CommandStoreError::StorageUnavailable)?;
+        let envelope: CommandEnvelope =
+            serde_json::from_str(&json).map_err(|_| CommandStoreError::StorageUnavailable)?;
+        if let WorkerCommand::StartRun(command) = envelope.command
+            && command.spec().id() == run_id
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

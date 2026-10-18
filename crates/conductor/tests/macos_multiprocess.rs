@@ -11,7 +11,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use conductor_core::{
     JobId, JobSpec, LogStream, ProtocolOffer, ProtocolVersionRange, ReadRunLogs, RunId, RunSpec,
-    RunState, StartRun, WorkerDescriptor, WorkerId, WorkerStatus,
+    RunState, StartRun, WorkerDescriptor, WorkerId, WorkerInventoryPage, WorkerStatus,
 };
 use conductor_manager::{SqliteJobRepository, WorkerPort};
 use conductor_process::HostProcessBackend;
@@ -455,6 +455,14 @@ async fn inject_authenticated_worker_identity_mismatch(
         worker_id: second_id,
         worker_incarnation: 1,
         status: WorkerStatus::new(descriptor, 0, 0, true, false, now_ms()),
+        inventory_page: WorkerInventoryPage {
+            worker_id: WorkerId::new(&first.worker_id).expect("first id"),
+            worker_incarnation: 1,
+            snapshot_generation: 0,
+            after_sequence: 0,
+            entries: Vec::new(),
+            next_after_sequence: None,
+        },
         protocol_offer: protocol_offer(),
     };
     let response = client

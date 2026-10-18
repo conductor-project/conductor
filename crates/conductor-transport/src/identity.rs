@@ -685,7 +685,9 @@ fn prepare_identity_directory(path: &Path) -> Result<PathBuf, IdentityError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use conductor_core::{ProtocolOffer, ProtocolVersionRange, WorkerDescriptor, WorkerStatus};
+    use conductor_core::{
+        ProtocolOffer, ProtocolVersionRange, WorkerDescriptor, WorkerInventoryPage, WorkerStatus,
+    };
     use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -957,6 +959,14 @@ mod tests {
                 false,
                 now_ms().expect("clock"),
             ),
+            inventory_page: WorkerInventoryPage {
+                worker_id: WorkerId::new("worker-impostor").expect("impostor id"),
+                worker_incarnation: 1,
+                snapshot_generation: 0,
+                after_sequence: 0,
+                entries: Vec::new(),
+                next_after_sequence: None,
+            },
             protocol_offer: offer.clone(),
         };
         let impersonation = worker_client

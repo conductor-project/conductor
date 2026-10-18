@@ -9,8 +9,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use conductor_core::{
-    CommandEnvelope, CommandId, JobId, JobSpec, RunFailureReason, RunId, RunSpec, RunState,
-    StartRun, WorkerCommand, WorkerId,
+    CommandEnvelope, CommandId, JobId, JobSpec, RunFailureReason, RunId, RunObservation, RunSpec,
+    RunState, StartRun, WorkerCommand, WorkerId,
 };
 use conductor_worker::{ExecutionBackend, WorkerError, WorkerService};
 use rusqlite::Connection;
@@ -626,6 +626,79 @@ fn incompatible_executable_format_fails_before_backend_spawn() {
         Some(RunFailureReason::IncompatibleExecutable)
     );
     assert_eq!(backend.spawns.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn worker_inventory_is_bounded_to_its_snapshot_generation() {
+    let directory = TempDir::new();
+    let service = open_worker(&directory, 1, Arc::new(TestBackend::default()));
+    let database = Connection::open(directory.0.join("worker.sqlite3")).unwrap();
+    let insert_run = |index: usize| {
+        let id = format!("inventory-{index:02}");
+        let spec = run(&id, job(&id, vec!["/bin/true".into()]));
+        let observation = RunObservation::requested(&spec, 1)
+            .with_worker_incarnation(service.descriptor().incarnation());
+        database
+            .execute(
+                "INSERT INTO runs (run_id, spec_json, observation_json, state, revision)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    spec.id().as_str(),
+                    serde_json::to_string(&spec).unwrap(),
+                    serde_json::to_string(&observation).unwrap(),
+                    observation.state().as_str(),
+                    observation.revision() as i64,
+                ],
+            )
+            .unwrap();
+    };
+    for index in 0..35 {
+        insert_run(index);
+    }
+
+    let first = service.inventory_page(None, 0, 16).unwrap();
+    assert_eq!(first.entries.len(), 16);
+    assert_eq!(first.snapshot_generation, 35);
+    assert_eq!(first.next_after_sequence, Some(first.entries[15].sequence));
+    assert!(first.is_valid());
+
+    insert_run(35);
+    let second = service
+        .inventory_page(
+            Some(first.snapshot_generation),
+            first.next_after_sequence.unwrap(),
+            16,
+        )
+        .unwrap();
+    assert_eq!(second.entries.len(), 16);
+    assert_eq!(
+        second.next_after_sequence,
+        Some(second.entries[15].sequence)
+    );
+
+    let third = service
+        .inventory_page(
+            Some(first.snapshot_generation),
+            second.next_after_sequence.unwrap(),
+            16,
+        )
+        .unwrap();
+    assert_eq!(third.entries.len(), 3);
+    assert_eq!(third.next_after_sequence, None);
+    assert!(third.is_valid());
+    assert_eq!(
+        first
+            .entries
+            .iter()
+            .chain(&second.entries)
+            .chain(&third.entries)
+            .map(|entry| entry.observation.run_id().clone())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        35
+    );
+    let refreshed = service.inventory_page(None, 0, 16).unwrap();
+    assert_eq!(refreshed.snapshot_generation, 36);
 }
 
 #[test]
