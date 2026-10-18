@@ -217,36 +217,56 @@ fn valid_grant_id(value: &str) -> bool {
 }
 
 fn canonicalize_allowing_missing(path: &Path) -> io::Result<PathBuf> {
+    match fs::canonicalize(path) {
+        Ok(canonical) => return Ok(canonical),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
         std::env::current_dir()?.join(path)
     };
-    let mut normalized = PathBuf::new();
+    let mut resolved = PathBuf::new();
+    let mut has_missing_component = false;
+
     for component in absolute.components() {
         match component {
-            std::path::Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            std::path::Component::RootDir => normalized.push(component.as_os_str()),
+            std::path::Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            std::path::Component::RootDir => resolved.push(component.as_os_str()),
             std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
+            std::path::Component::ParentDir if has_missing_component => {
+                return Err(invalid(
+                    "protected Conductor path traverses a parent after a missing component",
+                ));
             }
-            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                if let Some(parent) = resolved.parent() {
+                    resolved = parent.to_path_buf();
+                }
+            }
+            std::path::Component::Normal(part) if has_missing_component => resolved.push(part),
+            std::path::Component::Normal(part) => {
+                let candidate = resolved.join(part);
+                match fs::canonicalize(&candidate) {
+                    Ok(canonical) => resolved = canonical,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                        match fs::symlink_metadata(&candidate) {
+                            Err(metadata_error)
+                                if metadata_error.kind() == io::ErrorKind::NotFound => {}
+                            Ok(_) | Err(_) => return Err(error),
+                        }
+                        resolved = candidate;
+                        has_missing_component = true;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
     }
 
-    let mut existing = normalized.as_path();
-    while !existing.exists() {
-        existing = existing
-            .parent()
-            .ok_or_else(|| invalid("protected Conductor path cannot be resolved"))?;
-    }
-    let mut canonical = fs::canonicalize(existing)?;
-    let suffix = normalized
-        .strip_prefix(existing)
-        .map_err(|_| invalid("protected Conductor path cannot be resolved"))?;
-    canonical.push(suffix);
-    Ok(canonical)
+    Ok(resolved)
 }
 
 fn validate_overlaps(grants: &BTreeMap<String, Arc<LandlockGrant>>) -> io::Result<()> {

@@ -307,12 +307,21 @@ def main():
     ) as lock_temporary:
         root = Path(temporary)
         lock_parent = Path(lock_temporary)
-        lock_directory = lock_parent / "ownership-locks"
+        lock_runtime = lock_parent / "secure" / "runtime"
+        lock_runtime.mkdir(parents=True)
+        lock_target_child = lock_runtime / "child"
+        lock_target_child.mkdir()
+        lock_directory = lock_runtime / "locks"
         lock_directory.mkdir(mode=0o700)
         lock_child = lock_directory / "nested"
         lock_child.mkdir()
         lock_alias = root / "ownership-lock-alias"
         lock_alias.symlink_to(lock_directory, target_is_directory=True)
+        lock_parent_alias_dir = root / "ownership-lock-parent-alias"
+        lock_parent_alias_dir.mkdir()
+        lock_parent_alias = lock_parent_alias_dir / "alias"
+        lock_parent_alias.symlink_to(lock_target_child, target_is_directory=True)
+        lock_parent_traversal = lock_parent_alias / "../locks"
         manager = root / "manager"
         worker = root / "worker"
         manager.mkdir(mode=0o700)
@@ -646,13 +655,16 @@ def main():
 
             # The configured ownership directory is protected independently of
             # manager/worker state and the delegated cgroup hierarchy.
-            for index, (case, grant_path, configured_alias) in enumerate(
+            for index, (case, grant_path, configured_path) in enumerate(
                 (
-                    ("direct", lock_directory, False),
-                    ("ancestor", lock_parent, False),
-                    ("descendant", lock_child, False),
-                    ("grant-alias", lock_alias, False),
-                    ("configured-alias", lock_directory, True),
+                    ("direct", lock_directory, None),
+                    ("ancestor", lock_runtime, None),
+                    ("descendant", lock_child, None),
+                    ("grant-alias", lock_alias, None),
+                    ("configured-alias", lock_directory, lock_alias),
+                    ("configured-parent-traversal", lock_directory, lock_parent_traversal),
+                    ("configured-parent-ancestor", lock_runtime, lock_parent_traversal),
+                    ("configured-parent-descendant", lock_child, lock_parent_traversal),
                 )
             ):
                 protected_config = dict(config)
@@ -665,8 +677,8 @@ def main():
                     }
                 )
                 protected_config["cgroup_v2"] = dict(config["cgroup_v2"])
-                if configured_alias:
-                    protected_config["cgroup_v2"]["ownershipLockDir"] = str(lock_alias)
+                if configured_path is not None:
+                    protected_config["cgroup_v2"]["ownershipLockDir"] = str(configured_path)
                 protected_config["landlock"] = {
                     "mode": "required",
                     "grants": [{"id": "lock-write", "path": str(grant_path), "write": True}],
