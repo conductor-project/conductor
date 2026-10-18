@@ -21,11 +21,31 @@ request contains `definition`, `workload`, `executableDigest`, and
 increasing revision number; clients do not choose it. The path ID must equal
 `definition.id`. A revision cannot be edited or reused after creation.
 
-`workload` is either `{"kind":"one_shot"}` or
-`{"kind":"service","identity":{"namespace":"default","name":"api"}}`.
+`workload` is either `{"kind":"one_shot"}` or a service with a stable
+identity and an optional list of named TCP ports, for example
+`{"kind":"service","identity":{"namespace":"default","name":"api"},"ports":[{"name":"http","protocol":"tcp"}]}`.
 The service identity is a stable DNS label in the only supported namespace,
 `default`. Replica count is not revision data; deployment replica counts are
 limited to 10,000.
+
+Each named port is assigned from a manager-configured range for the worker's
+network domain. Configure `worker_service_network` for the primary worker and
+`service_network` for each additional worker with a routable
+`advertised_address`, a shared `network_domain_id` for workers on the same host
+network, and non-overlapping `port_range_start` and `port_range_end` values.
+SQLite holds a logical lease for every active run, so simultaneous Conductor
+reservations in a network domain cannot collide. The manager does not keep a
+socket open on behalf of the workload; the service process binds the assigned
+port itself. Leases survive manager restart and uncertain run outcomes; the
+manager releases one only after confirmed terminal cleanup or allocation
+release. Workers inject the assignment as
+`CONDUCTOR_PORT_<NAME>` (upper-case, hyphens changed to underscores). The
+service must exit nonzero when it cannot bind. If another process wins an
+external bind race, the failed attempt remains in run history and the retry
+advances its starting port candidate with the next run sequence, then scans
+for an unleased port. External races can recur because the manager cannot
+atomically reserve a socket used by the workload. Ranges must be large enough
+for concurrent services and any retries.
 
 Service revisions require positive `resourceRequest.cpuMillis` and
 `resourceRequest.memoryBytes`. The manager rejects a missing dimension instead
@@ -111,6 +131,13 @@ current allocation and run, retry count, next eligible start time, and
 `terminalFailure` flag. This distinguishes a service whose retry budget is
 exhausted from a deployment that is merely waiting for placement. The terminal
 run remains available through the run history endpoint.
+
+`GET /v1/jobs/{jobId}/endpoints` returns endpoint records tied to the current
+service instance and run attempt. Every endpoint currently reports
+`ready: false`; readiness remains false until a health check confirms the
+current attempt is serving traffic. Endpoint addresses are manager-configured
+routable addresses. Loopback addresses are rejected so test listener addresses
+are not published as production endpoints.
 
 `DELETE /v1/jobs/{jobId}/deployment` is conditional and idempotent. It records a
 durable deleting tombstone and returns `202` while active or uncertain

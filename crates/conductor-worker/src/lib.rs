@@ -986,7 +986,19 @@ impl WorkerService {
             }
         }
 
-        let child = match self.backend.spawn(spec.id().as_str(), spec.job()) {
+        let job = match spec.job().clone().with_environment_overrides(
+            spec.service_ports()
+                .iter()
+                .map(|port| (port.environment_name(), port.port().to_string())),
+        ) {
+            Ok(job) => job,
+            Err(_) => {
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stdout);
+                self.mark_log_closed(spec.id().as_str(), LogStream::Stderr);
+                return self.finish_backend_failure(starting);
+            }
+        };
+        let child = match self.backend.spawn(spec.id().as_str(), &job) {
             Ok(child) => child,
             Err(error) => {
                 emit_worker_diagnostic("execution_launch_failed", spec.id().as_str(), &error);

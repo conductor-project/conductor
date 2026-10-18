@@ -61,6 +61,24 @@ struct ServiceAttemptCollection {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct ServiceEndpointCollection {
+    endpoints: Vec<ServiceEndpoint>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceEndpoint {
+    service_instance_id: conductor_core::ServiceInstanceId,
+    run_id: RunId,
+    name: String,
+    protocol: conductor_core::ServicePortProtocol,
+    advertised_address: String,
+    port: u16,
+    ready: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RunLogsResponse {
     run_id: String,
     stream: LogStream,
@@ -372,6 +390,7 @@ fn router_with_recovery(
         )
         .route("/v1/jobs/{id}/runs", post(start_run))
         .route("/v1/jobs/{id}/service-attempts", get(list_service_attempts))
+        .route("/v1/jobs/{id}/endpoints", get(list_service_endpoints))
         .route("/v1/workers", get(list_workers))
         .route("/v1/workers/{id}", get(get_worker))
         .route("/v1/runs", get(list_runs))
@@ -612,6 +631,58 @@ async fn list_service_attempts(
         service_attempts: attempts,
     })
     .into_response()
+}
+
+async fn list_service_endpoints(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+) -> Response {
+    let Ok(job_id) = JobId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_id",
+            "the job ID is invalid",
+        );
+    };
+    let attempts = match run_blocking(&state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        move || manager.list_service_attempts(&job_id)
+    })
+    .await
+    {
+        Ok(Ok(attempts)) => attempts,
+        Ok(Err(_)) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "service endpoints could not be read",
+            );
+        }
+        Err(error_value) => return blocking_error(error_value),
+    };
+    let endpoints = attempts
+        .into_iter()
+        .filter_map(|attempt| {
+            let run_id = attempt.current_run_id?;
+            Some(
+                attempt
+                    .service_ports
+                    .into_iter()
+                    .map(|port| ServiceEndpoint {
+                        service_instance_id: attempt.service_instance_id.clone(),
+                        run_id: run_id.clone(),
+                        name: port.name().to_owned(),
+                        protocol: port.protocol(),
+                        advertised_address: port.advertised_address().to_owned(),
+                        port: port.port(),
+                        ready: attempt.service_ports_ready,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .flatten()
+        .collect();
+    Json(ServiceEndpointCollection { endpoints }).into_response()
 }
 
 async fn deploy_revision(
@@ -2316,6 +2387,25 @@ mod access_tests {
         let instances = attempts["serviceAttempts"].as_array().unwrap();
         assert_eq!(instances.len(), 2);
         assert_eq!(instances[0]["terminalFailure"], false);
+
+        let endpoints = app
+            .clone()
+            .oneshot(authorized_request(
+                "GET",
+                "/v1/jobs/web/endpoints",
+                "",
+                None,
+                None,
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(endpoints.status(), StatusCode::OK);
+        let endpoints_bytes = axum::body::to_bytes(endpoints.into_body(), 65_536)
+            .await
+            .unwrap();
+        let endpoints: serde_json::Value = serde_json::from_slice(&endpoints_bytes).unwrap();
+        assert_eq!(endpoints["endpoints"], serde_json::json!([]));
 
         drop(app);
         let restarted_app = router(&database);

@@ -601,6 +601,10 @@ impl WorkerSession {
                 last_seen_at_ms,
                 true,
             )
+            .and_then(|status| match self.metadata.service_network() {
+                Some(network) => status.with_service_network(network.clone()),
+                None => Some(status),
+            })
             .ok_or(StatusCode::CONFLICT)?;
         *self
             .status

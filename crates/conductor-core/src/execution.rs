@@ -69,6 +69,7 @@ pub enum ExecutionModelError {
     InvalidDeployment,
     DeploymentGenerationExhausted,
     InvalidServiceName,
+    InvalidServicePort,
     UnsupportedNamespace,
     InvalidExecutableDigest,
     RevisionJobMismatch,
@@ -90,6 +91,9 @@ impl fmt::Display for ExecutionModelError {
             Self::InvalidDeployment => "deployment intent is invalid for its job revision",
             Self::DeploymentGenerationExhausted => "deployment generation is exhausted",
             Self::InvalidServiceName => "service name must be a DNS-compatible label",
+            Self::InvalidServicePort => {
+                "service port must have a unique DNS-compatible name and valid endpoint"
+            }
             Self::UnsupportedNamespace => "only the default service namespace is supported",
             Self::InvalidExecutableDigest => {
                 "executable digest must be a 64-character SHA-256 hex value"
@@ -275,7 +279,159 @@ fn valid_dns_label(value: &str) -> bool {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Workload {
     OneShot,
-    Service { identity: ServiceIdentity },
+    Service {
+        identity: ServiceIdentity,
+        #[serde(default)]
+        ports: Vec<ServicePort>,
+    },
+}
+
+/// A named TCP listener exposed by a native service process.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ServicePort {
+    name: String,
+    #[serde(default = "tcp_protocol")]
+    protocol: ServicePortProtocol,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServicePortProtocol {
+    #[default]
+    Tcp,
+}
+
+fn tcp_protocol() -> ServicePortProtocol {
+    ServicePortProtocol::Tcp
+}
+
+impl ServicePort {
+    pub fn tcp(name: impl Into<String>) -> Result<Self, ExecutionModelError> {
+        let name = name.into();
+        if !valid_dns_label(&name) {
+            return Err(ExecutionModelError::InvalidServicePort);
+        }
+        Ok(Self {
+            name,
+            protocol: ServicePortProtocol::Tcp,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn protocol(&self) -> ServicePortProtocol {
+        self.protocol
+    }
+
+    pub fn environment_name(&self) -> String {
+        let mut name = String::with_capacity("CONDUCTOR_PORT_".len() + self.name.len());
+        name.push_str("CONDUCTOR_PORT_");
+        name.extend(
+            self.name
+                .bytes()
+                .map(|byte| {
+                    if byte == b'-' {
+                        b'_'
+                    } else {
+                        byte.to_ascii_uppercase()
+                    }
+                })
+                .map(char::from),
+        );
+        name
+    }
+}
+
+/// An assigned host endpoint injected into one service execution attempt.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", try_from = "RawAssignedServicePort")]
+pub struct AssignedServicePort {
+    name: String,
+    protocol: ServicePortProtocol,
+    port: u16,
+    advertised_address: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawAssignedServicePort {
+    name: String,
+    protocol: ServicePortProtocol,
+    port: u16,
+    advertised_address: String,
+}
+
+impl TryFrom<RawAssignedServicePort> for AssignedServicePort {
+    type Error = ExecutionModelError;
+
+    fn try_from(raw: RawAssignedServicePort) -> Result<Self, Self::Error> {
+        Self::new(raw.name, raw.protocol, raw.port, raw.advertised_address)
+    }
+}
+
+impl AssignedServicePort {
+    pub fn new(
+        name: impl Into<String>,
+        protocol: ServicePortProtocol,
+        port: u16,
+        advertised_address: impl Into<String>,
+    ) -> Result<Self, ExecutionModelError> {
+        let name = name.into();
+        let advertised_address = advertised_address.into();
+        if !valid_dns_label(&name) || port == 0 || !valid_advertised_address(&advertised_address) {
+            return Err(ExecutionModelError::InvalidServicePort);
+        }
+        Ok(Self {
+            name,
+            protocol,
+            port,
+            advertised_address,
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn protocol(&self) -> ServicePortProtocol {
+        self.protocol
+    }
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+    pub fn advertised_address(&self) -> &str {
+        &self.advertised_address
+    }
+
+    pub fn is_valid(&self) -> bool {
+        valid_dns_label(&self.name)
+            && self.port > 0
+            && valid_advertised_address(&self.advertised_address)
+    }
+
+    pub fn environment_name(&self) -> String {
+        let mut name = String::with_capacity("CONDUCTOR_PORT_".len() + self.name.len());
+        name.push_str("CONDUCTOR_PORT_");
+        name.extend(
+            self.name
+                .bytes()
+                .map(|byte| {
+                    if byte == b'-' {
+                        b'_'
+                    } else {
+                        byte.to_ascii_uppercase()
+                    }
+                })
+                .map(char::from),
+        );
+        name
+    }
+}
+
+fn valid_advertised_address(value: &str) -> bool {
+    crate::inventory::valid_advertised_address(value)
 }
 
 /// Maximum requested service replica count accepted by the public API.
@@ -876,6 +1032,20 @@ impl JobRevision {
         if !crate::valid_worker_labels(execution_requirements.worker_labels()) {
             return Err(ExecutionModelError::InvalidWorkerLabelConstraint);
         }
+        if let Workload::Service { ports, .. } = &workload {
+            if ports.len() > 32 {
+                return Err(ExecutionModelError::InvalidServicePort);
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for port in ports {
+                if !valid_dns_label(port.name())
+                    || !seen.insert(port.name())
+                    || definition.env().contains_key(&port.environment_name())
+                {
+                    return Err(ExecutionModelError::InvalidServicePort);
+                }
+            }
+        }
         let resource_request_provenance = if resource_request.cpu_millis().is_some()
             || resource_request.memory_bytes().is_some()
         {
@@ -1040,7 +1210,7 @@ impl Allocation {
     ) -> Result<Self, ExecutionModelError> {
         let service_instance_id = match (revision.workload(), service_instance) {
             (Workload::OneShot, None) => None,
-            (Workload::Service { identity }, Some(instance))
+            (Workload::Service { identity, .. }, Some(instance))
                 if instance.job_revision_id() == revision.id()
                     && instance.service() == identity =>
             {
@@ -1333,7 +1503,7 @@ impl ServiceInstance {
         revision: &JobRevision,
         replica_index: u32,
     ) -> Result<Self, ExecutionModelError> {
-        let Workload::Service { identity } = revision.workload() else {
+        let Workload::Service { identity, .. } = revision.workload() else {
             return Err(ExecutionModelError::InvalidServiceInstance);
         };
         if replica_index >= MAX_DEPLOYMENT_REPLICAS {

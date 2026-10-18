@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use conductor_core::{
-    Allocation, AllocationId, AllocationState, Architecture, AttemptState, DeploymentPendingReason,
-    DeploymentStatus, DigestAlgorithm, EnforcementCapability, ExecutableDigest, ExecutionAttempt,
-    ExecutionAttemptId, ExecutionBackend, ExecutionModelError, ExecutionRequirements,
-    FilesystemPolicy, JobDeployment, JobId, JobRevision, JobRevisionDraft, JobRevisionId, JobSpec,
-    OperatingSystem, ResourceLimits, ResourceRequest, ResourceReservation, ServiceIdentity,
-    ServiceInstance, ServiceInstanceId, WorkerCapabilities, WorkerId, Workload,
+    Allocation, AllocationId, AllocationState, Architecture, AssignedServicePort, AttemptState,
+    DeploymentPendingReason, DeploymentStatus, DigestAlgorithm, EnforcementCapability,
+    ExecutableDigest, ExecutionAttempt, ExecutionAttemptId, ExecutionBackend, ExecutionModelError,
+    ExecutionRequirements, FilesystemPolicy, JobDeployment, JobId, JobRevision, JobRevisionDraft,
+    JobRevisionId, JobSpec, OperatingSystem, ResourceLimits, ResourceRequest, ResourceReservation,
+    RunId, RunSpec, ServiceIdentity, ServiceInstance, ServiceInstanceId, ServicePort,
+    ServicePortProtocol, WorkerCapabilities, WorkerId, Workload,
 };
 
 fn job_spec(id: &str) -> JobSpec {
@@ -109,6 +110,7 @@ fn service_identity_and_replica_slots_have_stable_validated_ids() {
 
     let revision = revision(Workload::Service {
         identity: service.clone(),
+        ports: Vec::new(),
     });
     let instance = ServiceInstance::new(
         ServiceInstanceId::new("frontend-slot-0").unwrap(),
@@ -148,6 +150,7 @@ fn deployment_intent_is_mutable_separate_from_immutable_revisions() {
     let service = ServiceIdentity::new("frontend").unwrap();
     let first_revision = revision(Workload::Service {
         identity: service.clone(),
+        ports: Vec::new(),
     });
     let pending = JobDeployment::new(
         &first_revision,
@@ -269,6 +272,7 @@ fn allocation_and_attempt_transitions_reject_unsafe_reassignment() {
 fn service_revisions_require_complete_requests_and_derive_protection_requirements() {
     let service = Workload::Service {
         identity: ServiceIdentity::new("frontend").unwrap(),
+        ports: Vec::new(),
     };
     let digest = ExecutableDigest::sha256("a".repeat(64)).unwrap();
     let id = JobRevisionId::new(JobId::new("job-1").unwrap(), 1).unwrap();
@@ -337,6 +341,48 @@ fn service_revisions_require_complete_requests_and_derive_protection_requirement
             ResourceRequest::new(Some(1_000), Some(200 * 1024 * 1024)).unwrap(),
         ),
         Err(ExecutionModelError::UnsupportedPlatformCapability)
+    );
+}
+
+#[test]
+fn named_service_ports_validate_names_and_create_run_environment_overrides() {
+    let declared = ServicePort::tcp("admin-http").unwrap();
+    assert_eq!(declared.environment_name(), "CONDUCTOR_PORT_ADMIN_HTTP");
+    assert!(ServicePort::tcp("Admin").is_err());
+    assert!(ServicePort::tcp("bad_name").is_err());
+
+    let spec = RunSpec::new(
+        RunId::new("run-1").unwrap(),
+        WorkerId::new("worker-1").unwrap(),
+        job_spec("job-1"),
+    )
+    .with_service_ports(vec![
+        AssignedServicePort::new(
+            declared.name(),
+            ServicePortProtocol::Tcp,
+            31_000,
+            "192.0.2.10",
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+    let process_job = spec
+        .job()
+        .clone()
+        .with_environment_overrides(
+            spec.service_ports()
+                .iter()
+                .map(|port| (port.environment_name(), port.port().to_string())),
+        )
+        .unwrap();
+    assert_eq!(process_job.env()["CONDUCTOR_PORT_ADMIN_HTTP"], "31000");
+
+    assert!(AssignedServicePort::new("http", ServicePortProtocol::Tcp, 0, "192.0.2.10").is_err());
+    assert!(
+        AssignedServicePort::new("http", ServicePortProtocol::Tcp, 31_000, "127.0.0.1").is_err()
+    );
+    assert!(
+        AssignedServicePort::new("http", ServicePortProtocol::Tcp, 31_000, "localhost").is_err()
     );
 }
 
