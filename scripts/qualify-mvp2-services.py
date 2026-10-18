@@ -496,13 +496,31 @@ def main():
                      "A", f"{unknown}.", "@127.0.0.1"],
                     capture_output=True, text=True, timeout=3,
                 )
-                if negative.returncode or " IN SOA " not in negative.stdout or " IN A " in negative.stdout:
+                negative_records = [line.split() for line in negative.stdout.splitlines()]
+                negative_soa = next(
+                    (
+                        record
+                        for record in negative_records
+                        if len(record) >= 4 and record[2:4] == ["IN", "SOA"]
+                    ),
+                    None,
+                )
+                has_positive_a = any(
+                    len(record) >= 4 and record[2:4] == ["IN", "A"]
+                    for record in negative_records
+                )
+                if (
+                    negative.returncode
+                    or negative_soa is None
+                    or negative_soa[1] != "1"
+                    or has_positive_a
+                ):
                     raise RuntimeError(
                         f"unknown service did not return an authoritative negative answer: "
                         f"{negative.stdout.strip()} {negative.stderr.strip()}"
                     )
                 result["scenarios"].append(
-                    "host resolver rejects an uncreated service and authoritative DNS returns a negative SOA answer"
+                    "host resolver rejects an uncreated service and authoritative DNS returns a 1-second negative SOA"
                 )
 
                 service_program = root / "service.py"
