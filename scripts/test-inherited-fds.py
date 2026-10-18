@@ -8,6 +8,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import selectors
 import signal
 import subprocess
 import sys
@@ -29,6 +30,35 @@ def request(address: tuple[str, int], method: str, path: str, payload: object | 
         return response.status, response.read().decode("utf-8")
     finally:
         connection.close()
+
+
+def read_startup_event(child: subprocess.Popen[str]) -> dict[str, object]:
+    if child.stderr is None:
+        raise RuntimeError("daemon stderr was not captured")
+    selector = selectors.DefaultSelector()
+    selector.register(child.stderr, selectors.EVENT_READ)
+    buffer = bytearray()
+    deadline = time.monotonic() + 5
+    try:
+        while b"\n" not in buffer:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("daemon startup event deadline expired")
+            if not selector.select(remaining):
+                continue
+            chunk = os.read(child.stderr.fileno(), 4096)
+            if not chunk:
+                raise RuntimeError(f"daemon exited before startup: {child.poll()}")
+            buffer.extend(chunk)
+            if len(buffer) > 8192:
+                raise RuntimeError("daemon startup event exceeded its size limit")
+        line = bytes(buffer).split(b"\n", 1)[0]
+        event = json.loads(line)
+        if not isinstance(event, dict):
+            raise RuntimeError("daemon startup event was not a JSON object")
+        return event
+    finally:
+        selector.close()
 
 
 def main() -> int:
@@ -70,11 +100,7 @@ def main() -> int:
             text=True,
         )
         try:
-            assert child.stderr is not None
-            line = child.stderr.readline()
-            if not line:
-                raise RuntimeError(f"daemon exited before startup: {child.poll()}")
-            event = json.loads(line)
+            event = read_startup_event(child)
             if event.get("event") != "agent_started":
                 raise RuntimeError(f"unexpected startup event: {event}")
             host, port = event["address"].rsplit(":", 1)
@@ -82,9 +108,12 @@ def main() -> int:
 
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
-                status, body = request(address, "GET", "/readyz")
-                if status == 200 and json.loads(body).get("status") == "ready":
-                    break
+                try:
+                    status, body = request(address, "GET", "/readyz")
+                    if status == 200 and json.loads(body).get("status") == "ready":
+                        break
+                except (OSError, http.client.HTTPException):
+                    pass
                 if child.poll() is not None:
                     raise RuntimeError(f"daemon exited during readiness: {child.returncode}")
                 time.sleep(0.02)
@@ -141,6 +170,8 @@ def main() -> int:
                     child.kill()
                     child.wait(timeout=3)
                     raise TimeoutError("daemon cleanup exceeded its deadline")
+            if child.returncode != 0:
+                raise RuntimeError(f"daemon exited during cleanup with {child.returncode}")
             inherited.close()
 
 

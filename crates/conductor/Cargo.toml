@@ -29,6 +29,9 @@ close_fds.workspace = true
 close_fds.workspace = true
 
 [dev-dependencies]
+axum.workspace = true
+axum-server.workspace = true
+reqwest.workspace = true
 rusqlite.workspace = true
 
 [lints]

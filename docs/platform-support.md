@@ -26,6 +26,7 @@ those Linux kernel guarantees.
 | --- | --- | --- |
 | Native process execution | Yes | Yes |
 | Inherited descriptor hygiene | Close-on-exec scan before startup threads and after backend initialization; Linux CI checks descriptor visibility under Landlock | Same close-on-exec scan; macOS CI checks that a descriptor passed to the daemon is unavailable to its job |
+| Host resource inventory | Current worker status reports configured run slots; no host-wide resource inventory is exposed | Current worker status reports configured run slots; no host-wide resource inventory is exposed |
 | Process-group signal and cleanup | Yes; cgroup v2 can clean descendants that leave the process group when configured | Yes for ordinary process-group members; descendants that leave the group are outside Conductor's cleanup guarantee |
 | cgroup v2 CPU, memory, swap, and process limits | Optional, when an administrator delegates and configures cgroup v2 | Unavailable |
 | Landlock filesystem policy | Optional, when the kernel and administrator configuration meet the requirements | Unavailable |
@@ -38,11 +39,14 @@ macOS behavior. A macOS worker cannot advertise cgroup or Landlock enforcement,
 and a job that requires filesystem policy or resource limits fails before its
 executable is launched. Resource requests on macOS are not kernel-enforced.
 
-The macOS tests establish local multi-process behavior only. They do not qualify
-independent-host failure isolation, cross-host networking, or remote worker
-composition. Those require the separate MVP2 multi-host qualification in issue
-#77. The manager-plus-two-workers authenticated-transport demonstration is also
-tracked as a prerequisite in issue #61.
+The macOS tests establish local process lifecycle behavior only. They do not
+qualify independent-host failure isolation or cross-host networking; those
+require the separate MVP2 multi-host qualification in issue #77. The manager
+plus two worker authenticated-transport demonstration is tracked with runtime
+composition in issue #61. Host resource inventory and refusal to place work on
+incompatible workers are tracked in issues #66 and #67. Executable digest
+verification is tracked in issue #63. These remain explicit qualification gaps
+until their implementation and macOS evidence are complete.
 
 ## macOS prerequisites
 
