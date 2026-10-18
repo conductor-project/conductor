@@ -32,6 +32,7 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot, watch};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
+const SCHEMA_VERSION: i64 = 3;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_PERSISTENCE_BUDGET: Duration = Duration::from_secs(2);
 const PERSISTENCE_BLOCKING_CAPACITY: usize = 2;
@@ -663,11 +664,15 @@ impl WorkerService {
         let schema_version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(storage_error)?;
-        if !(0..=3).contains(&schema_version) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "worker database schema is newer than supported",
-            ));
+        if !(0..=SCHEMA_VERSION).contains(&schema_version) {
+            let message = if schema_version > SCHEMA_VERSION {
+                format!(
+                    "worker database schema version {schema_version} is newer than supported version {SCHEMA_VERSION}"
+                )
+            } else {
+                format!("worker database schema version {schema_version} is invalid")
+            };
+            return Err(io::Error::new(io::ErrorKind::InvalidData, message));
         }
         if schema_version == 0 {
             let existing_tables: bool = connection

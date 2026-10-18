@@ -21,15 +21,18 @@ use super::{ExecutionBackend, SpawnGuard, WorkerError, WorkerService};
 
 struct TestDirectory(PathBuf);
 
+static TEST_DIRECTORY_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+
 impl TestDirectory {
     fn new() -> Self {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock")
             .as_nanos();
+        let sequence = TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "conductor-reader-reaper-{}-{nonce}",
-            std::process::id()
+            "conductor-reader-reaper-{}-{nonce}-{sequence}",
+            std::process::id(),
         ));
         fs::create_dir(&path).expect("create test directory");
         Self(path)
