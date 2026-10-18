@@ -118,6 +118,7 @@ enum ApiRole {
 struct ApiReadiness {
     role: ApiRole,
     manager_workers_ready: Option<Arc<AtomicBool>>,
+    recovery_workers: Option<Vec<Arc<dyn WorkerPort>>>,
 }
 
 impl ApiRole {
@@ -170,6 +171,21 @@ impl ApiRole {
 pub enum ApiAccessPolicy {
     LocalMode,
     AuthenticatedOperator(Arc<dyn OperatorAuthenticator>),
+}
+
+/// Worker set and readiness signal used to recover a standalone manager.
+pub struct ManagerRecovery {
+    workers_ready: Arc<AtomicBool>,
+    workers: Vec<Arc<dyn WorkerPort>>,
+}
+
+impl ManagerRecovery {
+    pub fn new(workers_ready: Arc<AtomicBool>, workers: Vec<Arc<dyn WorkerPort>>) -> Self {
+        Self {
+            workers_ready,
+            workers,
+        }
+    }
 }
 
 /// Verifies operator credentials from HTTP headers without trusting request bodies.
@@ -277,6 +293,7 @@ pub fn router_with_access_policy(
         ApiReadiness {
             role: ApiRole::All,
             manager_workers_ready: None,
+            recovery_workers: None,
         },
     )
 }
@@ -1207,6 +1224,7 @@ pub async fn serve_with_access_policy(
         ApiReadiness {
             role: ApiRole::All,
             manager_workers_ready: None,
+            recovery_workers: None,
         },
     )
     .await
@@ -1220,7 +1238,7 @@ pub async fn serve_manager_with_access_policy(
     worker: Arc<dyn WorkerPort>,
     request_timeout: Duration,
     access_policy: ApiAccessPolicy,
-    manager_workers_ready: Arc<AtomicBool>,
+    recovery: ManagerRecovery,
 ) -> io::Result<()> {
     serve_with_role_and_access_policy(
         listener,
@@ -1231,7 +1249,8 @@ pub async fn serve_manager_with_access_policy(
         access_policy,
         ApiReadiness {
             role: ApiRole::Manager,
-            manager_workers_ready: Some(manager_workers_ready),
+            manager_workers_ready: Some(recovery.workers_ready),
+            recovery_workers: Some(recovery.workers),
         },
     )
     .await
@@ -1255,7 +1274,10 @@ async fn serve_with_role_and_access_policy(
     let recovery_ready = Arc::new(AtomicBool::new(false));
     let ready_for_recovery = Arc::clone(&recovery_ready);
     let recovery_manager = Arc::clone(&manager);
-    let recovery_worker = Arc::clone(&worker);
+    let recovery_workers = readiness
+        .recovery_workers
+        .clone()
+        .unwrap_or_else(|| vec![Arc::clone(&worker)]);
     let manager_workers_ready = readiness.manager_workers_ready.clone();
     let recovery_shutdown = Arc::clone(&shutdown);
     tokio::spawn(async move {
@@ -1265,28 +1287,16 @@ async fn serve_with_role_and_access_policy(
                 if recovery_shutdown.load(Ordering::Acquire) {
                     return;
                 }
-                if !workers_ready.load(Ordering::Acquire) || recovery_worker.is_degraded() {
+                if !workers_ready.load(Ordering::Acquire) {
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
-                let manager = Arc::clone(&recovery_manager);
-                let worker = Arc::clone(&recovery_worker);
-                let result =
-                    tokio::task::spawn_blocking(move || manager.reconcile(worker.as_ref())).await;
-                match result {
-                    Ok(Ok(())) => {
+                match reconcile_workers(&recovery_manager, &recovery_workers).await {
+                    Ok(()) => {
                         ready_for_recovery.store(true, Ordering::Release);
                         return;
                     }
-                    result => {
-                        let reason = match result {
-                            Ok(Err(conductor_manager::ManagerError::WorkerUnavailable)) => {
-                                "worker_unavailable"
-                            }
-                            Ok(Err(_)) => "manager_reconcile_failed",
-                            Err(_) => "reconcile_task_failed",
-                            Ok(Ok(())) => "unknown",
-                        };
+                    Err(reason) => {
                         eprintln!(
                             "{{\"timestampMs\":{},\"severity\":\"warn\",\"component\":\"manager\",\"event\":\"manager_recovery_retry\",\"reason\":\"{reason}\"}}",
                             timestamp_ms()
@@ -1298,11 +1308,10 @@ async fn serve_with_role_and_access_policy(
             }
         }
         for attempt in 0..4 {
-            let manager = Arc::clone(&recovery_manager);
-            let worker = Arc::clone(&recovery_worker);
-            let result =
-                tokio::task::spawn_blocking(move || manager.reconcile(worker.as_ref())).await;
-            if matches!(result, Ok(Ok(()))) {
+            if reconcile_workers(&recovery_manager, &recovery_workers)
+                .await
+                .is_ok()
+            {
                 ready_for_recovery.store(true, Ordering::SeqCst);
                 return;
             }
@@ -1345,6 +1354,23 @@ async fn serve_with_role_and_access_policy(
             }
         }
     }
+}
+
+async fn reconcile_workers(
+    manager: &Arc<JobService>,
+    workers: &[Arc<dyn WorkerPort>],
+) -> Result<(), &'static str> {
+    for worker in workers {
+        let manager = Arc::clone(manager);
+        let worker = Arc::clone(worker);
+        match tokio::task::spawn_blocking(move || manager.reconcile(worker.as_ref())).await {
+            Ok(Ok(())) => {}
+            Ok(Err(ManagerError::WorkerUnavailable)) => return Err("worker_unavailable"),
+            Ok(Err(_)) => return Err("manager_reconcile_failed"),
+            Err(_) => return Err("reconcile_task_failed"),
+        }
+    }
+    Ok(())
 }
 
 async fn wait_for_shutdown(shutdown: Arc<AtomicBool>) {
