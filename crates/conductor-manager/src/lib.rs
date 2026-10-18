@@ -310,6 +310,10 @@ pub trait JobRepository: Send + Sync + CommandJournal {
         identity: &ServiceIdentity,
         workers: &[WorkerStatus],
     ) -> Result<Vec<ServiceCatalogEndpoint>, ExecutionStoreError>;
+    fn service_identity_exists(
+        &self,
+        identity: &ServiceIdentity,
+    ) -> Result<bool, ExecutionStoreError>;
     fn begin_service_run(
         &self,
         job_id: &JobId,
@@ -3385,6 +3389,24 @@ impl JobRepository for SqliteJobRepository {
         Ok(endpoints)
     }
 
+    fn service_identity_exists(
+        &self,
+        identity: &ServiceIdentity,
+    ) -> Result<bool, ExecutionStoreError> {
+        self.connection
+            .lock()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM service_catalog_owners
+                     WHERE namespace = ?1 AND service_name = ?2
+                 )",
+                params![identity.namespace(), identity.name()],
+                |row| row.get(0),
+            )
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)
+    }
+
     fn begin_service_run(
         &self,
         job_id: &JobId,
@@ -4725,6 +4747,13 @@ impl JobService {
         workers: &[WorkerStatus],
     ) -> Result<Vec<ServiceCatalogEndpoint>, ExecutionStoreError> {
         self.repository.list_service_catalog(identity, workers)
+    }
+
+    pub fn service_identity_exists(
+        &self,
+        identity: &ServiceIdentity,
+    ) -> Result<bool, ExecutionStoreError> {
+        self.repository.service_identity_exists(identity)
     }
 
     /// Reconcile placed service slots with their workers. Repeated calls are

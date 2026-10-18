@@ -16,6 +16,7 @@ axum-server.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ipnet.workspace = true
 ctrlc.workspace = true
 clap.workspace = true
 tokio.workspace = true

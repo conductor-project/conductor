@@ -134,6 +134,8 @@ struct Config {
     worker_labels: BTreeMap<String, String>,
     #[serde(default)]
     worker_service_network: Option<ServiceNetworkConfig>,
+    #[serde(default)]
+    service_dns: Option<ServiceDnsListenerConfig>,
     #[serde(default = "default_log_max_bytes_per_stream")]
     log_max_bytes_per_stream: u64,
     #[serde(default = "default_log_retention_runs")]
@@ -144,6 +146,21 @@ struct Config {
     cgroup_v2: CgroupV2Config,
     #[serde(default)]
     landlock: LandlockConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ServiceDnsListenerConfig {
+    listen: SocketAddr,
+    #[serde(default = "default_service_dns_suffix")]
+    suffix: String,
+    /// Empty means loopback clients only. Non-loopback exposure must be explicit.
+    #[serde(default)]
+    allowed_clients: Vec<String>,
+}
+
+fn default_service_dns_suffix() -> String {
+    "conductor.internal".to_owned()
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -449,6 +466,7 @@ fn run_all(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let worker_id = WorkerId::new(required(&config.worker_id, "worker_id")?.clone())?;
     let worker_concurrency = *required(&config.worker_concurrency, "worker_concurrency")?;
     let listen = *required(&config.listen, "listen")?;
+    let dns_config = service_dns_config(config.service_dns.as_ref())?;
     let _state_locks = StateLocks::acquire(manager_data_dir, worker_data_dir)?;
     let manager = Arc::new(conductor_manager::JobService::open_sqlite(
         manager_data_dir.join("manager.sqlite3"),
@@ -490,17 +508,60 @@ fn run_all(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
+    let manager_for_dns = Arc::clone(&manager);
+    let dns_workers = vec![Arc::clone(&worker_port)];
     let serve_result = runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener)?;
-        conductor_api::serve_with_access_policy(
-            listener,
-            shutdown,
-            manager,
-            worker_port,
-            Duration::from_millis(config.request_timeout_ms),
-            api_access,
-        )
-        .await
+        if let Some(dns_config) = dns_config {
+            let dns_shutdown = Arc::clone(&shutdown);
+            let mut dns_task = tokio::spawn(conductor_api::dns::serve_service_dns(
+                dns_config,
+                manager_for_dns,
+                dns_workers,
+                dns_shutdown,
+            ));
+            let api_shutdown = Arc::clone(&shutdown);
+            let mut api_task = Box::pin(conductor_api::serve_with_access_policy(
+                listener,
+                api_shutdown,
+                manager,
+                worker_port,
+                Duration::from_millis(config.request_timeout_ms),
+                api_access,
+            ));
+            tokio::select! {
+                api_result = &mut api_task => {
+                    shutdown.store(true, Ordering::Release);
+                    let dns_result = dns_task.await
+                        .map_err(std::io::Error::other)?
+                        .map_err(|error| std::io::Error::other(error.to_string()));
+                    api_result.and(dns_result)
+                }
+                dns_result = &mut dns_task => {
+                    let shutting_down = shutdown.load(Ordering::Acquire);
+                    shutdown.store(true, Ordering::Release);
+                    let api_result = api_task.await;
+                    let dns_result = dns_result
+                        .map_err(std::io::Error::other)?
+                        .map_err(|error| std::io::Error::other(error.to_string()));
+                    if !shutting_down && dns_result.is_ok() {
+                        return Err(std::io::Error::other("service DNS server stopped unexpectedly"));
+                    }
+                    dns_result?;
+                    api_result
+                }
+            }
+        } else {
+            conductor_api::serve_with_access_policy(
+                listener,
+                shutdown,
+                manager,
+                worker_port,
+                Duration::from_millis(config.request_timeout_ms),
+                api_access,
+            )
+            .await
+        }
     });
     let shutdown_result = worker.shutdown();
     serve_result?;
@@ -519,6 +580,7 @@ fn run_manager(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
         &config.worker_transport_capacity,
         "worker_transport_capacity",
     )?;
+    let dns_config = service_dns_config(config.service_dns.as_ref())?;
     let api_access = api_access_policy(&config)?;
     let _state_locks = StateLocks::acquire_manager(manager_data_dir)
         .map_err(|error| format!("manager state lock could not be acquired: {error}"))?;
@@ -602,6 +664,8 @@ fn run_manager(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
         .enable_all()
         .build()?;
     let request_timeout = Duration::from_millis(config.request_timeout_ms);
+    let dns_manager = Arc::clone(&manager);
+    let dns_workers = worker_ports.clone();
     let result: Result<(), Box<dyn std::error::Error>> = runtime.block_on(async move {
         let server_handle = axum_server::Handle::new();
         let mut transport_task = tokio::spawn(
@@ -633,6 +697,14 @@ fn run_manager(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
             api_access,
             conductor_api::ManagerRecovery::new(workers_ready, recovery_ports),
         ));
+        let mut dns_task = dns_config.map(|dns_config| {
+            tokio::spawn(conductor_api::dns::serve_service_dns(
+                dns_config,
+                dns_manager,
+                dns_workers,
+                Arc::clone(&shutdown),
+            ))
+        });
         let (completed_transport, api_result, transport_result) = tokio::select! {
             api_result = &mut api_task => (false, api_result, None),
             transport_result = &mut transport_task => {
@@ -645,8 +717,34 @@ fn run_manager(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
                     };
                 }
                 (true, (&mut api_task).await, Some(transport_result))
+            },
+            dns_result = async {
+                match dns_task.as_mut() {
+                    Some(task) => Some(task.await),
+                    None => std::future::pending().await,
+                }
+            } => {
+                let shutting_down = shutdown.load(Ordering::Acquire);
+                if !shutting_down {
+                    shutdown.store(true, Ordering::Release);
+                }
+                server_handle.graceful_shutdown(Some(Duration::from_secs(5)));
+                readiness_task.abort();
+                let api_result = (&mut api_task).await;
+                finish_transport_server(&mut transport_task).await?;
+                return match dns_result {
+                    Some(Ok(Ok(()))) if shutting_down => {
+                        api_result?;
+                        Ok(())
+                    }
+                    Some(Ok(Ok(()))) => Err("service DNS server stopped unexpectedly".into()),
+                    Some(Ok(Err(error))) => Err(format!("service DNS server failed: {error}").into()),
+                    Some(Err(error)) => Err(format!("service DNS server task failed: {error}").into()),
+                    None => Err("service DNS server result is missing".into()),
+                };
             }
         };
+        shutdown.store(true, Ordering::Release);
         readiness_task.abort();
         if !completed_transport {
             server_handle.graceful_shutdown(Some(Duration::from_secs(5)));
@@ -661,6 +759,13 @@ fn run_manager(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
                     return Err(format!("worker transport server task failed: {error}").into());
                 }
                 None => return Err("worker transport task result is missing".into()),
+            }
+        }
+        if let Some(task) = dns_task.take() {
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(format!("service DNS server failed: {error}").into()),
+                Err(error) => return Err(format!("service DNS server task failed: {error}").into()),
             }
         }
         api_result?;
@@ -904,6 +1009,10 @@ fn log_started(
     if let Some(address) = transport_address {
         event["workerTransportAddress"] = serde_json::Value::String(address.to_string());
     }
+    if let Some(service_dns) = &config.service_dns {
+        event["serviceDnsAddress"] = serde_json::Value::String(service_dns.listen.to_string());
+        event["serviceDnsSuffix"] = serde_json::Value::String(service_dns.suffix.clone());
+    }
     eprintln!("{}", serde_json::to_string(&event)?);
     Ok(())
 }
@@ -1001,6 +1110,33 @@ fn process_backend(
         }
         Ok(Arc::new(conductor_process::HostProcessBackend::default()))
     }
+}
+
+fn service_dns_config(
+    configured: Option<&ServiceDnsListenerConfig>,
+) -> Result<Option<conductor_api::dns::ServiceDnsConfig>, Box<dyn std::error::Error>> {
+    let Some(configured) = configured else {
+        return Ok(None);
+    };
+    if !configured.listen.ip().is_loopback() && configured.allowed_clients.is_empty() {
+        return Err("non-loopback service DNS listeners require explicit allowed_clients".into());
+    }
+    let allowed_clients = if configured.allowed_clients.is_empty() {
+        vec!["127.0.0.0/8".parse()?, "::1/128".parse()?]
+    } else {
+        configured
+            .allowed_clients
+            .iter()
+            .map(|range| range.parse())
+            .collect::<Result<Vec<ipnet::IpNet>, _>>()?
+    };
+    let service_dns = conductor_api::dns::ServiceDnsConfig {
+        listen: configured.listen,
+        suffix: configured.suffix.clone(),
+        allowed_clients,
+    };
+    service_dns.validate().map_err(std::io::Error::other)?;
+    Ok(Some(service_dns))
 }
 
 fn timestamp_ms() -> u128 {
@@ -1179,6 +1315,7 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 || config.worker_resource_domain_id.is_some()
                 || !config.worker_labels.is_empty()
                 || config.worker_service_network.is_some()
+                || config.service_dns.is_some()
             {
                 return Err("manager-only fields cannot be used with role 'worker'".into());
             }
@@ -1529,6 +1666,7 @@ mod tests {
             worker_resource_domain_id: None,
             worker_labels: BTreeMap::new(),
             worker_service_network: None,
+            service_dns: None,
             log_max_bytes_per_stream: conductor_worker::DEFAULT_LOG_MAX_BYTES_PER_STREAM,
             log_retention_runs: conductor_worker::DEFAULT_LOG_RETENTION_RUNS,
             request_timeout_ms: default_request_timeout_ms(),
@@ -1548,6 +1686,33 @@ mod tests {
         config.manager_server_name = Some("localhost".to_owned());
         config.worker_transport_capacity = Some(2);
         config
+    }
+
+    #[test]
+    fn service_dns_defaults_to_loopback_and_requires_explicit_remote_ranges() {
+        let local: super::ServiceDnsListenerConfig =
+            serde_json::from_str(r#"{"listen":"127.0.0.1:8053"}"#).expect("valid local DNS config");
+        assert_eq!(local.suffix, "conductor.internal");
+        let converted = super::service_dns_config(Some(&local))
+            .expect("loopback-only access defaults")
+            .expect("configured DNS listener");
+        assert_eq!(converted.allowed_clients.len(), 2);
+
+        let remote: super::ServiceDnsListenerConfig =
+            serde_json::from_str(r#"{"listen":"192.0.2.53:53"}"#)
+                .expect("well-formed remote listener config");
+        assert!(super::service_dns_config(Some(&remote)).is_err());
+        let remote: super::ServiceDnsListenerConfig =
+            serde_json::from_str(r#"{"listen":"192.0.2.53:53","allowedClients":["192.0.2.0/24"]}"#)
+                .expect("remote listener with explicit CIDR");
+        assert_eq!(
+            super::service_dns_config(Some(&remote))
+                .expect("valid remote DNS config")
+                .expect("configured DNS listener")
+                .allowed_clients
+                .len(),
+            1
+        );
     }
 
     #[test]

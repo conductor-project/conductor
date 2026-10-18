@@ -405,6 +405,23 @@ fn actual_binary_serves_health_and_shuts_down_on_sigint() {
 }
 
 #[test]
+fn actual_binary_runs_service_dns_until_graceful_shutdown() {
+    let directory = TempDir::new("service-dns-agent");
+    let config = write_config(
+        &directory,
+        "all",
+        "127.0.0.1:0",
+        r#", "service_dns":{"listen":"127.0.0.1:0"}"#,
+    );
+    let (mut agent, address) = start_config(config, None);
+    let (status, _) = http(address, "GET", "/healthz", None, &[]);
+    assert_eq!(status, 200);
+    assert!(agent.0.try_wait().expect("check daemon status").is_none());
+    signal(&agent, "INT");
+    wait_for_exit(&mut agent);
+}
+
+#[test]
 fn worker_diagnostics_report_capacity_identity_and_restart_incarnation() {
     let path = TempDir::new("worker-status");
     let (mut child, address) = start_with_capacity(&path, "all", None, 2);
