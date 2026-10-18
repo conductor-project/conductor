@@ -1,3 +1,4 @@
+mod operator_cli;
 mod state_lock;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,6 +20,7 @@ use conductor_core::{
     StartRun, StopRun, WorkerDescriptor, WorkerId, WorkerMetadata, WorkerResourceCapacity,
 };
 use conductor_manager::{WorkerPort, WorkerPortError};
+use operator_cli::OperatorArgs;
 use serde::Deserialize;
 use state_lock::StateLocks;
 use tokio::sync::watch;
@@ -41,6 +43,8 @@ enum Commands {
         #[arg(long, value_enum)]
         role: Option<Role>,
     },
+    /// Inspect and operate a remote manager through its authenticated HTTP API.
+    Operator(OperatorArgs),
     /// Create a one-time worker enrollment credential in a protected file.
     EnrollWorker {
         /// Manager data directory containing manager.sqlite3.
@@ -311,6 +315,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
     };
     let (config_path, role_override) = match cli.command {
         Commands::Agent { config, role } => (config, role),
+        Commands::Operator(args) => return Ok(operator_cli::run(args)),
         Commands::EnrollWorker {
             manager_data_dir,
             identity_dir,
