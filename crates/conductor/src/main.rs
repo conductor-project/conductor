@@ -493,10 +493,10 @@ fn run_manager(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
         )?,
     );
     let enrollment = Arc::new(conductor_transport::WorkerEnrollmentService::new(
-        repository,
+        repository.clone(),
         Arc::clone(&authority),
     ));
-    let hub = conductor_transport::WorkerTransportHub::default();
+    let hub = conductor_transport::WorkerTransportHub::with_journal(repository.clone());
     let descriptor = WorkerDescriptor::new(worker_id.clone(), capacity, true);
     let offer = ProtocolOffer::new(
         ProtocolVersionRange::current(),
