@@ -17,12 +17,15 @@ serde_json.workspace = true
 ctrlc.workspace = true
 clap.workspace = true
 tokio.workspace = true
+base64.workspace = true
+getrandom.workspace = true
+zeroize.workspace = true
+nix.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 close_fds.workspace = true
 
 [dev-dependencies]
-base64.workspace = true
 rusqlite.workspace = true
 
 [lints]

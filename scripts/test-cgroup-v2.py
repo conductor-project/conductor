@@ -167,6 +167,7 @@ def main():
             "worker_data_dir": str(state / "worker"),
             "worker_id": worker_id,
             "worker_concurrency": 2,
+            "api_access": {"mode": "local"},
             "request_timeout_ms": 30000,
             "cgroup_v2": {
                 "enabled": True,

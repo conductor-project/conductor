@@ -5,6 +5,9 @@
   "worker_data_dir": "./state/worker",
   "worker_id": "landlock-worker",
   "worker_concurrency": 2,
+  "api_access": {
+    "mode": "local"
+  },
   "landlock": {
     "mode": "required",
     "protectedPaths": ["/opt/conductor/credentials"],

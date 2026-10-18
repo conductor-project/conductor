@@ -1,6 +1,7 @@
 mod state_lock;
 
 use std::fs;
+use std::io::Read;
 use std::net::{SocketAddr, TcpListener};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -10,6 +11,7 @@ use std::sync::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use base64::Engine;
 use clap::{Parser, Subcommand, ValueEnum, error::ErrorKind};
 use conductor_core::{
     InspectRun, MAX_WORKER_CAPACITY, ReadRunLogs, ResolveRun, StartRun, StopRun, WorkerId,
@@ -63,6 +65,12 @@ enum Commands {
         #[arg(long)]
         worker_id: String,
     },
+    /// Create a 256-bit operator bearer token in a protected, new file.
+    CreateOperatorToken {
+        /// New output file for the token; existing files are never overwritten.
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Internal launcher used only to enter a configured cgroup before exec.
     #[command(name = "__internal-launch", hide = true)]
     InternalLaunch {
@@ -90,6 +98,7 @@ struct Config {
     worker_data_dir: PathBuf,
     worker_id: String,
     worker_concurrency: usize,
+    api_access: ApiAccessConfig,
     #[serde(default = "default_log_max_bytes_per_stream")]
     log_max_bytes_per_stream: u64,
     #[serde(default = "default_log_retention_runs")]
@@ -100,6 +109,13 @@ struct Config {
     cgroup_v2: CgroupV2Config,
     #[serde(default)]
     landlock: LandlockConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+enum ApiAccessConfig {
+    Local,
+    OperatorTokenFile { token_file: PathBuf },
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -274,6 +290,24 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
             );
             return Ok(ExitCode::SUCCESS);
         }
+        Commands::CreateOperatorToken { output } => {
+            let mut random = zeroize::Zeroizing::new([0_u8; 32]);
+            getrandom::fill(&mut *random).map_err(|_| "secure random token generation failed")?;
+            let mut encoded = zeroize::Zeroizing::new([0_u8; 43]);
+            let written = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode_slice(*random, &mut *encoded)
+                .map_err(|_| "operator token encoding failed")?;
+            let write_result = state_lock::write_secret_file_once(&output, &encoded[..written]);
+            drop(random);
+            drop(encoded);
+            write_result.map_err(|_| "operator token file could not be created securely")?;
+            eprintln!(
+                "{{\"timestampMs\":{},\"severity\":\"info\",\"component\":\"identity\",\"event\":\"operator_token_created\",\"tokenFile\":{}}}",
+                timestamp_ms(),
+                serde_json::to_string(&output.to_string_lossy().as_ref())?
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
         Commands::InternalLaunch {
             cgroup_path,
             ready_socket,
@@ -298,6 +332,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         config.role = role;
     }
     validate(&config)?;
+    let api_access = api_access_policy(&config)?;
     if !matches!(config.role, Role::All) {
         return Err(format!(
             "standalone role '{}' is unsupported until remote transport is implemented",
@@ -335,9 +370,13 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         signal_shutdown.store(true, Ordering::SeqCst);
     })?;
     eprintln!(
-        "{{\"timestampMs\":{},\"severity\":\"info\",\"component\":\"agent\",\"event\":\"agent_started\",\"role\":\"all\",\"address\":{},\"cgroupV2Enabled\":{},\"landlockMode\":{}}}",
+        "{{\"timestampMs\":{},\"severity\":\"info\",\"component\":\"agent\",\"event\":\"agent_started\",\"role\":\"all\",\"address\":{},\"apiAccessMode\":{},\"cgroupV2Enabled\":{},\"landlockMode\":{}}}",
         timestamp_ms(),
         serde_json::to_string(&address.to_string())?,
+        serde_json::to_string(match &config.api_access {
+            ApiAccessConfig::Local => "local",
+            ApiAccessConfig::OperatorTokenFile { .. } => "operator_token",
+        })?,
         cgroup_v2_enabled,
         serde_json::to_string(match config.landlock.mode {
             LandlockModeConfig::Disabled => "disabled",
@@ -350,12 +389,13 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         .build()?;
     let serve_result = runtime.block_on(async move {
         let listener = tokio::net::TcpListener::from_std(listener)?;
-        conductor_api::serve(
+        conductor_api::serve_with_access_policy(
             listener,
             shutdown,
             manager,
             worker_port,
             Duration::from_millis(config.request_timeout_ms),
+            api_access,
         )
         .await
     });
@@ -528,7 +568,11 @@ fn map_worker_error(error: conductor_worker::WorkerError) -> WorkerPortError {
 
 fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     if !config.listen.ip().is_loopback() {
-        return Err("listen address must be an IPv4 or IPv6 loopback address".into());
+        return Err("HTTP API listener must use loopback; terminate TLS at a trusted proxy".into());
+    }
+    if matches!(&config.api_access, ApiAccessConfig::OperatorTokenFile { token_file } if token_file.as_os_str().is_empty())
+    {
+        return Err("api_access.token_file must not be empty".into());
     }
     if config.worker_id.is_empty()
         || config.worker_id.len() > 128
@@ -585,6 +629,62 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn api_access_policy(
+    config: &Config,
+) -> Result<conductor_api::ApiAccessPolicy, Box<dyn std::error::Error>> {
+    match &config.api_access {
+        ApiAccessConfig::Local => Ok(conductor_api::ApiAccessPolicy::LocalMode),
+        ApiAccessConfig::OperatorTokenFile { token_file } => {
+            let configured_path = if token_file.is_absolute() {
+                token_file.clone()
+            } else {
+                config
+                    .source_config_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(token_file)
+            };
+            #[cfg(not(unix))]
+            {
+                let path_metadata = fs::symlink_metadata(&configured_path)
+                    .map_err(|_| "operator token file could not be accessed securely")?;
+                if path_metadata.file_type().is_symlink() || !path_metadata.is_file() {
+                    return Err(
+                        "operator token path must be a regular file, not a symbolic link".into(),
+                    );
+                }
+            }
+            let token_file = state_lock::open_secret_file_no_follow(&configured_path)
+                .map_err(|_| "operator token file could not be accessed securely")?;
+            let metadata = token_file
+                .metadata()
+                .map_err(|_| "operator token file could not be accessed securely")?;
+            if !metadata.is_file() {
+                return Err("operator token path must be a regular file".into());
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    return Err(
+                        "operator token file permissions must deny group and other access".into(),
+                    );
+                }
+            }
+            let mut token = zeroize::Zeroizing::new(Vec::with_capacity(44));
+            token_file
+                .take(44)
+                .read_to_end(&mut token)
+                .map_err(|_| "operator token file could not be accessed securely")?;
+            let authenticator = conductor_api::BearerTokenAuthenticator::new(&token)
+                .map_err(|_| "operator token file contains an invalid token")?;
+            Ok(conductor_api::ApiAccessPolicy::AuthenticatedOperator(
+                Arc::new(authenticator),
+            ))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
@@ -601,6 +701,7 @@ mod tests {
             worker_data_dir: PathBuf::from("worker"),
             worker_id: "test-worker".to_owned(),
             worker_concurrency: 1,
+            api_access: super::ApiAccessConfig::Local,
             log_max_bytes_per_stream: conductor_worker::DEFAULT_LOG_MAX_BYTES_PER_STREAM,
             log_retention_runs: conductor_worker::DEFAULT_LOG_RETENTION_RUNS,
             request_timeout_ms: default_request_timeout_ms(),
@@ -614,6 +715,11 @@ mod tests {
     fn configuration_accepts_ipv6_loopback_and_rejects_public_listener_without_binding() {
         assert!(validate(&config("[::1]:8080")).is_ok());
         assert!(validate(&config("192.0.2.1:8080")).is_err());
+        let mut remote_operator = config("192.0.2.1:8080");
+        remote_operator.api_access = super::ApiAccessConfig::OperatorTokenFile {
+            token_file: PathBuf::from("operator-token"),
+        };
+        assert!(validate(&remote_operator).is_err());
         let mut excessive_capacity = config("127.0.0.1:8080");
         excessive_capacity.worker_concurrency = conductor_core::MAX_WORKER_CAPACITY + 1;
         assert!(validate(&excessive_capacity).is_err());

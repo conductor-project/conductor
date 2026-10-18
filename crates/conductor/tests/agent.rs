@@ -90,7 +90,7 @@ fn write_config_dirs(
     fs::create_dir_all(path).expect("create config directory");
     let config_path = path.join("agent.json");
     let content = format!(
-        r#"{{"role":"{role}","listen":"{listen}","manager_data_dir":"{}","worker_data_dir":"{}","worker_id":"test-worker","worker_concurrency":1{extra}}}"#,
+        r#"{{"role":"{role}","listen":"{listen}","manager_data_dir":"{}","worker_data_dir":"{}","worker_id":"test-worker","worker_concurrency":1,"api_access":{{"mode":"local"}}{extra}}}"#,
         manager_dir.display(),
         worker_dir.display(),
     );
@@ -1009,6 +1009,122 @@ fn enroll_worker_cli_writes_a_private_one_time_credential_without_logging_it() {
             0o600
         );
     }
+}
+
+#[test]
+fn operator_token_cli_config_and_routes_enforce_operator_access() {
+    let path = TempDir::new("operator-access");
+    let token_path = path.join("operator-token");
+    let output = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args([
+            "create-operator-token",
+            "--output",
+            token_path.to_str().expect("token path"),
+        ])
+        .output()
+        .expect("create operator token");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let token = fs::read_to_string(&token_path).expect("read operator token file");
+    let token = token.trim();
+    assert_eq!(token.len(), 43);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("operator_token_created"));
+    assert!(!stderr.contains(token));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(token));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&token_path)
+                .expect("token metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        use std::os::unix::fs::symlink;
+        let symlink_path = path.join("operator-token-link");
+        symlink(&token_path, &symlink_path).expect("create token symlink");
+        let symlink_config = write_config(&path, "all", "127.0.0.1:0", "");
+        let content = fs::read_to_string(&symlink_config)
+            .expect("read symlink config")
+            .replace(
+                "\"api_access\":{\"mode\":\"local\"}",
+                &format!(
+                    "\"api_access\":{{\"mode\":\"operator_token_file\",\"token_file\":{}}}",
+                    serde_json::to_string(symlink_path.to_str().expect("utf8 symlink path"))
+                        .expect("encode symlink path")
+                ),
+            );
+        fs::write(&symlink_config, content).expect("write symlink config");
+        let result = failed(&symlink_config, None);
+        assert!(
+            String::from_utf8_lossy(&result.stderr)
+                .contains("operator token file could not be accessed securely")
+        );
+    }
+
+    let config = write_config(&path, "all", "127.0.0.1:0", "");
+    let content = fs::read_to_string(&config)
+        .expect("read generated config")
+        .replace(
+            "\"api_access\":{\"mode\":\"local\"}",
+            &format!(
+                "\"api_access\":{{\"mode\":\"operator_token_file\",\"token_file\":{}}}",
+                serde_json::to_string(token_path.to_str().expect("utf8 token path"))
+                    .expect("encode token path")
+            ),
+        );
+    fs::write(&config, content).expect("write operator config");
+    let (mut child, address) = start_config(config, None);
+
+    assert_eq!(http(address, "GET", "/healthz", None, &[]).0, 200);
+    let (status, headers, _) = http_with_custom_headers(
+        address,
+        "GET",
+        "/v1/workers",
+        None,
+        &[("X-Worker-Id", "test-worker")],
+        &[],
+    );
+    assert_eq!(status, 401);
+    assert!(
+        headers
+            .to_ascii_lowercase()
+            .contains("www-authenticate: bearer")
+    );
+    assert_eq!(http(address, "GET", "/v1/jobs", None, &[]).0, 401);
+
+    let job = job_json("operator-job", &["/bin/true"]);
+    assert_eq!(
+        http(address, "POST", "/v1/jobs", Some("application/json"), &job).0,
+        401
+    );
+    let (status, _, body) = http_with_custom_headers(
+        address,
+        "POST",
+        "/v1/jobs",
+        Some("application/json"),
+        &[("Authorization", &format!("Bearer {token}"))],
+        &job,
+    );
+    assert_eq!(status, 201, "{body}");
+    let (status, _, _) = http_with_custom_headers(
+        address,
+        "GET",
+        "/v1/workers",
+        None,
+        &[("Authorization", &format!("Bearer {token}"))],
+        &[],
+    );
+    assert_eq!(status, 200);
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
 }
 
 fn http(

@@ -12,6 +12,12 @@ tokio.workspace = true
 serde.workspace = true
 conductor-core.workspace = true
 conductor-manager.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+
+[dev-dependencies]
+tower.workspace = true
+rusqlite.workspace = true
 
 [lints]
 workspace = true

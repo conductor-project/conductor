@@ -39,6 +39,7 @@ class Demo:
                     "worker_data_dir": str(self.worker),
                     "worker_id": f"demo-{name}",
                     "worker_concurrency": capacity,
+                    "api_access": {"mode": "local"},
                     "log_max_bytes_per_stream": self.log_cap,
                     "log_retention_runs": 100,
                 }
