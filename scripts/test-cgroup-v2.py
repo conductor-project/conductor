@@ -95,22 +95,20 @@ def reserve_address():
         return ("127.0.0.1", reserved.getsockname()[1])
 
 
-def wait_for_private_tmp_namespace(process):
+def wait_for_private_tmp_namespace(process, namespace_file):
     host_namespace = os.readlink("/proc/self/ns/mnt")
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
+        if namespace_file.is_file():
+            namespace = namespace_file.read_text(encoding="ascii").strip()
+            if not namespace:
+                time.sleep(0.01)
+                continue
+            if namespace != host_namespace:
+                return namespace
+            raise RuntimeError("daemon remained in the host mount namespace")
         if process.poll() is not None:
             raise RuntimeError(f"daemon exited before entering a private /tmp mount namespace: {process.returncode}")
-        namespace = os.readlink(f"/proc/{process.pid}/ns/mnt")
-        mountinfo = Path(f"/proc/{process.pid}/mountinfo").read_text(encoding="utf-8")
-        private_tmp = any(
-            line.split(" - ", 1)[0].split()[4] == "/tmp"
-            and line.split(" - ", 1)[1].startswith("tmpfs ")
-            for line in mountinfo.splitlines()
-            if " - " in line and len(line.split(" - ", 1)[0].split()) > 4
-        )
-        if namespace != host_namespace and private_tmp:
-            return namespace
         time.sleep(0.01)
     raise TimeoutError("daemon did not enter a distinct mount namespace with a private tmpfs at /tmp")
 
@@ -188,6 +186,7 @@ def main():
         config_path.write_text(json.dumps(config), encoding="utf-8")
 
         def launch(path=config_path, log=agent_log, cwd=state):
+            namespace_file = log.with_suffix(log.suffix + ".mount-namespace")
             command = [
                 "unshare",
                 "--mount",
@@ -195,8 +194,9 @@ def main():
                 "private",
                 "sh",
                 "-c",
-                'mount --make-rprivate / && mount -t tmpfs -o mode=1777 tmpfs /tmp && exec "$@"',
+                'mount --make-rprivate / && mount -t tmpfs -o mode=1777 tmpfs /tmp && awk \'$5=="/tmp" && / - tmpfs / {found=1} END{exit !found}\' /proc/self/mountinfo && readlink /proc/self/ns/mnt > "$1" && shift && exec "$@"',
                 "conductor-private-tmp",
+                str(namespace_file),
                 str(args.binary.resolve()),
                 "agent",
                 "--config",
@@ -210,7 +210,9 @@ def main():
             )
 
         process = launch()
-        process_mount_namespace = wait_for_private_tmp_namespace(process)
+        process_mount_namespace = wait_for_private_tmp_namespace(
+            process, agent_log.with_suffix(agent_log.suffix + ".mount-namespace")
+        )
         run_ids = []
         try:
             wait_agent(process, address)
@@ -281,7 +283,9 @@ def main():
                 "same-owner", worker_id, alias_root
             )
             contender = launch(contender_config, contender_log, contender_config.parent)
-            contender_mount_namespace = wait_for_private_tmp_namespace(contender)
+            contender_mount_namespace = wait_for_private_tmp_namespace(
+                contender, contender_log.with_suffix(contender_log.suffix + ".mount-namespace")
+            )
             assert contender_mount_namespace != process_mount_namespace, "contender did not enter a distinct mount namespace"
             contender.wait(timeout=5)
             contender_output = contender_log.read_text(encoding="utf-8", errors="replace")
@@ -320,7 +324,13 @@ def main():
                 launch(path, log, path.parent)
                 for path, log, _ in race_specs
             ]
-            racer_mount_namespaces = [wait_for_private_tmp_namespace(race_process) for race_process in racers]
+            racer_mount_namespaces = [
+                wait_for_private_tmp_namespace(
+                    race_process,
+                    spec[1].with_suffix(spec[1].suffix + ".mount-namespace"),
+                )
+                for race_process, spec in zip(racers, race_specs)
+            ]
             assert len(set(racer_mount_namespaces + [process_mount_namespace])) == 3, (
                 "concurrent daemons did not enter distinct mount namespaces",
                 racer_mount_namespaces,
