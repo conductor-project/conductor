@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -274,6 +274,359 @@ fn deployment_request(replicas: u32) -> DeploymentMutation {
         revision: 1,
         replicas,
     }
+}
+
+struct ServiceRunner {
+    worker_id: WorkerId,
+    status: WorkerStatus,
+    starts: AtomicUsize,
+    disconnected: AtomicBool,
+    runs: Mutex<BTreeMap<RunId, RunObservation>>,
+}
+
+impl ServiceRunner {
+    fn fail_all(&self) {
+        let mut runs = self.runs.lock().expect("worker run lock");
+        for observation in runs.values_mut() {
+            if observation.state().is_terminal() {
+                continue;
+            }
+            let running = observation
+                .next_revision(RunState::Running, Some(2), None, None, None, None)
+                .expect("requested run can start");
+            *observation = running
+                .next_revision(
+                    RunState::Failed,
+                    Some(2),
+                    Some(3),
+                    Some(1),
+                    None,
+                    Some(RunFailureReason::NonZeroExit),
+                )
+                .expect("running run can fail");
+        }
+    }
+
+    fn disconnect(&self) {
+        self.disconnected.store(true, Ordering::Release);
+    }
+}
+
+impl WorkerPort for ServiceRunner {
+    fn descriptor(&self) -> WorkerDescriptor {
+        WorkerDescriptor::new(self.worker_id.clone(), 4, true)
+    }
+
+    fn start(&self, command: StartRun) -> Result<RunObservation, WorkerPortError> {
+        self.starts.fetch_add(1, Ordering::Relaxed);
+        let observation = RunObservation::requested(command.spec(), 1);
+        self.runs
+            .lock()
+            .map_err(|_| WorkerPortError::Unavailable)?
+            .insert(observation.run_id().clone(), observation.clone());
+        Ok(observation)
+    }
+
+    fn inspect(&self, command: InspectRun) -> Result<Option<RunObservation>, WorkerPortError> {
+        if self.disconnected.load(Ordering::Acquire) {
+            return Err(WorkerPortError::Unavailable);
+        }
+        Ok(self
+            .runs
+            .lock()
+            .map_err(|_| WorkerPortError::Unavailable)?
+            .get(command.run_id())
+            .cloned())
+    }
+
+    fn stop(&self, command: StopRun) -> Result<RunObservation, WorkerPortError> {
+        if self.disconnected.load(Ordering::Acquire) {
+            return Err(WorkerPortError::Unavailable);
+        }
+        let mut runs = self.runs.lock().map_err(|_| WorkerPortError::Unavailable)?;
+        let current = runs
+            .get(command.run_id())
+            .cloned()
+            .ok_or(WorkerPortError::RunConflict)?;
+        let stopped = current
+            .next_revision(
+                RunState::Cancelled,
+                current.started_at_ms(),
+                Some(2),
+                None,
+                None,
+                None,
+            )
+            .ok_or(WorkerPortError::RunConflict)?;
+        runs.insert(stopped.run_id().clone(), stopped.clone());
+        Ok(stopped)
+    }
+
+    fn status(&self) -> Result<WorkerStatus, WorkerPortError> {
+        Ok(self.status.clone())
+    }
+
+    fn read_logs(&self, _command: ReadRunLogs) -> Result<RunLogChunk, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
+}
+
+#[test]
+fn service_reconciliation_starts_each_replica_once_and_keeps_one_shot_semantics() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    manager.register(job("one-shot")).unwrap();
+    let revision = manager
+        .create_revision(&service_revision_draft("v1"), "service-reconcile-revision")
+        .unwrap();
+    let worker_status = scheduling_worker(
+        "worker-a",
+        "host-a",
+        2_000,
+        2_147_483_648,
+        2_000,
+        2_147_483_648,
+        BTreeMap::new(),
+        true,
+    );
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &DeploymentMutation::Deploy {
+                revision: 1,
+                replicas: 2,
+            },
+            "service-reconcile-deploy",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    let worker_id = WorkerId::new("worker-a").unwrap();
+    let worker: Arc<dyn WorkerPort> = Arc::new(ServiceRunner {
+        worker_id,
+        status: worker_status,
+        starts: AtomicUsize::new(0),
+        disconnected: AtomicBool::new(false),
+        runs: Mutex::new(BTreeMap::new()),
+    });
+
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    assert!(
+        manager
+            .list_runs(Some(&JobId::new("one-shot").unwrap()), None, 10)
+            .unwrap()
+            .is_empty()
+    );
+    let runs = manager
+        .list_runs(Some(revision.id().job_id()), None, 10)
+        .unwrap();
+    assert_eq!(runs.len(), 2, "both desired replicas should start");
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    assert_eq!(
+        manager
+            .list_runs(Some(revision.id().job_id()), None, 10)
+            .unwrap()
+            .len(),
+        2,
+        "a repeated reconciliation must not duplicate a live attempt"
+    );
+
+    let original_allocations = manager.list_allocations(revision.id().job_id()).unwrap();
+    let original_instances = original_allocations
+        .iter()
+        .filter_map(|allocation| allocation.allocation().service_instance_id())
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    let scaled = manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            Some(1),
+            &DeploymentMutation::Scale { replicas: 0 },
+            "service-reconcile-scale-zero",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(scaled.desired_replicas(), 0);
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    assert!(
+        manager
+            .list_allocations(revision.id().job_id())
+            .unwrap()
+            .iter()
+            .filter(|allocation| original_allocations
+                .iter()
+                .any(|old| { old.allocation().id() == allocation.allocation().id() }))
+            .all(|allocation| allocation.allocation().state() == AllocationState::Released)
+    );
+
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            Some(2),
+            &DeploymentMutation::Scale { replicas: 2 },
+            "service-reconcile-resume",
+            &[worker.status().expect("worker status remains available")],
+        )
+        .unwrap();
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .unwrap();
+    assert_eq!(
+        manager
+            .list_runs(Some(revision.id().job_id()), None, 10)
+            .unwrap()
+            .len(),
+        4,
+        "resuming scale-to-zero should start one new run for each stable slot"
+    );
+    let resumed_instances = manager
+        .list_allocations(revision.id().job_id())
+        .unwrap()
+        .iter()
+        .filter(|allocation| allocation.allocation().state() != AllocationState::Released)
+        .filter_map(|allocation| allocation.allocation().service_instance_id())
+        .map(ToString::to_string)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(resumed_instances, original_instances);
+}
+
+#[test]
+fn service_restart_backoff_survives_manager_restart_and_retries_after_bounded_polling() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let revision = manager
+        .create_revision(&service_revision_draft("crash"), "restart-revision")
+        .unwrap();
+    let worker_status = scheduling_worker(
+        "worker-a",
+        "host-a",
+        1_000,
+        1_073_741_824,
+        1_000,
+        1_073_741_824,
+        BTreeMap::new(),
+        true,
+    );
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &DeploymentMutation::Deploy {
+                revision: 1,
+                replicas: 1,
+            },
+            "restart-deploy",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    let worker_id = WorkerId::new("worker-a").unwrap();
+    let worker = Arc::new(ServiceRunner {
+        worker_id,
+        status: worker_status,
+        starts: AtomicUsize::new(0),
+        disconnected: AtomicBool::new(false),
+        runs: Mutex::new(BTreeMap::new()),
+    });
+    let worker_port: Arc<dyn WorkerPort> = worker.clone();
+    manager
+        .reconcile_services(std::slice::from_ref(&worker_port))
+        .unwrap();
+    worker.fail_all();
+    manager
+        .reconcile_services(std::slice::from_ref(&worker_port))
+        .unwrap();
+    assert_eq!(
+        manager
+            .list_runs(Some(revision.id().job_id()), None, 10)
+            .unwrap()
+            .len(),
+        1,
+        "a failed service waits for its durable backoff"
+    );
+    drop(manager);
+
+    let reopened = service(&directory);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        reopened
+            .reconcile_services(std::slice::from_ref(&worker_port))
+            .unwrap();
+        let runs = reopened
+            .list_runs(Some(revision.id().job_id()), None, 10)
+            .unwrap();
+        if runs.len() == 2 {
+            assert_eq!(worker.starts.load(Ordering::Relaxed), 2);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "service retry did not become eligible"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn unresolved_service_run_is_not_relaunched_during_worker_disconnect() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let revision = manager
+        .create_revision(&service_revision_draft("disconnect"), "disconnect-revision")
+        .unwrap();
+    let worker_status = scheduling_worker(
+        "worker-a",
+        "host-a",
+        1_000,
+        1_073_741_824,
+        1_000,
+        1_073_741_824,
+        BTreeMap::new(),
+        true,
+    );
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &DeploymentMutation::Deploy {
+                revision: 1,
+                replicas: 1,
+            },
+            "disconnect-deploy",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    let worker = Arc::new(ServiceRunner {
+        worker_id: WorkerId::new("worker-a").unwrap(),
+        status: worker_status,
+        starts: AtomicUsize::new(0),
+        disconnected: AtomicBool::new(false),
+        runs: Mutex::new(BTreeMap::new()),
+    });
+    let worker_port: Arc<dyn WorkerPort> = worker.clone();
+    manager
+        .reconcile_services(std::slice::from_ref(&worker_port))
+        .unwrap();
+    worker.disconnect();
+    for _ in 0..5 {
+        manager
+            .reconcile_services(std::slice::from_ref(&worker_port))
+            .unwrap();
+    }
+    assert_eq!(worker.starts.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        manager
+            .list_runs(Some(revision.id().job_id()), None, 10)
+            .unwrap()
+            .len(),
+        1,
+        "an unresolved disconnected run must stay attached to its service slot"
+    );
 }
 
 #[test]
@@ -941,7 +1294,7 @@ fn schema_five_migrates_execution_tables_without_losing_jobs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert!(table_exists(&connection, "job_revisions"));
     assert!(table_exists(&connection, "job_deployments"));
     assert!(table_exists(&connection, "execution_idempotency"));
@@ -968,10 +1321,30 @@ fn schema_six_adds_durable_scheduling_tables() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert!(table_exists(&connection, "service_instances"));
     assert!(table_exists(&connection, "allocations"));
     assert!(table_exists(&connection, "scheduling_sequence"));
+}
+
+#[test]
+fn schema_seven_migrates_service_attempt_state() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    drop(manager);
+    let connection = Connection::open(directory.database()).unwrap();
+    connection
+        .execute_batch("DROP TABLE service_attempts; PRAGMA user_version = 7;")
+        .unwrap();
+    drop(connection);
+
+    let _migrated = service(&directory);
+    let connection = Connection::open(directory.database()).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 8);
+    assert!(table_exists(&connection, "service_attempts"));
 }
 
 fn all_jobs(manager: &JobService) -> Vec<JobSpec> {
@@ -1077,7 +1450,7 @@ fn legacy_schema_migrates_transactionally_and_repeated_startup_is_stable() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read migrated schema and fixture");
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert_eq!(created_at, 1234);
     assert_eq!(deleted_at, None);
 }
@@ -1127,7 +1500,7 @@ fn schema_two_migration_adds_idempotency_and_indexed_run_order() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert!(columns.iter().any(|column| column == "idempotency_key"));
     assert!(columns.iter().any(|column| column == "request_fingerprint"));
     assert!(columns.iter().any(|column| column == "run_order"));
@@ -1192,7 +1565,7 @@ fn schema_four_identity_layout_migrates_with_command_outbox_without_losing_token
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     let outbox_exists = table_exists(&connection, "manager_commands");
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert!(outbox_exists);
 }
 
@@ -1233,7 +1606,7 @@ fn schema_four_command_layout_migrates_with_identity_tables_without_resetting_se
         )
         .unwrap();
     let identity_exists = table_exists(&connection, "worker_identities");
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
     assert_eq!(sequence, 17);
     assert!(identity_exists);
 }
@@ -1493,7 +1866,7 @@ fn version_one_manager_database_migrates_runs_and_accepts_timeout_specs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 7);
+    assert_eq!(version, 8);
 }
 
 struct FullWorker(WorkerId);
