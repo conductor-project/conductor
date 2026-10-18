@@ -346,7 +346,7 @@ def service_attempt_failed(base, service):
         (
             attempt
             for attempt in response.get("serviceAttempts", [])
-            if attempt.get("currentRun", {}).get("state") == "failed"
+            if (attempt.get("currentRun") or {}).get("state") == "failed"
         ),
         None,
     )
