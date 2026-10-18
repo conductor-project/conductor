@@ -11,16 +11,17 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use base64::Engine;
 use conductor_core::{
-    CommandEnvelope, CommandId, InspectRun, JobId, JobSpec, MAX_WORKER_CAPACITY, ReadRunLogs,
-    ResolveRun, RunFailureReason, RunId, RunLogChunk, RunObservation, RunSpec, RunState,
-    RunTerminationReason, StartRun, StopRun, WorkerCommand, WorkerDescriptor, WorkerId,
-    WorkerInventoryEntry, WorkerStatus,
+    CommandEnvelope, CommandId, DeploymentMutation, DeploymentPendingReason, DeploymentStatus,
+    InspectRun, JobDeployment, JobId, JobRevision, JobRevisionDraft, JobRevisionId, JobSpec,
+    MAX_DEPLOYMENT_REPLICAS, MAX_WORKER_CAPACITY, ReadRunLogs, ResolveRun, RunFailureReason, RunId,
+    RunLogChunk, RunObservation, RunSpec, RunState, RunTerminationReason, StartRun, StopRun,
+    WorkerCommand, WorkerDescriptor, WorkerId, WorkerInventoryEntry, WorkerStatus,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 
 /// Temporary limit for active jobs. Pagination is a later milestone.
 pub const MAX_JOBS: usize = 1_000;
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_PENDING_COMMANDS_PER_WORKER: usize = 32;
 
@@ -53,6 +54,18 @@ pub enum CommandStoreError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum QueryError {
     InvalidCursor,
+    StorageUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionStoreError {
+    JobNotFound,
+    JobLimitReached,
+    RevisionNotFound,
+    Conflict,
+    PreconditionFailed,
+    IdempotencyConflict,
+    InvalidRequest,
     StorageUnavailable,
 }
 
@@ -194,6 +207,20 @@ pub trait JobRepository: Send + Sync + CommandJournal {
         cursor: Option<&str>,
     ) -> Result<Page<JobSpec>, QueryError>;
     fn delete(&self, id: &JobId) -> Result<bool, JobStoreError>;
+    fn create_revision(
+        &self,
+        draft: &JobRevisionDraft,
+        idempotency_key: &str,
+    ) -> Result<JobRevision, ExecutionStoreError>;
+    fn get_revision(&self, id: &JobRevisionId) -> Result<Option<JobRevision>, ExecutionStoreError>;
+    fn get_deployment(&self, id: &JobId) -> Result<Option<JobDeployment>, ExecutionStoreError>;
+    fn mutate_deployment(
+        &self,
+        id: &JobId,
+        expected_generation: Option<u64>,
+        mutation: &DeploymentMutation,
+        idempotency_key: &str,
+    ) -> Result<JobDeployment, ExecutionStoreError>;
     fn create_run(
         &self,
         job_id: &JobId,
@@ -631,12 +658,36 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
         connection
             .prepare("SELECT worker_id, active_fingerprint, created_at_ms, revoked_at_ms FROM worker_identities LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare(
+                "SELECT job_id, revision, revision_json, created_at_ms FROM job_revisions LIMIT 0",
+            )
+            .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare("SELECT job_id, generation, deployment_json, deleted_at_ms FROM job_deployments LIMIT 0")
+            .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare("SELECT operation, scope_key, idempotency_key, request_json, response_json FROM execution_idempotency LIMIT 0")
+            .map_err(MigrationError::Sqlite)?;
         return Ok(());
+    }
+
+    if version == 5 {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(MigrationError::Sqlite)?;
+        create_execution_schema(&transaction).map_err(MigrationError::Sqlite)?;
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(MigrationError::Sqlite)?;
+        transaction.commit().map_err(MigrationError::Sqlite)?;
+        return migrate(connection);
     }
 
     // Schema 4 was published by two independently developed MVP2 branches:
     // #59 added worker identity tables, while #62 added the manager outbox.
-    // Complete whichever half is missing before advancing to the unified v5.
+    // Complete whichever half is missing before advancing to v5; v6 adds the
+    // revision and deployment tables after that normalized layout is present.
     if version == 4 {
         let transaction = connection
             .unchecked_transaction()
@@ -670,7 +721,7 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
             create_identity_schema(&transaction).map_err(MigrationError::Sqlite)?;
         }
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 5)
             .map_err(MigrationError::Sqlite)?;
         transaction.commit().map_err(MigrationError::Sqlite)?;
         return migrate(connection);
@@ -683,7 +734,7 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
         create_command_schema(&transaction).map_err(MigrationError::Sqlite)?;
         create_identity_schema(&transaction).map_err(MigrationError::Sqlite)?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 5)
             .map_err(MigrationError::Sqlite)?;
         transaction.commit().map_err(MigrationError::Sqlite)?;
         return migrate(connection);
@@ -795,6 +846,7 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
         .map_err(MigrationError::Sqlite)?;
     create_command_schema(&transaction).map_err(MigrationError::Sqlite)?;
     create_identity_schema(&transaction).map_err(MigrationError::Sqlite)?;
+    create_execution_schema(&transaction).map_err(MigrationError::Sqlite)?;
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(MigrationError::Sqlite)?;
@@ -820,6 +872,35 @@ fn create_command_schema(transaction: &rusqlite::Transaction<'_>) -> rusqlite::R
          );
          CREATE INDEX manager_commands_by_worker_state ON manager_commands(worker_id, worker_incarnation, state, command_id);
          CREATE INDEX manager_commands_by_run ON manager_commands(run_id, command_id);",
+    )
+}
+
+fn create_execution_schema(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE job_revisions (
+             job_id TEXT NOT NULL,
+             revision INTEGER NOT NULL CHECK (revision > 0),
+             revision_json TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+             PRIMARY KEY (job_id, revision),
+             FOREIGN KEY (job_id) REFERENCES jobs(id)
+         );
+         CREATE TABLE job_deployments (
+             job_id TEXT PRIMARY KEY NOT NULL,
+             generation INTEGER NOT NULL CHECK (generation > 0),
+             deployment_json TEXT NOT NULL,
+             deleted_at_ms INTEGER CHECK (deleted_at_ms IS NULL OR deleted_at_ms >= 0),
+             FOREIGN KEY (job_id) REFERENCES jobs(id)
+         );
+         CREATE TABLE execution_idempotency (
+             operation TEXT NOT NULL,
+             scope_key TEXT NOT NULL,
+             idempotency_key TEXT NOT NULL,
+             request_json TEXT NOT NULL,
+             response_json TEXT NOT NULL,
+             created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+             PRIMARY KEY (operation, scope_key, idempotency_key)
+         );",
     )
 }
 
@@ -1159,7 +1240,14 @@ impl JobRepository for SqliteJobRepository {
                 |row| row.get(0),
             )
             .map_err(|_| JobStoreError::StorageUnavailable)?;
-        if active_run {
+        let active_deployment: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM job_deployments WHERE job_id = ?1 AND deleted_at_ms IS NULL)",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| JobStoreError::StorageUnavailable)?;
+        if active_run || active_deployment {
             return Err(JobStoreError::ActiveRunConflict);
         }
         let deleted_at_ms = now_ms().map_err(|_| JobStoreError::StorageUnavailable)?;
@@ -1173,6 +1261,375 @@ impl JobRepository for SqliteJobRepository {
             .commit()
             .map_err(|_| JobStoreError::StorageUnavailable)?;
         Ok(changed == 1)
+    }
+
+    fn create_revision(
+        &self,
+        draft: &JobRevisionDraft,
+        idempotency_key: &str,
+    ) -> Result<JobRevision, ExecutionStoreError> {
+        let job_id = draft.job_id();
+        let request_json =
+            serde_json::to_string(draft).map_err(|_| ExecutionStoreError::InvalidRequest)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+
+        if let Some((previous_request, previous_response)) = transaction
+            .query_row(
+                "SELECT request_json, response_json FROM execution_idempotency
+                 WHERE operation = 'revision' AND scope_key = ?1 AND idempotency_key = ?2",
+                params![job_id.as_str(), idempotency_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?
+        {
+            if previous_request != request_json {
+                return Err(ExecutionStoreError::IdempotencyConflict);
+            }
+            let revision = serde_json::from_str(&previous_response)
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            transaction
+                .commit()
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            return Ok(revision);
+        }
+
+        let existing_job: Option<Option<i64>> = transaction
+            .query_row(
+                "SELECT deleted_at_ms FROM jobs WHERE id = ?1",
+                [job_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        match existing_job {
+            Some(Some(_)) => return Err(ExecutionStoreError::JobNotFound),
+            Some(None) => {}
+            None => {
+                let active_count: i64 = transaction
+                    .query_row(
+                        "SELECT COUNT(*) FROM jobs WHERE deleted_at_ms IS NULL",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+                if active_count >= MAX_JOBS as i64 {
+                    return Err(ExecutionStoreError::JobLimitReached);
+                }
+                let spec_json = serde_json::to_string(draft.definition())
+                    .map_err(|_| ExecutionStoreError::InvalidRequest)?;
+                let created_at_ms =
+                    now_ms().map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+                transaction
+                    .execute(
+                        "INSERT INTO jobs (id, spec_json, created_at_ms, deleted_at_ms)
+                         VALUES (?1, ?2, ?3, NULL)",
+                        params![job_id.as_str(), spec_json, created_at_ms],
+                    )
+                    .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            }
+        }
+
+        let latest_revision: i64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(revision), 0) FROM job_revisions WHERE job_id = ?1",
+                [job_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let revision_number = u64::try_from(latest_revision)
+            .ok()
+            .and_then(|value| value.checked_add(1))
+            .ok_or(ExecutionStoreError::Conflict)?;
+        let stored_revision_number =
+            i64::try_from(revision_number).map_err(|_| ExecutionStoreError::Conflict)?;
+        let revision = draft
+            .clone()
+            .into_revision(revision_number)
+            .map_err(|_| ExecutionStoreError::InvalidRequest)?;
+        let revision_json = serde_json::to_string(&revision)
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let created_at_ms = now_ms().map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO job_revisions (job_id, revision, revision_json, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    job_id.as_str(),
+                    stored_revision_number,
+                    revision_json,
+                    created_at_ms
+                ],
+            )
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO execution_idempotency
+                 (operation, scope_key, idempotency_key, request_json, response_json, created_at_ms)
+                 VALUES ('revision', ?1, ?2, ?3, ?4, ?5)",
+                params![
+                    job_id.as_str(),
+                    idempotency_key,
+                    request_json,
+                    revision_json,
+                    created_at_ms
+                ],
+            )
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        Ok(revision)
+    }
+
+    fn get_revision(&self, id: &JobRevisionId) -> Result<Option<JobRevision>, ExecutionStoreError> {
+        let revision_number =
+            i64::try_from(id.revision()).map_err(|_| ExecutionStoreError::RevisionNotFound)?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let revision_json = connection
+            .query_row(
+                "SELECT revision_json FROM job_revisions WHERE job_id = ?1 AND revision = ?2",
+                params![id.job_id().as_str(), revision_number],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        revision_json
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|_| ExecutionStoreError::StorageUnavailable)
+            })
+            .transpose()
+    }
+
+    fn get_deployment(&self, id: &JobId) -> Result<Option<JobDeployment>, ExecutionStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let deployment_json = connection
+            .query_row(
+                "SELECT deployment_json FROM job_deployments WHERE job_id = ?1",
+                [id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        deployment_json
+            .map(|json| {
+                serde_json::from_str(&json).map_err(|_| ExecutionStoreError::StorageUnavailable)
+            })
+            .transpose()
+    }
+
+    fn mutate_deployment(
+        &self,
+        id: &JobId,
+        expected_generation: Option<u64>,
+        mutation: &DeploymentMutation,
+        idempotency_key: &str,
+    ) -> Result<JobDeployment, ExecutionStoreError> {
+        let request_json = serde_json::to_string(&(expected_generation, mutation))
+            .map_err(|_| ExecutionStoreError::InvalidRequest)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+
+        if let Some((previous_request, previous_response)) = transaction
+            .query_row(
+                "SELECT request_json, response_json FROM execution_idempotency
+                 WHERE operation = 'deployment' AND scope_key = ?1 AND idempotency_key = ?2",
+                params![id.as_str(), idempotency_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?
+        {
+            if previous_request != request_json {
+                return Err(ExecutionStoreError::IdempotencyConflict);
+            }
+            let deployment = serde_json::from_str(&previous_response)
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            transaction
+                .commit()
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            return Ok(deployment);
+        }
+
+        let job_active: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE id = ?1 AND deleted_at_ms IS NULL)",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        if !job_active {
+            return Err(ExecutionStoreError::JobNotFound);
+        }
+        let current_json: Option<String> = transaction
+            .query_row(
+                "SELECT deployment_json FROM job_deployments WHERE job_id = ?1",
+                [id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let current = current_json
+            .as_deref()
+            .map(serde_json::from_str::<JobDeployment>)
+            .transpose()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        match (&current, expected_generation) {
+            (None, None) if matches!(mutation, DeploymentMutation::Deploy { .. }) => {}
+            (Some(existing), Some(expected)) if existing.generation() == expected => {}
+            _ => return Err(ExecutionStoreError::PreconditionFailed),
+        }
+        if current.as_ref().is_some_and(|deployment| {
+            matches!(
+                deployment.status(),
+                DeploymentStatus::Deleting | DeploymentStatus::Deleted
+            )
+        }) {
+            return Err(ExecutionStoreError::Conflict);
+        }
+
+        let (revision_number, replicas, suspended) = match (current.as_ref(), mutation) {
+            (None, DeploymentMutation::Deploy { revision, replicas }) => {
+                (*revision, *replicas, false)
+            }
+            (Some(existing), DeploymentMutation::Deploy { revision, replicas }) => {
+                (*revision, *replicas, existing.suspended())
+            }
+            (Some(existing), DeploymentMutation::Scale { replicas }) => (
+                existing.revision_id().revision(),
+                *replicas,
+                existing.suspended(),
+            ),
+            (Some(existing), DeploymentMutation::Suspend) if !existing.suspended() => (
+                existing.revision_id().revision(),
+                existing.desired_replicas(),
+                true,
+            ),
+            (Some(existing), DeploymentMutation::Resume) if existing.suspended() => (
+                existing.revision_id().revision(),
+                existing.desired_replicas(),
+                false,
+            ),
+            (Some(existing), DeploymentMutation::Rollback { revision }) => {
+                (*revision, existing.desired_replicas(), existing.suspended())
+            }
+            (Some(_), DeploymentMutation::Delete) => {
+                let current = current
+                    .as_ref()
+                    .ok_or(ExecutionStoreError::StorageUnavailable)?;
+                (current.revision_id().revision(), 0, true)
+            }
+            _ => return Err(ExecutionStoreError::Conflict),
+        };
+        if replicas > MAX_DEPLOYMENT_REPLICAS {
+            return Err(ExecutionStoreError::InvalidRequest);
+        }
+        let revision_id = JobRevisionId::new(id.clone(), revision_number)
+            .map_err(|_| ExecutionStoreError::InvalidRequest)?;
+        let stored_revision_number =
+            i64::try_from(revision_number).map_err(|_| ExecutionStoreError::RevisionNotFound)?;
+        let revision_json: Option<String> = transaction
+            .query_row(
+                "SELECT revision_json FROM job_revisions WHERE job_id = ?1 AND revision = ?2",
+                params![id.as_str(), stored_revision_number],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let revision: JobRevision = revision_json
+            .ok_or(ExecutionStoreError::RevisionNotFound)
+            .and_then(|json| {
+                serde_json::from_str(&json).map_err(|_| ExecutionStoreError::StorageUnavailable)
+            })?;
+        if revision.id() != &revision_id
+            || !matches!(
+                revision.workload(),
+                conductor_core::Workload::Service { .. }
+            )
+        {
+            return Err(ExecutionStoreError::InvalidRequest);
+        }
+        let (status, pending_reason, pending_message) = if suspended {
+            if matches!(mutation, DeploymentMutation::Delete) {
+                (DeploymentStatus::Deleted, None, None)
+            } else {
+                (DeploymentStatus::Suspended, None, None)
+            }
+        } else if replicas == 0 {
+            (DeploymentStatus::Ready, None, None)
+        } else {
+            (
+                DeploymentStatus::Pending,
+                Some(DeploymentPendingReason::PlacementPending),
+                Some("deployment intent is durable; scheduler placement is pending".to_owned()),
+            )
+        };
+        let generation = current
+            .as_ref()
+            .map_or(Some(1), |value| value.generation().checked_add(1))
+            .ok_or(ExecutionStoreError::Conflict)?;
+        let deployment = JobDeployment::new(
+            &revision,
+            generation,
+            replicas,
+            suspended,
+            status,
+            pending_reason,
+            pending_message,
+        )
+        .map_err(|_| ExecutionStoreError::InvalidRequest)?;
+        let deployment_json = serde_json::to_string(&deployment)
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let deleted_at_ms = if status == DeploymentStatus::Deleted {
+            Some(now_ms().map_err(|_| ExecutionStoreError::StorageUnavailable)?)
+        } else {
+            None
+        };
+        let created_at_ms = now_ms().map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO job_deployments (job_id, generation, deployment_json, deleted_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(job_id) DO UPDATE SET generation = excluded.generation,
+                     deployment_json = excluded.deployment_json, deleted_at_ms = excluded.deleted_at_ms",
+                params![id.as_str(), generation as i64, deployment_json, deleted_at_ms],
+            )
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO execution_idempotency
+                 (operation, scope_key, idempotency_key, request_json, response_json, created_at_ms)
+                 VALUES ('deployment', ?1, ?2, ?3, ?4, ?5)",
+                params![
+                    id.as_str(),
+                    idempotency_key,
+                    request_json,
+                    deployment_json,
+                    created_at_ms
+                ],
+            )
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        Ok(deployment)
     }
 
     fn create_run(
@@ -1935,6 +2392,36 @@ impl JobService {
 
     pub fn delete(&self, id: &JobId) -> Result<bool, ManagerError> {
         self.repository.delete(id).map_err(map_store_error)
+    }
+
+    pub fn create_revision(
+        &self,
+        draft: &JobRevisionDraft,
+        idempotency_key: &str,
+    ) -> Result<JobRevision, ExecutionStoreError> {
+        self.repository.create_revision(draft, idempotency_key)
+    }
+
+    pub fn get_revision(
+        &self,
+        id: &JobRevisionId,
+    ) -> Result<Option<JobRevision>, ExecutionStoreError> {
+        self.repository.get_revision(id)
+    }
+
+    pub fn get_deployment(&self, id: &JobId) -> Result<Option<JobDeployment>, ExecutionStoreError> {
+        self.repository.get_deployment(id)
+    }
+
+    pub fn mutate_deployment(
+        &self,
+        id: &JobId,
+        expected_generation: Option<u64>,
+        mutation: &DeploymentMutation,
+        idempotency_key: &str,
+    ) -> Result<JobDeployment, ExecutionStoreError> {
+        self.repository
+            .mutate_deployment(id, expected_generation, mutation, idempotency_key)
     }
 
     pub fn start_run(

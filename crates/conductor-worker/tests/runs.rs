@@ -986,11 +986,21 @@ fn terminal_retry_backoff_yields_to_other_run_deadlines() {
              BEGIN SELECT RAISE(FAIL, 'injected terminal persistence failure'); END;",
         )
         .unwrap();
+    let release_pending_runs = directory.0.join("release-pending-runs");
     for id in ["pending-a", "pending-b"] {
         service
             .start(StartRun::new(run(
                 id,
-                job(id, vec!["/bin/sh".into(), "-c".into(), "sleep 0.05".into()]),
+                job(
+                    id,
+                    vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "while [ ! -e \"$1\" ]; do sleep 0.01; done".into(),
+                        "sh".into(),
+                        release_pending_runs.to_string_lossy().into_owned(),
+                    ],
+                ),
             )))
             .unwrap();
     }
@@ -1007,6 +1017,8 @@ fn terminal_retry_backoff_yields_to_other_run_deadlines() {
     service
         .start(StartRun::new(run("deadline-run", deadline_job)))
         .unwrap();
+    fs::write(&release_pending_runs, b"release").unwrap();
+    wait_for_pending_count(&service, 2);
     let terminal = wait_for(&service, "deadline-run");
     assert_eq!(terminal.state(), RunState::TimedOut);
     assert_eq!(

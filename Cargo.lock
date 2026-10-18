@@ -375,6 +375,7 @@ dependencies = [
  "conductor-manager",
  "rusqlite",
  "serde",
+ "serde_json",
  "sha2",
  "subtle",
  "tokio",

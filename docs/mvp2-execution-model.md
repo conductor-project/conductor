@@ -16,9 +16,9 @@ for one-shot execution.
   digest; the worker must verify it before execution. MVP1 `JobSpec` values
   remain representable without being rewritten as MVP2 revisions.
 - A `Workload::OneShot` revision preserves one-shot completion semantics. A
-  `Workload::Service` revision names a service and a positive desired replica
-  count. Service identity has an explicit namespace; MVP2 accepts only
-  `default`.
+  `Workload::Service` revision names a service; mutable desired replica counts
+  live in `JobDeployment`, not in the immutable revision. Service identity has
+  an explicit namespace; MVP2 accepts only `default`.
 - Each desired replica slot has a stable `ServiceInstanceId` and zero-based
   replica index. Its identity survives allocation and attempt replacement.
 - Each `AllocationId` identifies durable ownership of one one-shot execution

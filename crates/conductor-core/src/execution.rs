@@ -66,11 +66,16 @@ const DEFAULT_NAMESPACE: &str = "default";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ExecutionModelError {
     InvalidRevision,
+    InvalidDeployment,
+    DeploymentGenerationExhausted,
     InvalidServiceName,
     UnsupportedNamespace,
     InvalidExecutableDigest,
     RevisionJobMismatch,
     InvalidServiceInstance,
+    IncompleteServiceResourceRequest,
+    ResourceRequestBelowExecutionLimit,
+    ConflictingExecutableDigest,
     MissingExecutionBackend,
     UnsupportedPlatformCapability,
     InvalidTransition,
@@ -81,6 +86,8 @@ impl fmt::Display for ExecutionModelError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::InvalidRevision => "job revision must be positive",
+            Self::InvalidDeployment => "deployment intent is invalid for its job revision",
+            Self::DeploymentGenerationExhausted => "deployment generation is exhausted",
             Self::InvalidServiceName => "service name must be a DNS-compatible label",
             Self::UnsupportedNamespace => "only the default service namespace is supported",
             Self::InvalidExecutableDigest => {
@@ -90,6 +97,15 @@ impl fmt::Display for ExecutionModelError {
                 "job revision identifier does not match its job definition"
             }
             Self::InvalidServiceInstance => "service instance does not match the job revision",
+            Self::IncompleteServiceResourceRequest => {
+                "service revisions require positive CPU and memory requests"
+            }
+            Self::ResourceRequestBelowExecutionLimit => {
+                "service resource requests must cover their configured CPU and memory limits"
+            }
+            Self::ConflictingExecutableDigest => {
+                "revision and job definition executable digests must match"
+            }
             Self::MissingExecutionBackend => "worker must advertise at least one execution backend",
             Self::UnsupportedPlatformCapability => {
                 "worker cannot advertise Linux enforcement on macOS"
@@ -257,10 +273,211 @@ fn valid_dns_label(value: &str) -> bool {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Workload {
     OneShot,
-    Service {
-        identity: ServiceIdentity,
-        desired_replicas: NonZeroU32,
-    },
+    Service { identity: ServiceIdentity },
+}
+
+/// Maximum requested service replica count accepted by the public API.
+pub const MAX_DEPLOYMENT_REPLICAS: u32 = 10_000;
+
+/// Lifecycle status reported for mutable deployment intent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentStatus {
+    Pending,
+    Ready,
+    Suspended,
+    Deleting,
+    Deleted,
+}
+
+/// Actionable reason that a persisted deployment has not reached its desired
+/// replica count. These values are stable API identifiers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentPendingReason {
+    NoEligibleWorker,
+    WorkerCapacityExhausted,
+    WorkerDisconnected,
+    RequiredProtectionUnavailable,
+    SharedHostCapacityExhausted,
+    PlacementPending,
+}
+
+/// Mutable service intent. Revision contents remain immutable; scaling and
+/// suspension advance this generation while retaining the selected revision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobDeployment {
+    job_id: JobId,
+    revision_id: JobRevisionId,
+    generation: NonZeroU64,
+    desired_replicas: u32,
+    suspended: bool,
+    status: DeploymentStatus,
+    pending_reason: Option<DeploymentPendingReason>,
+    pending_message: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RawJobDeployment {
+    job_id: JobId,
+    revision_id: JobRevisionId,
+    generation: NonZeroU64,
+    desired_replicas: u32,
+    suspended: bool,
+    status: DeploymentStatus,
+    #[serde(default)]
+    pending_reason: Option<DeploymentPendingReason>,
+    #[serde(default)]
+    pending_message: Option<String>,
+}
+
+impl JobDeployment {
+    pub fn new(
+        revision: &JobRevision,
+        generation: u64,
+        desired_replicas: u32,
+        suspended: bool,
+        status: DeploymentStatus,
+        pending_reason: Option<DeploymentPendingReason>,
+        pending_message: Option<String>,
+    ) -> Result<Self, ExecutionModelError> {
+        if !matches!(revision.workload(), Workload::Service { .. })
+            || desired_replicas > MAX_DEPLOYMENT_REPLICAS
+            || matches!(
+                status,
+                DeploymentStatus::Suspended
+                    | DeploymentStatus::Deleting
+                    | DeploymentStatus::Deleted
+            ) != suspended
+            || (suspended && pending_reason.is_some())
+            || (pending_reason.is_some() != pending_message.is_some())
+            || (status == DeploymentStatus::Pending
+                && (desired_replicas == 0 || pending_reason.is_none()))
+            || (status == DeploymentStatus::Ready && pending_reason.is_some())
+            || (matches!(
+                status,
+                DeploymentStatus::Deleting | DeploymentStatus::Deleted
+            ) && (!suspended || desired_replicas != 0))
+            || pending_message
+                .as_ref()
+                .is_some_and(|message| message.trim().is_empty() || message.len() > 512)
+        {
+            return Err(ExecutionModelError::InvalidDeployment);
+        }
+        Ok(Self {
+            job_id: revision.id().job_id().clone(),
+            revision_id: revision.id().clone(),
+            generation: NonZeroU64::new(generation).ok_or(ExecutionModelError::InvalidRevision)?,
+            desired_replicas,
+            suspended,
+            status,
+            pending_reason,
+            pending_message,
+        })
+    }
+
+    pub fn job_id(&self) -> &JobId {
+        &self.job_id
+    }
+
+    pub fn revision_id(&self) -> &JobRevisionId {
+        &self.revision_id
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.get()
+    }
+
+    pub fn desired_replicas(&self) -> u32 {
+        self.desired_replicas
+    }
+
+    pub fn suspended(&self) -> bool {
+        self.suspended
+    }
+
+    pub fn status(&self) -> DeploymentStatus {
+        self.status
+    }
+
+    pub fn pending_reason(&self) -> Option<DeploymentPendingReason> {
+        self.pending_reason
+    }
+
+    pub fn pending_message(&self) -> Option<&str> {
+        self.pending_message.as_deref()
+    }
+
+    pub fn next_generation(
+        &self,
+        revision: &JobRevision,
+        desired_replicas: u32,
+        suspended: bool,
+        status: DeploymentStatus,
+        pending_reason: Option<DeploymentPendingReason>,
+        pending_message: Option<String>,
+    ) -> Result<Self, ExecutionModelError> {
+        let generation = self
+            .generation()
+            .checked_add(1)
+            .ok_or(ExecutionModelError::DeploymentGenerationExhausted)?;
+        Self::new(
+            revision,
+            generation,
+            desired_replicas,
+            suspended,
+            status,
+            pending_reason,
+            pending_message,
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for JobDeployment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawJobDeployment::deserialize(deserializer)?;
+        if raw.job_id != *raw.revision_id.job_id()
+            || raw.desired_replicas > MAX_DEPLOYMENT_REPLICAS
+            || matches!(
+                raw.status,
+                DeploymentStatus::Suspended
+                    | DeploymentStatus::Deleting
+                    | DeploymentStatus::Deleted
+            ) != raw.suspended
+            || (raw.suspended && raw.pending_reason.is_some())
+            || (raw.pending_reason.is_some() != raw.pending_message.is_some())
+            || (raw.status == DeploymentStatus::Pending
+                && (raw.desired_replicas == 0 || raw.pending_reason.is_none()))
+            || (raw.status == DeploymentStatus::Ready && raw.pending_reason.is_some())
+            || (matches!(
+                raw.status,
+                DeploymentStatus::Deleting | DeploymentStatus::Deleted
+            ) && (!raw.suspended || raw.desired_replicas != 0))
+            || raw
+                .pending_message
+                .as_ref()
+                .is_some_and(|message| message.trim().is_empty() || message.len() > 512)
+        {
+            return Err(serde::de::Error::custom(
+                "deployment state, revision, and pending fields disagree",
+            ));
+        }
+        Ok(Self {
+            job_id: raw.job_id,
+            revision_id: raw.revision_id,
+            generation: raw.generation,
+            desired_replicas: raw.desired_replicas,
+            suspended: raw.suspended,
+            status: raw.status,
+            pending_reason: raw.pending_reason,
+            pending_message: raw.pending_message,
+        })
+    }
 }
 
 /// Requirements a worker must satisfy before an allocation can be assigned.
@@ -306,6 +523,24 @@ impl ExecutionRequirements {
 
     pub fn required_enforcement(&self) -> &BTreeSet<EnforcementCapability> {
         &self.required_enforcement
+    }
+
+    fn with_required_enforcement(
+        mut self,
+        required: impl IntoIterator<Item = EnforcementCapability>,
+    ) -> Result<Self, ExecutionModelError> {
+        self.required_enforcement.extend(required);
+        if self.operating_system == Some(OperatingSystem::Macos)
+            && self.required_enforcement.iter().any(|capability| {
+                matches!(
+                    capability,
+                    EnforcementCapability::CgroupV2 | EnforcementCapability::Landlock
+                )
+            })
+        {
+            return Err(ExecutionModelError::UnsupportedPlatformCapability);
+        }
+        Ok(self)
     }
 
     pub fn is_satisfied_by(&self, capabilities: &WorkerCapabilities) -> bool {
@@ -458,6 +693,10 @@ impl ResourceRequest {
     pub fn memory_bytes(&self) -> Option<u64> {
         self.memory_bytes.map(NonZeroU64::get)
     }
+
+    pub fn is_complete(&self) -> bool {
+        self.cpu_millis.is_some() && self.memory_bytes.is_some()
+    }
 }
 
 /// Capacity reserved for one allocation by the scheduler, stored separately
@@ -504,6 +743,7 @@ pub struct JobRevision {
     executable_digest: ExecutableDigest,
     execution_requirements: ExecutionRequirements,
     resource_request: ResourceRequest,
+    resource_request_provenance: ResourceRequestProvenance,
 }
 
 #[derive(Deserialize)]
@@ -517,6 +757,81 @@ struct RawJobRevision {
     execution_requirements: ExecutionRequirements,
     #[serde(default)]
     resource_request: ResourceRequest,
+    #[serde(default)]
+    resource_request_provenance: Option<ResourceRequestProvenance>,
+}
+
+/// Whether effective scheduling requests came from the client or were absent.
+/// MVP2 has no administrator defaults: omitted one-shot requests remain
+/// unspecified and service requests must be explicit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceRequestProvenance {
+    Explicit,
+    Unspecified,
+}
+
+/// Strict public input for creating an immutable job revision. The manager
+/// assigns the revision number and returns a `JobRevision`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct JobRevisionDraft {
+    definition: JobSpec,
+    workload: Workload,
+    executable_digest: ExecutableDigest,
+    #[serde(default)]
+    execution_requirements: ExecutionRequirements,
+    #[serde(default)]
+    resource_request: ResourceRequest,
+}
+
+/// Conditional update requested for the mutable deployment of one logical job.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DeploymentMutation {
+    Deploy { revision: u64, replicas: u32 },
+    Scale { replicas: u32 },
+    Suspend,
+    Resume,
+    Rollback { revision: u64 },
+    Delete,
+}
+
+impl JobRevisionDraft {
+    pub fn new(
+        definition: JobSpec,
+        workload: Workload,
+        executable_digest: ExecutableDigest,
+        execution_requirements: ExecutionRequirements,
+        resource_request: ResourceRequest,
+    ) -> Self {
+        Self {
+            definition,
+            workload,
+            executable_digest,
+            execution_requirements,
+            resource_request,
+        }
+    }
+
+    pub fn job_id(&self) -> &JobId {
+        self.definition.id()
+    }
+
+    pub fn definition(&self) -> &JobSpec {
+        &self.definition
+    }
+
+    pub fn into_revision(self, revision: u64) -> Result<JobRevision, ExecutionModelError> {
+        JobRevision::new(
+            JobRevisionId::new(self.definition.id().clone(), revision)?,
+            self.definition,
+            self.workload,
+            self.executable_digest,
+            self.execution_requirements,
+            self.resource_request,
+        )
+    }
 }
 
 impl JobRevision {
@@ -531,6 +846,59 @@ impl JobRevision {
         if id.job_id() != definition.id() {
             return Err(ExecutionModelError::RevisionJobMismatch);
         }
+        let resource_request_provenance = if resource_request.cpu_millis().is_some()
+            || resource_request.memory_bytes().is_some()
+        {
+            ResourceRequestProvenance::Explicit
+        } else {
+            ResourceRequestProvenance::Unspecified
+        };
+        if matches!(workload, Workload::Service { .. }) && !resource_request.is_complete() {
+            return Err(ExecutionModelError::IncompleteServiceResourceRequest);
+        }
+        if matches!(workload, Workload::Service { .. }) {
+            let limits = definition.resource_limits();
+            if let (Some(quota), Some(period), Some(requested)) = (
+                limits.cpu_quota_us(),
+                limits.cpu_period_us(),
+                resource_request.cpu_millis(),
+            ) {
+                let required_millis = quota
+                    .checked_mul(1_000)
+                    .and_then(|value| value.checked_add(period - 1))
+                    .map(|value| value / period)
+                    .ok_or(ExecutionModelError::ResourceRequestBelowExecutionLimit)?;
+                if u64::from(requested) < required_millis {
+                    return Err(ExecutionModelError::ResourceRequestBelowExecutionLimit);
+                }
+            }
+            if limits.memory_max_bytes().is_some_and(|limit| {
+                resource_request
+                    .memory_bytes()
+                    .is_none_or(|request| request < limit)
+            }) {
+                return Err(ExecutionModelError::ResourceRequestBelowExecutionLimit);
+            }
+        }
+        if definition
+            .executable_digest()
+            .is_some_and(|digest| digest != &executable_digest)
+        {
+            return Err(ExecutionModelError::ConflictingExecutableDigest);
+        }
+        let definition = definition.with_executable_digest(Some(executable_digest.clone()));
+        let mut derived_enforcement = BTreeSet::new();
+        if !definition.resource_limits().is_empty() {
+            derived_enforcement.insert(EnforcementCapability::CgroupV2);
+        }
+        if definition
+            .filesystem_policy()
+            .is_some_and(|policy| !policy.grants().is_empty())
+        {
+            derived_enforcement.insert(EnforcementCapability::Landlock);
+        }
+        let execution_requirements =
+            execution_requirements.with_required_enforcement(derived_enforcement)?;
         Ok(Self {
             id,
             definition,
@@ -538,6 +906,7 @@ impl JobRevision {
             executable_digest,
             execution_requirements,
             resource_request,
+            resource_request_provenance,
         })
     }
 
@@ -564,6 +933,10 @@ impl JobRevision {
     pub fn resource_request(&self) -> &ResourceRequest {
         &self.resource_request
     }
+
+    pub fn resource_request_provenance(&self) -> ResourceRequestProvenance {
+        self.resource_request_provenance
+    }
 }
 
 impl<'de> Deserialize<'de> for JobRevision {
@@ -572,7 +945,7 @@ impl<'de> Deserialize<'de> for JobRevision {
         D: Deserializer<'de>,
     {
         let raw = RawJobRevision::deserialize(deserializer)?;
-        Self::new(
+        let revision = Self::new(
             raw.id,
             raw.definition,
             raw.workload,
@@ -580,7 +953,16 @@ impl<'de> Deserialize<'de> for JobRevision {
             raw.execution_requirements,
             raw.resource_request,
         )
-        .map_err(serde::de::Error::custom)
+        .map_err(serde::de::Error::custom)?;
+        if raw
+            .resource_request_provenance
+            .is_some_and(|source| source != revision.resource_request_provenance())
+        {
+            return Err(serde::de::Error::custom(
+                "resource request provenance does not match the submitted request",
+            ));
+        }
+        Ok(revision)
     }
 }
 
@@ -628,15 +1010,9 @@ impl Allocation {
     ) -> Result<Self, ExecutionModelError> {
         let service_instance_id = match (revision.workload(), service_instance) {
             (Workload::OneShot, None) => None,
-            (
-                Workload::Service {
-                    identity,
-                    desired_replicas,
-                },
-                Some(instance),
-            ) if instance.job_revision_id() == revision.id()
-                && instance.service() == identity
-                && instance.replica_index() < desired_replicas.get() =>
+            (Workload::Service { identity }, Some(instance))
+                if instance.job_revision_id() == revision.id()
+                    && instance.service() == identity =>
             {
                 Some(instance.id().clone())
             }
@@ -927,14 +1303,10 @@ impl ServiceInstance {
         revision: &JobRevision,
         replica_index: u32,
     ) -> Result<Self, ExecutionModelError> {
-        let Workload::Service {
-            identity,
-            desired_replicas,
-        } = revision.workload()
-        else {
+        let Workload::Service { identity } = revision.workload() else {
             return Err(ExecutionModelError::InvalidServiceInstance);
         };
-        if replica_index >= desired_replicas.get() {
+        if replica_index >= MAX_DEPLOYMENT_REPLICAS {
             return Err(ExecutionModelError::InvalidServiceInstance);
         }
         Ok(Self {

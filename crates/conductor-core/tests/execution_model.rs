@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
 
 use conductor_core::{
-    Allocation, AllocationId, AllocationState, Architecture, AttemptState, DigestAlgorithm,
-    EnforcementCapability, ExecutableDigest, ExecutionAttempt, ExecutionAttemptId,
-    ExecutionBackend, ExecutionModelError, ExecutionRequirements, JobId, JobRevision,
-    JobRevisionId, JobSpec, OperatingSystem, ResourceRequest, ResourceReservation, ServiceIdentity,
+    Allocation, AllocationId, AllocationState, Architecture, AttemptState, DeploymentPendingReason,
+    DeploymentStatus, DigestAlgorithm, EnforcementCapability, ExecutableDigest, ExecutionAttempt,
+    ExecutionAttemptId, ExecutionBackend, ExecutionModelError, ExecutionRequirements,
+    FilesystemPolicy, JobDeployment, JobId, JobRevision, JobRevisionDraft, JobRevisionId, JobSpec,
+    OperatingSystem, ResourceLimits, ResourceRequest, ResourceReservation, ServiceIdentity,
     ServiceInstance, ServiceInstanceId, WorkerCapabilities, WorkerId, Workload,
 };
 
@@ -25,6 +26,23 @@ fn revision(workload: Workload) -> JobRevision {
         ResourceRequest::new(Some(500), Some(1024 * 1024)).unwrap(),
     )
     .unwrap()
+}
+
+#[test]
+fn revision_submission_rejects_unknown_fields() {
+    let draft = JobRevisionDraft::new(
+        job_spec("job-1"),
+        Workload::OneShot,
+        ExecutableDigest::sha256("a".repeat(64)).unwrap(),
+        ExecutionRequirements::default(),
+        ResourceRequest::default(),
+    );
+    let mut value = serde_json::to_value(draft).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("unrecognized".to_owned(), serde_json::Value::Bool(true));
+    assert!(serde_json::from_value::<JobRevisionDraft>(value).is_err());
 }
 
 fn worker_capabilities(
@@ -91,7 +109,6 @@ fn service_identity_and_replica_slots_have_stable_validated_ids() {
 
     let revision = revision(Workload::Service {
         identity: service.clone(),
-        desired_replicas: 2.try_into().unwrap(),
     });
     let instance = ServiceInstance::new(
         ServiceInstanceId::new("frontend-slot-0").unwrap(),
@@ -109,19 +126,77 @@ fn service_identity_and_replica_slots_have_stable_validated_ids() {
     )
     .unwrap();
     assert_eq!(allocation.service_instance_id(), Some(instance.id()));
-    assert!(
-        ServiceInstance::new(
-            ServiceInstanceId::new("out-of-range").unwrap(),
-            &revision,
-            2
-        )
-        .is_err()
-    );
+    // Replica counts belong to mutable deployment intent, so a revision does
+    // not impose a bound on stable service slot identities.
+    let later_slot = ServiceInstance::new(
+        ServiceInstanceId::new("frontend-slot-2").unwrap(),
+        &revision,
+        2,
+    )
+    .unwrap();
+    assert_eq!(later_slot.replica_index(), 2);
     assert!(
         serde_json::from_str::<ServiceIdentity>(r#"{"namespace":"default","name":"x-"}"#)
             .unwrap_err()
             .to_string()
             .contains("DNS-compatible")
+    );
+}
+
+#[test]
+fn deployment_intent_is_mutable_separate_from_immutable_revisions() {
+    let service = ServiceIdentity::new("frontend").unwrap();
+    let first_revision = revision(Workload::Service {
+        identity: service.clone(),
+    });
+    let pending = JobDeployment::new(
+        &first_revision,
+        1,
+        3,
+        false,
+        DeploymentStatus::Pending,
+        Some(DeploymentPendingReason::PlacementPending),
+        Some("placement has not been evaluated yet".to_owned()),
+    )
+    .unwrap();
+    assert_eq!(pending.desired_replicas(), 3);
+    assert_eq!(pending.revision_id(), first_revision.id());
+
+    let scaled_to_zero = pending
+        .next_generation(
+            &first_revision,
+            0,
+            false,
+            DeploymentStatus::Ready,
+            None,
+            None,
+        )
+        .unwrap();
+    assert_eq!(scaled_to_zero.generation(), 2);
+    assert_eq!(scaled_to_zero.desired_replicas(), 0);
+
+    let suspended = scaled_to_zero
+        .next_generation(
+            &first_revision,
+            3,
+            true,
+            DeploymentStatus::Suspended,
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(suspended.suspended());
+    assert_eq!(suspended.desired_replicas(), 3);
+    let encoded = serde_json::to_string(&suspended).unwrap();
+    assert_eq!(
+        serde_json::from_str::<JobDeployment>(&encoded).unwrap(),
+        suspended
+    );
+    assert!(
+        serde_json::from_str::<JobDeployment>(
+            &encoded.replace("\"generation\":3", "\"generation\":0")
+        )
+        .is_err()
     );
 }
 
@@ -188,6 +263,81 @@ fn allocation_and_attempt_transitions_reject_unsafe_reassignment() {
     );
     allocation.release().unwrap();
     assert!(allocation.release().is_err());
+}
+
+#[test]
+fn service_revisions_require_complete_requests_and_derive_protection_requirements() {
+    let service = Workload::Service {
+        identity: ServiceIdentity::new("frontend").unwrap(),
+    };
+    let digest = ExecutableDigest::sha256("a".repeat(64)).unwrap();
+    let id = JobRevisionId::new(JobId::new("job-1").unwrap(), 1).unwrap();
+    assert_eq!(
+        JobRevision::new(
+            id.clone(),
+            job_spec("job-1"),
+            service.clone(),
+            digest.clone(),
+            ExecutionRequirements::default(),
+            ResourceRequest::default(),
+        ),
+        Err(ExecutionModelError::IncompleteServiceResourceRequest)
+    );
+
+    let definition = job_spec("job-1")
+        .with_resource_limits(
+            ResourceLimits::new(
+                Some(100_000),
+                Some(100_000),
+                Some(200 * 1024 * 1024),
+                None,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .with_filesystem_policy(Some(
+            FilesystemPolicy::new(vec!["runtime".to_owned()]).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(
+        JobRevision::new(
+            id.clone(),
+            definition.clone(),
+            service.clone(),
+            digest.clone(),
+            ExecutionRequirements::default(),
+            ResourceRequest::new(Some(999), Some(200 * 1024 * 1024)).unwrap(),
+        ),
+        Err(ExecutionModelError::ResourceRequestBelowExecutionLimit)
+    );
+    let revision = JobRevision::new(
+        id.clone(),
+        definition.clone(),
+        service.clone(),
+        digest.clone(),
+        ExecutionRequirements::default(),
+        ResourceRequest::new(Some(1_000), Some(200 * 1024 * 1024)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        revision.execution_requirements().required_enforcement(),
+        &BTreeSet::from([
+            EnforcementCapability::CgroupV2,
+            EnforcementCapability::Landlock,
+        ])
+    );
+    assert_eq!(
+        JobRevision::new(
+            id,
+            definition,
+            service,
+            digest,
+            ExecutionRequirements::new(Some(OperatingSystem::Macos), None, None, BTreeSet::new(),),
+            ResourceRequest::new(Some(1_000), Some(200 * 1024 * 1024)).unwrap(),
+        ),
+        Err(ExecutionModelError::UnsupportedPlatformCapability)
+    );
 }
 
 #[test]
