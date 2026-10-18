@@ -14,17 +14,18 @@ use conductor_core::{
     Allocation, AllocationId, AllocationState, AssignedServicePort, CommandEnvelope, CommandId,
     DeploymentMutation, DeploymentPendingReason, DeploymentStatus, InspectRun, JobDeployment,
     JobId, JobRevision, JobRevisionDraft, JobRevisionId, JobSpec, MAX_DEPLOYMENT_REPLICAS,
-    MAX_WORKER_CAPACITY, ReadRunLogs, ResolveRun, ResourceReservation, RunFailureReason, RunId,
-    RunLogChunk, RunObservation, RunSpec, RunState, RunTerminationReason, ServiceInstance,
-    ServiceInstanceId, StartRun, StopRun, WorkerCommand, WorkerDescriptor, WorkerId,
-    WorkerInventoryEntry, WorkerResourceCapacity, WorkerServiceNetwork, WorkerStatus, Workload,
+    MAX_WORKER_CAPACITY, ReadRunLogs, ReadinessState, ResolveRun, ResourceReservation,
+    RunFailureReason, RunId, RunLogChunk, RunObservation, RunSpec, RunState, RunTerminationReason,
+    ServiceIdentity, ServiceInstance, ServiceInstanceId, ServicePortProtocol, StartRun, StopRun,
+    WorkerCommand, WorkerDescriptor, WorkerId, WorkerInventoryEntry, WorkerResourceCapacity,
+    WorkerServiceNetwork, WorkerStatus, Workload,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 
 /// Temporary limit for active jobs. Pagination is a later milestone.
 pub const MAX_JOBS: usize = 1_000;
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_PENDING_COMMANDS_PER_WORKER: usize = 32;
 const MAX_PENDING_NON_CONTROL_COMMANDS_PER_WORKER: usize = 24;
@@ -125,6 +126,26 @@ pub struct ServiceAttemptRecord {
     pub terminal_failure: bool,
     pub service_ports: Vec<AssignedServicePort>,
     pub service_ports_ready: bool,
+}
+
+/// A manager-derived catalog registration for one persisted allocation/run port.
+/// Readiness and worker connectivity are evaluated from durable observations and
+/// the current worker-status snapshot so a manager restart cannot resurrect a
+/// stale endpoint.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServiceCatalogEndpoint {
+    pub job_id: JobId,
+    pub service_identity: ServiceIdentity,
+    pub service_instance_id: ServiceInstanceId,
+    pub allocation_id: AllocationId,
+    pub run_id: RunId,
+    pub worker_id: WorkerId,
+    pub port: AssignedServicePort,
+    pub readiness: Option<ReadinessState>,
+    pub worker_fresh: bool,
+    pub worker_draining: bool,
+    pub eligible: bool,
 }
 
 impl AllocationRecord {
@@ -284,6 +305,11 @@ pub trait JobRepository: Send + Sync + CommandJournal {
         &self,
         id: &JobId,
     ) -> Result<Vec<ServiceAttemptRecord>, ExecutionStoreError>;
+    fn list_service_catalog(
+        &self,
+        identity: &ServiceIdentity,
+        workers: &[WorkerStatus],
+    ) -> Result<Vec<ServiceCatalogEndpoint>, ExecutionStoreError>;
     fn begin_service_run(
         &self,
         job_id: &JobId,
@@ -781,7 +807,23 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
         connection
             .prepare("SELECT network_domain_id, protocol, port, allocation_id, run_id FROM service_port_leases LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare("SELECT namespace, service_name, job_id, revision FROM service_catalog_owners LIMIT 0")
+            .map_err(MigrationError::Sqlite)?;
         return Ok(());
+    }
+
+    if version == 9 {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(MigrationError::Sqlite)?;
+        create_service_catalog_owner_schema(&transaction).map_err(MigrationError::Sqlite)?;
+        backfill_service_catalog_owners(&transaction)?;
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(MigrationError::Sqlite)?;
+        transaction.commit().map_err(MigrationError::Sqlite)?;
+        return migrate(connection);
     }
 
     if version == 8 {
@@ -790,7 +832,7 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
             .map_err(MigrationError::Sqlite)?;
         create_service_port_schema(&transaction).map_err(MigrationError::Sqlite)?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 9)
             .map_err(MigrationError::Sqlite)?;
         transaction.commit().map_err(MigrationError::Sqlite)?;
         return migrate(connection);
@@ -998,6 +1040,7 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
     create_scheduling_schema(&transaction).map_err(MigrationError::Sqlite)?;
     create_service_attempt_schema(&transaction).map_err(MigrationError::Sqlite)?;
     create_service_port_schema(&transaction).map_err(MigrationError::Sqlite)?;
+    create_service_catalog_owner_schema(&transaction).map_err(MigrationError::Sqlite)?;
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(MigrationError::Sqlite)?;
@@ -1203,6 +1246,148 @@ fn create_service_attempt_schema(transaction: &rusqlite::Transaction<'_>) -> rus
              terminal_failure INTEGER NOT NULL DEFAULT 0 CHECK (terminal_failure IN (0, 1))
          );",
     )
+}
+
+fn create_service_catalog_owner_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS service_catalog_owners (
+             namespace TEXT NOT NULL,
+             service_name TEXT NOT NULL,
+             job_id TEXT PRIMARY KEY NOT NULL REFERENCES jobs(id),
+             revision INTEGER NOT NULL CHECK (revision > 0),
+             FOREIGN KEY (job_id, revision) REFERENCES job_revisions(job_id, revision)
+         );
+         CREATE UNIQUE INDEX IF NOT EXISTS service_catalog_owner_by_identity
+             ON service_catalog_owners(namespace, service_name);",
+    )
+}
+
+fn backfill_service_catalog_owners(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), MigrationError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT job_id, deployment_json FROM job_deployments
+             WHERE deleted_at_ms IS NULL ORDER BY job_id",
+        )
+        .map_err(MigrationError::Sqlite)?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(MigrationError::Sqlite)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(MigrationError::Sqlite)?;
+    drop(statement);
+    for (job_id, deployment_json) in rows {
+        let deployment: JobDeployment = serde_json::from_str(&deployment_json)
+            .map_err(|_| MigrationError::InvalidLegacySchema)?;
+        let revision_number = i64::try_from(deployment.revision_id().revision())
+            .map_err(|_| MigrationError::InvalidLegacySchema)?;
+        let revision_json: String = transaction
+            .query_row(
+                "SELECT revision_json FROM job_revisions WHERE job_id = ?1 AND revision = ?2",
+                params![job_id, revision_number],
+                |row| row.get(0),
+            )
+            .map_err(MigrationError::Sqlite)?;
+        let revision: JobRevision = serde_json::from_str(&revision_json)
+            .map_err(|_| MigrationError::InvalidLegacySchema)?;
+        if revision.id() != deployment.revision_id() {
+            return Err(MigrationError::InvalidLegacySchema);
+        }
+        let Workload::Service { identity, .. } = revision.workload() else {
+            continue;
+        };
+        let existing_owner: Option<String> = transaction
+            .query_row(
+                "SELECT job_id FROM service_catalog_owners
+                 WHERE namespace = ?1 AND service_name = ?2",
+                params![identity.namespace(), identity.name()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(MigrationError::Sqlite)?;
+        if existing_owner
+            .as_deref()
+            .is_some_and(|owner| owner != job_id)
+        {
+            return Err(MigrationError::InvalidLegacySchema);
+        }
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO service_catalog_owners(namespace, service_name, job_id, revision)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    identity.namespace(),
+                    identity.name(),
+                    job_id,
+                    i64::try_from(deployment.revision_id().revision())
+                        .map_err(|_| MigrationError::InvalidLegacySchema)?
+                ],
+            )
+            .map_err(MigrationError::Sqlite)?;
+    }
+    Ok(())
+}
+
+fn upsert_service_catalog_owner(
+    transaction: &rusqlite::Transaction<'_>,
+    job_id: &JobId,
+    revision: &JobRevision,
+) -> Result<(), ExecutionStoreError> {
+    let Workload::Service { identity, .. } = revision.workload() else {
+        return Err(ExecutionStoreError::InvalidRequest);
+    };
+    transaction
+        .execute(
+            "INSERT INTO service_catalog_owners(namespace, service_name, job_id, revision)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(job_id) DO UPDATE SET namespace = excluded.namespace,
+                 service_name = excluded.service_name, revision = excluded.revision",
+            params![
+                identity.namespace(),
+                identity.name(),
+                job_id.as_str(),
+                i64::try_from(revision.id().revision())
+                    .map_err(|_| ExecutionStoreError::StorageUnavailable)?
+            ],
+        )
+        .map_err(|error| {
+            if matches!(error, rusqlite::Error::SqliteFailure(ref code, _)
+                if code.code == rusqlite::ErrorCode::ConstraintViolation)
+            {
+                ExecutionStoreError::Conflict
+            } else {
+                ExecutionStoreError::StorageUnavailable
+            }
+        })?;
+    Ok(())
+}
+
+fn ensure_service_identity_available(
+    transaction: &rusqlite::Transaction<'_>,
+    job_id: &JobId,
+    identity: &ServiceIdentity,
+) -> Result<(), ExecutionStoreError> {
+    let owner: Option<String> = transaction
+        .query_row(
+            "SELECT job_id FROM service_catalog_owners
+             WHERE namespace = ?1 AND service_name = ?2",
+            params![identity.namespace(), identity.name()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+    if owner
+        .as_deref()
+        .is_some_and(|owner| owner != job_id.as_str())
+    {
+        return Err(ExecutionStoreError::Conflict);
+    }
+    Ok(())
 }
 
 fn active_allocations_exist(
@@ -2613,6 +2798,11 @@ impl JobRepository for SqliteJobRepository {
         {
             return Err(ExecutionStoreError::InvalidRequest);
         }
+        if !matches!(mutation, DeploymentMutation::Delete)
+            && let Workload::Service { identity, .. } = revision.workload()
+        {
+            ensure_service_identity_available(&transaction, id, identity)?;
+        }
         let (status, pending_reason, pending_message) = if suspended {
             if matches!(mutation, DeploymentMutation::Delete) {
                 (DeploymentStatus::Deleted, None, None)
@@ -2652,6 +2842,16 @@ impl JobRepository for SqliteJobRepository {
             deployment =
                 JobDeployment::new(&revision, generation, 0, true, deletion_status, None, None)
                     .map_err(|_| ExecutionStoreError::InvalidRequest)?;
+        }
+        if deployment.status() == DeploymentStatus::Deleted {
+            transaction
+                .execute(
+                    "DELETE FROM service_catalog_owners WHERE job_id = ?1",
+                    [id.as_str()],
+                )
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        } else {
+            upsert_service_catalog_owner(&transaction, id, &revision)?;
         }
         let deployment_json = serde_json::to_string(&deployment)
             .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
@@ -2760,6 +2960,12 @@ impl JobRepository for SqliteJobRepository {
                         id.as_str(),
                         current.generation() as i64
                     ],
+                )
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            transaction
+                .execute(
+                    "DELETE FROM service_catalog_owners WHERE job_id = ?1",
+                    [id.as_str()],
                 )
                 .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
             transaction
@@ -2972,6 +3178,211 @@ impl JobRepository for SqliteJobRepository {
             })
         })
         .collect()
+    }
+
+    fn list_service_catalog(
+        &self,
+        identity: &ServiceIdentity,
+        workers: &[WorkerStatus],
+    ) -> Result<Vec<ServiceCatalogEndpoint>, ExecutionStoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let mut deployments_statement = transaction
+            .prepare(
+                "SELECT d.job_id, d.deployment_json
+                 FROM service_catalog_owners o
+                 JOIN job_deployments d ON d.job_id = o.job_id
+                 WHERE o.namespace = ?1 AND o.service_name = ?2
+                   AND d.deleted_at_ms IS NULL
+                 ORDER BY d.job_id",
+            )
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        let deployments = deployments_statement
+            .query_map(params![identity.namespace(), identity.name()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        drop(deployments_statement);
+
+        let mut endpoints = Vec::new();
+        for (raw_job_id, deployment_json) in deployments {
+            let job_id =
+                JobId::new(raw_job_id).map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            let deployment: JobDeployment = serde_json::from_str(&deployment_json)
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            if deployment.suspended() || deployment.desired_replicas() == 0 {
+                continue;
+            }
+            let revision_number = i64::try_from(deployment.revision_id().revision())
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            let revision_json: String = transaction
+                .query_row(
+                    "SELECT revision_json FROM job_revisions WHERE job_id = ?1 AND revision = ?2",
+                    params![job_id.as_str(), revision_number],
+                    |row| row.get(0),
+                )
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            let revision: JobRevision = serde_json::from_str(&revision_json)
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            if revision.id() != deployment.revision_id()
+                || !matches!(
+                    revision.workload(),
+                    Workload::Service { identity: current, .. } if current == identity
+                )
+            {
+                continue;
+            }
+
+            let mut statement = transaction
+                .prepare(
+                    "SELECT si.instance_id, si.replica_index, si.current_allocation_id,
+                            a.allocation_json, sa.current_run_id, r.observation_json,
+                            r.job_spec_json, l.name, l.protocol, l.port, l.advertised_address
+                     FROM service_instances si
+                     JOIN allocations a ON a.allocation_id = si.current_allocation_id
+                         AND a.job_id = si.job_id AND a.revision = ?2 AND a.state = 'assigned'
+                     JOIN service_attempts sa ON sa.service_instance_id = si.instance_id
+                         AND sa.allocation_id = a.allocation_id
+                         AND sa.current_run_id IS NOT NULL
+                     JOIN runs r ON r.run_id = sa.current_run_id AND r.job_id = si.job_id
+                     JOIN service_port_leases l ON l.run_id = r.run_id
+                         AND l.allocation_id = a.allocation_id
+                     WHERE si.job_id = ?1 AND si.replica_index < ?3
+                     ORDER BY si.replica_index, l.name",
+                )
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            let rows = statement
+                .query_map(
+                    params![
+                        job_id.as_str(),
+                        revision_number,
+                        i64::from(deployment.desired_replicas())
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, String>(6)?,
+                            row.get::<_, String>(7)?,
+                            row.get::<_, String>(8)?,
+                            row.get::<_, i64>(9)?,
+                            row.get::<_, String>(10)?,
+                        ))
+                    },
+                )
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+            drop(statement);
+
+            for (
+                raw_instance_id,
+                replica_index,
+                current_allocation_id,
+                allocation_json,
+                raw_run_id,
+                observation_json,
+                run_spec_json,
+                port_name,
+                protocol,
+                raw_port,
+                advertised_address,
+            ) in rows
+            {
+                let replica_index = u32::try_from(replica_index)
+                    .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+                if replica_index >= deployment.desired_replicas() {
+                    continue;
+                }
+                let instance_id = ServiceInstanceId::new(raw_instance_id)
+                    .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+                let allocation: Allocation = serde_json::from_str(&allocation_json)
+                    .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+                let allocation_id = allocation.id().clone();
+                if current_allocation_id.as_deref() != Some(allocation_id.as_str())
+                    || allocation.state() != AllocationState::Assigned
+                    || allocation.job_revision_id() != deployment.revision_id()
+                {
+                    continue;
+                }
+                let worker_id = allocation
+                    .assigned_worker_id()
+                    .filter(|_| allocation.state() == AllocationState::Assigned)
+                    .cloned()
+                    .ok_or(ExecutionStoreError::StorageUnavailable)?;
+                let run_id =
+                    RunId::new(raw_run_id).map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+                let observation: RunObservation = serde_json::from_str(&observation_json)
+                    .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+                let run_spec: RunSpec = serde_json::from_str(&run_spec_json)
+                    .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+                let port = AssignedServicePort::new(
+                    port_name,
+                    match protocol.as_str() {
+                        "tcp" => ServicePortProtocol::Tcp,
+                        _ => return Err(ExecutionStoreError::StorageUnavailable),
+                    },
+                    u16::try_from(raw_port).map_err(|_| ExecutionStoreError::StorageUnavailable)?,
+                    advertised_address,
+                )
+                .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+                if !run_spec.service_ports().contains(&port) {
+                    return Err(ExecutionStoreError::StorageUnavailable);
+                }
+                let observation_matches_attempt = observation.run_id() == &run_id
+                    && observation.job_id() == &job_id
+                    && observation.worker_id() == &worker_id
+                    && run_spec.id() == &run_id
+                    && run_spec.worker_id() == &worker_id
+                    && run_spec.job().id() == &job_id;
+                let worker = workers
+                    .iter()
+                    .find(|worker| worker.worker_id() == &worker_id);
+                let worker_fresh = worker.is_some_and(|worker| worker.is_valid() && worker.fresh());
+                let worker_draining = worker.is_some_and(WorkerStatus::draining);
+                let worker_available = worker.is_some_and(|worker| {
+                    worker.is_valid()
+                        && worker.available()
+                        && !worker.degraded()
+                        && worker.incarnation() == observation.worker_incarnation()
+                });
+                let readiness = observation.readiness();
+                let eligible = observation_matches_attempt
+                    && observation.state() == RunState::Running
+                    && readiness == Some(ReadinessState::Ready)
+                    && worker_fresh
+                    && worker_available
+                    && !worker_draining;
+                endpoints.push(ServiceCatalogEndpoint {
+                    job_id: job_id.clone(),
+                    service_identity: identity.clone(),
+                    service_instance_id: instance_id,
+                    allocation_id,
+                    run_id,
+                    worker_id,
+                    port,
+                    readiness,
+                    worker_fresh,
+                    worker_draining,
+                    eligible,
+                });
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
+        Ok(endpoints)
     }
 
     fn begin_service_run(
@@ -4306,6 +4717,14 @@ impl JobService {
         id: &JobId,
     ) -> Result<Vec<ServiceAttemptRecord>, ExecutionStoreError> {
         self.repository.list_service_attempts(id)
+    }
+
+    pub fn list_service_catalog(
+        &self,
+        identity: &ServiceIdentity,
+        workers: &[WorkerStatus],
+    ) -> Result<Vec<ServiceCatalogEndpoint>, ExecutionStoreError> {
+        self.repository.list_service_catalog(identity, workers)
     }
 
     /// Reconcile placed service slots with their workers. Repeated calls are

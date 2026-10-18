@@ -713,6 +713,14 @@ fn named_service_ports_are_leased_uniquely_persisted_and_not_ready_without_healt
     )
     .with_service_network(service_network)
     .unwrap();
+    let second_draft = {
+        let mut value = serde_json::to_value(service_revision_with_probe("second-job")).unwrap();
+        value["definition"]["id"] = serde_json::json!("other-web");
+        serde_json::from_value::<JobRevisionDraft>(value).unwrap()
+    };
+    let second_revision = manager
+        .create_revision(&second_draft, "second-probe-revision")
+        .unwrap();
     manager
         .mutate_deployment_with_workers(
             revision.id().job_id(),
@@ -722,6 +730,17 @@ fn named_service_ports_are_leased_uniquely_persisted_and_not_ready_without_healt
             std::slice::from_ref(&worker_status),
         )
         .unwrap();
+    assert_eq!(
+        manager.mutate_deployment_with_workers(
+            second_revision.id().job_id(),
+            None,
+            &deployment_request(1),
+            "second-probe-deploy",
+            std::slice::from_ref(&worker_status),
+        ),
+        Err(ExecutionStoreError::Conflict),
+        "one active job owns a logical service identity"
+    );
     let worker: Arc<dyn WorkerPort> = Arc::new(ServiceRunner {
         worker_id,
         status: worker_status,
@@ -828,7 +847,7 @@ fn manager_publishes_service_ports_ready_only_after_a_newer_probe_observation() 
         .unwrap();
     let worker = Arc::new(ServiceRunner {
         worker_id,
-        status: worker_status,
+        status: worker_status.clone(),
         starts: AtomicUsize::new(0),
         disconnected: AtomicBool::new(false),
         runs: Mutex::new(BTreeMap::new()),
@@ -845,6 +864,15 @@ fn manager_publishes_service_ports_ready_only_after_a_newer_probe_observation() 
         .pop()
         .unwrap();
     assert!(!attempt.service_ports_ready);
+    let identity = match revision.workload() {
+        conductor_core::Workload::Service { identity, .. } => identity,
+        _ => unreachable!("service revision"),
+    };
+    let catalog = manager
+        .list_service_catalog(identity, std::slice::from_ref(&worker_status))
+        .unwrap();
+    assert!(!catalog.is_empty());
+    assert!(catalog.iter().all(|endpoint| !endpoint.eligible));
     let run_id = attempt.current_run_id.unwrap();
     let current_run = attempt.current_run.unwrap();
     let stale_spec = conductor_core::RunSpec::new(
@@ -889,6 +917,73 @@ fn manager_publishes_service_ports_ready_only_after_a_newer_probe_observation() 
         .unwrap();
     assert!(attempt.service_ports_ready);
     assert_eq!(attempt.current_run.unwrap().state(), RunState::Running);
+    let catalog = manager
+        .list_service_catalog(identity, std::slice::from_ref(&worker_status))
+        .unwrap();
+    assert_eq!(catalog.len(), 1);
+    assert!(catalog[0].eligible);
+    assert_eq!(catalog[0].readiness, Some(ReadinessState::Ready));
+    let stale_worker = worker_status.clone().with_freshness(false);
+    let stale_catalog = manager
+        .list_service_catalog(identity, std::slice::from_ref(&stale_worker))
+        .unwrap();
+    assert!(!stale_catalog[0].worker_fresh);
+    assert!(!stale_catalog[0].eligible);
+
+    let reopened = service(&directory);
+    let reconstructed = reopened
+        .list_service_catalog(identity, std::slice::from_ref(&worker_status))
+        .unwrap();
+    assert_eq!(
+        reconstructed, catalog,
+        "catalog is reconstructed after restart"
+    );
+}
+
+#[test]
+fn schema_nine_migration_backfills_indexed_service_owners() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let first = manager
+        .create_revision(&service_revision_draft("catalog-owner"), "owner-revision")
+        .unwrap();
+    manager
+        .mutate_deployment(
+            first.id().job_id(),
+            None,
+            &deployment_request(0),
+            "owner-deploy",
+        )
+        .unwrap();
+    drop(manager);
+
+    let legacy = Connection::open(directory.database()).unwrap();
+    legacy
+        .execute_batch(
+            "DROP TABLE service_catalog_owners;
+             PRAGMA user_version = 9;",
+        )
+        .unwrap();
+    drop(legacy);
+
+    let migrated = service(&directory);
+    let second_draft = {
+        let mut value = serde_json::to_value(service_revision_draft("second-owner")).unwrap();
+        value["definition"]["id"] = serde_json::json!("second-web");
+        serde_json::from_value::<JobRevisionDraft>(value).unwrap()
+    };
+    let second = migrated
+        .create_revision(&second_draft, "second-owner-revision")
+        .unwrap();
+    assert_eq!(
+        migrated.mutate_deployment(
+            second.id().job_id(),
+            None,
+            &deployment_request(0),
+            "second-owner-deploy",
+        ),
+        Err(ExecutionStoreError::Conflict)
+    );
 }
 
 #[test]
@@ -1957,7 +2052,7 @@ fn schema_five_migrates_execution_tables_without_losing_jobs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert!(table_exists(&connection, "job_revisions"));
     assert!(table_exists(&connection, "job_deployments"));
     assert!(table_exists(&connection, "execution_idempotency"));
@@ -1984,7 +2079,7 @@ fn schema_six_adds_durable_scheduling_tables() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert!(table_exists(&connection, "service_instances"));
     assert!(table_exists(&connection, "allocations"));
     assert!(table_exists(&connection, "scheduling_sequence"));
@@ -2006,7 +2101,7 @@ fn schema_seven_migrates_service_attempt_state() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert!(table_exists(&connection, "service_attempts"));
 }
 
@@ -2113,7 +2208,7 @@ fn legacy_schema_migrates_transactionally_and_repeated_startup_is_stable() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read migrated schema and fixture");
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert_eq!(created_at, 1234);
     assert_eq!(deleted_at, None);
 }
@@ -2163,7 +2258,7 @@ fn schema_two_migration_adds_idempotency_and_indexed_run_order() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert!(columns.iter().any(|column| column == "idempotency_key"));
     assert!(columns.iter().any(|column| column == "request_fingerprint"));
     assert!(columns.iter().any(|column| column == "run_order"));
@@ -2228,7 +2323,7 @@ fn schema_four_identity_layout_migrates_with_command_outbox_without_losing_token
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     let outbox_exists = table_exists(&connection, "manager_commands");
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert!(outbox_exists);
 }
 
@@ -2269,7 +2364,7 @@ fn schema_four_command_layout_migrates_with_identity_tables_without_resetting_se
         )
         .unwrap();
     let identity_exists = table_exists(&connection, "worker_identities");
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     assert_eq!(sequence, 17);
     assert!(identity_exists);
 }
@@ -2529,7 +2624,7 @@ fn version_one_manager_database_migrates_runs_and_accepts_timeout_specs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 }
 
 struct FullWorker(WorkerId);
