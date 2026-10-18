@@ -96,7 +96,14 @@ PRELOAD_SOURCE = r"""
 static void write_marker(const char *path, const char *value) {
   int fd = open(path, O_CREAT | O_WRONLY | O_TRUNC, 0600);
   if (fd >= 0) {
-    (void)write(fd, value, strlen(value));
+    const char *cursor = value;
+    size_t remaining = strlen(value);
+    while (remaining > 0) {
+      ssize_t written = write(fd, cursor, remaining);
+      if (written <= 0) break;
+      cursor += written;
+      remaining -= (size_t)written;
+    }
     close(fd);
   }
 }
