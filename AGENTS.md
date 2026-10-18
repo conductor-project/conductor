@@ -1,6 +1,6 @@
 # Conductor contributor guidance
 
-Conductor is a Linux daemon for managing and running host processes. The MVP1 deployment is one `conductor` binary with a combined manager and worker. The process backend runs with the daemon user's host permissions and network access; it is not a security sandbox.
+Conductor is a daemon for submitting one-shot jobs and managing service deployments on hosts you operate. It supports a combined manager/worker process and separate manager and worker roles connected by authenticated transport. The process backend runs with the daemon user's host permissions and network access; it is not a security sandbox.
 
 ## Crates and dependency directions
 
@@ -9,9 +9,14 @@ Conductor is a Linux daemon for managing and running host processes. The MVP1 de
 - `conductor-worker`: worker-owned supervision, persistence, deadlines, logs, and an execution-backend interface. It depends on core.
 - `conductor-process`: host-specific process execution implementing the worker interface.
 - `conductor-api`: HTTP entrypoint and request/response mapping; handlers call manager operations.
+- `conductor-transport`: authenticated manager/worker transport implementing explicit command and report adapters.
 - `conductor`: CLI, configuration, composition, local manager/worker adapter, and shutdown.
 
-Communication between manager and worker goes through explicit command/report interfaces. Keep PIDs and worker filesystem paths internal to the worker. Use stable job, run, and worker IDs at boundaries. The planned roles are manager, worker, and all; MVP1 starts with combined local mode. Standalone roles must fail clearly until remote transport exists.
+Communication between manager and worker goes through explicit command/report interfaces. Keep PIDs and worker filesystem paths internal to the worker. Use stable job, run, and worker IDs at boundaries. The supported role selections are manager, worker, and all. The `all` role composes manager and worker in one process; standalone roles use authenticated transport. Keep this description aligned with the CLI and transport implementation.
+
+## Knowledge bundles
+
+`README.md` is the user entry point. `OKF.md` links the cross-crate repository knowledge bundle in `okf/` and independent technical bundles under each `crates/<crate>/okf/`. Keep these pages descriptive and source-linked: they do not override this file. When behavior, configuration, API contracts, platform support, or verification evidence changes, update affected knowledge pages and any relevant README walkthrough in the same change. Record the reviewed source revision and distinguish source review, tests, local runtime validation, CI, and platform qualification. Do not claim verification that was not performed. See `okf/migration-map.md` for old documentation paths and their canonical destinations.
 
 ## Required workflow
 
