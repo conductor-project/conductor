@@ -23,10 +23,10 @@ use conductor_core::{
     Architecture as WorkerArchitecture, CommandEnvelope, CommandId, EnforcementCapability,
     ExecutionBackend as WorkerExecutionBackend, InspectRun, JobSpec, LogStream,
     MAX_LOG_CHUNK_BYTES, MAX_WORKER_CAPACITY, MAX_WORKER_INVENTORY_PAGE_SIZE, OperatingSystem,
-    ReadRunLogs, ResolveRun, RunFailureReason, RunLogChunk, RunLogStatus, RunObservation, RunState,
-    RunTerminationReason, StartRun, StopRun, WorkerCapabilities, WorkerDescriptor, WorkerId,
-    WorkerInventory, WorkerInventoryEntry, WorkerInventoryPage, WorkerResourceCapacity,
-    WorkerStatus,
+    ReadRunLogs, ReadinessProbe, ReadinessProbeProtocol, ReadinessState, ResolveRun,
+    RunFailureReason, RunLogChunk, RunLogStatus, RunObservation, RunState, RunTerminationReason,
+    StartRun, StopRun, WorkerCapabilities, WorkerDescriptor, WorkerId, WorkerInventory,
+    WorkerInventoryEntry, WorkerInventoryPage, WorkerResourceCapacity, WorkerStatus,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
@@ -616,6 +616,7 @@ impl WorkerService {
         }
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
+            .enable_io()
             .enable_time()
             .build()?;
         let log_directory = state_directory.join("runs");
@@ -1057,6 +1058,13 @@ impl WorkerService {
         };
         let running = starting
             .next_revision(RunState::Running, Some(started), None, None, None, None)
+            .map(|observation| {
+                if spec.readiness_probe().is_some() {
+                    observation.with_readiness(ReadinessState::Starting)
+                } else {
+                    observation
+                }
+            })
             .ok_or(WorkerError::StorageUnavailable);
         let running = match running {
             Ok(running) => running,
@@ -1130,6 +1138,8 @@ impl WorkerService {
             grace,
             log_directory,
             retention_runs,
+            readiness_probe: spec.readiness_probe().cloned(),
+            service_ports: spec.service_ports().to_vec(),
         }));
         let mut supervisors = self
             .supervisors
@@ -2496,6 +2506,106 @@ struct RunSupervision {
     grace: Duration,
     log_directory: PathBuf,
     retention_runs: usize,
+    readiness_probe: Option<ReadinessProbe>,
+    service_ports: Vec<conductor_core::AssignedServicePort>,
+}
+
+const MAX_READINESS_RESPONSE_BYTES: u64 = 8 * 1024;
+
+async fn run_readiness_probe(
+    client: &reqwest::Client,
+    probe: &ReadinessProbe,
+    port: &conductor_core::AssignedServicePort,
+) -> bool {
+    let timeout = Duration::from_millis(probe.timeout_ms());
+    let loopback = if port
+        .advertised_address()
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_ipv6())
+    {
+        "::1"
+    } else {
+        "127.0.0.1"
+    };
+    match probe.protocol() {
+        ReadinessProbeProtocol::Tcp => tokio::time::timeout(
+            timeout,
+            tokio::net::TcpStream::connect((loopback, port.port())),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok()),
+        ReadinessProbeProtocol::Http => {
+            let host = if loopback.contains(':') {
+                format!("[{loopback}]")
+            } else {
+                loopback.to_owned()
+            };
+            let url = format!("http://{host}:{}/", port.port());
+            let url = match reqwest::Url::parse(&url) {
+                Ok(mut url) => {
+                    let Some(path) = probe.path() else {
+                        return false;
+                    };
+                    url.set_path(path);
+                    url
+                }
+                Err(_) => return false,
+            };
+            let response = match tokio::time::timeout(timeout, client.get(url).send()).await {
+                Ok(Ok(response)) => response,
+                _ => return false,
+            };
+            if response
+                .content_length()
+                .is_some_and(|length| length > MAX_READINESS_RESPONSE_BYTES)
+            {
+                return false;
+            }
+            response.status().is_success()
+        }
+    }
+}
+
+async fn persist_readiness(
+    state: &Arc<SharedWorkerState>,
+    pending: &Arc<PendingPersistence>,
+    admission: &Arc<Semaphore>,
+    current: &mut RunObservation,
+    readiness: ReadinessState,
+) {
+    if current.readiness() == Some(readiness) {
+        return;
+    }
+    let Some(next) = current.next_readiness_revision(readiness) else {
+        pending.degraded.store(true, Ordering::SeqCst);
+        return;
+    };
+    let persisted = run_bounded_blocking(admission, {
+        let state = Arc::clone(state);
+        let next = next.clone();
+        move || {
+            let serialized = serde_json::to_string(&next)
+                .map_err(|_| io::Error::other("readiness observation serialization failed"))?;
+            let state = state
+                .0
+                .lock()
+                .map_err(|_| io::Error::other("worker state is unavailable"))?;
+            let changed = state.connection.execute(
+                "UPDATE runs SET observation_json = ?1, revision = ?2, state = ?3 WHERE run_id = ?4 AND revision < ?2 AND state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
+                params![serialized, next.revision() as i64, next.state().as_str(), next.run_id().as_str()],
+            )
+            .map_err(io::Error::other)?;
+            if changed != 1 {
+                return Err(io::Error::other("readiness observation was superseded"));
+            }
+            Ok(())
+        }
+    })
+    .await;
+    match persisted {
+        Ok(()) => *current = next,
+        Err(_) => pending.degraded.store(true, Ordering::SeqCst),
+    }
 }
 
 async fn run_bounded_blocking<T, F>(admission: &Arc<Semaphore>, operation: F) -> io::Result<T>
@@ -2558,6 +2668,8 @@ async fn supervise(supervision: RunSupervision) {
         grace,
         log_directory,
         retention_runs,
+        readiness_probe,
+        service_ports,
     } = supervision;
     let group_id = spawned.group_id;
     if spawned.child.is_none() {
@@ -2569,6 +2681,20 @@ async fn supervise(supervision: RunSupervision) {
         return;
     };
     let timeout_deadline = timeout.map(|limit| tokio::time::Instant::from_std(launched_at + limit));
+    let probe_client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(10))
+        .build()
+        .ok();
+    let mut probe_tasks = tokio::task::JoinSet::new();
+    let mut next_probe_at = readiness_probe.as_ref().map(|probe| {
+        tokio::time::Instant::from_std(
+            launched_at + Duration::from_millis(probe.startup_grace_ms()),
+        )
+    });
+    let mut consecutive_successes = 0_u16;
+    let mut consecutive_failures = 0_u16;
     let mut status = None;
     let mut wait_failed = false;
     if *shutdown_signal.borrow() {
@@ -2602,7 +2728,50 @@ async fn supervise(supervision: RunSupervision) {
         if intent.load(Ordering::SeqCst) != INTENT_NONE {
             break;
         }
+        if probe_tasks.is_empty()
+            && next_probe_at.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+            && let Some(probe) = readiness_probe.as_ref()
+        {
+            let port = service_ports
+                .iter()
+                .find(|port| port.name() == probe.port_name())
+                .cloned();
+            let probe = probe.clone();
+            let client = probe_client.clone();
+            probe_tasks.spawn(async move {
+                match (client, port) {
+                    (Some(client), Some(port)) => run_readiness_probe(&client, &probe, &port).await,
+                    _ => false,
+                }
+            });
+        }
+        let probe_result = async {
+            match probe_tasks.join_next().await {
+                Some(result) => result,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(probe_result);
         tokio::select! {
+            result = &mut probe_result => {
+                let probe_succeeded = result.unwrap_or(false);
+                if let Some(probe) = readiness_probe.as_ref() {
+                    next_probe_at = Some(tokio::time::Instant::now() + Duration::from_millis(probe.interval_ms()));
+                    if probe_succeeded {
+                        consecutive_successes = consecutive_successes.saturating_add(1);
+                        consecutive_failures = 0;
+                        if consecutive_successes >= probe.success_threshold() {
+                            persist_readiness(&state, &pending, &persistence_admission, &mut current, ReadinessState::Ready).await;
+                        }
+                    } else {
+                        consecutive_failures = consecutive_failures.saturating_add(1);
+                        consecutive_successes = 0;
+                        if consecutive_failures >= probe.failure_threshold() {
+                            persist_readiness(&state, &pending, &persistence_admission, &mut current, ReadinessState::Unready).await;
+                        }
+                    }
+                }
+            },
             _ = control_notify.notified() => {},
             changed = shutdown_signal.changed() => {
                 if changed.is_ok() && *shutdown_signal.borrow() {
@@ -2630,6 +2799,8 @@ async fn supervise(supervision: RunSupervision) {
             }
         }
     }
+
+    probe_tasks.abort_all();
 
     if intent.load(Ordering::SeqCst) != INTENT_NONE {
         let requested = intent.load(Ordering::SeqCst);

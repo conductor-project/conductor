@@ -70,6 +70,7 @@ pub enum ExecutionModelError {
     DeploymentGenerationExhausted,
     InvalidServiceName,
     InvalidServicePort,
+    InvalidReadinessProbe,
     UnsupportedNamespace,
     InvalidExecutableDigest,
     RevisionJobMismatch,
@@ -94,6 +95,7 @@ impl fmt::Display for ExecutionModelError {
             Self::InvalidServicePort => {
                 "service port must have a unique DNS-compatible name and valid endpoint"
             }
+            Self::InvalidReadinessProbe => "service readiness probe configuration is invalid",
             Self::UnsupportedNamespace => "only the default service namespace is supported",
             Self::InvalidExecutableDigest => {
                 "executable digest must be a 64-character SHA-256 hex value"
@@ -276,14 +278,177 @@ fn valid_dns_label(value: &str) -> bool {
 /// Desired lifecycle for a job revision. Existing MVP1 jobs remain plain
 /// `JobSpec` values and map to `OneShot` when represented as an MVP2 revision.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase",
+    deny_unknown_fields
+)]
 pub enum Workload {
     OneShot,
     Service {
         identity: ServiceIdentity,
         #[serde(default)]
         ports: Vec<ServicePort>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        readiness_probe: Option<ReadinessProbe>,
     },
+}
+
+/// A bounded worker-side readiness check for one declared service port.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReadinessProbe {
+    port_name: String,
+    protocol: ReadinessProbeProtocol,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    interval_ms: u64,
+    timeout_ms: u64,
+    startup_grace_ms: u64,
+    success_threshold: u16,
+    failure_threshold: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReadinessProbeProtocol {
+    Tcp,
+    Http,
+}
+
+impl ReadinessProbe {
+    pub fn tcp(port_name: impl Into<String>) -> Result<Self, ExecutionModelError> {
+        Self::new(
+            port_name.into(),
+            ReadinessProbeProtocol::Tcp,
+            None,
+            1_000,
+            500,
+            0,
+            1,
+            1,
+        )
+    }
+
+    pub fn http(
+        port_name: impl Into<String>,
+        path: impl Into<String>,
+    ) -> Result<Self, ExecutionModelError> {
+        Self::new(
+            port_name.into(),
+            ReadinessProbeProtocol::Http,
+            Some(path.into()),
+            1_000,
+            500,
+            0,
+            1,
+            1,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn configured(
+        port_name: impl Into<String>,
+        protocol: ReadinessProbeProtocol,
+        path: Option<String>,
+        interval_ms: u64,
+        timeout_ms: u64,
+        startup_grace_ms: u64,
+        success_threshold: u16,
+        failure_threshold: u16,
+    ) -> Result<Self, ExecutionModelError> {
+        Self::new(
+            port_name.into(),
+            protocol,
+            path,
+            interval_ms,
+            timeout_ms,
+            startup_grace_ms,
+            success_threshold,
+            failure_threshold,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        port_name: String,
+        protocol: ReadinessProbeProtocol,
+        path: Option<String>,
+        interval_ms: u64,
+        timeout_ms: u64,
+        startup_grace_ms: u64,
+        success_threshold: u16,
+        failure_threshold: u16,
+    ) -> Result<Self, ExecutionModelError> {
+        if !valid_dns_label(&port_name)
+            || (protocol == ReadinessProbeProtocol::Http
+                && path.as_ref().is_none_or(|value| {
+                    !value.starts_with('/')
+                        || value.len() > 1_024
+                        || value.contains(['#', '?', '\n', '\r'])
+                }))
+            || (protocol == ReadinessProbeProtocol::Tcp && path.is_some())
+            || !(50..=60_000).contains(&interval_ms)
+            || timeout_ms == 0
+            || timeout_ms > 10_000
+            || timeout_ms > interval_ms
+            || startup_grace_ms > 600_000
+            || !(1..=10).contains(&success_threshold)
+            || !(1..=10).contains(&failure_threshold)
+        {
+            return Err(ExecutionModelError::InvalidReadinessProbe);
+        }
+        Ok(Self {
+            port_name,
+            protocol,
+            path,
+            interval_ms,
+            timeout_ms,
+            startup_grace_ms,
+            success_threshold,
+            failure_threshold,
+        })
+    }
+
+    pub fn port_name(&self) -> &str {
+        &self.port_name
+    }
+    pub fn protocol(&self) -> ReadinessProbeProtocol {
+        self.protocol
+    }
+    pub fn path(&self) -> Option<&str> {
+        self.path.as_deref()
+    }
+    pub fn interval_ms(&self) -> u64 {
+        self.interval_ms
+    }
+    pub fn timeout_ms(&self) -> u64 {
+        self.timeout_ms
+    }
+    pub fn startup_grace_ms(&self) -> u64 {
+        self.startup_grace_ms
+    }
+    pub fn success_threshold(&self) -> u16 {
+        self.success_threshold
+    }
+    pub fn failure_threshold(&self) -> u16 {
+        self.failure_threshold
+    }
+
+    pub fn is_valid(&self) -> bool {
+        Self::new(
+            self.port_name.clone(),
+            self.protocol,
+            self.path.clone(),
+            self.interval_ms,
+            self.timeout_ms,
+            self.startup_grace_ms,
+            self.success_threshold,
+            self.failure_threshold,
+        )
+        .is_ok()
+    }
 }
 
 /// A named TCP listener exposed by a native service process.
@@ -1032,7 +1197,12 @@ impl JobRevision {
         if !crate::valid_worker_labels(execution_requirements.worker_labels()) {
             return Err(ExecutionModelError::InvalidWorkerLabelConstraint);
         }
-        if let Workload::Service { ports, .. } = &workload {
+        if let Workload::Service {
+            ports,
+            readiness_probe,
+            ..
+        } = &workload
+        {
             if ports.len() > 32 {
                 return Err(ExecutionModelError::InvalidServicePort);
             }
@@ -1044,6 +1214,11 @@ impl JobRevision {
                 {
                     return Err(ExecutionModelError::InvalidServicePort);
                 }
+            }
+            if let Some(probe) = readiness_probe
+                && (!probe.is_valid() || !seen.contains(probe.port_name()))
+            {
+                return Err(ExecutionModelError::InvalidReadinessProbe);
             }
         }
         let resource_request_provenance = if resource_request.cpu_millis().is_some()

@@ -5,9 +5,10 @@ use conductor_core::{
     DeploymentPendingReason, DeploymentStatus, DigestAlgorithm, EnforcementCapability,
     ExecutableDigest, ExecutionAttempt, ExecutionAttemptId, ExecutionBackend, ExecutionModelError,
     ExecutionRequirements, FilesystemPolicy, JobDeployment, JobId, JobRevision, JobRevisionDraft,
-    JobRevisionId, JobSpec, OperatingSystem, ResourceLimits, ResourceRequest, ResourceReservation,
-    RunId, RunSpec, ServiceIdentity, ServiceInstance, ServiceInstanceId, ServicePort,
-    ServicePortProtocol, WorkerCapabilities, WorkerId, Workload,
+    JobRevisionId, JobSpec, OperatingSystem, ReadinessProbe, ReadinessProbeProtocol,
+    ResourceLimits, ResourceRequest, ResourceReservation, RunId, RunSpec, ServiceIdentity,
+    ServiceInstance, ServiceInstanceId, ServicePort, ServicePortProtocol, WorkerCapabilities,
+    WorkerId, Workload,
 };
 
 fn job_spec(id: &str) -> JobSpec {
@@ -111,6 +112,7 @@ fn service_identity_and_replica_slots_have_stable_validated_ids() {
     let revision = revision(Workload::Service {
         identity: service.clone(),
         ports: Vec::new(),
+        readiness_probe: None,
     });
     let instance = ServiceInstance::new(
         ServiceInstanceId::new("frontend-slot-0").unwrap(),
@@ -151,6 +153,7 @@ fn deployment_intent_is_mutable_separate_from_immutable_revisions() {
     let first_revision = revision(Workload::Service {
         identity: service.clone(),
         ports: Vec::new(),
+        readiness_probe: None,
     });
     let pending = JobDeployment::new(
         &first_revision,
@@ -273,6 +276,7 @@ fn service_revisions_require_complete_requests_and_derive_protection_requirement
     let service = Workload::Service {
         identity: ServiceIdentity::new("frontend").unwrap(),
         ports: Vec::new(),
+        readiness_probe: None,
     };
     let digest = ExecutableDigest::sha256("a".repeat(64)).unwrap();
     let id = JobRevisionId::new(JobId::new("job-1").unwrap(), 1).unwrap();
@@ -384,6 +388,70 @@ fn named_service_ports_validate_names_and_create_run_environment_overrides() {
     assert!(
         AssignedServicePort::new("http", ServicePortProtocol::Tcp, 31_000, "localhost").is_err()
     );
+}
+
+#[test]
+fn readiness_probes_validate_bounds_and_reference_a_declared_port() {
+    let probe = ReadinessProbe::configured(
+        "http",
+        ReadinessProbeProtocol::Http,
+        Some("/ready".to_owned()),
+        100,
+        50,
+        250,
+        2,
+        3,
+    )
+    .unwrap();
+    assert_eq!(probe.port_name(), "http");
+    assert_eq!(probe.timeout_ms(), 50);
+    assert!(ReadinessProbe::http("http", "not-a-path").is_err());
+    assert!(
+        ReadinessProbe::configured("http", ReadinessProbeProtocol::Tcp, None, 100, 101, 0, 1, 1,)
+            .is_err()
+    );
+
+    let workload = Workload::Service {
+        identity: ServiceIdentity::new("frontend").unwrap(),
+        ports: vec![ServicePort::tcp("http").unwrap()],
+        readiness_probe: Some(probe),
+    };
+    assert!(
+        revision(workload)
+            .workload()
+            .clone()
+            .eq(&Workload::Service {
+                identity: ServiceIdentity::new("frontend").unwrap(),
+                ports: vec![ServicePort::tcp("http").unwrap()],
+                readiness_probe: Some(
+                    ReadinessProbe::configured(
+                        "http",
+                        ReadinessProbeProtocol::Http,
+                        Some("/ready".to_owned()),
+                        100,
+                        50,
+                        250,
+                        2,
+                        3,
+                    )
+                    .unwrap()
+                ),
+            })
+    );
+
+    let invalid = JobRevision::new(
+        JobRevisionId::new(JobId::new("job-1").unwrap(), 1).unwrap(),
+        job_spec("job-1"),
+        Workload::Service {
+            identity: ServiceIdentity::new("frontend").unwrap(),
+            ports: Vec::new(),
+            readiness_probe: Some(ReadinessProbe::tcp("missing").unwrap()),
+        },
+        ExecutableDigest::sha256("b".repeat(64)).unwrap(),
+        ExecutionRequirements::default(),
+        ResourceRequest::new(Some(1_000), Some(200 * 1024 * 1024)).unwrap(),
+    );
+    assert_eq!(invalid, Err(ExecutionModelError::InvalidReadinessProbe));
 }
 
 #[test]

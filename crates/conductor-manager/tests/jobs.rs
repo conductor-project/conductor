@@ -9,10 +9,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use conductor_core::{
     AllocationState, Architecture, CommandEnvelope, CommandId, DeploymentMutation,
     DeploymentPendingReason, DeploymentStatus, EnforcementCapability, ExecutionBackend, InspectRun,
-    JobId, JobRevisionDraft, JobSpec, LogStream, OperatingSystem, ReadRunLogs, ResolveRun,
-    RunFailureReason, RunId, RunLogChunk, RunLogStatus, RunObservation, RunState, StartRun,
-    StopRun, WorkerCapabilities, WorkerCommand, WorkerDescriptor, WorkerId, WorkerInventory,
-    WorkerResourceCapacity, WorkerServiceNetwork, WorkerStatus,
+    JobId, JobRevisionDraft, JobSpec, LogStream, OperatingSystem, ReadRunLogs, ReadinessState,
+    ResolveRun, RunFailureReason, RunId, RunLogChunk, RunLogStatus, RunObservation, RunState,
+    StartRun, StopRun, WorkerCapabilities, WorkerCommand, WorkerDescriptor, WorkerId,
+    WorkerInventory, WorkerResourceCapacity, WorkerServiceNetwork, WorkerStatus,
 };
 use conductor_manager::{
     CommandJournal, CommandStoreError, ExecutionStoreError, JobRepository, JobService, MAX_JOBS,
@@ -221,6 +221,20 @@ fn service_revision_with_ports(command_arg: &str) -> JobRevisionDraft {
         "a".repeat(64)
     );
     serde_json::from_str(&json).expect("valid service revision with named port")
+}
+
+fn service_revision_with_probe(command_arg: &str) -> JobRevisionDraft {
+    let mut value = serde_json::to_value(service_revision_with_ports(command_arg)).unwrap();
+    value["workload"]["readinessProbe"] = serde_json::json!({
+        "portName": "http",
+        "protocol": "tcp",
+        "intervalMs": 100,
+        "timeoutMs": 50,
+        "startupGraceMs": 0,
+        "successThreshold": 2,
+        "failureThreshold": 3
+    });
+    serde_json::from_value(value).expect("valid service readiness probe revision")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -623,6 +637,84 @@ fn named_service_ports_are_leased_uniquely_persisted_and_not_ready_without_healt
         2,
         "active leases remain unavailable after manager restart"
     );
+}
+
+#[test]
+fn manager_publishes_service_ports_ready_only_after_a_newer_probe_observation() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let revision = manager
+        .create_revision(&service_revision_with_probe("readiness"), "probe-revision")
+        .unwrap();
+    let worker_id = WorkerId::new("worker-probe").unwrap();
+    let service_network = WorkerServiceNetwork::new(
+        WorkerId::new("host-probe").unwrap(),
+        31_000,
+        31_000,
+        "192.0.2.12",
+    )
+    .unwrap();
+    let worker_status = scheduling_worker(
+        "worker-probe",
+        "host-probe",
+        2_000,
+        2_147_483_648,
+        2_000,
+        2_147_483_648,
+        BTreeMap::new(),
+        true,
+    )
+    .with_service_network(service_network)
+    .unwrap();
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &deployment_request(1),
+            "probe-deploy",
+            std::slice::from_ref(&worker_status),
+        )
+        .unwrap();
+    let worker = Arc::new(ServiceRunner {
+        worker_id,
+        status: worker_status,
+        starts: AtomicUsize::new(0),
+        disconnected: AtomicBool::new(false),
+        runs: Mutex::new(BTreeMap::new()),
+    });
+    let worker_port: Arc<dyn WorkerPort> = worker.clone();
+
+    manager
+        .reconcile_services(std::slice::from_ref(&worker_port))
+        .unwrap();
+    let attempt = manager
+        .list_service_attempts(revision.id().job_id())
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(!attempt.service_ports_ready);
+    let run_id = attempt.current_run_id.unwrap();
+    {
+        let mut runs = worker.runs.lock().unwrap();
+        let current = runs.get_mut(&run_id).unwrap();
+        let running = current
+            .next_revision(RunState::Running, Some(2), None, None, None, None)
+            .unwrap()
+            .with_readiness(ReadinessState::Starting);
+        *current = running
+            .next_readiness_revision(ReadinessState::Ready)
+            .unwrap();
+    }
+    manager
+        .reconcile_services(std::slice::from_ref(&worker_port))
+        .unwrap();
+    let attempt = manager
+        .list_service_attempts(revision.id().job_id())
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert!(attempt.service_ports_ready);
+    assert_eq!(attempt.current_run.unwrap().state(), RunState::Running);
 }
 
 #[test]

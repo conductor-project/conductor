@@ -444,6 +444,7 @@ version = "0.1.0"
 dependencies = [
  "conductor-core",
  "nix",
+ "reqwest",
  "rusqlite",
  "serde_json",
  "sha2",

@@ -2784,6 +2784,16 @@ impl JobRepository for SqliteJobRepository {
                 .map_err(|_| ExecutionStoreError::StorageUnavailable)?
                 .map(|spec| spec.service_ports().to_vec())
                 .unwrap_or_default();
+            let current_run = observation
+                .map(|json| {
+                    serde_json::from_str::<RunObservation>(&json)
+                        .map_err(|_| ExecutionStoreError::StorageUnavailable)
+                })
+                .transpose()?;
+            let service_ports_ready = current_run.as_ref().is_some_and(|run| {
+                run.state() == RunState::Running
+                    && run.readiness() == Some(conductor_core::ReadinessState::Ready)
+            });
             Ok(ServiceAttemptRecord {
                 service_instance_id: ServiceInstanceId::new(instance)
                     .map_err(|_| ExecutionStoreError::StorageUnavailable)?,
@@ -2816,18 +2826,13 @@ impl JobRepository for SqliteJobRepository {
                     .map(RunId::new)
                     .transpose()
                     .map_err(|_| ExecutionStoreError::StorageUnavailable)?,
-                current_run: observation
-                    .map(|json| {
-                        serde_json::from_str(&json)
-                            .map_err(|_| ExecutionStoreError::StorageUnavailable)
-                    })
-                    .transpose()?,
+                current_run,
                 restart_count: u32::try_from(count)
                     .map_err(|_| ExecutionStoreError::StorageUnavailable)?,
                 next_start_at_ms: next_start,
                 terminal_failure: terminal != 0,
                 service_ports,
-                service_ports_ready: false,
+                service_ports_ready,
             })
         })
         .collect()
@@ -2968,9 +2973,13 @@ impl JobRepository for SqliteJobRepository {
             .map_err(|_| RunStoreError::StorageUnavailable)?;
         let run_id =
             RunId::new(format!("run-{sequence}")).map_err(|_| RunStoreError::StorageUnavailable)?;
-        let declared_ports: &[conductor_core::ServicePort] = match revision.workload() {
-            Workload::Service { ports, .. } => ports,
-            Workload::OneShot => &[],
+        let (declared_ports, readiness_probe) = match revision.workload() {
+            Workload::Service {
+                ports,
+                readiness_probe,
+                ..
+            } => (ports.as_slice(), readiness_probe.as_ref()),
+            Workload::OneShot => (&[][..], None),
         };
         if !declared_ports.is_empty() && service_network.is_none() {
             transaction
@@ -2995,9 +3004,14 @@ impl JobRepository for SqliteJobRepository {
                 .map_err(|_| RunStoreError::StorageUnavailable)?;
             return Ok(None);
         }
-        let spec = RunSpec::new(run_id, worker_id.clone(), revision.definition().clone())
+        let mut spec = RunSpec::new(run_id, worker_id.clone(), revision.definition().clone())
             .with_service_ports(assigned_ports)
             .map_err(|_| RunStoreError::StorageUnavailable)?;
+        if let Some(probe) = readiness_probe {
+            spec = spec
+                .with_readiness_probe(probe.clone())
+                .map_err(|_| RunStoreError::StorageUnavailable)?;
+        }
         let command_id =
             next_command_id(&transaction).map_err(|_| RunStoreError::StorageUnavailable)?;
         let envelope = CommandEnvelope {
