@@ -530,15 +530,19 @@ def main():
                     for name in services
                 }
                 for service in services:
-                    wait_until(
-                        f"host resolver positive answer for {service}",
-                        lambda service=service: system_resolves(
-                            f"{service}.default.service.{SUFFIX}."
-                        ),
-                        timeout=8,
-                        interval=0.1,
-                        timings=result["timingsMs"],
-                    )
+                    fqdn = f"{service}.default.service.{SUFFIX}."
+                    try:
+                        wait_until(
+                            f"host resolver positive answer for {service}",
+                            lambda fqdn=fqdn: system_resolves(fqdn),
+                            timeout=8,
+                            interval=0.1,
+                            timings=result["timingsMs"],
+                        )
+                    except TimeoutError as error:
+                        raise TimeoutError(
+                            f"{error}; resolver diagnostics={resolver_diagnostics(fqdn, dig)}"
+                        ) from error
                     wait_until(
                         f"host resolver search answer for {service}",
                         lambda service=service: system_resolves(service),
@@ -571,12 +575,20 @@ def main():
                     version="v1-unhealthy",
                 )
                 deploy_service(base, "unready", 1, create=True, key="mvp2-unready-deploy")
-                wait_until(
-                    "failed readiness probe to hold deployment pending",
-                    lambda: deployment_pending_for_readiness(base, "unready"),
-                    timeout=8,
-                    timings=result["timingsMs"],
-                )
+                unready_snapshot = {}
+                try:
+                    wait_until(
+                        "failed readiness probe to hold deployment pending",
+                        lambda: deployment_pending_for_readiness(
+                            base, "unready", unready_snapshot
+                        ),
+                        timeout=8,
+                        timings=result["timingsMs"],
+                    )
+                except TimeoutError as error:
+                    raise TimeoutError(
+                        f"{error}; latest unready deployment={unready_snapshot}"
+                    ) from error
                 status, _, response = request(base, "GET", "/v1/jobs/unready/endpoints")
                 if status != 200 or response.get("endpoints"):
                     raise RuntimeError(f"unready service published an endpoint: {response}")
@@ -759,20 +771,59 @@ def endpoint_if_on_other_worker(base, service, excluded_worker):
         return endpoints
 
 
-def deployment_pending_for_readiness(base, service):
-    return deployment_pending_for_reason(base, service, "service_readiness_pending")
+def deployment_pending_for_readiness(base, service, latest):
+    return deployment_pending_for_reason(
+        base, service, "service_readiness_pending", latest
+    )
 
 
-def deployment_pending_for_reason(base, service, reason):
+def deployment_pending_for_reason(base, service, reason, latest=None):
     status, _, deployment = request(base, "GET", f"/v1/jobs/{service}/deployment")
+    if latest is not None:
+        latest.update(status=status, body=deployment)
     return (
         deployment
         if status == 200
+        and isinstance(deployment, dict)
         and deployment.get("status") == "pending"
         and deployment.get("pendingReason") == reason
         else None
     )
     return None
+
+
+def resolver_diagnostics(name, dig):
+    details = {"name": name}
+    try:
+        details["getaddrinfo"] = [item[4][0] for item in socket.getaddrinfo(
+            name, None, type=socket.SOCK_STREAM
+        )]
+    except socket.gaierror as error:
+        details["getaddrinfoError"] = str(error)
+    direct = subprocess.run(
+        [dig, "+time=1", "+tries=1", "+noall", "+answer", "+authority", "A", name, "@127.0.0.1"],
+        capture_output=True, text=True, timeout=3,
+    )
+    details["directDns"] = {
+        "returnCode": direct.returncode,
+        "stdout": direct.stdout.strip(),
+        "stderr": direct.stderr.strip(),
+    }
+    if sys.platform == "darwin":
+        cache = subprocess.run(
+            ["dscacheutil", "-q", "host", "-a", "name", name],
+            capture_output=True, text=True, timeout=3,
+        )
+        details["dscacheutil"] = cache.stdout.strip()
+        resolvers = subprocess.run(
+            ["scutil", "--dns"], capture_output=True, text=True, timeout=3,
+        ).stdout.splitlines()
+        details["supplementalResolver"] = [
+            resolvers[index:index + 5]
+            for index, line in enumerate(resolvers)
+            if f"service.{SUFFIX}" in line
+        ][:2]
+    return details
 
 
 def system_resolves(name):
