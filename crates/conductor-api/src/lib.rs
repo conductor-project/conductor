@@ -927,6 +927,12 @@ async fn request_bounds(
             "request headers exceed the configured count or byte limit",
         );
     }
+    // Liveness and readiness probes do not perform blocking work. Keep them
+    // available while manager requests are saturated, even when the configured
+    // processing deadline is intentionally short.
+    if matches!(request.uri().path(), "/healthz" | "/readyz") {
+        return next.run(request).await;
+    }
     match tokio::time::timeout(timeout, next.run(request)).await {
         Ok(response) => response,
         Err(_) => error(
