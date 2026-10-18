@@ -3,7 +3,7 @@ type: Component
 title: conductor crate overview
 description: The executable exposes daemon, job, run, deployment, worker, service discovery, diagnostics, operator context, and bootstrap commands.
 status: stable
-source_revision: bff6a3d635a1d9599e7185f0a7f484fd48749a0c
+source_revision: b5f8e8614fbdc2134fb3f4405a42e03caa3097b3
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/main.rs
@@ -28,6 +28,8 @@ sources:
     title: Service discovery and diagnostics CLI integration evidence
   - resource: ../tests/job_cli.rs
     title: Job CLI integration evidence
+  - resource: ../tests/contexts.rs
+    title: Context and generated command completion integration evidence
   - resource: ../tests/run_cli.rs
     title: Run CLI and documented first-job workflow evidence
   - resource: ../tests/deployment_cli.rs

@@ -3,7 +3,7 @@ type: Verification Record
 title: Local MVP3 CLI workflow evidence
 description: Debug CLI workflows are exercised against real local agents on Apple silicon macOS, with portable integration coverage in the conductor crate.
 status: stable
-source_revision: bff6a3d635a1d9599e7185f0a7f484fd48749a0c
+source_revision: b5f8e8614fbdc2134fb3f4405a42e03caa3097b3
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../README.md
@@ -12,6 +12,8 @@ sources:
     title: First-job, JSON run ID, wait, logs, and inspect integration test
   - resource: ../crates/conductor/tests/job_cli.rs
     title: Job submission, validation, conflict, and timeout integration tests
+  - resource: ../crates/conductor/tests/contexts.rs
+    title: Context and generated command completion integration tests
   - resource: ../crates/conductor/tests/deployment_cli.rs
     title: Checked-in service deployment, rollback, scale, and wait integration tests
   - resource: ../crates/conductor/tests/worker_cli.rs
