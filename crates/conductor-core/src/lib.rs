@@ -91,12 +91,17 @@ stable_id!(RunId);
 stable_id!(WorkerId);
 
 mod execution;
+mod protocol;
 pub use execution::{
     Allocation, AllocationId, AllocationState, Architecture, AttemptState, DigestAlgorithm,
     EnforcementCapability, ExecutableDigest, ExecutionAttempt, ExecutionAttemptId,
     ExecutionBackend, ExecutionModelError, ExecutionRequirements, JobRevision, JobRevisionId,
     OperatingSystem, ResourceRequest, ResourceReservation, ServiceIdentity, ServiceInstance,
     ServiceInstanceId, WorkerCapabilities, Workload,
+};
+pub use protocol::{
+    CURRENT_PROTOCOL_VERSION, NegotiatedProtocol, ProtocolCapability, ProtocolNegotiationError,
+    ProtocolOffer, ProtocolVersionRange,
 };
 
 /// Local worker registration advertised through the manager-worker contract.

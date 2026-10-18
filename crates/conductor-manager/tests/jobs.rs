@@ -194,6 +194,8 @@ fn schema_two_migration_adds_idempotency_and_indexed_run_order() {
              );
              CREATE INDEX runs_by_state_worker ON runs(state, worker_id);
              CREATE INDEX runs_by_job_created ON runs(job_id, run_id);
+             INSERT INTO runs (run_id, job_id, worker_id, job_spec_json, observation_json, revision, state)
+                 VALUES ('legacy-run', 'legacy-job', 'legacy-worker', 'legacy-spec', 'legacy-observation', 4, 'succeeded');
              CREATE TABLE run_sequence (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL);
              INSERT INTO run_sequence (id, value) VALUES (1, 0);
              PRAGMA user_version = 2;",
@@ -218,6 +220,26 @@ fn schema_two_migration_adds_idempotency_and_indexed_run_order() {
     assert!(columns.iter().any(|column| column == "idempotency_key"));
     assert!(columns.iter().any(|column| column == "request_fingerprint"));
     assert!(columns.iter().any(|column| column == "run_order"));
+    let history: (String, String, String, String, String, i64, String, i64) = connection
+        .query_row(
+            "SELECT run_id, job_id, worker_id, job_spec_json, observation_json, revision, state, run_order FROM runs WHERE run_id = 'legacy-run'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?, row.get(7)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        history,
+        (
+            "legacy-run".into(),
+            "legacy-job".into(),
+            "legacy-worker".into(),
+            "legacy-spec".into(),
+            "legacy-observation".into(),
+            4,
+            "succeeded".into(),
+            1,
+        )
+    );
 }
 
 #[test]

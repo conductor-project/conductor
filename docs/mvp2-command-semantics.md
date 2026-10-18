@@ -37,7 +37,8 @@ uses a new ID. Reusing an ID with different contents is a protocol conflict.
 ## Command envelope
 
 The following JSON is illustrative. Fields are required and unknown fields
-are rejected. Protocol version negotiation is specified by issue #57.
+are rejected. Protocol version negotiation is specified in
+[MVP2 protocol and persistence versions](mvp2-protocol-and-schema-versions.md).
 
 ```json
 {

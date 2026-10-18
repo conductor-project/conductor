@@ -150,6 +150,92 @@ fn open_worker(directory: &TempDir, capacity: usize, backend: Arc<TestBackend>) 
     .unwrap()
 }
 
+#[test]
+fn version_one_schema_migration_preserves_run_history_and_log_metadata() {
+    let directory = TempDir::new();
+    let spec = run("legacy", job("legacy", vec!["/usr/bin/true".into()]));
+    let spec_json = serde_json::to_string(&spec).unwrap();
+    let observation_json = r#"{"runId":"legacy","jobId":"legacy","workerId":"worker-1","revision":2,"state":"succeeded","requestedAtMs":1234,"startedAtMs":1235,"finishedAtMs":1236,"exitCode":0,"terminationSignal":null,"failureReason":null,"terminationReason":null,"resolutionReason":null,"workerIncarnation":0}"#.to_owned();
+    let connection = Connection::open(directory.0.join("worker.sqlite3")).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY NOT NULL,
+                spec_json TEXT NOT NULL,
+                observation_json TEXT NOT NULL,
+                state TEXT NOT NULL,
+                revision INTEGER NOT NULL CHECK (revision > 0)
+             );
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO runs (run_id, spec_json, observation_json, state, revision) VALUES (?1, ?2, ?3, 'succeeded', 2)",
+            (&"legacy", &spec_json, &observation_json),
+        )
+        .unwrap();
+    drop(connection);
+
+    let service = open_worker(&directory, 1, Arc::new(TestBackend::default()));
+    drop(service);
+
+    let connection = Connection::open(directory.0.join("worker.sqlite3")).unwrap();
+    let (version, migrated_spec, migrated_observation, state, revision):
+        (i64, String, String, String, i64) = connection
+        .query_row(
+            "SELECT (SELECT user_version FROM pragma_user_version), spec_json, observation_json, state, revision FROM runs WHERE run_id = 'legacy'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .unwrap();
+    assert_eq!(version, 3);
+    assert_eq!(migrated_spec, spec_json);
+    assert_eq!(migrated_observation, observation_json);
+    assert_eq!((state.as_str(), revision), ("succeeded", 2));
+    let (stdout_closed, stderr_closed): (i64, i64) = connection
+        .query_row(
+            "SELECT stdout_closed, stderr_closed FROM run_logs WHERE run_id = 'legacy'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((stdout_closed, stderr_closed), (1, 1));
+}
+
+#[test]
+fn future_worker_schema_fails_with_version_and_keeps_existing_data() {
+    let directory = TempDir::new();
+    let database = directory.0.join("worker.sqlite3");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE marker (value TEXT);
+             INSERT INTO marker VALUES ('preserve');
+             PRAGMA user_version = 77;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = WorkerService::open(
+        &directory.0,
+        WorkerId::new("worker-1").unwrap(),
+        1,
+        Arc::new(TestBackend::default()),
+    )
+    .err()
+    .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "worker database schema version 77 is newer than supported version 3"
+    );
+    let connection = Connection::open(database).unwrap();
+    let value: String = connection
+        .query_row("SELECT value FROM marker", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(value, "preserve");
+}
+
 fn wait_for(service: &WorkerService, id: &str) -> conductor_core::RunObservation {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     loop {
