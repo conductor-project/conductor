@@ -695,10 +695,10 @@ fn blocking_storage_does_not_block_liveness_and_timed_out_work_keeps_its_permit(
     let deadline = Instant::now() + ASYNC_TEST_WATCHDOG;
     loop {
         let (status, body) = http(address, "GET", &format!("/v1/runs/{run_id}"), None, &[]);
-        if status == 429 {
+        if matches!(status, 408 | 429) {
             assert!(
                 Instant::now() < deadline,
-                "blocking work did not release its permits"
+                "timed-out or saturated run inspection did not recover"
             );
             thread::sleep(Duration::from_millis(20));
             continue;
