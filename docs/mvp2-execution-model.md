@@ -53,7 +53,19 @@ allocations both consume capacity; a lost worker makes its assignments
 uncertain and does not free the reservation. Candidate workers are selected
 deterministically by current reserved slots and then worker ID. Omitted
 one-shot resource requests retain the no-reservation behavior; service requests
-must specify positive CPU and memory dimensions.
+must specify positive CPU and memory dimensions. The manager starts each
+assigned service slot independently of one-shot admission, so replicas of one
+job can run concurrently. It polls durable run observations and restarts a
+service after any terminal exit with exponential backoff starting at 250 ms,
+capped at 30 seconds, for at most five retries. After the retry budget is
+exhausted, it retains the terminal run as failure evidence and stops relaunching
+that slot. MVP1 one-shot completion never enters this restart loop.
+
+An unresolved or disconnected service run remains attached to its durable slot;
+the manager does not relaunch it until reconciliation establishes a terminal
+outcome. This avoids duplicate processes when delivery or worker state is
+uncertain. The restart timer and budget survive manager restart. This MVP2
+policy is fixed per service and does not yet expose per-revision policy knobs.
 
 ## Allocation transitions
 
@@ -88,11 +100,11 @@ stopped.
 
 ## Compatibility and scope
 
-These types define the durable identities and state vocabulary used by later
+These types define the durable identities and state vocabulary used by
 protocol, persistence, reconciliation, and scheduler work. They make no
-guarantee about remote delivery, retry policy, health checks, port ownership,
-external-resource fencing, or manager high availability. Existing MVP1
-one-shot JSON contracts and combined manager/worker mode remain unchanged.
+guarantee about health checks, port ownership, external-resource fencing, or
+manager high availability. Existing MVP1 one-shot JSON contracts and combined
+manager/worker mode remain unchanged.
 
 See [MVP2 command and report semantics](mvp2-command-semantics.md) for the
 worker-incarnation, assignment-generation, command-deduplication, and report

@@ -1875,6 +1875,35 @@ async fn serve_with_role_and_access_policy(
             timestamp_ms()
         );
     });
+    let service_manager = Arc::clone(&manager);
+    let service_workers = readiness
+        .recovery_workers
+        .clone()
+        .unwrap_or_else(|| vec![Arc::clone(&worker)]);
+    let service_ready = Arc::clone(&recovery_ready);
+    let service_shutdown = Arc::clone(&shutdown);
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(250));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            if service_shutdown.load(Ordering::Acquire) {
+                return;
+            }
+            if !service_ready.load(Ordering::Acquire) {
+                continue;
+            }
+            let manager = Arc::clone(&service_manager);
+            let workers = service_workers.clone();
+            match tokio::task::spawn_blocking(move || manager.reconcile_services(&workers)).await {
+                Ok(Ok(())) => {}
+                _ => eprintln!(
+                    "{{\"timestampMs\":{},\"severity\":\"warn\",\"component\":\"manager\",\"event\":\"service_reconcile_failed\"}}",
+                    timestamp_ms()
+                ),
+            }
+        }
+    });
     let server_shutdown = Arc::clone(&shutdown);
     let server = axum::serve(
         listener,
