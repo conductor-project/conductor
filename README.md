@@ -1,12 +1,12 @@
 # Conductor
 
-Conductor is an early-stage Linux daemon for managing and running jobs. MVP1 targets one `conductor` binary that combines manager and worker responsibilities behind explicit interfaces. It validates and stores immutable job definitions, starts local host processes, and records run observations through a loopback HTTP API. Job definitions and run history survive agent restarts; a process whose outcome becomes ambiguous across a crash is marked `unknown` and is not automatically replayed.
+Conductor is an early-stage daemon for managing and running jobs. MVP1 targets one `conductor` binary that combines manager and worker responsibilities behind explicit interfaces. It validates and stores immutable job definitions, starts local host processes, and records run observations through a loopback HTTP API. Job definitions and run history survive agent restarts; a process whose outcome becomes ambiguous across a crash is marked `unknown` and is not automatically replayed.
 
 The host process backend runs with the daemon user's operating-system permissions and network access. It is not a security sandbox. Each process starts in a dedicated process group; ordinary group members are force-cleaned after the leader exits and during daemon shutdown. A process can deliberately leave its group, so process groups alone are not containment. Optional Linux cgroup v2 enforcement places the launcher in a per-run cgroup before it executes the job, applies CPU, memory, swap, and process-count limits, and cleans up descendants that leave the process group. It does not provide filesystem or network isolation, and workloads sharing the daemon UID may interfere with cgroup files if the administrator has not protected the delegated hierarchy. Optional Landlock enforcement restricts filesystem operations for selected jobs; it supplements Unix permissions and does not isolate networking or mounts, hide all metadata, revoke already-open handles, or prevent every same-UID interaction.
 
 ## Requirements
 
-- Linux for the supported daemon deployment.
+- See the [platform support matrix](docs/platform-support.md) for OS and architecture status and platform-specific guarantees.
 - Rust 1.99.1 with `rustfmt` and `clippy` (installed by `rust-toolchain.toml`).
 - `curl` and `jq` for the HTTP walkthrough.
 - Python 3.9 or newer for the reproducible agent demo and release probe.
@@ -206,7 +206,7 @@ The Linux CI run also executes [`scripts/qualify-linux-capacity.py`](scripts/qua
 
 HTTP handlers in `conductor-api` call manager operations. `conductor-manager` owns desired state and assignment. `conductor-worker` owns process supervision, worker persistence, deadlines, logs, and observed execution state; its two-thread Tokio runtime schedules supervisors without creating a supervisor OS thread per run. Output capture uses one polling reader thread per stream, while a single bounded reaper thread joins readers and reaps child processes without blocking supervisor tasks. `conductor-process` contains host process mechanics. `conductor-core` holds shared contracts only. The `conductor` binary composes the pieces through explicit interfaces. See [AGENTS.md](AGENTS.md) for boundaries and contribution rules.
 
-MVP1 runs Linux host processes with the daemon user's permissions and network access in combined local mode. The default local API mode has no authentication; operator-token mode authenticates every manager route and is intended for remote HTTPS access through a trusted loopback TLS proxy. It does not provide distributed placement, automatic retries, automatic daemon restart/recovery of workloads, or process isolation. Use OS service controls and permissions according to the trust level of the jobs; process-group cleanup is lifecycle management, not containment.
+The combined MVP1 deployment is qualified on Linux. Native macOS support is in qualification; see the [platform support matrix](docs/platform-support.md). On both operating systems, host jobs use the daemon user's permissions and network access. The default local API mode has no authentication; operator-token mode authenticates every manager route and is intended for remote HTTPS access through a trusted loopback TLS proxy. MVP1 does not provide distributed placement, automatic retries, automatic daemon restart/recovery of workloads, or process isolation. Use OS service controls and permissions according to the trust level of the jobs; process-group cleanup is lifecycle management, not containment.
 
 ## Contribution
 

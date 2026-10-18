@@ -25,7 +25,13 @@ nix.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 close_fds.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+close_fds.workspace = true
+
 [dev-dependencies]
+axum.workspace = true
+axum-server.workspace = true
+reqwest.workspace = true
 rusqlite.workspace = true
 
 [lints]
