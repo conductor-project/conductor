@@ -24,8 +24,8 @@ kernel/platform string, topology, worker placement, and completed scenarios.
 Debug qualification runs before merge. Release qualification runs only in the
 post-merge workflow, in keeping with the repository's local release policy.
 The suite also exercises a real listener port conflict and retry, a failed
-readiness probe, shared-host resource pressure, negative-to-positive host
-resolver convergence, service revision replacement, a manager DNS outage and
+readiness probe, shared-host resource pressure, authoritative negative DNS
+answers, host resolver lookups, service revision replacement, a manager DNS outage and
 restart with worker reconnect, and a worker drain that moves a service while
 preserving its name. The report includes measured readiness, resolver,
 application-request, restart, and drain timings for the run.

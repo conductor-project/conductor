@@ -488,11 +488,22 @@ def main():
                     ) from error
                 result["scenarios"].append("two enrolled standalone workers report fresh status")
 
-                for service in ("frontend", "backend"):
-                    unknown = f"{service}.default.service.{SUFFIX}."
-                    if system_resolves(unknown):
-                        raise RuntimeError(f"uncreated service unexpectedly resolves: {unknown}")
-                result["scenarios"].append("unknown service names return through the host resolver before deployment")
+                unknown = f"uncreated.default.service.{SUFFIX}"
+                if system_resolves(unknown):
+                    raise RuntimeError(f"uncreated service unexpectedly resolves: {unknown}")
+                negative = subprocess.run(
+                    [dig, "+time=1", "+tries=1", "+noall", "+answer", "+authority",
+                     "A", f"{unknown}.", "@127.0.0.1"],
+                    capture_output=True, text=True, timeout=3,
+                )
+                if negative.returncode or " IN SOA " not in negative.stdout or " IN A " in negative.stdout:
+                    raise RuntimeError(
+                        f"unknown service did not return an authoritative negative answer: "
+                        f"{negative.stdout.strip()} {negative.stderr.strip()}"
+                    )
+                result["scenarios"].append(
+                    "host resolver rejects an uncreated service and authoritative DNS returns a negative SOA answer"
+                )
 
                 service_program = root / "service.py"
                 service_program.write_text(SERVICE_PROGRAM, encoding="utf-8")
@@ -550,7 +561,9 @@ def main():
                         interval=0.1,
                         timings=result["timingsMs"],
                     )
-                result["scenarios"].append("host resolver negative answers converged to positive FQDN and search-name answers")
+                result["scenarios"].append(
+                    "host resolver resolves deployed service FQDNs and search-name short names"
+                )
                 worker_ids = {name: endpoints[name][0]["workerId"] for name in services}
                 if worker_ids["frontend"] == worker_ids["backend"]:
                     raise RuntimeError(f"services did not land on distinct workers: {worker_ids}")
@@ -578,8 +591,8 @@ def main():
                 unready_snapshot = {}
                 try:
                     wait_until(
-                        "failed readiness probe to hold deployment pending",
-                        lambda: deployment_pending_for_readiness(
+                        "worker to report the failed readiness probe",
+                        lambda: service_attempt_unready(
                             base, "unready", unready_snapshot
                         ),
                         timeout=8,
@@ -785,9 +798,18 @@ def endpoint_if_on_other_worker(base, service, excluded_worker):
         return endpoints
 
 
-def deployment_pending_for_readiness(base, service, latest):
-    return deployment_pending_for_reason(
-        base, service, "service_readiness_pending", latest
+def service_attempt_unready(base, service, latest):
+    status, _, response = request(base, "GET", f"/v1/jobs/{service}/service-attempts")
+    latest.update(status=status, body=response)
+    if status != 200 or not isinstance(response, dict):
+        return None
+    return next(
+        (
+            attempt
+            for attempt in response.get("serviceAttempts", [])
+            if (attempt.get("currentRun") or {}).get("readiness") == "unready"
+        ),
+        None,
     )
 
 
