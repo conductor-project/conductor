@@ -969,6 +969,48 @@ fn clap_help_and_invalid_role_are_clear() {
     assert!(String::from_utf8_lossy(&result.stderr).contains("possible values"));
 }
 
+#[test]
+fn enroll_worker_cli_writes_a_private_one_time_credential_without_logging_it() {
+    let path = TempDir::new("enrollment-cli");
+    let credential_path = path.join("credential");
+    let output = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args([
+            "enroll-worker",
+            "--manager-data-dir",
+            path.join("manager").to_str().expect("manager path"),
+            "--identity-dir",
+            path.join("identity").to_str().expect("identity path"),
+            "--worker-id",
+            "cli-worker",
+            "--output",
+            credential_path.to_str().expect("credential path"),
+        ])
+        .output()
+        .expect("run enrollment credential command");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let credential = fs::read_to_string(&credential_path).expect("read protected credential file");
+    assert_eq!(credential.trim().len(), 43);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("enrollment_credential_created"));
+    assert!(!stderr.contains(credential.trim()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(credential_path)
+                .expect("credential metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
 fn http(
     address: SocketAddr,
     method: &str,

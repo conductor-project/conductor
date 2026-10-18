@@ -30,7 +30,7 @@ impl StateLocks {
     }
 }
 
-fn prepare_directory(path: &Path) -> io::Result<PathBuf> {
+pub(super) fn prepare_directory(path: &Path) -> io::Result<PathBuf> {
     let mut builder = DirBuilder::new();
     builder.recursive(true);
     #[cfg(unix)]

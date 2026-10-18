@@ -1,5 +1,11 @@
 //! Bounded, worker-initiated HTTP transport for manager/worker commands.
 
+mod identity;
+pub use identity::{
+    CertificateAuthority, IdentityError, IssuedServerIdentity, IssuedWorkerIdentity,
+    WorkerEnrollmentService, WorkerKeyMaterial,
+};
+
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -733,6 +739,25 @@ impl WorkerTransportClient {
         endpoint: &str,
         certificate_and_private_key_pem: &[u8],
     ) -> Result<Self, TransportError> {
+        Self::build(endpoint, certificate_and_private_key_pem, None)
+    }
+
+    /// Construct a worker client using the provided bootstrap CA trust anchor.
+    pub fn from_pem_identity_with_root(
+        endpoint: &str,
+        certificate_and_private_key_pem: &[u8],
+        certificate_authority_pem: &[u8],
+    ) -> Result<Self, TransportError> {
+        let root = reqwest::Certificate::from_pem(certificate_authority_pem)
+            .map_err(|_| TransportError::InvalidIdentity)?;
+        Self::build(endpoint, certificate_and_private_key_pem, Some(root))
+    }
+
+    fn build(
+        endpoint: &str,
+        certificate_and_private_key_pem: &[u8],
+        root: Option<reqwest::Certificate>,
+    ) -> Result<Self, TransportError> {
         let endpoint = Url::parse(endpoint).map_err(|_| TransportError::InvalidEndpoint)?;
         if endpoint.scheme() != "https"
             || endpoint.host_str().is_none()
@@ -745,11 +770,15 @@ impl WorkerTransportClient {
         }
         let identity = reqwest::Identity::from_pem(certificate_and_private_key_pem)
             .map_err(|_| TransportError::InvalidIdentity)?;
-        let client = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .https_only(true)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(CLIENT_REQUEST_TIMEOUT)
-            .identity(identity)
+            .identity(identity);
+        if let Some(root) = root {
+            builder = builder.add_root_certificate(root);
+        }
+        let client = builder
             .build()
             .map_err(|_| TransportError::InvalidIdentity)?;
         Ok(Self {

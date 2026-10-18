@@ -11,6 +11,7 @@ conductor-manager.workspace = true
 conductor-worker.workspace = true
 conductor-process.workspace = true
 conductor-api.workspace = true
+conductor-transport.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ctrlc.workspace = true

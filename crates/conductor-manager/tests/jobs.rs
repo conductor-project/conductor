@@ -12,7 +12,7 @@ use conductor_core::{
 };
 use conductor_manager::{
     JobRepository, JobService, MAX_JOBS, ManagerError, RepositoryOpenError, RunStoreError,
-    SqliteJobRepository, WorkerPort, WorkerPortError,
+    SqliteJobRepository, WorkerIdentityError, WorkerPort, WorkerPortError,
 };
 use rusqlite::Connection;
 
@@ -57,6 +57,116 @@ fn job(id: &str) -> JobSpec {
         5_000,
     )
     .expect("valid spec")
+}
+
+#[test]
+fn worker_identity_enrollment_is_one_time_and_survives_reopen() {
+    let path = TempDir::new();
+    let worker_id = WorkerId::new("worker-a").expect("valid worker id");
+    let store = SqliteJobRepository::open(path.database()).expect("open manager store");
+    let token_hash = [1; 32];
+    let first_fingerprint = [2; 32];
+    let replacement_fingerprint = [3; 32];
+
+    store
+        .create_enrollment_credential(&token_hash, &worker_id, 10_000)
+        .expect("store hashed credential");
+    assert_eq!(
+        store.enroll_worker_identity(&[9; 32], &first_fingerprint, "02", 1_000, 50_000, 2_000),
+        Err(WorkerIdentityError::CredentialInvalid)
+    );
+    assert_eq!(
+        store
+            .enroll_worker_identity(&token_hash, &first_fingerprint, "02", 1_000, 50_000, 2_000)
+            .expect("consume enrollment token"),
+        worker_id
+    );
+    assert_eq!(
+        store.authenticate_worker_certificate(&first_fingerprint, 2_000),
+        Ok(Some(worker_id.clone()))
+    );
+    assert_eq!(
+        store.authenticate_worker_certificate(&first_fingerprint, 50_000),
+        Ok(None)
+    );
+    assert_eq!(
+        store.renew_worker_identity(&first_fingerprint, &[9; 32], "09", 50_000, 80_000, 50_000),
+        Err(WorkerIdentityError::IdentityUnavailable)
+    );
+    assert_eq!(
+        store.enroll_worker_identity(&token_hash, &[4; 32], "04", 1_000, 50_000, 2_000),
+        Err(WorkerIdentityError::CredentialInvalid)
+    );
+
+    drop(store);
+    let store = SqliteJobRepository::open(path.database()).expect("reopen manager store");
+    assert_eq!(
+        store
+            .renew_worker_identity(
+                &first_fingerprint,
+                &replacement_fingerprint,
+                "03",
+                2_500,
+                60_000,
+                2_500
+            )
+            .expect("renew using current certificate"),
+        worker_id
+    );
+    assert_eq!(
+        store.authenticate_worker_certificate(&first_fingerprint, 3_000),
+        Ok(None)
+    );
+    assert_eq!(
+        store.authenticate_worker_certificate(&replacement_fingerprint, 3_000),
+        Ok(Some(WorkerId::new("worker-a").expect("valid worker id")))
+    );
+    assert!(
+        store
+            .revoke_worker_identity(&WorkerId::new("worker-a").expect("valid worker id"), 4_000)
+            .expect("revoke identity")
+    );
+    assert_eq!(
+        store.authenticate_worker_certificate(&replacement_fingerprint, 4_000),
+        Ok(None)
+    );
+    let reenrollment_hash = [7; 32];
+    let new_fingerprint = [8; 32];
+    store
+        .create_enrollment_credential(&reenrollment_hash, &worker_id, 20_000)
+        .expect("create replacement enrollment credential");
+    assert_eq!(
+        store
+            .enroll_worker_identity(
+                &reenrollment_hash,
+                &new_fingerprint,
+                "08",
+                5_000,
+                70_000,
+                5_000
+            )
+            .expect("reenroll after explicit revocation"),
+        worker_id
+    );
+    assert_eq!(
+        store.authenticate_worker_certificate(&new_fingerprint, 5_000),
+        Ok(Some(WorkerId::new("worker-a").expect("valid worker id")))
+    );
+}
+
+#[test]
+fn expired_worker_enrollment_credential_is_rejected() {
+    let path = TempDir::new();
+    let store = SqliteJobRepository::open(path.database()).expect("open manager store");
+    let worker_id = WorkerId::new("worker-expired").expect("valid worker id");
+    let token_hash = [5; 32];
+    store
+        .create_enrollment_credential(&token_hash, &worker_id, 2_000)
+        .expect("store hashed credential");
+    assert_eq!(
+        store.enroll_worker_identity(&token_hash, &[6; 32], "06", 1_000, 50_000, 2_000),
+        Err(WorkerIdentityError::CredentialInvalid)
+    );
 }
 
 fn service(path: &TempDir) -> JobService {
@@ -166,7 +276,7 @@ fn legacy_schema_migrates_transactionally_and_repeated_startup_is_stable() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read migrated schema and fixture");
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     assert_eq!(created_at, 1234);
     assert_eq!(deleted_at, None);
 }
@@ -216,7 +326,7 @@ fn schema_two_migration_adds_idempotency_and_indexed_run_order() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
     assert!(columns.iter().any(|column| column == "idempotency_key"));
     assert!(columns.iter().any(|column| column == "request_fingerprint"));
     assert!(columns.iter().any(|column| column == "run_order"));
@@ -487,7 +597,7 @@ fn version_one_manager_database_migrates_runs_and_accepts_timeout_specs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 }
 
 struct FullWorker(WorkerId);
