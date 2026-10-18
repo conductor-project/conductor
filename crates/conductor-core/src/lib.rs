@@ -90,6 +90,15 @@ stable_id!(JobId);
 stable_id!(RunId);
 stable_id!(WorkerId);
 
+mod execution;
+pub use execution::{
+    Allocation, AllocationId, AllocationState, Architecture, AttemptState, DigestAlgorithm,
+    EnforcementCapability, ExecutableDigest, ExecutionAttempt, ExecutionAttemptId,
+    ExecutionBackend, ExecutionModelError, ExecutionRequirements, JobRevision, JobRevisionId,
+    OperatingSystem, ResourceRequest, ResourceReservation, ServiceIdentity, ServiceInstance,
+    ServiceInstanceId, WorkerCapabilities, Workload,
+};
+
 /// Local worker registration advertised through the manager-worker contract.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
