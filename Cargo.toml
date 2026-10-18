@@ -14,7 +14,7 @@ resolver = "3"
 version = "0.1.0"
 rust-version = "1.99.1"
 edition = "2024"
-license = "MIT"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 conductor-core = { path = "crates/conductor-core", default-features = false }
