@@ -81,6 +81,20 @@ def logs(address, run_id):
     return base64.b64decode(body["data"], validate=True).decode("utf-8")
 
 
+def worker_cgroup_root(delegated_root, worker_id):
+    value = 0xCBF29CE484222325
+    for byte in worker_id.encode():
+        value ^= byte
+        value = (value * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return delegated_root / f"conductor-{value:016x}"
+
+
+def reserve_address():
+    with socket.socket() as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        return ("127.0.0.1", reserved.getsockname()[1])
+
+
 def reap_owned_groups(worker_root):
     if not worker_root.exists():
         return
@@ -121,16 +135,10 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="conductor-cgroup-v2-") as temporary:
         state = Path(temporary)
-        with socket.socket() as reserved:
-            reserved.bind(("127.0.0.1", 0))
-            port = reserved.getsockname()[1]
-        address = ("127.0.0.1", port)
+        address = reserve_address()
+        port = address[1]
         worker_id = "cgroup-v2-test"
-        worker_hash = 0xCBF29CE484222325
-        for byte in worker_id.encode():
-            worker_hash ^= byte
-            worker_hash = (worker_hash * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-        worker_root = delegated_root / f"conductor-{worker_hash:016x}"
+        worker_root = worker_cgroup_root(delegated_root, worker_id)
         config = {
             "role": "all",
             "listen": f"127.0.0.1:{port}",
@@ -155,12 +163,12 @@ def main():
         agent_log = state / "agent.stderr.log"
         config_path.write_text(json.dumps(config), encoding="utf-8")
 
-        def launch():
+        def launch(path=config_path, log=agent_log, cwd=state):
             return subprocess.Popen(
-                [str(args.binary.resolve()), "agent", "--config", str(config_path)],
-                cwd=state,
+                [str(args.binary.resolve()), "agent", "--config", str(path)],
+                cwd=cwd,
                 stdout=subprocess.DEVNULL,
-                stderr=agent_log.open("ab"),
+                stderr=log.open("ab"),
             )
 
         process = launch()
@@ -210,6 +218,98 @@ def main():
             assert "memory=134217728" in output, output
             assert "swap=0" in output, output
             assert "pids=32" in output, output
+
+            def auxiliary_agent(name, identity, root):
+                directory = state / name
+                directory.mkdir(mode=0o700)
+                config_copy = json.loads(json.dumps(config))
+                extra_address = reserve_address()
+                config_copy["listen"] = f"{extra_address[0]}:{extra_address[1]}"
+                config_copy["manager_data_dir"] = str(directory / "manager")
+                config_copy["worker_data_dir"] = str(directory / "worker")
+                config_copy["worker_id"] = identity
+                config_copy["cgroup_v2"]["delegatedRoot"] = str(root)
+                path = directory / "agent.json"
+                log = directory / "agent.stderr.log"
+                path.write_text(json.dumps(config_copy), encoding="utf-8")
+                return path, log, extra_address
+
+            # A second daemon with separate state and an alias of the same cgroup
+            # root must fail before reconciliation; the first run remains alive.
+            alias_root = state / "delegated-root-alias"
+            alias_root.symlink_to(delegated_root, target_is_directory=True)
+            contender_config, contender_log, contender_address = auxiliary_agent(
+                "same-owner", worker_id, alias_root
+            )
+            contender = launch(contender_config, contender_log, contender_config.parent)
+            contender.wait(timeout=5)
+            contender_output = contender_log.read_text(encoding="utf-8", errors="replace")
+            assert "startup_failed" in contender_output, contender_output
+            assert "worker cgroup namespace is already owned" in contender_output, contender_output
+            assert wait_run(address, run_id, {"running"})["state"] == "running"
+            assert os.kill(int(pid_path.read_text(encoding="ascii")), 0) is None
+            assert list(worker_root.glob("run-*")), "competing startup removed the live worker cgroup"
+
+            # A different worker namespace can be opened at the same time.
+            other_id = "cgroup-v2-other"
+            other_config, other_log, other_address = auxiliary_agent(
+                "other-owner", other_id, delegated_root
+            )
+            other = launch(other_config, other_log, other_config.parent)
+            try:
+                wait_agent(other, other_address)
+                other_root = worker_cgroup_root(delegated_root, other_id)
+                assert other_root.is_dir(), "distinct worker namespace was not created"
+            finally:
+                if other.poll() is None:
+                    other.send_signal(signal.SIGINT)
+                    other.wait(timeout=8)
+                reap_owned_groups(worker_cgroup_root(delegated_root, other_id))
+                other_root = worker_cgroup_root(delegated_root, other_id)
+                if other_root.exists():
+                    other_root.rmdir()
+
+            # Simultaneous owners for a free namespace have exactly one winner.
+            race_id = "cgroup-v2-race"
+            race_specs = [
+                auxiliary_agent("race-one", race_id, delegated_root),
+                auxiliary_agent("race-two", race_id, alias_root),
+            ]
+            racers = [
+                launch(path, log, path.parent)
+                for path, log, _ in race_specs
+            ]
+            states = {}
+            deadline = time.monotonic() + 10
+            try:
+                while len(states) < 2 and time.monotonic() < deadline:
+                    for index, (race_process, spec) in enumerate(zip(racers, race_specs)):
+                        if index in states:
+                            continue
+                        if race_process.poll() is not None:
+                            states[index] = "failed"
+                            continue
+                        try:
+                            status, body = request(spec[2], "GET", "/readyz")
+                            if status == 200 and body["status"] == "ready":
+                                states[index] = "ready"
+                        except (OSError, TimeoutError, http.client.HTTPException):
+                            pass
+                    if len(states) < 2:
+                        time.sleep(0.01)
+                assert sorted(states.values()) == ["failed", "ready"], states
+                loser = next(index for index, state_value in states.items() if state_value == "failed")
+                loser_output = race_specs[loser][1].read_text(encoding="utf-8", errors="replace")
+                assert "worker cgroup namespace is already owned" in loser_output, loser_output
+            finally:
+                for index, race_process in enumerate(racers):
+                    if race_process.poll() is None:
+                        race_process.send_signal(signal.SIGINT)
+                        race_process.wait(timeout=8)
+                race_root = worker_cgroup_root(delegated_root, race_id)
+                reap_owned_groups(race_root)
+                if race_root.exists():
+                    race_root.rmdir()
 
             status, _ = request(address, "POST", f"/v1/runs/{run_id}/stop")
             assert status in (200, 202), f"stop returned HTTP {status}"
