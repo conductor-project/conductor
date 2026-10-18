@@ -7,14 +7,15 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use conductor_core::{
-    CommandEnvelope, CommandId, InspectRun, JobId, JobSpec, LogStream, ReadRunLogs, ResolveRun,
+    CommandEnvelope, CommandId, DeploymentMutation, DeploymentPendingReason, DeploymentStatus,
+    InspectRun, JobId, JobRevisionDraft, JobSpec, LogStream, ReadRunLogs, ResolveRun,
     RunFailureReason, RunId, RunLogChunk, RunLogStatus, RunObservation, RunState, StartRun,
     StopRun, WorkerCommand, WorkerDescriptor, WorkerId,
 };
 use conductor_manager::{
-    CommandJournal, CommandStoreError, JobRepository, JobService, MAX_JOBS, ManagerError,
-    RepositoryOpenError, RunStoreError, SqliteJobRepository, WorkerIdentityError, WorkerPort,
-    WorkerPortError,
+    CommandJournal, CommandStoreError, ExecutionStoreError, JobRepository, JobService, MAX_JOBS,
+    ManagerError, RepositoryOpenError, RunStoreError, SqliteJobRepository, WorkerIdentityError,
+    WorkerPort, WorkerPortError,
 };
 use rusqlite::Connection;
 
@@ -175,6 +176,309 @@ fn service(path: &TempDir) -> JobService {
     JobService::open_sqlite(path.database()).expect("open manager database")
 }
 
+fn service_revision_draft(command_arg: &str) -> JobRevisionDraft {
+    let json = format!(
+        r#"{{
+            "definition": {{
+                "id": "web",
+                "command": ["/usr/bin/true", "{command_arg}"],
+                "cwd": "/tmp",
+                "terminationGraceMs": 5000
+            }},
+            "workload": {{
+                "kind": "service",
+                "identity": {{"namespace": "default", "name": "web"}}
+            }},
+            "executableDigest": {{"algorithm": "sha256", "value": "{}"}},
+            "executionRequirements": {{}},
+            "resourceRequest": {{"cpuMillis": 250, "memoryBytes": 268435456}}
+        }}"#,
+        "a".repeat(64)
+    );
+    serde_json::from_str(&json).expect("valid service revision draft")
+}
+
+#[test]
+fn revisions_and_deployment_mutations_are_durable_conditional_and_idempotent() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let draft = service_revision_draft("v1");
+    let revision_one = manager
+        .create_revision(&draft, "revision-one")
+        .expect("create first revision");
+    assert_eq!(revision_one.id().revision(), 1);
+    assert_eq!(
+        manager.create_revision(&draft, "revision-one").unwrap(),
+        revision_one
+    );
+    assert_eq!(
+        manager.create_revision(&service_revision_draft("different"), "revision-one"),
+        Err(ExecutionStoreError::IdempotencyConflict)
+    );
+
+    let initial = manager
+        .mutate_deployment(
+            revision_one.id().job_id(),
+            None,
+            &DeploymentMutation::Deploy {
+                revision: 1,
+                replicas: 3,
+            },
+            "deploy-one",
+        )
+        .expect("persist initial deployment");
+    assert_eq!(initial.generation(), 1);
+    assert_eq!(initial.status(), DeploymentStatus::Pending);
+    assert_eq!(
+        initial.pending_reason(),
+        Some(DeploymentPendingReason::PlacementPending)
+    );
+    assert_eq!(
+        manager
+            .mutate_deployment(
+                revision_one.id().job_id(),
+                None,
+                &DeploymentMutation::Deploy {
+                    revision: 1,
+                    replicas: 3,
+                },
+                "deploy-one",
+            )
+            .unwrap(),
+        initial
+    );
+
+    let scaled_to_zero = manager
+        .mutate_deployment(
+            revision_one.id().job_id(),
+            Some(1),
+            &DeploymentMutation::Scale { replicas: 0 },
+            "scale-zero",
+        )
+        .expect("scale to zero");
+    assert_eq!(scaled_to_zero.generation(), 2);
+    assert_eq!(scaled_to_zero.desired_replicas(), 0);
+    assert_eq!(scaled_to_zero.status(), DeploymentStatus::Ready);
+    assert_eq!(
+        manager
+            .mutate_deployment(
+                revision_one.id().job_id(),
+                Some(1),
+                &DeploymentMutation::Scale { replicas: 0 },
+                "scale-zero",
+            )
+            .unwrap(),
+        scaled_to_zero
+    );
+    assert_eq!(
+        manager.mutate_deployment(
+            revision_one.id().job_id(),
+            Some(1),
+            &DeploymentMutation::Suspend,
+            "stale-suspend",
+        ),
+        Err(ExecutionStoreError::PreconditionFailed)
+    );
+
+    let suspended = manager
+        .mutate_deployment(
+            revision_one.id().job_id(),
+            Some(2),
+            &DeploymentMutation::Suspend,
+            "suspend",
+        )
+        .expect("suspend deployment");
+    assert_eq!(suspended.status(), DeploymentStatus::Suspended);
+    let resumed = manager
+        .mutate_deployment(
+            revision_one.id().job_id(),
+            Some(3),
+            &DeploymentMutation::Resume,
+            "resume",
+        )
+        .expect("resume zero replica deployment");
+    assert_eq!(resumed.status(), DeploymentStatus::Ready);
+    assert_eq!(resumed.desired_replicas(), 0);
+
+    let revision_two = manager
+        .create_revision(&service_revision_draft("v2"), "revision-two")
+        .expect("create update revision");
+    assert_eq!(revision_two.id().revision(), 2);
+    let updated = manager
+        .mutate_deployment(
+            revision_one.id().job_id(),
+            Some(4),
+            &DeploymentMutation::Deploy {
+                revision: 2,
+                replicas: 3,
+            },
+            "deploy-two",
+        )
+        .expect("deploy new revision");
+    let rolled_back = manager
+        .mutate_deployment(
+            revision_one.id().job_id(),
+            Some(updated.generation()),
+            &DeploymentMutation::Rollback { revision: 1 },
+            "rollback-one",
+        )
+        .expect("rollback execution revision");
+    assert_eq!(rolled_back.revision_id(), revision_one.id());
+    assert_eq!(rolled_back.desired_replicas(), 3);
+    assert!(!rolled_back.suspended());
+    drop(manager);
+
+    let reopened = service(&directory);
+    assert_eq!(
+        reopened.get_revision(revision_two.id()).unwrap(),
+        Some(revision_two)
+    );
+    assert_eq!(
+        reopened.get_deployment(revision_one.id().job_id()).unwrap(),
+        Some(rolled_back.clone())
+    );
+    assert_eq!(
+        reopened
+            .mutate_deployment(
+                revision_one.id().job_id(),
+                Some(updated.generation()),
+                &DeploymentMutation::Rollback { revision: 1 },
+                "rollback-one",
+            )
+            .unwrap(),
+        rolled_back
+    );
+    let deleted = reopened
+        .mutate_deployment(
+            revision_one.id().job_id(),
+            Some(rolled_back.generation()),
+            &DeploymentMutation::Delete,
+            "delete-deployment",
+        )
+        .expect("delete deployment");
+    assert_eq!(deleted.status(), DeploymentStatus::Deleted);
+    assert!(
+        reopened
+            .delete(revision_one.id().job_id())
+            .expect("delete inactive job")
+    );
+}
+
+#[test]
+fn invalid_revision_submission_does_not_reserve_its_job_or_idempotency_key() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    let mut invalid_json = serde_json::to_value(service_revision_draft("v1")).unwrap();
+    invalid_json
+        .as_object_mut()
+        .unwrap()
+        .remove("resourceRequest");
+    let invalid_draft: JobRevisionDraft = serde_json::from_value(invalid_json).unwrap();
+    assert_eq!(
+        manager.create_revision(&invalid_draft, "revision-retry"),
+        Err(ExecutionStoreError::InvalidRequest)
+    );
+    assert_eq!(manager.get(invalid_draft.job_id()).unwrap(), None);
+
+    let accepted = manager
+        .create_revision(&service_revision_draft("v1"), "revision-retry")
+        .expect("valid retry reuses key after validation failure");
+    assert_eq!(accepted.id().revision(), 1);
+}
+
+#[test]
+fn concurrent_deployment_updates_cannot_overwrite_the_same_generation() {
+    let directory = TempDir::new();
+    let manager = Arc::new(service(&directory));
+    let revision = manager
+        .create_revision(&service_revision_draft("v1"), "revision")
+        .unwrap();
+    manager
+        .mutate_deployment(
+            revision.id().job_id(),
+            None,
+            &DeploymentMutation::Deploy {
+                revision: 1,
+                replicas: 2,
+            },
+            "deploy",
+        )
+        .unwrap();
+
+    let barrier = Arc::new(Barrier::new(3));
+    let scale = {
+        let manager = Arc::clone(&manager);
+        let barrier = Arc::clone(&barrier);
+        let job_id = revision.id().job_id().clone();
+        thread::spawn(move || {
+            barrier.wait();
+            manager.mutate_deployment(
+                &job_id,
+                Some(1),
+                &DeploymentMutation::Scale { replicas: 4 },
+                "concurrent-scale",
+            )
+        })
+    };
+    let suspend = {
+        let manager = Arc::clone(&manager);
+        let barrier = Arc::clone(&barrier);
+        let job_id = revision.id().job_id().clone();
+        thread::spawn(move || {
+            barrier.wait();
+            manager.mutate_deployment(
+                &job_id,
+                Some(1),
+                &DeploymentMutation::Suspend,
+                "concurrent-suspend",
+            )
+        })
+    };
+    barrier.wait();
+    let results = [scale.join().unwrap(), suspend.join().unwrap()];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == Err(ExecutionStoreError::PreconditionFailed))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn schema_five_migrates_execution_tables_without_losing_jobs() {
+    let directory = TempDir::new();
+    let manager = service(&directory);
+    manager.register(job("kept-job")).unwrap();
+    drop(manager);
+    let connection = Connection::open(directory.database()).unwrap();
+    connection
+        .execute_batch(
+            "DROP TABLE execution_idempotency;
+             DROP TABLE job_deployments;
+             DROP TABLE job_revisions;
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let migrated = service(&directory);
+    assert_eq!(
+        migrated.get(&JobId::new("kept-job").unwrap()).unwrap(),
+        Some(job("kept-job"))
+    );
+    drop(migrated);
+    let connection = Connection::open(directory.database()).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 6);
+    assert!(table_exists(&connection, "job_revisions"));
+    assert!(table_exists(&connection, "job_deployments"));
+    assert!(table_exists(&connection, "execution_idempotency"));
+}
+
 fn all_jobs(manager: &JobService) -> Vec<JobSpec> {
     let mut jobs = Vec::new();
     let mut cursor = None;
@@ -278,7 +582,7 @@ fn legacy_schema_migrates_transactionally_and_repeated_startup_is_stable() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read migrated schema and fixture");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     assert_eq!(created_at, 1234);
     assert_eq!(deleted_at, None);
 }
@@ -328,7 +632,7 @@ fn schema_two_migration_adds_idempotency_and_indexed_run_order() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     assert!(columns.iter().any(|column| column == "idempotency_key"));
     assert!(columns.iter().any(|column| column == "request_fingerprint"));
     assert!(columns.iter().any(|column| column == "run_order"));
@@ -370,6 +674,9 @@ fn schema_four_identity_layout_migrates_with_command_outbox_without_losing_token
         .execute_batch(
             "DROP TABLE manager_commands;
              DROP TABLE command_sequence;
+             DROP TABLE execution_idempotency;
+             DROP TABLE job_deployments;
+             DROP TABLE job_revisions;
              PRAGMA user_version = 4;",
         )
         .unwrap();
@@ -387,7 +694,7 @@ fn schema_four_identity_layout_migrates_with_command_outbox_without_losing_token
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     let outbox_exists = table_exists(&connection, "manager_commands");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     assert!(outbox_exists);
 }
 
@@ -404,6 +711,9 @@ fn schema_four_command_layout_migrates_with_identity_tables_without_resetting_se
              DROP TABLE worker_identities;
              DROP TABLE worker_certificates;
              DROP TABLE enrollment_credentials;
+             DROP TABLE execution_idempotency;
+             DROP TABLE job_deployments;
+             DROP TABLE job_revisions;
              PRAGMA user_version = 4;",
         )
         .unwrap();
@@ -422,7 +732,7 @@ fn schema_four_command_layout_migrates_with_identity_tables_without_resetting_se
         )
         .unwrap();
     let identity_exists = table_exists(&connection, "worker_identities");
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
     assert_eq!(sequence, 17);
     assert!(identity_exists);
 }
@@ -682,7 +992,7 @@ fn version_one_manager_database_migrates_runs_and_accepts_timeout_specs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 }
 
 struct FullWorker(WorkerId);

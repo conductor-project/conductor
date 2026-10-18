@@ -122,11 +122,13 @@ mod execution;
 mod inventory;
 mod protocol;
 pub use execution::{
-    Allocation, AllocationId, AllocationState, Architecture, AttemptState, DigestAlgorithm,
-    EnforcementCapability, ExecutableDigest, ExecutionAttempt, ExecutionAttemptId,
-    ExecutionBackend, ExecutionModelError, ExecutionRequirements, JobRevision, JobRevisionId,
-    OperatingSystem, ResourceRequest, ResourceReservation, ServiceIdentity, ServiceInstance,
-    ServiceInstanceId, WorkerCapabilities, Workload,
+    Allocation, AllocationId, AllocationState, Architecture, AttemptState, DeploymentMutation,
+    DeploymentPendingReason, DeploymentStatus, DigestAlgorithm, EnforcementCapability,
+    ExecutableDigest, ExecutionAttempt, ExecutionAttemptId, ExecutionBackend, ExecutionModelError,
+    ExecutionRequirements, JobDeployment, JobRevision, JobRevisionDraft, JobRevisionId,
+    MAX_DEPLOYMENT_REPLICAS, OperatingSystem, ResourceRequest, ResourceRequestProvenance,
+    ResourceReservation, ServiceIdentity, ServiceInstance, ServiceInstanceId, WorkerCapabilities,
+    Workload,
 };
 pub use inventory::{
     WorkerInventory, WorkerInventoryEntry, WorkerInventoryError, WorkerInventoryPage,

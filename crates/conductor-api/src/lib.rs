@@ -18,11 +18,13 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use base64::Engine;
 use conductor_core::{
-    DEFAULT_LOG_CHUNK_BYTES, JobId, JobSpec, LogStream, MAX_LOG_CHUNK_BYTES, ReadRunLogs, RunId,
-    RunState, WorkerId,
+    DEFAULT_LOG_CHUNK_BYTES, DeploymentMutation, DeploymentStatus, JobId, JobRevisionDraft,
+    JobRevisionId, JobSpec, LogStream, MAX_DEPLOYMENT_REPLICAS, MAX_LOG_CHUNK_BYTES, ReadRunLogs,
+    RunId, RunState, WorkerId,
 };
 use conductor_manager::{
-    DEFAULT_PAGE_SIZE, JobService, MAX_PAGE_SIZE, ManagerError, QueryError, WorkerPort,
+    DEFAULT_PAGE_SIZE, ExecutionStoreError, JobService, MAX_PAGE_SIZE, ManagerError, QueryError,
+    WorkerPort,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -94,6 +96,25 @@ struct RunLogFilters {
 struct ResolveRunRequest {
     resolution: String,
     reason: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct DeployRequest {
+    revision: u64,
+    replicas: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScaleDeploymentRequest {
+    replicas: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RollbackRequest {
+    revision: u64,
 }
 
 struct ApiState {
@@ -328,6 +349,21 @@ fn router_with_recovery(
     let mut manager_routes = Router::new()
         .route("/v1/jobs", post(create_job).get(list_jobs))
         .route("/v1/jobs/{id}", get(get_job).delete(delete_job))
+        .route("/v1/jobs/{id}/revisions", post(create_revision))
+        .route("/v1/jobs/{id}/revisions/{revision}", get(get_revision))
+        .route(
+            "/v1/jobs/{id}/deployment",
+            get(get_deployment)
+                .put(deploy_revision)
+                .delete(delete_deployment),
+        )
+        .route("/v1/jobs/{id}/deployment/scale", post(scale_deployment))
+        .route("/v1/jobs/{id}/deployment/suspend", post(suspend_deployment))
+        .route("/v1/jobs/{id}/deployment/resume", post(resume_deployment))
+        .route(
+            "/v1/jobs/{id}/deployment/rollback",
+            post(rollback_deployment),
+        )
         .route("/v1/jobs/{id}/runs", post(start_run))
         .route("/v1/workers", get(list_workers))
         .route("/v1/workers/{id}", get(get_worker))
@@ -406,6 +442,470 @@ fn blocking_error(error_value: BlockingError) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR,
             "internal_error",
             "the blocking operation stopped unexpectedly",
+        ),
+    }
+}
+
+async fn create_revision(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+    headers: HeaderMap,
+    payload: Result<Json<JobRevisionDraft>, JsonRejection>,
+) -> Response {
+    let Ok(job_id) = JobId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_id",
+            "the job ID is invalid",
+        );
+    };
+    let Json(draft) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return json_rejection(rejection),
+    };
+    if draft.job_id() != &job_id {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "revision_job_mismatch",
+            "the definition ID must match the job ID in the request path",
+        );
+    }
+    let idempotency_key = match required_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(()) => return invalid_idempotency_key(),
+    };
+    let result = match run_blocking(&state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        move || manager.create_revision(&draft, &idempotency_key)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error_value) => return blocking_error(error_value),
+    };
+    match result {
+        Ok(revision) => (StatusCode::CREATED, Json(revision)).into_response(),
+        Err(error_value) => execution_store_error(error_value),
+    }
+}
+
+async fn get_revision(
+    State(state): State<Arc<ApiState>>,
+    Path((raw_id, raw_revision)): Path<(String, String)>,
+) -> Response {
+    let Ok(job_id) = JobId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_id",
+            "the job ID is invalid",
+        );
+    };
+    let Ok(number) = raw_revision.parse::<u64>() else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_revision",
+            "the revision must be a positive integer",
+        );
+    };
+    let revision_id = match JobRevisionId::new(job_id, number) {
+        Ok(id) => id,
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_revision",
+                "the revision must be a positive integer",
+            );
+        }
+    };
+    let result = match run_blocking(&state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        move || manager.get_revision(&revision_id)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error_value) => return blocking_error(error_value),
+    };
+    match result {
+        Ok(Some(revision)) => (StatusCode::OK, Json(revision)).into_response(),
+        Ok(None) => error(
+            StatusCode::NOT_FOUND,
+            "revision_not_found",
+            "the job revision does not exist",
+        ),
+        Err(error_value) => execution_store_error(error_value),
+    }
+}
+
+async fn get_deployment(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+) -> Response {
+    let Ok(job_id) = JobId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_id",
+            "the job ID is invalid",
+        );
+    };
+    let result = match run_blocking(&state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        move || manager.get_deployment(&job_id)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error_value) => return blocking_error(error_value),
+    };
+    match result {
+        Ok(Some(deployment)) => deployment_response(deployment, false),
+        Ok(None) => error(
+            StatusCode::NOT_FOUND,
+            "deployment_not_found",
+            "the job has no deployment",
+        ),
+        Err(error_value) => execution_store_error(error_value),
+    }
+}
+
+async fn deploy_revision(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+    headers: HeaderMap,
+    payload: Result<Json<DeployRequest>, JsonRejection>,
+) -> Response {
+    let Ok(job_id) = JobId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_id",
+            "the job ID is invalid",
+        );
+    };
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return json_rejection(rejection),
+    };
+    if payload.replicas > MAX_DEPLOYMENT_REPLICAS {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_replica_count",
+            "replicas must be between 0 and 10000",
+        );
+    }
+    let expected_generation = match deployment_precondition(&headers, true) {
+        Ok(generation) => generation,
+        Err(error_value) => return deployment_precondition_error(error_value, true),
+    };
+    let key = match required_idempotency_key(&headers) {
+        Ok(key) => key,
+        Err(()) => return invalid_idempotency_key(),
+    };
+    mutate_deployment(
+        &state,
+        job_id,
+        expected_generation,
+        DeploymentMutation::Deploy {
+            revision: payload.revision,
+            replicas: payload.replicas,
+        },
+        key,
+    )
+    .await
+}
+
+async fn scale_deployment(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+    headers: HeaderMap,
+    payload: Result<Json<ScaleDeploymentRequest>, JsonRejection>,
+) -> Response {
+    let Ok(job_id) = JobId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_id",
+            "the job ID is invalid",
+        );
+    };
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return json_rejection(rejection),
+    };
+    if payload.replicas > MAX_DEPLOYMENT_REPLICAS {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_replica_count",
+            "replicas must be between 0 and 10000",
+        );
+    }
+    mutate_deployment_with_headers(
+        &state,
+        job_id,
+        &headers,
+        DeploymentMutation::Scale {
+            replicas: payload.replicas,
+        },
+        false,
+    )
+    .await
+}
+
+async fn suspend_deployment(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(job_id) = JobId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_id",
+            "the job ID is invalid",
+        );
+    };
+    mutate_deployment_with_headers(&state, job_id, &headers, DeploymentMutation::Suspend, false)
+        .await
+}
+
+async fn resume_deployment(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(job_id) = JobId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_id",
+            "the job ID is invalid",
+        );
+    };
+    mutate_deployment_with_headers(&state, job_id, &headers, DeploymentMutation::Resume, false)
+        .await
+}
+
+async fn rollback_deployment(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+    headers: HeaderMap,
+    payload: Result<Json<RollbackRequest>, JsonRejection>,
+) -> Response {
+    let Ok(job_id) = JobId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_id",
+            "the job ID is invalid",
+        );
+    };
+    let Json(payload) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return json_rejection(rejection),
+    };
+    mutate_deployment_with_headers(
+        &state,
+        job_id,
+        &headers,
+        DeploymentMutation::Rollback {
+            revision: payload.revision,
+        },
+        false,
+    )
+    .await
+}
+
+async fn delete_deployment(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(job_id) = JobId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_job_id",
+            "the job ID is invalid",
+        );
+    };
+    mutate_deployment_with_headers(&state, job_id, &headers, DeploymentMutation::Delete, false)
+        .await
+}
+
+async fn mutate_deployment_with_headers(
+    state: &Arc<ApiState>,
+    job_id: JobId,
+    headers: &HeaderMap,
+    mutation: DeploymentMutation,
+    allow_create: bool,
+) -> Response {
+    let expected_generation = match deployment_precondition(headers, allow_create) {
+        Ok(generation) => generation,
+        Err(error_value) => return deployment_precondition_error(error_value, allow_create),
+    };
+    let key = match required_idempotency_key(headers) {
+        Ok(key) => key,
+        Err(()) => return invalid_idempotency_key(),
+    };
+    mutate_deployment(state, job_id, expected_generation, mutation, key).await
+}
+
+async fn mutate_deployment(
+    state: &Arc<ApiState>,
+    job_id: JobId,
+    expected_generation: Option<u64>,
+    mutation: DeploymentMutation,
+    idempotency_key: String,
+) -> Response {
+    let result = match run_blocking(state, BlockingClass::General, {
+        let manager = Arc::clone(&state.manager);
+        move || manager.mutate_deployment(&job_id, expected_generation, &mutation, &idempotency_key)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error_value) => return blocking_error(error_value),
+    };
+    match result {
+        Ok(deployment) => deployment_response(deployment, true),
+        Err(error_value) => execution_store_error(error_value),
+    }
+}
+
+fn deployment_response(
+    deployment: conductor_core::JobDeployment,
+    accepted_mutation: bool,
+) -> Response {
+    let status = if accepted_mutation
+        && matches!(
+            deployment.status(),
+            DeploymentStatus::Pending | DeploymentStatus::Deleting
+        ) {
+        StatusCode::ACCEPTED
+    } else {
+        StatusCode::OK
+    };
+    let etag = HeaderValue::from_str(&format!("\"{}\"", deployment.generation()))
+        .unwrap_or_else(|_| HeaderValue::from_static("\"1\""));
+    let mut response = (status, Json(deployment)).into_response();
+    response.headers_mut().insert(header::ETAG, etag);
+    response
+}
+
+fn required_idempotency_key(headers: &HeaderMap) -> Result<String, ()> {
+    match parse_idempotency_key(headers) {
+        Ok(Some(key)) => Ok(key.to_owned()),
+        Ok(None) | Err(()) => Err(()),
+    }
+}
+
+fn invalid_idempotency_key() -> Response {
+    error(
+        StatusCode::BAD_REQUEST,
+        "invalid_idempotency_key",
+        "Idempotency-Key is required and must contain 1-128 valid ASCII characters",
+    )
+}
+
+#[derive(Clone, Copy)]
+enum PreconditionError {
+    Invalid,
+    Missing,
+}
+
+fn deployment_precondition(
+    headers: &HeaderMap,
+    allow_create: bool,
+) -> Result<Option<u64>, PreconditionError> {
+    let if_match = headers.get_all(header::IF_MATCH).iter().collect::<Vec<_>>();
+    let if_none_match = headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .collect::<Vec<_>>();
+    if if_match.len() > 1
+        || if_none_match.len() > 1
+        || (!if_match.is_empty() && !if_none_match.is_empty())
+    {
+        return Err(PreconditionError::Invalid);
+    }
+    if let Some(value) = if_none_match.first() {
+        if allow_create && value.as_bytes() == b"*" {
+            return Ok(None);
+        }
+        return Err(PreconditionError::Invalid);
+    }
+    if let Some(value) = if_match.first() {
+        let Ok(value) = value.to_str() else {
+            return Err(PreconditionError::Invalid);
+        };
+        if let Some(generation) = value
+            .strip_prefix('\"')
+            .and_then(|value| value.strip_suffix('\"'))
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|generation| *generation > 0)
+        {
+            return Ok(Some(generation));
+        }
+        return Err(PreconditionError::Invalid);
+    }
+    Err(PreconditionError::Missing)
+}
+
+fn deployment_precondition_error(error_value: PreconditionError, allow_create: bool) -> Response {
+    match error_value {
+        PreconditionError::Invalid => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_precondition",
+            "supply exactly one valid deployment generation precondition",
+        ),
+        PreconditionError::Missing if allow_create => error(
+            StatusCode::PRECONDITION_REQUIRED,
+            "precondition_required",
+            "supply If-None-Match: * to create or If-Match to update the deployment",
+        ),
+        PreconditionError::Missing => error(
+            StatusCode::PRECONDITION_REQUIRED,
+            "precondition_required",
+            "a current deployment If-Match ETag is required",
+        ),
+    }
+}
+
+fn execution_store_error(error_value: ExecutionStoreError) -> Response {
+    match error_value {
+        ExecutionStoreError::JobLimitReached => error(
+            StatusCode::INSUFFICIENT_STORAGE,
+            "job_limit_reached",
+            "the manager has reached its active job limit",
+        ),
+        ExecutionStoreError::JobNotFound => error(
+            StatusCode::NOT_FOUND,
+            "job_not_found",
+            "the job does not exist",
+        ),
+        ExecutionStoreError::RevisionNotFound => error(
+            StatusCode::NOT_FOUND,
+            "revision_not_found",
+            "the job revision does not exist",
+        ),
+        ExecutionStoreError::Conflict => error(
+            StatusCode::CONFLICT,
+            "deployment_conflict",
+            "the deployment mutation conflicts with its current state",
+        ),
+        ExecutionStoreError::PreconditionFailed => error(
+            StatusCode::PRECONDITION_FAILED,
+            "precondition_failed",
+            "the deployment generation does not match the supplied precondition",
+        ),
+        ExecutionStoreError::IdempotencyConflict => error(
+            StatusCode::CONFLICT,
+            "idempotency_conflict",
+            "the Idempotency-Key was already used for a different request",
+        ),
+        ExecutionStoreError::InvalidRequest => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_execution_request",
+            "the revision or deployment request is invalid",
+        ),
+        ExecutionStoreError::StorageUnavailable => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "the manager could not access execution storage",
         ),
     }
 }
@@ -1536,6 +2036,35 @@ mod access_tests {
         builder.body(Body::empty()).expect("valid request")
     }
 
+    fn authorized_request(
+        method: &str,
+        path: &str,
+        body: &str,
+        idempotency_key: Option<&str>,
+        if_match: Option<&str>,
+        if_none_match: bool,
+    ) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(path).header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", "0123456789ABCDEFGHIJKLMNOPQRSTUVabcdefghijk"),
+        );
+        if let Some(key) = idempotency_key {
+            builder = builder.header("idempotency-key", key);
+        }
+        if let Some(etag) = if_match {
+            builder = builder.header(header::IF_MATCH, etag);
+        }
+        if if_none_match {
+            builder = builder.header(header::IF_NONE_MATCH, "*");
+        }
+        if !body.is_empty() {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+        }
+        builder
+            .body(Body::from(body.to_owned()))
+            .expect("valid authorized request")
+    }
+
     fn router(database: &TestDatabase) -> Router {
         router_with_access_policy(
             database.manager(),
@@ -1611,5 +2140,221 @@ mod access_tests {
         assert!(
             BearerTokenAuthenticator::new(b"0123456789ABCDEFGHIJKLMNOPQRSTUVabcdefghij=").is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn revision_and_deployment_api_is_strict_durable_and_conditional() {
+        let database = TestDatabase::new();
+        let revision_body = |argument: &str| {
+            format!(
+                r#"{{"definition":{{"id":"web","command":["/usr/bin/true","{argument}"],"cwd":"/tmp","terminationGraceMs":5000}},"workload":{{"kind":"service","identity":{{"namespace":"default","name":"web"}}}},"executableDigest":{{"algorithm":"sha256","value":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}},"executionRequirements":{{}},"resourceRequest":{{"cpuMillis":250,"memoryBytes":268435456}}}}"#
+            )
+        };
+        let app = router(&database);
+        let created = app
+            .clone()
+            .oneshot(authorized_request(
+                "POST",
+                "/v1/jobs/web/revisions",
+                &revision_body("v1"),
+                Some("revision-one"),
+                None,
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created_bytes = axum::body::to_bytes(created.into_body(), 65_536)
+            .await
+            .unwrap();
+        let revision_one: conductor_core::JobRevision =
+            serde_json::from_slice(&created_bytes).unwrap();
+        assert_eq!(revision_one.id().revision(), 1);
+        assert_eq!(
+            revision_one.resource_request_provenance(),
+            conductor_core::ResourceRequestProvenance::Explicit
+        );
+
+        let initial = app
+            .clone()
+            .oneshot(authorized_request(
+                "PUT",
+                "/v1/jobs/web/deployment",
+                r#"{"revision":1,"replicas":2}"#,
+                Some("deployment-one"),
+                None,
+                true,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(initial.status(), StatusCode::ACCEPTED);
+        assert_eq!(initial.headers().get(header::ETAG).unwrap(), "\"1\"");
+        let initial_bytes = axum::body::to_bytes(initial.into_body(), 65_536)
+            .await
+            .unwrap();
+        let initial: conductor_core::JobDeployment =
+            serde_json::from_slice(&initial_bytes).unwrap();
+        assert_eq!(initial.status(), DeploymentStatus::Pending);
+
+        drop(app);
+        let restarted_app = router(&database);
+        let scaled = restarted_app
+            .clone()
+            .oneshot(authorized_request(
+                "POST",
+                "/v1/jobs/web/deployment/scale",
+                r#"{"replicas":0}"#,
+                Some("scale-zero"),
+                Some("\"1\""),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(scaled.status(), StatusCode::OK);
+        assert_eq!(scaled.headers().get(header::ETAG).unwrap(), "\"2\"");
+        let scaled_bytes = axum::body::to_bytes(scaled.into_body(), 65_536)
+            .await
+            .unwrap();
+        let scaled: conductor_core::JobDeployment = serde_json::from_slice(&scaled_bytes).unwrap();
+        assert_eq!(scaled.desired_replicas(), 0);
+
+        let replayed = restarted_app
+            .clone()
+            .oneshot(authorized_request(
+                "POST",
+                "/v1/jobs/web/deployment/scale",
+                r#"{"replicas":0}"#,
+                Some("scale-zero"),
+                Some("\"1\""),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(replayed.status(), StatusCode::OK);
+        assert_eq!(replayed.headers().get(header::ETAG).unwrap(), "\"2\"");
+
+        let suspended = restarted_app
+            .clone()
+            .oneshot(authorized_request(
+                "POST",
+                "/v1/jobs/web/deployment/suspend",
+                "",
+                Some("suspend-zero"),
+                Some("\"2\""),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(suspended.status(), StatusCode::OK);
+        assert_eq!(suspended.headers().get(header::ETAG).unwrap(), "\"3\"");
+        let resumed = restarted_app
+            .clone()
+            .oneshot(authorized_request(
+                "POST",
+                "/v1/jobs/web/deployment/resume",
+                "",
+                Some("resume-zero"),
+                Some("\"3\""),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resumed.status(), StatusCode::OK);
+        assert_eq!(resumed.headers().get(header::ETAG).unwrap(), "\"4\"");
+
+        let stale = restarted_app
+            .clone()
+            .oneshot(authorized_request(
+                "POST",
+                "/v1/jobs/web/deployment/suspend",
+                "",
+                Some("stale-suspend"),
+                Some("\"1\""),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+
+        let second_revision = restarted_app
+            .clone()
+            .oneshot(authorized_request(
+                "POST",
+                "/v1/jobs/web/revisions",
+                &revision_body("v2"),
+                Some("revision-two"),
+                None,
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(second_revision.status(), StatusCode::CREATED);
+        let updated = restarted_app
+            .clone()
+            .oneshot(authorized_request(
+                "PUT",
+                "/v1/jobs/web/deployment",
+                r#"{"revision":2,"replicas":2}"#,
+                Some("deployment-two"),
+                Some("\"4\""),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(updated.status(), StatusCode::ACCEPTED);
+        assert_eq!(updated.headers().get(header::ETAG).unwrap(), "\"5\"");
+        let rolled_back = restarted_app
+            .clone()
+            .oneshot(authorized_request(
+                "POST",
+                "/v1/jobs/web/deployment/rollback",
+                r#"{"revision":1}"#,
+                Some("rollback-one"),
+                Some("\"5\""),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rolled_back.status(), StatusCode::ACCEPTED);
+        let rolled_back_bytes = axum::body::to_bytes(rolled_back.into_body(), 65_536)
+            .await
+            .unwrap();
+        let rolled_back: conductor_core::JobDeployment =
+            serde_json::from_slice(&rolled_back_bytes).unwrap();
+        assert_eq!(rolled_back.revision_id().revision(), 1);
+        assert_eq!(rolled_back.desired_replicas(), 2);
+        assert!(!rolled_back.suspended());
+
+        let inspection = restarted_app
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/v1/jobs/web/deployment",
+                Some("0123456789ABCDEFGHIJKLMNOPQRSTUVabcdefghijk"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(inspection.status(), StatusCode::OK);
+        assert_eq!(inspection.headers().get(header::ETAG).unwrap(), "\"6\"");
+
+        let deleted = restarted_app
+            .clone()
+            .oneshot(authorized_request(
+                "DELETE",
+                "/v1/jobs/web/deployment",
+                "",
+                Some("delete-deployment"),
+                Some("\"6\""),
+                false,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted_bytes = axum::body::to_bytes(deleted.into_body(), 65_536)
+            .await
+            .unwrap();
+        let deleted: conductor_core::JobDeployment =
+            serde_json::from_slice(&deleted_bytes).unwrap();
+        assert_eq!(deleted.status(), DeploymentStatus::Deleted);
     }
 }
