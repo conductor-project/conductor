@@ -25,24 +25,16 @@ From the repository root, build the debug binary:
 cargo +1.99.1 build --locked -p conductor
 ```
 
-Create a user configuration and persistent state directories. The API binds to
-loopback and uses local access without a bearer token:
-
-```sh
-config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/conductor"
-data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/conductor"
-mkdir -p "$config_dir" "$data_dir/manager" "$data_dir/worker"
-jq -n --arg manager "$data_dir/manager" --arg worker "$data_dir/worker" \
-  '{role:"all",listen:"127.0.0.1:8080",manager_data_dir:$manager,
-    worker_data_dir:$worker,worker_id:"local-worker",worker_concurrency:2,
-    api_access:{mode:"local"}}' > "$config_dir/agent.json"
-```
+The checked-in [`examples/local.json`](examples/local.json) configures an
+all-role daemon with a loopback API and local access. It stores state under
+`./state`; run the following commands from the repository root. The daemon
+creates the state directories when it starts.
 
 **Terminal A:** from the repository root, start the foreground daemon:
 
 ```sh
 ./target/debug/conductor agent \
-  --config "${XDG_CONFIG_HOME:-$HOME/.config}/conductor/agent.json"
+  --config examples/local.json
 ```
 
 Keep this terminal open. **Terminal B:** confirm that the manager responds and
@@ -65,20 +57,23 @@ command is an argument array and Conductor does not implicitly invoke a shell.
 
 ```sh
 ./target/debug/conductor job --output json submit examples/cli-job.json \
-  --idempotency-key mvp3-first-job --wait --wait-timeout-seconds 30
+  --idempotency-key mvp3-first-job
 ```
 
-The JSON result includes stable `jobId` and `runId` values. Retry the same
-command with the same input and idempotency key after an ambiguous timeout; the
-same accepted run is returned instead of starting another. A successful
-`--wait` ends in `succeeded`; other terminal states include `failed`,
-`cancelled`, and `timed_out`. A wait timeout does not stop the remote run.
+The JSON response includes stable `jobId` and `runId` values. Copy the returned
+`runId` into the next commands. Retry the same command with the same input and
+idempotency key after an ambiguous timeout; the same accepted run is returned
+instead of starting another. A successful `run wait` ends in `succeeded`; other
+terminal states include `failed`, `cancelled`, and `timed_out`. A wait timeout
+does not stop the remote run.
 
 ```sh
+./target/debug/conductor run wait RUN_ID --timeout-seconds 30
+./target/debug/conductor run logs RUN_ID --stream stdout --offset 0 --limit 4096
+./target/debug/conductor run inspect RUN_ID --output json
 ./target/debug/conductor job list --output json
 ./target/debug/conductor job inspect mvp3-first-job --output json
 ./target/debug/conductor run list --job-id mvp3-first-job --output json
-./target/debug/conductor run logs RUN_ID --stream stdout --offset 0 --limit 4096
 ```
 
 The final command prints `hello conductor`. The executable and working
@@ -134,7 +129,8 @@ the manager reports the requested state, but does not guarantee that every
 external client has observed the change. Before creating either checked-in
 service revision, set its `executableDigest.value` to the SHA-256 digest of
 `/bin/sleep` on the target worker (for example, get it with
-`shasum -a 256 /bin/sleep`).
+`shasum -a 256 /bin/sleep` on macOS or `sha256sum /bin/sleep` on Linux), then
+replace the example's all-zero digest with that value before creating it.
 
 ```sh
 ./target/debug/conductor job register examples/cli-service-job.json
@@ -154,8 +150,12 @@ service revision, set its `executableDigest.value` to the SHA-256 digest of
   --wait --wait-timeout-seconds 120
 ./target/debug/conductor deployment scale mvp3-demo-service \
   --replicas 1 --generation 3 --idempotency-key service-scale-1 --wait
+./target/debug/conductor deployment suspend mvp3-demo-service \
+  --generation 4 --idempotency-key service-suspend-1 --wait --output json
+./target/debug/conductor deployment resume mvp3-demo-service \
+  --generation 5 --idempotency-key service-resume-1 --wait --output json
 ./target/debug/conductor deployment delete mvp3-demo-service \
-  --generation 4 --idempotency-key service-delete-1 --wait
+  --generation 6 --idempotency-key service-delete-1 --wait
 ```
 
 Each mutation requires a fresh idempotency key and an expected generation for
@@ -220,6 +220,42 @@ Readiness reports whether the manager can currently accept work; a reachable
 manager can be not ready while draining, degraded, or recovering. Metrics are
 Prometheus text by default; use `--output json` to wrap them in a JSON response.
 
+## Command output and recovery
+
+The manager and combined `all` role expose the management API; a standalone
+`worker` role does not. The API listens on loopback by default. Remote operator
+access is supported through a trusted TLS proxy in front of the loopback API;
+the proxy terminates TLS and forwards to the manager. Do not expose the local
+API directly on an untrusted network. Use a token file and CA file in the
+operator context for the proxy's authenticated HTTPS endpoint.
+
+Successful commands exit with status `0`. Application or API errors exit with
+status `1`; command-line usage errors exit with status `2`. With `--output json`,
+structured command errors are written to stderr as an error object with `code`
+and `message` fields and an optional `partial` result when a command has useful
+accepted state to report. Human errors also go to stderr. Run
+`conductor COMMAND --help` for flags and defaults.
+
+| Situation | Result |
+| --- | --- |
+| Invalid job JSON or unknown fields | `invalid_job`; no request is submitted |
+| Authentication required or rejected | API error `operator_authentication_required` or an HTTP status code |
+| Duplicate job ID with different contents | `duplicate_job`; the existing job is unchanged |
+| Stale deployment generation | Conflict error; inspect the deployment and retry with its current generation and a new idempotency key |
+| Server unavailable | `api_error`; retry after checking the manager or proxy |
+| Job wait times out or is interrupted | `wait_timeout` or `wait_interrupted`; the run continues until explicitly stopped |
+| Deployment wait times out or is interrupted | `rollout_timeout` or `rollout_interrupted`; accepted desired state remains active |
+
+List commands accept `--limit` and an opaque `--cursor`; pass the returned
+`nextCursor` to the next request. Cursors are for pagination only. For a
+submission or mutation with an ambiguous response, retry the same command with
+the same idempotency key. For a new operation, choose a fresh key. Read current
+deployment generations before mutations; a conflict is not safe to retry with
+the stale generation. These commands are documented in the job, run, service,
+deployment, and worker sections above.
+The resource commands complement the existing `operator` API command; they do
+not change the HTTP API or require migrating stored jobs, runs, or deployments.
+
 Stopping a run is different from stopping the daemon. To stop the daemon, press
 Ctrl-C in Terminal A and wait for its shutdown to finish. Job definitions and
 run history persist. A daemon restart can leave an ambiguous run in `unknown`;
@@ -250,8 +286,8 @@ any context subcommand to get machine-readable results, for example:
 ./target/debug/conductor context show local --output json
 ```
 
-For a remote TLS endpoint, provide a protected token file and, when needed, a
-CA certificate file:
+For the trusted TLS proxy's remote HTTPS endpoint, provide a protected token
+file and, when needed, a CA certificate file:
 
 ```sh
 ./target/debug/conductor context create production \
@@ -271,8 +307,8 @@ Without an explicit context, Conductor uses the selected default; without a
 stored default, `operator` uses local loopback and does not require a dummy
 token. Plain HTTP to non-loopback hosts is rejected. Use
 `conductor context delete NAME` to remove a saved context. The existing
-`operator` command remains available while resource-oriented CLI commands are
-added incrementally. Operator responses default to concise human text; use
+`operator` command remains available for lower-level API operations.
+Resource-oriented CLI commands use concise human output by default; use
 `--output json` for JSON output. `conductor completions SHELL` generates
 completion scripts for Bash, Elvish, Fish, PowerShell, and Zsh.
 
