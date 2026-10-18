@@ -388,7 +388,8 @@ impl JobService {
                                         .is_some_and(|state| state != ReadinessState::Ready)
                             }
                             (Some(run), _) => {
-                                run.state().is_terminal() || run.state() == RunState::Unknown
+                                run.state().is_terminal()
+                                    || matches!(run.state(), RunState::Stopping | RunState::Unknown)
                             }
                             (None, _) => true,
                         }
@@ -416,7 +417,8 @@ impl JobService {
                         .find(|worker| worker.descriptor().worker_id() == current.worker_id())
                         .map(AsRef::as_ref);
                     if !run_is_desired && !current.state().is_terminal() {
-                        if let Some(rollout) = deployment.rollout()
+                        if current.state() != RunState::Stopping
+                            && let Some(rollout) = deployment.rollout()
                             && run_allocation.job_revision_id() != deployment.revision_id()
                             && u32::try_from(rollout_unavailable).unwrap_or(u32::MAX)
                                 >= rollout.strategy().max_unavailable()
@@ -461,28 +463,63 @@ impl JobService {
                         let Some(worker) = worker else {
                             continue;
                         };
-                        if let Ok(stopped) = self.stop_run(current.run_id(), worker)
-                            && stopped.state().is_terminal()
-                        {
-                            if deployment.rollout().is_some()
-                                && run_allocation.job_revision_id() != deployment.revision_id()
-                            {
-                                rollout_unavailable = rollout_unavailable.saturating_add(1);
-                            }
-                            self.repository
-                                .finish_service_attempt(
-                                    &attempt.service_instance_id,
-                                    stopped.run_id(),
-                                    attempt.restart_count,
-                                    now_ms().map_err(|_| ManagerError::StorageUnavailable)?,
-                                    true,
+                        if current.state() == RunState::Stopping {
+                            // The stop intent is persisted before delivery. A
+                            // failed dispatch therefore leaves the run in
+                            // Stopping with a pending command that must be
+                            // retried during ordinary service reconciliation.
+                            if let Ok(pending) = self.repository.pending_commands(
+                                current.worker_id(),
+                                worker.descriptor().incarnation(),
+                                MAX_PENDING_COMMANDS_PER_WORKER,
+                            ) && pending.into_iter().any(|envelope| {
+                                matches!(
+                                    &envelope.command,
+                                    WorkerCommand::StopRun(command)
+                                        if command.run_id() == current.run_id()
                                 )
-                                .map_err(map_run_error)?;
-                            self.repository
-                                .release_service_allocation(run_allocation.id())
-                                .map_err(|_| ManagerError::StorageUnavailable)?;
+                            }) && let Ok(stopped) = self.stop_run(current.run_id(), worker)
+                                && stopped.state().is_terminal()
+                            {
+                                self.repository
+                                    .finish_service_attempt(
+                                        &attempt.service_instance_id,
+                                        stopped.run_id(),
+                                        attempt.restart_count,
+                                        now_ms().map_err(|_| ManagerError::StorageUnavailable)?,
+                                        true,
+                                    )
+                                    .map_err(map_run_error)?;
+                                self.repository
+                                    .release_service_allocation(run_allocation.id())
+                                    .map_err(|_| ManagerError::StorageUnavailable)?;
+                                continue;
+                            }
+                        } else {
+                            if let Ok(stopped) = self.stop_run(current.run_id(), worker) {
+                                if deployment.rollout().is_some()
+                                    && run_allocation.job_revision_id() != deployment.revision_id()
+                                {
+                                    rollout_unavailable = rollout_unavailable.saturating_add(1);
+                                }
+                                if stopped.state().is_terminal() {
+                                    self.repository
+                                        .finish_service_attempt(
+                                            &attempt.service_instance_id,
+                                            stopped.run_id(),
+                                            attempt.restart_count,
+                                            now_ms()
+                                                .map_err(|_| ManagerError::StorageUnavailable)?,
+                                            true,
+                                        )
+                                        .map_err(map_run_error)?;
+                                    self.repository
+                                        .release_service_allocation(run_allocation.id())
+                                        .map_err(|_| ManagerError::StorageUnavailable)?;
+                                }
+                            }
+                            continue;
                         }
-                        continue;
                     }
                     // A persisted terminal observation is durable evidence that
                     // the old process has ended. Consume it without requiring
