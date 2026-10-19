@@ -3,7 +3,7 @@ type: Runbook
 title: Operations and recovery
 description: Use health and readiness correctly, plan graceful shutdown, and resolve uncertain work after restart.
 status: stable
-source_revision: 636059dbca9a89b34a6133c701a9df5a121c8a4b
+source_revision: db60ba9
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../crates/conductor-api/src/lib.rs

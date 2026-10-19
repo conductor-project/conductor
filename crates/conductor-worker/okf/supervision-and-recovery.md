@@ -3,7 +3,7 @@ type: Reference
 title: Worker supervision and recovery
 description: The worker persists command acceptance and observations around run supervision, then reconciles uncertain work on restart.
 status: stable
-source_revision: e7e17917291459f16a2d9a53fcd03a7f29ae3271
+source_revision: db60ba9
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/lib.rs
