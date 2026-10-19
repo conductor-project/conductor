@@ -264,6 +264,64 @@ run history persist. A daemon restart can leave an ambiguous run in `unknown`;
 Conductor does not automatically replay it. See
 [operations and recovery](okf/operations-and-recovery.md).
 
+## Offline backup and restore
+
+Stop Conductor and every worker before planned maintenance. Create and verify a
+backup with explicit manager/worker state paths, plus every configuration and
+identity file or directory needed to reconnect the installation:
+
+```sh
+./target/debug/conductor backup create \
+  --manager-data-dir /var/lib/conductor/manager \
+  --worker-data-dir /var/lib/conductor/worker \
+  --include-path /etc/conductor/agent.json \
+  --include-path /var/lib/conductor/manager-identity \
+  --include-path /etc/conductor/worker-identity.pem \
+  --output /var/backups/conductor-maintenance.tar
+./target/debug/conductor backup inspect \
+  --input /var/backups/conductor-maintenance.tar
+```
+
+The archive contains consistent SQLite snapshots, worker run logs, and the
+explicitly included files. It is created with owner-only permissions and
+includes a versioned manifest with file sizes and SHA-256 checksums. The
+manifest detects accidental corruption; it does not authenticate who created
+the archive. Protect and encrypt backup storage according to your deployment's
+credential-handling policy. Symlinks, special files, invalid paths, unsupported
+schemas, and checksum mismatches are rejected. Manager/worker state paths may
+not also be passed as included paths.
+
+Restore only into a new directory; the command never replaces an existing
+destination. It validates the archive before publishing the restored tree:
+
+```sh
+./target/debug/conductor backup restore \
+  --input /var/backups/conductor-maintenance.tar \
+  --destination /var/lib/conductor/restored
+```
+
+The restored state is at `restored/manager` and `restored/worker`; explicit
+included files are under `restored/included/NNNN`. Update the restored
+configuration to use those state paths and the restored identity files. A
+restore creates a recovery hold in every restored component, so manager,
+worker, and `all` roles refuse to start until surviving workers and workloads
+are fenced and uncertain outcomes have been reviewed. After those checks,
+clear each hold explicitly (pass both paths when both roles were restored):
+
+```sh
+./target/debug/conductor backup recovery-resolve \
+  --manager-data-dir /var/lib/conductor/restored/manager \
+  --worker-data-dir /var/lib/conductor/restored/worker \
+  --confirm-workers-fenced \
+  --confirm-unknown-outcomes-reviewed
+```
+
+Restoring an older snapshot discards writes after its backup time. The recovery
+hold does not prove that external processes stopped or undo their effects; do
+not resume scheduling until the operator has checked those conditions. See the
+[backup and recovery runbook](okf/operations-and-recovery.md#offline-backup-and-restore)
+for the complete procedure.
+
 ## Configure operator connections
 
 The operator CLI supports named connection contexts. Contexts store the manager

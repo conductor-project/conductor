@@ -1,3 +1,4 @@
+mod backup_cli;
 mod contexts;
 mod deployment_cli;
 mod diagnostics_cli;
@@ -67,6 +68,8 @@ enum Commands {
     Service(service_cli::ServiceArgs),
     /// Check manager health, readiness, and metrics.
     Diagnostics(diagnostics_cli::DiagnosticsArgs),
+    /// Create, inspect, or restore offline state backups.
+    Backup(backup_cli::BackupArgs),
     /// Generate shell completion scripts for the implemented CLI commands.
     Completions {
         #[arg(value_enum)]
@@ -350,6 +353,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Commands::Worker(args) => return Ok(worker_cli::run(args)),
         Commands::Service(args) => return Ok(service_cli::run(args)),
         Commands::Diagnostics(args) => return Ok(diagnostics_cli::run(args)),
+        Commands::Backup(args) => return Ok(backup_cli::run(args)),
         Commands::Completions { shell } => {
             let mut command = Cli::command();
             clap_complete::generate(shell, &mut command, "conductor", &mut std::io::stdout());
@@ -364,6 +368,8 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         } => {
             let worker_id = WorkerId::new(worker_id)?;
             let manager_data_dir = state_lock::prepare_directory(&manager_data_dir)?;
+            backup_cli::ensure_no_recovery_hold(&manager_data_dir)
+                .map_err(|_| "restored manager state requires recovery clearance")?;
             let manager = Arc::new(conductor_manager::SqliteJobRepository::open(
                 manager_data_dir.join("manager.sqlite3"),
             )?);
@@ -397,6 +403,8 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         } => {
             let worker_id = WorkerId::new(worker_id)?;
             let manager_data_dir = state_lock::prepare_directory(&manager_data_dir)?;
+            backup_cli::ensure_no_recovery_hold(&manager_data_dir)
+                .map_err(|_| "restored manager state requires recovery clearance")?;
             let manager = conductor_manager::SqliteJobRepository::open(
                 manager_data_dir.join("manager.sqlite3"),
             )?;
@@ -512,6 +520,8 @@ fn run_all(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let listen = *required(&config.listen, "listen")?;
     let dns_config = service_dns_config(config.service_dns.as_ref())?;
     let _state_locks = StateLocks::acquire(manager_data_dir, worker_data_dir)?;
+    backup_cli::ensure_no_recovery_hold(manager_data_dir)?;
+    backup_cli::ensure_no_recovery_hold(worker_data_dir)?;
     let manager = Arc::new(conductor_manager::JobService::open_sqlite(
         manager_data_dir.join("manager.sqlite3"),
     )?);
@@ -628,6 +638,8 @@ fn run_manager(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let api_access = api_access_policy(&config)?;
     let _state_locks = StateLocks::acquire_manager(manager_data_dir)
         .map_err(|error| format!("manager state lock could not be acquired: {error}"))?;
+    backup_cli::ensure_no_recovery_hold(manager_data_dir)
+        .map_err(|_| "restored manager state requires recovery clearance")?;
 
     let repository = Arc::new(
         conductor_manager::SqliteJobRepository::open(manager_data_dir.join("manager.sqlite3"))
@@ -838,6 +850,8 @@ fn run_worker(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let ca_path = required(&config.manager_ca_file, "manager_ca_file")?;
     let endpoint = required(&config.manager_endpoint, "manager_endpoint")?;
     let _state_locks = StateLocks::acquire_worker(worker_data_dir)?;
+    backup_cli::ensure_no_recovery_hold(worker_data_dir)
+        .map_err(|_| "restored worker state requires recovery clearance")?;
     let ca = fs::read(ca_path).map_err(|_| "manager CA certificate could not be read")?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

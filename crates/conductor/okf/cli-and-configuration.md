@@ -12,6 +12,8 @@ sources:
     title: Operator subcommands and flags
   - resource: ../src/contexts.rs
     title: Named connection contexts
+  - resource: ../src/backup_cli.rs
+    title: Offline backup, restore, and recovery clearance
   - resource: ../../../examples/local.json
     title: Local configuration
   - resource: ../../../examples/manager.json
@@ -24,6 +26,11 @@ sources:
 
 `conductor completions SHELL` generates completions from the implemented Clap
 command tree for Bash, Elvish, Fish, PowerShell, and Zsh.
+`conductor backup create|inspect|restore` creates, checks, and restores an
+offline state archive. Pass every required configuration and identity path to
+`backup create` with `--include-path`; restore creates a new destination with
+manager and worker state below it and never replaces an existing path. Each
+restored component remains held from startup until explicit recovery clearance.
 `conductor agent --config PATH [--role all|manager|worker]` starts the daemon.
 `--role` overrides the role in the JSON file but does not bypass validation.
 `conductor context create|list|show|use|delete` manages named connection
