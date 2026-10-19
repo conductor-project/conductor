@@ -3,7 +3,7 @@ type: Reference
 title: Documentation migration map
 description: Every former documentation page and long README reference section maps to canonical repository or crate knowledge pages.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: 5a56d84
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../docs

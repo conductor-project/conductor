@@ -3,7 +3,7 @@ type: Architecture
 title: Conductor crate boundaries and runtime ownership
 description: The manager owns desired state, the worker owns execution, and explicit ports connect transport, API, and process layers.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: 5a56d84
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../crates/conductor-core/src/lib.rs
