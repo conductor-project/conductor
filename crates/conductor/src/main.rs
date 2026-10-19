@@ -1013,6 +1013,14 @@ fn run_worker(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 .map_err(|_| "worker overlay helper could not apply its peer map")?;
             let candidate_refresh_at_ms =
                 candidate_refresh_at(acknowledgement.candidates_expires_at_ms);
+            report_overlay_observation(
+                &client,
+                &domain_id,
+                &worker_id,
+                &configuration,
+                conductor_core::OverlayPeerObservationStatus::Applied,
+            )
+            .await;
             Ok::<_, Box<dyn std::error::Error>>(Some(tokio::spawn(run_worker_overlay(
                 Arc::clone(&client),
                 domain_id,
@@ -1107,10 +1115,27 @@ async fn run_worker_overlay(
                     return Err("manager returned an overlay configuration for a different worker or domain".to_owned());
                 }
                 if updated != configuration {
-                    helper.reconfigure(&updated).await
-                        .map_err(|_| "worker overlay helper rejected a manager configuration update".to_owned())?;
+                    if helper.reconfigure(&updated).await.is_err() {
+                        report_overlay_observation(
+                            &client,
+                            &domain_id,
+                            &worker_id,
+                            &updated,
+                            conductor_core::OverlayPeerObservationStatus::Rejected,
+                        )
+                        .await;
+                        return Err("worker overlay helper rejected a manager configuration update".to_owned());
+                    }
                     configuration = updated;
                 }
+                report_overlay_observation(
+                    &client,
+                    &domain_id,
+                    &worker_id,
+                    &configuration,
+                    conductor_core::OverlayPeerObservationStatus::Applied,
+                )
+                .await;
             }
         }
     }
@@ -1127,6 +1152,27 @@ fn candidate_refresh_at(expires_at_ms: Option<i64>) -> i64 {
 #[cfg(target_os = "linux")]
 fn overlay_now_ms() -> i64 {
     i64::try_from(timestamp_ms()).unwrap_or(i64::MAX)
+}
+
+#[cfg(target_os = "linux")]
+async fn report_overlay_observation(
+    client: &conductor_transport::WorkerTransportClient,
+    domain_id: &NetworkDomainId,
+    worker_id: &WorkerId,
+    configuration: &conductor_core::OverlayPeerConfiguration,
+    status: conductor_core::OverlayPeerObservationStatus,
+) {
+    let observation = conductor_core::OverlayPeerObservation {
+        network_domain_id: domain_id.clone(),
+        worker_id: worker_id.clone(),
+        peer_generation: configuration.peer_generation,
+        applied_network_generation: configuration.network_generation,
+        observed_at_ms: i64::try_from(timestamp_ms()).unwrap_or(i64::MAX),
+        status,
+    };
+    let _ = client
+        .report_overlay_observation(domain_id, &observation)
+        .await;
 }
 
 #[cfg(target_os = "linux")]

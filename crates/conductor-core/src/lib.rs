@@ -98,8 +98,8 @@ pub use overlay_network::{
     MAX_OVERLAY_DIRECT_CANDIDATES, OVERLAY_PEER_CONFIGURATION_SCHEMA_VERSION,
     OverlayDirectCandidateAcknowledgement, OverlayDirectCandidateAdvertisement, OverlayEndpointId,
     OverlayNetworkDomainConfig, OverlayPeer, OverlayPeerAssignment, OverlayPeerConfiguration,
-    OverlayPeerObservation, OverlayPeerObservationStatus, OverlayPeerState,
-    valid_overlay_direct_candidates,
+    OverlayPeerDiagnostic, OverlayPeerObservation, OverlayPeerObservationStatus, OverlayPeerState,
+    OverlayReachability, valid_overlay_direct_candidates,
 };
 #[path = "structs/network_domain_id.rs"]
 mod network_domain_id;

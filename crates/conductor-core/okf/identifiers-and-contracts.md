@@ -34,6 +34,10 @@ monotonic peer/network generations. Configuration snapshots carry a schema
 version, bounded direct UDP candidates, and candidate expiry. They contain
 public peer identities only; secret endpoint keys remain worker-local. These shared types describe
 control-plane state and do not implement packet transport.
+Peer diagnostics keep the latest worker apply report separate from desired
+assignment and carry its network generation and freshness. `not_verified` is
+the only reachability state until a bounded application probe exists; an
+applied helper report does not imply a live peer path.
 
 # Job contracts
 

@@ -191,6 +191,27 @@ conductor run list --job-id frontend --state unknown --limit 25
 Run-list pages expose `nextCursor`; pass it with `--cursor` for the next page.
 Use `worker undrain` only after drain status reports `completed`.
 
+# Configure and inspect worker overlays
+
+Overlay commands create a manager-owned network domain, inspect its relay and
+address pools, list desired peer assignments with lease state and the latest
+worker apply report and generation, and revoke a worker peer. Use the operator API; do not edit
+manager SQLite state directly. A report is fresh only when it matches the desired generation and its timestamp
+is within the last 60 seconds. It describes the helper's last successful configuration apply. It does not prove a live Iroh
+path or application reachability; `reachability` remains `not_verified` until
+Conductor has a bounded application probe. Revoke output also marks reachability
+`not_verified` deliberately.
+
+```sh
+conductor operator --context production overlay create workers-east \
+  --relay-url https://relay.example.net \
+  --worker-address-pool 10.90.0.0/24 \
+  --service-address-pool 10.90.1.0/24
+conductor operator --context production overlay inspect workers-east
+conductor operator --context production --output json overlay peers workers-east
+conductor operator --context production overlay revoke workers-east worker-17
+```
+
 # Retrieve logs
 
 Each `run logs` request fetches one chunk between 1 and 65,536 bytes. Human

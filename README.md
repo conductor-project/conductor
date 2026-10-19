@@ -246,6 +246,12 @@ those reachability hints in versioned peer maps; candidates do not authenticate
 or authorize a peer. The initial Iroh topology requires directly reachable
 UDP and disables relays, public/default address discovery, and NAT traversal.
 
+Operators can create and inspect network domains with
+`conductor operator overlay create|inspect|peers|revoke`; peer diagnostics
+distinguish desired membership from the worker's last helper-apply report and
+never infer live reachability from that report. See the [operator command
+guide](crates/conductor/okf/operator-commands.md).
+
 The worker overlay crate validates IPv4 packets, routes them by the manager's
 peer map, and carries them in authenticated Iroh datagrams with relays and
 address lookup disabled. On Linux, a separate helper owns the tun-rs device

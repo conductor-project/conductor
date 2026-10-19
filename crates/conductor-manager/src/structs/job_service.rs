@@ -130,6 +130,16 @@ impl JobService {
             .list_overlay_peers(network_domain_id, limit, now_ms)
     }
 
+    pub fn list_overlay_peer_diagnostics(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<Vec<conductor_core::OverlayPeerDiagnostic>, OverlayNetworkError> {
+        self.repository
+            .list_overlay_peer_diagnostics(network_domain_id, limit, now_ms)
+    }
+
     pub fn reconcile_metrics(&self) -> ReconcileMetrics {
         self.telemetry.snapshot()
     }

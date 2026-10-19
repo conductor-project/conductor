@@ -1528,6 +1528,80 @@ impl JobRepository for SqliteJobRepository {
         Ok(peers)
     }
 
+    fn list_overlay_peer_diagnostics(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<Vec<conductor_core::OverlayPeerDiagnostic>, OverlayNetworkError> {
+        let peers = self.list_overlay_peers(network_domain_id, limit, now_ms)?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        peers
+            .into_iter()
+            .map(|assignment| {
+                let observation = connection
+                    .query_row(
+                        "SELECT peer_generation, applied_network_generation, observed_at_ms, status
+                         FROM overlay_peer_observations
+                         WHERE network_domain_id = ?1 AND worker_id = ?2",
+                        params![network_domain_id.as_str(), assignment.worker_id.as_str()],
+                        |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, String>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(|_| OverlayNetworkError::StorageUnavailable)?
+                    .filter(|(peer_generation, _, _, _)| {
+                        *peer_generation >= 0
+                            && *peer_generation as u64 == assignment.peer_generation
+                    });
+                let (
+                    observation_status,
+                    observation_network_generation,
+                    observation_at_ms,
+                    observation_fresh,
+                ) = if let Some((_, network_generation, observed_at_ms, status)) = observation {
+                    let status = match status.as_str() {
+                        "applied" => conductor_core::OverlayPeerObservationStatus::Applied,
+                        "rejected" => conductor_core::OverlayPeerObservationStatus::Rejected,
+                        "unavailable" => conductor_core::OverlayPeerObservationStatus::Unavailable,
+                        _ => return Err(OverlayNetworkError::StorageUnavailable),
+                    };
+                    let current_generation = network_generation >= 0
+                        && network_generation as u64 == assignment.network_generation;
+                    let fresh = current_generation
+                        && observed_at_ms >= 0
+                        && observed_at_ms <= now_ms
+                        && now_ms.saturating_sub(observed_at_ms) <= 60_000;
+                    (
+                        Some(status),
+                        u64::try_from(network_generation).ok(),
+                        Some(observed_at_ms),
+                        fresh,
+                    )
+                } else {
+                    (None, None, None, false)
+                };
+                Ok(conductor_core::OverlayPeerDiagnostic {
+                    assignment,
+                    observation_status,
+                    observation_network_generation,
+                    observation_at_ms,
+                    observation_fresh,
+                    reachability: conductor_core::OverlayReachability::NotVerified,
+                })
+            })
+            .collect()
+    }
+
     fn insert(&self, job: JobSpec) -> Result<(), JobStoreError> {
         let spec_json =
             serde_json::to_string(&job).map_err(|_| JobStoreError::StorageUnavailable)?;

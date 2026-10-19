@@ -70,11 +70,13 @@ the [README](../../../README.md) is a shorter successful one-shot flow.
 Overlay domain creation requires disjoint private IPv4 worker and service
 pools. Domain creation and peer revocation are audited operator mutations.
 Peer status contains public endpoint IDs, assigned addresses, generations,
-expiry, and quarantine state; it contains no Iroh private key. Worker identity
-enrollment, configuration delivery, and observations use the separate mTLS
-worker transport endpoints described in the transport bundle. These routes
-manage membership and desired state only; they do not configure a tunnel or
-host route.
+expiry, quarantine state, and the latest worker application report with its
+generation and a freshness bit; it contains no Iroh private key. `reachability` is
+always `not_verified`: an applied report does not prove a live peer path or
+application traffic. Worker identity enrollment, configuration delivery, and
+observations use the separate mTLS worker transport endpoints described in the
+transport bundle. These routes manage membership and observed configuration;
+they do not configure a tunnel or host route.
 
 # Important run semantics
 

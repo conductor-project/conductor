@@ -333,6 +333,12 @@ pub trait JobRepository: Send + Sync + CommandJournal {
         limit: usize,
         now_ms: i64,
     ) -> Result<Vec<conductor_core::OverlayPeerAssignment>, OverlayNetworkError>;
+    fn list_overlay_peer_diagnostics(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<Vec<conductor_core::OverlayPeerDiagnostic>, OverlayNetworkError>;
     fn insert(&self, job: JobSpec) -> Result<(), JobStoreError>;
     fn get(&self, id: &JobId) -> Result<Option<JobSpec>, JobStoreError>;
     fn list_jobs_page(

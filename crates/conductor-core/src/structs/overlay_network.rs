@@ -174,6 +174,25 @@ pub struct OverlayPeerObservation {
     pub status: OverlayPeerObservationStatus,
 }
 
+/// Manager view that keeps desired assignment separate from the worker's
+/// bounded application report. A report is not proof of peer reachability.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OverlayPeerDiagnostic {
+    pub assignment: OverlayPeerAssignment,
+    pub observation_status: Option<OverlayPeerObservationStatus>,
+    pub observation_network_generation: Option<u64>,
+    pub observation_at_ms: Option<i64>,
+    pub observation_fresh: bool,
+    pub reachability: OverlayReachability,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayReachability {
+    NotVerified,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OverlayPeerObservationStatus {

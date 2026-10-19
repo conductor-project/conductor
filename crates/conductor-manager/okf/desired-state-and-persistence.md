@@ -70,9 +70,13 @@ authorized workers.
 
 These rows are in the normal manager SQLite snapshot and restore unit. No
 network-domain deletion operation is exposed; address pools and replay
-tombstones therefore remain reserved. This is identity and allocation state,
-not proof that a worker has installed a tunnel or withdrawn a route. The Iroh
-packet adapter and worker-side expiry enforcement are separate MVP5 work.
+tombstones therefore remain reserved. The peer-list diagnostic joins that
+desired state with the latest worker report and marks it fresh only when its
+timestamp is nonnegative, no later than manager time, and at most 60 seconds
+old, and its network generation matches desired state. The diagnostic includes
+the report generation so older applies remain visible as stale. Reports describe the helper's last successful configuration apply; they
+are not a live route check or proof of peer/application reachability. Those
+claims remain `not_verified` until an explicit bounded probe succeeds.
 
 ## Run-history retention
 

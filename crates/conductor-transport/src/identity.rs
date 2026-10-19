@@ -1276,6 +1276,23 @@ mod tests {
             .await
             .expect("report overlay observation over mTLS");
         assert_eq!(report.status(), reqwest::StatusCode::NO_CONTENT);
+        let diagnostics = repository
+            .list_overlay_peer_diagnostics(
+                &assignment.network_domain_id,
+                128,
+                now_ms().expect("clock"),
+            )
+            .expect("read overlay diagnostics");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(
+            diagnostics[0].observation_status,
+            Some(conductor_core::OverlayPeerObservationStatus::Applied)
+        );
+        assert!(diagnostics[0].observation_fresh);
+        assert_eq!(
+            diagnostics[0].reachability,
+            conductor_core::OverlayReachability::NotVerified
+        );
         let poll_url = format!("https://localhost:{}/v1/worker/poll", address.port());
         let mismatched_poll = super::super::WorkerPollRequest {
             worker_id: WorkerId::new("worker-impostor").expect("impostor id"),
