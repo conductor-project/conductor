@@ -222,7 +222,7 @@ manager can be not ready while draining, degraded, or recovering. Metrics are
 Prometheus text by default; use `--output json` to wrap them in a JSON response.
 The versioned `diagnostics export` collects health, readiness, worker summaries,
 and allowlisted scheduling metrics through the authenticated typed API. Each
-section has a bounded request deadline and reports `collected` or
+remote section has a bounded request deadline and reports `collected` or
 `unavailable`; the overall result can be `partial`. Worker/item and output
 sizes are capped. The export omits worker labels, inventory, network details,
 commands, logs, and request contents. Remote storage sizes are not available;
