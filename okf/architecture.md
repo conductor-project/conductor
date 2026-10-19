@@ -51,6 +51,12 @@ The API calls manager operations. Manager-to-worker interaction uses command
 and report ports; remote transport implements those boundaries over HTTPS and
 mTLS. The `conductor` binary chooses composition and coordinates lifecycle.
 
+The proposed MVP5 host-network overlay, packet-tunnel boundary, addressing,
+leases, and failure behavior are described in the
+[overlay networking architecture](overlay-networking-architecture.md). That
+proposal does not change current crate ownership or claim an implemented
+network backend.
+
 ## Source and verification
 
 Read this with each crate's contracts. The ownership statements are source
