@@ -213,12 +213,21 @@ state.
 ./target/debug/conductor diagnostics health --output json
 ./target/debug/conductor diagnostics ready --output json
 ./target/debug/conductor diagnostics metrics
+./target/debug/conductor diagnostics --output json export --deadline-seconds 15
 ```
 
 Health reports whether the API responds and the manager process is healthy.
 Readiness reports whether the manager can currently accept work; a reachable
 manager can be not ready while draining, degraded, or recovering. Metrics are
 Prometheus text by default; use `--output json` to wrap them in a JSON response.
+The versioned `diagnostics export` collects health, readiness, worker summaries,
+and allowlisted scheduling metrics through the authenticated typed API. Each
+section has a bounded request deadline and reports `collected` or
+`unavailable`; the overall result can be `partial`. Worker/item and output
+sizes are capped. The export omits worker labels, inventory, network details,
+commands, logs, and request contents. Remote storage sizes are not available;
+use the explicitly offline `conductor storage inspect` command against local
+data directories when the daemon is stopped.
 
 ## Command output and recovery
 
