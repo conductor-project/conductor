@@ -76,6 +76,9 @@ fn start_agent(root: &Path, role: &str) -> (Agent, SocketAddr) {
         config["worker_data_dir"] = serde_json::json!(root.join("worker"));
         config["worker_id"] = serde_json::json!("service-cli-worker");
         config["worker_concurrency"] = serde_json::json!(2);
+        config["worker_labels"] = serde_json::json!({
+            "diagnostics_test_label": "do-not-export-this-secret"
+        });
         config["worker_service_network"] = serde_json::json!({
             "networkDomainId":"service-cli-network",
             "portRangeStart":31000,
@@ -384,6 +387,37 @@ fn diagnostics_separate_health_readiness_and_metrics() {
             .contains("conductor_deployments")
     );
 
+    let export = command(
+        address,
+        &[
+            "diagnostics",
+            "--output",
+            "json",
+            "export",
+            "--deadline-seconds",
+            "3",
+        ],
+    );
+    assert!(
+        export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let export_json = json(&export);
+    assert_eq!(export_json["schemaVersion"], 1);
+    assert_eq!(export_json["versions"]["binary"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(export_json["versions"]["httpApi"], 1);
+    assert_eq!(export_json["collectionStatus"], "complete");
+    assert_eq!(export_json["sections"]["health"]["status"], "collected");
+    assert_eq!(export_json["sections"]["workers"]["status"], "collected");
+    assert_eq!(
+        export_json["sections"]["storage"]["data"]["remoteCollection"],
+        "not_supported"
+    );
+    let export_text = String::from_utf8(export.stdout).expect("diagnostics export UTF-8");
+    assert!(!export_text.contains("do-not-export-this-secret"));
+    assert!(!export_text.contains("diagnostics_test_label"));
+
     let manager_root = TempDir::new();
     let (_manager, manager_address) = start_agent(&manager_root, "manager");
     let not_ready = command(
@@ -398,5 +432,41 @@ fn diagnostics_separate_health_readiness_and_metrics() {
     assert_eq!(
         json_stderr(&not_ready)["error"]["partial"]["reachable"],
         true
+    );
+}
+
+#[test]
+fn diagnostics_export_returns_explicit_partial_result_when_manager_is_unreachable() {
+    let _guard = lock_tests();
+    let output = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args([
+            "diagnostics",
+            "--server",
+            "http://127.0.0.1:1",
+            "--output",
+            "json",
+            "export",
+            "--deadline-seconds",
+            "1",
+        ])
+        .output()
+        .expect("run partial diagnostics export");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = json(&output);
+    assert_eq!(report["collectionStatus"], "partial");
+    for section in ["health", "readiness", "workers", "metrics"] {
+        assert_eq!(report["sections"][section]["status"], "unavailable");
+        assert!(report["sections"][section]["errorCode"].is_string());
+    }
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|finding| { finding["code"] == "diagnostics_partial" })
     );
 }
