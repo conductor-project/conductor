@@ -76,6 +76,19 @@ fn preflight_reports_older_schemas_without_migrating_them() {
     assert_eq!(report["databases"][0]["state"], "migration_required");
     assert_eq!(report["databases"][1]["schemaVersion"], 3);
     assert_eq!(report["databases"][1]["state"], "migration_required");
+    assert_eq!(
+        report["requiredMaintenanceActions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(
+        report["requiredMaintenanceActions"][0]
+            .as_str()
+            .unwrap()
+            .contains("verified backup")
+    );
     for (path, expected) in [(manager, 11), (worker, 3)] {
         let connection = Connection::open(path).expect("reopen inspected database");
         let version: i64 = connection
@@ -99,6 +112,19 @@ fn preflight_blocks_a_newer_schema_and_allows_missing_databases() {
     let blocked_report: Value = serde_json::from_slice(&blocked.stdout).expect("blocked report");
     assert_eq!(blocked_report["schemaMarkersSupported"], false);
     assert_eq!(blocked_report["databases"][0]["state"], "unsupported");
+    assert_eq!(
+        blocked_report["requiredMaintenanceActions"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        blocked_report["requiredMaintenanceActions"][0]
+            .as_str()
+            .unwrap()
+            .contains("Do not start the candidate")
+    );
 
     let missing = preflight(&[
         "--worker-data-dir",

@@ -3,7 +3,7 @@ type: Runbook
 title: Operations and recovery
 description: Use health and readiness correctly, plan graceful shutdown, and resolve uncertain work after restart.
 status: stable
-source_revision: ae824f0a6ed7242e589b340243d46897c3b67877
+source_revision: 4f95c85
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../crates/conductor-api/src/lib.rs
@@ -186,7 +186,7 @@ development builds are not a supported upgrade source.
 | --- | --- | --- |
 | CLI binary | `0.0.1` | Upgrade all manager and worker binaries together to the same stable release. Untagged builds are unsupported upgrade baselines. |
 | HTTP API | `v1` | Routes are versioned under `/v1`. No cross-release client/server window has been validated; use matching release versions. |
-| Manager-worker transport | Protocol `3` | Protocol negotiation checks version overlap and required capabilities. Mixed Conductor release versions are not a supported operating mode until separately qualified. |
+| Manager-worker transport | Protocol `3` | Negotiation requires an overlapping version and all required capabilities. An incompatible worker poll returns HTTP `426` with a compatibility diagnostic and the worker exits; install matching Conductor versions. Mixed release versions are not a supported operating mode until separately qualified. |
 | Manager database | Schema `12` | Each source migration step is transactional and the current code migrates known earlier markers. This does not prove a real previous-release upgrade. No downgrade is supported after migration. |
 | Worker database | Schema `4` | Independently versioned and migrated during worker startup. This does not prove a real previous-release upgrade. No downgrade is supported after migration. |
 
@@ -198,25 +198,37 @@ a release-to-release upgrade.
 
 The binary-level test
 `failed_upgrade_restores_matching_backup_and_keeps_recovery_hold_until_confirmed`
-also exercises a failed candidate preflight, restore from the matching
-pre-upgrade manager/worker backup, and startup blocking until the operator
-confirms worker fencing and unknown-outcome review. It verifies that state
-written after the backup is absent after restore. This isolated CLI fixture
-proves the backup/recovery gate behavior; it does not exercise a live surviving
-worker or reconcile a running workload.
+exercises a failed candidate preflight, restore from the matching pre-upgrade
+manager/worker backup, and startup blocking until the operator confirms worker
+fencing and unknown-outcome review. It verifies that state written after the
+backup is absent after restore.
+
+`actual_binary_recovery_hold_blocks_restore_while_a_workload_survives_failure`
+starts the real combined daemon, records an offline backup, runs a long-lived
+workload, and kills the daemon while the workload remains alive. It then plants
+a conflicting audit-table schema at marker 11 and starts the real daemon again;
+the migration fails on the missing `occurred_at_ms` column and leaves marker 11
+unchanged. Preflight still reports that known marker as requiring migration.
+The test restores the matching backup and verifies startup remains blocked while
+the workload survives. It then explicitly fences the workload, clears the hold,
+and confirms the restored job definition is available. The post-backup run is
+absent, as expected for this restore point. This test exercises a real
+transactional migration failure, workload survival, and the operator fencing
+gate; it does not test a separately running remote worker or an upgrade from a
+published prior release. The recovery command records operator confirmation and
+does not independently inspect external processes.
 
 Local debug verification on source revision
-`ae824f0a6ed7242e589b340243d46897c3b67877` plus the migration and recovery
-tests in this change:
+`afcacf3b2c0f277e6b9b2c75f01592a9b1d536a9`:
 
 - `python3 scripts/check-dependency-policy.py` — passed.
 - `cargo fmt --all -- --check` — passed.
 - `cargo clippy --workspace --locked --all-targets --all-features -- -D warnings` — passed.
-- `cargo test --workspace --locked --all-targets --all-features` — 271 tests passed across 27 suites with local loopback permission.
+- `cargo test --workspace --locked --all-targets --all-features` — 272 tests passed across 27 suites, including the live-workload recovery drill.
 
-This is local debug test evidence only. No release build/test, stable previous-
-release upgrade, package qualification, or recovery drill with a live surviving
-worker/workload is claimed here.
+This is local debug evidence. No release build/test, stable previous-release
+upgrade, package qualification, or recovery drill with a separately running
+remote worker is claimed here.
 
 The release policy and the upgrade evidence are separate: the policy defines
 which stable lines are intended to receive support, while a supported upgrade
@@ -230,9 +242,13 @@ using the candidate binary, after draining work and stopping the daemons. It
 opens existing SQLite files read-only and reports whether their schema markers
 are understood by that binary. An older marker is reported as
 `migration_required`, not as proof that the database is valid or that a release
-upgrade is supported. It does not run migrations, inspect active remote peers,
-validate workload compatibility, or establish package/distribution support.
-The report's API and transport versions describe this binary only.
+upgrade is supported. JSON and human output include required maintenance
+actions: unsupported markers must be resolved with a compatible binary or a
+matching verified backup; supported older markers require a verified joint
+backup and an explicit manager/worker restart to apply migration. Preflight
+does not run migrations, inspect active remote peers, validate workload
+compatibility, or establish package/distribution support. The report's API and
+transport versions describe this binary only.
 
 ### Planned upgrade and rollback sequence
 

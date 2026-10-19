@@ -3,7 +3,7 @@ type: Reference
 title: conductor CLI and configuration
 description: Clap commands select daemon operation, named operator contexts, and strict JSON configuration selects role-specific listeners, state, and identity paths.
 status: stable
-source_revision: db60ba9
+source_revision: 4f95c85
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/main.rs
@@ -62,7 +62,9 @@ without opening the daemon or applying migrations. It requires
 `--manager-data-dir`, `--worker-data-dir`, or both; use `--output json` for a
 machine-readable report. A report about an existing database is local evidence
 only and does not validate active remote peers, installed packages, or
-distribution support. See the [upgrade compatibility policy](../../../okf/operations-and-recovery.md#upgrade-compatibility-policy).
+distribution support. JSON reports include `requiredMaintenanceActions`;
+human output prints the same guidance for unsupported schemas or required
+migrations. See the [upgrade compatibility policy](../../../okf/operations-and-recovery.md#upgrade-compatibility-policy).
 
 Context commands use concise human output consistently, including create, list,
 show, use, and delete. Add `--output json` before or after the subcommand for
