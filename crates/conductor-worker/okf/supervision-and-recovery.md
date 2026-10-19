@@ -3,7 +3,7 @@ type: Reference
 title: Worker supervision and recovery
 description: The worker persists command acceptance and observations around run supervision, then reconciles uncertain work on restart.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: e7e17917291459f16a2d9a53fcd03a7f29ae3271
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/lib.rs
@@ -14,6 +14,8 @@ sources:
     title: Per-run supervision state
   - resource: ../tests/runs.rs
     title: Recovery and idempotency tests
+  - resource: ../../conductor/src/upgrade_cli.rs
+    title: Read-only schema marker preflight
 ---
 
 # Durable acceptance
@@ -38,6 +40,10 @@ The worker database has its own migration series; current source sets
 `SCHEMA_VERSION` to **4** in `src/lib.rs`. It is independent of manager schema
 version 12. Worker records include runs/logs, metadata/incarnation, accepted
 commands, and report state.
+
+The `conductor upgrade preflight` command reads the worker's `PRAGMA user_version`
+through a read-only connection. It does not start the worker, migrate its
+database, inspect the tables, or establish that retained logs can be restored.
 
 ## Failure boundary
 

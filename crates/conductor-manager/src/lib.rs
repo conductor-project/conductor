@@ -37,6 +37,35 @@ const MAX_SERVICE_RESTARTS: u32 = 5;
 const SERVICE_RESTART_BASE_BACKOFF_MS: u64 = 250;
 const SERVICE_RESTART_MAX_BACKOFF_MS: u64 = 30_000;
 
+/// Current manager database schema understood by this build.
+pub const CURRENT_SCHEMA_VERSION: i64 = SCHEMA_VERSION;
+
+/// Read the manager schema marker without opening the database for writes or running migrations.
+/// `None` means that the database file does not exist yet.
+pub fn inspect_schema_version(path: &Path) -> io::Result<Option<i64>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(io::Error::other("manager database could not be inspected"));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::other("manager database could not be inspected"));
+    }
+    let resolved_path = fs::canonicalize(path)
+        .map_err(|_| io::Error::other("manager database could not be inspected"))?;
+    let connection = Connection::open_with_flags(
+        resolved_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|_| io::Error::other("manager database could not be inspected"))?;
+    let version = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|_| io::Error::other("manager database could not be inspected"))?;
+    Ok(Some(version))
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JobStoreError {
     DuplicateId,

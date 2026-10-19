@@ -258,6 +258,26 @@ deployment, and worker sections above.
 The resource commands complement the existing `operator` API command; they do
 not change the HTTP API or require migrating stored jobs, runs, or deployments.
 
+Before a planned upgrade, stop every Conductor process and make a consistent
+backup of manager and worker state. Then inspect the local database schemas
+without starting a daemon or applying migrations:
+
+```sh
+./target/debug/conductor upgrade preflight \
+  --manager-data-dir /var/lib/conductor/manager \
+  --worker-data-dir /var/lib/conductor/worker
+```
+
+The command reports the binary, HTTP API, and manager-worker protocol versions,
+plus each selected database's schema state. It is read-only; an older schema
+with a migration path is reported as requiring migration, and a newer or
+invalid schema blocks the upgrade. Migrations run only when the corresponding
+role is explicitly started. The preflight reads local files only: it does not
+verify versions of running remote workers or package/distribution
+compatibility. Keep manager and worker binaries on the same Conductor version
+during an upgrade, and use the compatibility policy in the [operations
+runbook](okf/operations-and-recovery.md).
+
 Stopping a run is different from stopping the daemon. To stop the daemon, press
 Ctrl-C in Terminal A and wait for its shutdown to finish. Job definitions and
 run history persist. A daemon restart can leave an ambiguous run in `unknown`;

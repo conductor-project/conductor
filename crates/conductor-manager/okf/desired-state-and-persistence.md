@@ -3,7 +3,7 @@ type: Reference
 title: Manager desired state and persistence
 description: SQLite stores immutable job/revision records, mutable deployment state, run reservations, worker records, commands, allocations, and audit.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: e7e17917291459f16a2d9a53fcd03a7f29ae3271
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/lib.rs
@@ -12,6 +12,8 @@ sources:
     title: Manager repository operations
   - resource: ../tests/jobs.rs
     title: Persistence and restart tests
+  - resource: ../../conductor/src/upgrade_cli.rs
+    title: Read-only schema marker preflight
 ---
 
 # Durable state
@@ -28,6 +30,11 @@ SQLite uses WAL mode and full synchronization. Startup migrates supported older
 schemas transactionally, and fails closed when a database is corrupt,
 inaccessible, or newer than the supported schema. Back up a consistent DB/WAL
 state with the daemon stopped.
+
+The `conductor upgrade preflight` command reads only `PRAGMA user_version` via
+a read-only connection. It does not validate table structure or prove that a
+database is recoverable; successful marker inspection is not a substitute for
+a backup or a migration test.
 
 Before upgrading, stop the daemon and take a consistent backup of manager
 state and worker state/logs. Start only binaries whose worker transport
