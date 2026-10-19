@@ -40,6 +40,11 @@ jobs:
         with:
           ref: ${{ github.event_name == 'push' && github.ref || inputs.tag }}
           fetch-depth: 0
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event_name == 'push' && github.event.repository.default_branch || github.sha }}
+          path: workflow-source
+          fetch-depth: 1
       - name: Verify release tag, authorized branch, and version
         id: candidate
         env:
@@ -47,7 +52,7 @@ jobs:
         run: |
           set -euo pipefail
           manifest_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
-          candidate=$(python3 scripts/resolve-release-ref.py "$GITHUB_WORKSPACE" "$RELEASE_TAG" "$manifest_version")
+          candidate=$(python3 "$GITHUB_WORKSPACE/workflow-source/scripts/resolve-release-ref.py" "$GITHUB_WORKSPACE" "$RELEASE_TAG" "$manifest_version")
           echo "version=$(jq -r .version <<<"$candidate")" >> "$GITHUB_OUTPUT"
           echo "sha=$(jq -r .sha <<<"$candidate")" >> "$GITHUB_OUTPUT"
           echo "line=$(jq -r .line <<<"$candidate")" >> "$GITHUB_OUTPUT"
@@ -106,7 +111,7 @@ jobs:
           gh attestation verify --help >/dev/null
           for arch in x86_64 aarch64; do
             dir="candidate/conductor-linux-packages-${arch}-release"
-            python3 scripts/verify-release-candidate.py "$dir" "$VERSION" "$SOURCE_SHA" "$arch"
+            python3 "$GITHUB_WORKSPACE/workflow-source/scripts/verify-release-candidate.py" "$dir" "$VERSION" "$SOURCE_SHA" "$arch"
             for package in "$dir"/*.deb "$dir"/*.rpm; do
               cosign verify-blob --bundle "${package}.sigstore.json" --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/merge.yml@refs/heads/${BRANCH}" --certificate-oidc-issuer https://token.actions.githubusercontent.com "$package"
               gh attestation verify "$package" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/merge.yml"
