@@ -267,6 +267,161 @@ fn backup_round_trip_preserves_databases_logs_included_identity_and_recovery_hol
 }
 
 #[test]
+fn failed_upgrade_restores_matching_backup_and_keeps_recovery_hold_until_confirmed() {
+    let temp = TempDir::new();
+    let manager = temp.0.join("source-manager");
+    let worker = temp.0.join("source-worker");
+    let manager_db = make_database(&manager, "manager.sqlite3", 12);
+    let worker_db = make_database(&worker, "worker.sqlite3", 4);
+    let archive = temp.0.join("pre-upgrade.tar");
+
+    let backup = run(&[
+        "backup",
+        "create",
+        "--manager-data-dir",
+        manager.to_str().unwrap(),
+        "--worker-data-dir",
+        worker.to_str().unwrap(),
+        "--output",
+        archive.to_str().unwrap(),
+    ]);
+    assert_success(backup);
+
+    // Model the candidate leaving an unsupported schema marker after a failed
+    // migration, and a worker observation arriving after the backup point.
+    Connection::open(&manager_db)
+        .unwrap()
+        .pragma_update(None, "user_version", 77_i64)
+        .unwrap();
+    Connection::open(&worker_db)
+        .unwrap()
+        .execute(
+            "INSERT INTO retained VALUES ('post-backup-observation', 'not-in-snapshot')",
+            [],
+        )
+        .unwrap();
+
+    let preflight = run(&[
+        "upgrade",
+        "preflight",
+        "--manager-data-dir",
+        manager.to_str().unwrap(),
+        "--worker-data-dir",
+        worker.to_str().unwrap(),
+        "--output",
+        "json",
+    ]);
+    assert!(!preflight.status.success());
+    let report: serde_json::Value =
+        serde_json::from_slice(&preflight.stdout).expect("JSON upgrade preflight report");
+    assert_eq!(report["schemaMarkersSupported"], false);
+    assert_eq!(report["databases"][0]["state"], "unsupported");
+    let candidate_version: i64 = Connection::open(&manager_db)
+        .unwrap()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(
+        candidate_version, 77,
+        "preflight must not change candidate state"
+    );
+
+    let restored = temp.0.join("restored-after-failure");
+    let restore = run(&[
+        "backup",
+        "restore",
+        "--input",
+        archive.to_str().unwrap(),
+        "--destination",
+        restored.to_str().unwrap(),
+    ]);
+    assert_success(restore);
+
+    let restored_manager = Connection::open(restored.join("manager/manager.sqlite3")).unwrap();
+    let restored_manager_version: i64 = restored_manager
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(restored_manager_version, 12);
+    let restored_worker = Connection::open(restored.join("worker/worker.sqlite3")).unwrap();
+    let restored_worker_version: i64 = restored_worker
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(restored_worker_version, 4);
+    let post_backup_rows: i64 = restored_worker
+        .query_row(
+            "SELECT COUNT(*) FROM retained WHERE id = 'post-backup-observation'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        post_backup_rows, 0,
+        "restore must return to the matching backup point"
+    );
+    drop(restored_manager);
+    drop(restored_worker);
+
+    let config = temp.0.join("restored-agent.json");
+    let config_json = serde_json::json!({
+        "role": "manager",
+        "listen": "127.0.0.1:0",
+        "manager_data_dir": restored.join("manager"),
+        "worker_transport_listen": "127.0.0.1:0",
+        "worker_id": "recovery-drill-worker",
+        "worker_transport_capacity": 1,
+        "api_access": {"mode": "local"},
+        "manager_identity_dir": temp.0.join("restored-identity"),
+        "manager_server_name": "localhost"
+    });
+    fs::write(&config, serde_json::to_vec(&config_json).unwrap()).unwrap();
+    let blocked_start = run(&["agent", "--config", config.to_str().unwrap()]);
+    assert!(!blocked_start.status.success());
+    assert!(
+        String::from_utf8_lossy(&blocked_start.stderr).contains("recovery clearance"),
+        "stderr: {}",
+        String::from_utf8_lossy(&blocked_start.stderr)
+    );
+
+    let unconfirmed = run(&[
+        "backup",
+        "recovery-resolve",
+        "--manager-data-dir",
+        restored.join("manager").to_str().unwrap(),
+        "--worker-data-dir",
+        restored.join("worker").to_str().unwrap(),
+    ]);
+    assert!(!unconfirmed.status.success());
+    assert!(
+        restored
+            .join("manager/.conductor-recovery-required")
+            .is_file()
+            && restored
+                .join("worker/.conductor-recovery-required")
+                .is_file(),
+        "recovery hold must remain until both confirmations are supplied"
+    );
+
+    let resolved = run(&[
+        "backup",
+        "recovery-resolve",
+        "--manager-data-dir",
+        restored.join("manager").to_str().unwrap(),
+        "--worker-data-dir",
+        restored.join("worker").to_str().unwrap(),
+        "--confirm-workers-fenced",
+        "--confirm-unknown-outcomes-reviewed",
+    ]);
+    assert_success(resolved);
+    assert!(
+        !restored
+            .join("manager/.conductor-recovery-required")
+            .exists()
+            && !restored
+                .join("worker/.conductor-recovery-required")
+                .exists()
+    );
+}
+
+#[test]
 fn backup_rejects_symlinks_and_busy_state_locks() {
     let temp = TempDir::new();
     let manager = temp.0.join("manager");
