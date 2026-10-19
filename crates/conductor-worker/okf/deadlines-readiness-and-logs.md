@@ -3,7 +3,7 @@ type: Reference
 title: Worker deadlines, readiness, logs, and inventory
 description: Supervisors enforce execution deadlines, collect bounded streams, report readiness, and advertise host capabilities.
 status: stable
-source_revision: d71b592
+source_revision: 7365053
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/lib.rs
