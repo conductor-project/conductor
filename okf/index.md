@@ -19,6 +19,7 @@ surrounding repository checkout.
 - [Package installation and recovery acceptance](package-lifecycle-acceptance.md) - planned local package lifecycle scenarios and evidence requirements.
 - [Platforms and evidence](platforms-and-evidence.md) - supported targets, enforcement boundaries, and qualification evidence.
 - [Release and support policy](release-and-support-policy.md) - supported release lines, backports, security handling, and publication rules.
+- [Linux package installation](../docs/package-install.md) - package verification, first configuration, service start, upgrade, and removal.
 - [README walkthrough evidence](walkthrough-evidence.md) - recorded local debug-only first-job and cancellation run.
 
 ## Project structure

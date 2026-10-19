@@ -1,0 +1,21 @@
+[Unit]
+Description=Conductor job and service manager
+After=network.target
+
+[Service]
+Type=simple
+User=conductor
+Group=conductor
+WorkingDirectory=/var/lib/conductor
+StateDirectory=conductor
+StateDirectoryMode=0700
+ExecStart=/usr/bin/conductor agent --config /etc/conductor/agent.json
+Restart=no
+KillSignal=SIGTERM
+TimeoutStopSec=15s
+KillMode=control-group
+Delegate=cpu memory pids
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -26,15 +26,19 @@ sources:
 
 | Target | CI status | Scope and limit |
 | --- | --- | --- |
-| Linux x86_64 | PR and post-merge jobs | Debug and release builds/tests on Ubuntu; Linux-only cgroup v2 and Landlock checks run here. |
+| Linux x86_64 | PR and post-merge jobs | Debug/release builds and tests, plus package construction and binary-identity checks on Ubuntu 26.04. Distribution installation/runtime qualification is separate. |
+| Linux arm64 | PR and post-merge jobs | Native debug/release builds and tests, plus package construction and binary-identity checks on Ubuntu 26.04 arm64. Distribution installation/runtime qualification is separate. |
 | Apple silicon macOS | PR and post-merge jobs | Debug and release builds/tests on the current macOS runner; Intel macOS is explicitly skipped. |
-| Linux arm64 | Not in current matrix | Build and runtime qualification are not established by these workflows. |
 | Intel macOS | Not in current matrix | Do not infer support from Apple silicon results. |
 
-The PR workflow runs debug checks. The merge workflow runs release tests and
-builds after merge. A passing CI job establishes the specific checks it ran on
-that runner and commit; it is not universal hardware, kernel, filesystem, or
-network evidence.
+The PR workflow runs CodeQL, debug checks, and non-published debug packages.
+The merge workflow runs CodeQL, release tests/builds, and signed/attested
+package artifacts on trusted pushes to `main` and `release/*`. Package checks
+compare the binary extracted from each package to the matching workflow
+artifact. A passing CI job establishes the specific checks it ran on that
+runner and commit; it is not universal hardware, kernel, filesystem, network,
+or target-distribution installation evidence. See the [package installation
+guide](../docs/package-install.md) for target distributions and operator steps.
 
 The configuration accepts `worker_concurrency` from 1 through 64. This is an
 admission ceiling per worker, not a measured 64-run capacity qualification or

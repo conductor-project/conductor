@@ -14,6 +14,10 @@ sources:
     title: Pull request checks
   - resource: ../.github/workflows/merge.yml
     title: Post-merge release checks
+  - resource: ../scripts/package-linux.sh
+    title: Native package construction and binary identity checks
+  - resource: ../docs/package-install.md
+    title: Operator package installation and verification
 ---
 
 # Policy authority
@@ -25,10 +29,13 @@ that file. Read `dependency-decisions.md` before changing dependencies.
 
 # Checks
 
-The PR workflow runs dependency policy, formatting, all-target debug builds,
-Clippy, and workspace debug tests on the configured OS matrix. Release builds
-and tests run only in the post-merge workflow, except when reproducing a
-specific CI failure. Follow the exact check commands in `AGENTS.md` rather than
+The PR workflow runs Rust CodeQL analysis, dependency policy, formatting,
+all-target debug builds, Clippy, and workspace debug tests on native Linux
+x86_64/arm64 and macOS runners. It packages debug binaries from same-run
+artifacts without signing credentials. The post-merge workflow runs CodeQL,
+release builds/tests, and Linux package construction from matching binary
+artifacts; package signatures and provenance are restricted to that trusted
+workflow. Follow the exact local check commands in `AGENTS.md` rather than
 using this summary as a policy source.
 
 # Documentation maintenance
