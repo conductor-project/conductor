@@ -3,7 +3,7 @@ type: Runbook
 title: Operations and recovery
 description: Use health and readiness correctly, plan graceful shutdown, and resolve uncertain work after restart.
 status: stable
-source_revision: aa3ed5a1e2cc15ed9a7216067d18278b4ce99e37
+source_revision: ae824f0a6ed7242e589b340243d46897c3b67877
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../crates/conductor-api/src/lib.rs
@@ -196,18 +196,27 @@ migration fails. These synthetic debug-test fixtures establish transaction
 behavior only; they are not fixtures from a published release and do not qualify
 a release-to-release upgrade.
 
+The binary-level test
+`failed_upgrade_restores_matching_backup_and_keeps_recovery_hold_until_confirmed`
+also exercises a failed candidate preflight, restore from the matching
+pre-upgrade manager/worker backup, and startup blocking until the operator
+confirms worker fencing and unknown-outcome review. It verifies that state
+written after the backup is absent after restore. This isolated CLI fixture
+proves the backup/recovery gate behavior; it does not exercise a live surviving
+worker or reconcile a running workload.
+
 Local debug verification on source revision
-`aa3ed5a1e2cc15ed9a7216067d18278b4ce99e37` plus the migration failure tests in
-this change:
+`ae824f0a6ed7242e589b340243d46897c3b67877` plus the migration and recovery
+tests in this change:
 
 - `python3 scripts/check-dependency-policy.py` — passed.
 - `cargo fmt --all -- --check` — passed.
 - `cargo clippy --workspace --locked --all-targets --all-features -- -D warnings` — passed.
-- `cargo test --workspace --locked --all-targets --all-features` — 270 tests passed across 27 suites. The first sandboxed attempt could not bind loopback listeners; the same command passed when rerun with local loopback permission.
+- `cargo test --workspace --locked --all-targets --all-features` — 271 tests passed across 27 suites with local loopback permission.
 
 This is local debug test evidence only. No release build/test, stable previous-
-release upgrade, package qualification, or failed-upgrade backup drill is
-claimed here.
+release upgrade, package qualification, or recovery drill with a live surviving
+worker/workload is claimed here.
 
 The release policy and the upgrade evidence are separate: the policy defines
 which stable lines are intended to receive support, while a supported upgrade
