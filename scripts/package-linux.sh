@@ -63,36 +63,9 @@ Depends: adduser, systemd
 Description: daemon for submitting one-shot jobs and managing service deployments
  Conductor runs jobs and manages services on hosts operated by the administrator.
 EOF
-cat > "$deb_root/DEBIAN/postinst" <<'EOF'
-#!/bin/sh
-set -e
-if [ "$1" = configure ]; then
-    if ! getent passwd conductor >/dev/null; then
-        adduser --system --group --no-create-home --home /var/lib/conductor conductor
-    fi
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl daemon-reload || true
-    fi
-fi
-exit 0
-EOF
-cat > "$deb_root/DEBIAN/prerm" <<'EOF'
-#!/bin/sh
-set -e
-if [ "$1" = remove ] && command -v deb-systemd-invoke >/dev/null 2>&1; then
-    deb-systemd-invoke stop conductor.service || true
-fi
-exit 0
-EOF
-cat > "$deb_root/DEBIAN/postrm" <<'EOF'
-#!/bin/sh
-set -e
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload || true
-fi
-exit 0
-EOF
-chmod 0755 "$deb_root/DEBIAN/postinst" "$deb_root/DEBIAN/prerm" "$deb_root/DEBIAN/postrm"
+for maintainer_script in postinst prerm postrm; do
+  install -m 0755 "packaging/debian/$maintainer_script" "$deb_root/DEBIAN/$maintainer_script"
+done
 cp -R "$root"/. "$deb_root"/
 dpkg-deb --root-owner-group --build --uniform-compression "$deb_root" "$deb"
 
@@ -104,62 +77,8 @@ cmp "$binary" "$deb_extract/usr/bin/conductor"
 rpm_top="$work/rpmbuild"
 mkdir -p "$rpm_top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
 tar -C "$work" -czf "$rpm_top/SOURCES/conductor-package.tar.gz" root
-cat > "$rpm_top/SPECS/conductor.spec" <<EOF
-%global debug_package %{nil}
-# Preserve the exact prebuilt executable in the package payload. The default
-# RPM install-post hooks strip binaries and rewrite ELF notes in the buildroot.
-%global __os_install_post %{nil}
-Name: conductor
-Version: $version
-Release: 1
-Summary: Conductor job and service manager
-License: Apache-2.0
-URL: https://github.com/conductor-project/conductor
-Source0: conductor-package.tar.gz
-BuildArch: $rpm_arch
-Requires(pre): shadow-utils
-Requires: systemd
-
-%description
-Daemon for submitting one-shot jobs and managing service deployments on hosts operated by the administrator.
-
-%prep
-%setup -q -n root
-
-%build
-
-%install
-mkdir -p %{buildroot}/usr/bin %{buildroot}/usr/lib/systemd/system
-mkdir -p %{buildroot}/usr/share/doc/conductor/examples %{buildroot}/usr/share/licenses/conductor
-install -m 0755 usr/bin/conductor %{buildroot}/usr/bin/conductor
-install -m 0644 usr/lib/systemd/system/conductor.service %{buildroot}/usr/lib/systemd/system/conductor.service
-install -m 0644 usr/share/doc/conductor/INSTALL.md %{buildroot}/usr/share/doc/conductor/INSTALL.md
-install -m 0644 usr/share/doc/conductor/examples/agent.json %{buildroot}/usr/share/doc/conductor/examples/agent.json
-install -m 0644 usr/share/doc/conductor/copyright %{buildroot}/usr/share/licenses/conductor/LICENSE.md
-
-%pre
-getent passwd conductor >/dev/null || useradd --system --user-group --no-create-home --home-dir /var/lib/conductor --shell /sbin/nologin conductor
-
-%post
-systemctl daemon-reload >/dev/null 2>&1 || :
-
-%preun
-if [ "\$1" -eq 0 ]; then
-    systemctl stop conductor.service >/dev/null 2>&1 || :
-fi
-
-%postun
-systemctl daemon-reload >/dev/null 2>&1 || :
-
-%files
-%attr(0755,root,root) /usr/bin/conductor
-%attr(0644,root,root) /usr/lib/systemd/system/conductor.service
-%attr(0644,root,root) /usr/share/doc/conductor/INSTALL.md
-%attr(0644,root,root) /usr/share/doc/conductor/examples/agent.json
-%license /usr/share/licenses/conductor/LICENSE.md
-
-EOF
-rpmbuild --define "_topdir $rpm_top" -bb "$rpm_top/SPECS/conductor.spec"
+cp packaging/rpm/conductor.spec "$rpm_top/SPECS/conductor.spec"
+rpmbuild --define "_topdir $rpm_top" --define "package_version $version" --define "package_arch $rpm_arch" -bb "$rpm_top/SPECS/conductor.spec"
 rpm_source=$(find "$rpm_top/RPMS" -type f -name '*.rpm' -print -quit)
 [[ -n "$rpm_source" ]] || { echo "RPM package was not produced" >&2; exit 1; }
 rpm_output="$output_dir/conductor-${version}-1.${rpm_arch}.rpm"

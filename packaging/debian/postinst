@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+if [ "$1" = configure ]; then
+    if ! getent passwd conductor >/dev/null; then
+        adduser --system --group --no-create-home --home /var/lib/conductor conductor
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload || true
+    fi
+fi
+exit 0
