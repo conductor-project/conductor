@@ -334,6 +334,7 @@ fn collect_state_directory(
             || name == database_name
             || name == format!("{database_name}-wal")
             || name == format!("{database_name}-shm")
+            || name == format!("{database_name}-journal")
         {
             continue;
         }

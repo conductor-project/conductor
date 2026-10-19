@@ -107,7 +107,10 @@ fn backup_round_trip_preserves_databases_logs_included_identity_and_recovery_hol
     let manager = temp.0.join("source-manager");
     let worker = temp.0.join("source-worker");
     let manager_db = make_database(&manager, "manager.sqlite3", 12);
-    make_database(&worker, "worker.sqlite3", 4);
+    let worker_db = make_database(&worker, "worker.sqlite3", 4);
+    fs::write(manager.join("manager.sqlite3-journal"), []).expect("write manager journal fixture");
+    fs::write(worker_db.with_file_name("worker.sqlite3-journal"), [])
+        .expect("write worker journal fixture");
     let run_logs = worker.join("runs");
     fs::create_dir_all(&run_logs).expect("create worker log directory");
     fs::write(run_logs.join("run-1.stdout"), b"retained output\n").expect("write worker log");
@@ -169,6 +172,14 @@ fn backup_round_trip_preserves_databases_logs_included_identity_and_recovery_hol
     assert_eq!(
         fs::read(restored.join("worker/runs/run-1.stdout")).expect("read restored worker log"),
         b"retained output\n"
+    );
+    assert!(
+        !restored.join("manager/manager.sqlite3-journal").exists(),
+        "a SQLite rollback journal must not be paired with the database snapshot"
+    );
+    assert!(
+        !restored.join("worker/worker.sqlite3-journal").exists(),
+        "a SQLite rollback journal must not be paired with the database snapshot"
     );
     assert_eq!(
         fs::read(restored.join("included/0000/worker-ca-key.pem")).expect("read restored identity"),
