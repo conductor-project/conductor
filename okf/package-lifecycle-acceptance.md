@@ -35,7 +35,9 @@ Final execution depends on the package workflow and artifacts from #132, the
 compatibility and preflight behavior from #134, and the diagnostics coverage
 from #136. The offline backup and restore commands are provided by #133. This
 plan must be reconciled with the final delivered commands before it is treated
-as operator guidance.
+as operator guidance. A supported release-to-release upgrade cannot be
+qualified until a prior supported release exists; a temporary version override
+or a debug package is useful fixture input but is not release-upgrade evidence.
 
 # Fixture contract
 
@@ -62,7 +64,7 @@ as operator guidance.
 | Fresh install | Install each package on its selected distribution with no operator config. | Package files, dedicated account, paths, ownership, and unit match the package contract. The service is not enabled or started before explicit valid configuration is installed. |
 | Configure and workload | Install isolated manager/worker configuration and identity; start the packaged service; wait for readiness; submit and inspect a job; deploy a service and verify its endpoints. | Job and service reach the documented states, and persistent state is written only under the configured paths. |
 | Drain and stop | Drain the worker, wait for the bounded drain result, stop the service, then inspect status and logs. | No new assignment is accepted after drain; shutdown follows the documented policy; stored run and service state remains inspectable. |
-| Upgrade | Seed active and completed records, stop or drain as documented, back up both state and external config/identity, then install the next compatible package. | Package restart policy is followed. Config and state hashes remain unchanged except for documented migration writes. Preflight and post-upgrade inspection report the expected versions and records. |
+| Upgrade | Seed active and completed records, stop or drain as documented, back up both state and external config/identity, then install the next compatible package. Record whether the baseline is a supported published release or a temporary debug fixture. | Package restart policy is followed. Config and state hashes remain unchanged except for documented migration writes. Preflight and post-upgrade inspection report the expected versions and records. Only a supported published baseline counts as release-upgrade qualification. |
 | Interrupted maintenance | Stop between backup, package replacement, and explicit restart; resume using the documented runbook. | No package hook starts the daemon with absent/invalid config or silently crosses an irreversible migration boundary. Each interruption point has a documented recovery action. |
 | Manager/worker crash and lost connection | Terminate only the fixture-owned daemon/process; partition or pause the fixture's worker connection; restore connectivity and inspect. | Recovered work is not silently replayed. If execution cannot be established, the run remains `unknown` until an explicit operator resolution; diagnostics identify actionable blockers without claiming success. |
 | Migration failure | Present a copied fixture database with a future or deliberately invalid schema marker to the preflight/start path. | Preflight/start blocks as documented, retains the original state, and exposes enough diagnostics to select recovery. No in-place downgrade is attempted. |
