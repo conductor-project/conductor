@@ -106,6 +106,9 @@ mkdir -p "$rpm_top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
 tar -C "$work" -czf "$rpm_top/SOURCES/conductor-package.tar.gz" root
 cat > "$rpm_top/SPECS/conductor.spec" <<EOF
 %global debug_package %{nil}
+# Preserve the exact prebuilt executable in the package payload. The default
+# RPM install-post hooks strip binaries and rewrite ELF notes in the buildroot.
+%global __os_install_post %{nil}
 Name: conductor
 Version: $version
 Release: 1
