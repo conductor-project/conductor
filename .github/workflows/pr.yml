@@ -11,13 +11,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  codeql:
+    name: CodeQL (Rust)
+    runs-on: ubuntu-26.04
+    env:
+      RUSTUP_TOOLCHAIN: 1.99.1
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Rust 1.99.1 for CodeQL Rust extraction
+        run: rustup toolchain install 1.99.1 --profile minimal
+      - uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          languages: rust
+          build-mode: none
+      - uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+
   debug:
-    name: Debug (${{ matrix.os }})
+    name: Debug (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-26.04, macos-latest]
+        include:
+          - name: Linux x86_64
+            os: ubuntu-26.04
+            artifact: conductor-linux-x86_64-debug
+            package: true
+          - name: Linux arm64
+            os: ubuntu-26.04-arm
+            artifact: conductor-linux-arm64-debug
+            package: true
+          - name: macOS
+            os: macos-latest
+            package: false
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: actions/cache@d4323d4df104b026a6aa633fdb11d772146be0bf # v4.2.2
@@ -26,10 +55,62 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-rust-1.99.1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          key: ${{ runner.os }}-${{ runner.arch }}-debug-rust-1.99.1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
       - name: Install Rust 1.99.1
         run: rustup toolchain install 1.99.1 --profile minimal
+      - name: Check dependency policy
+        run: python3 scripts/check-dependency-policy.py
+      - name: Check formatting
+        run: cargo +1.99.1 fmt --all -- --check
       - name: Build debug
         run: cargo +1.99.1 build --workspace --locked --all-targets --all-features
+      - name: Run Clippy
+        run: cargo +1.99.1 clippy --workspace --locked --all-targets --all-features -- -D warnings
       - name: Test debug
         run: cargo +1.99.1 test --workspace --locked --all-targets --all-features
+      - name: Upload debug binary for native package architecture
+        if: matrix.package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/debug/conductor
+          if-no-files-found: error
+          retention-days: 30
+
+  package:
+    name: Debug packages (${{ matrix.name }})
+    needs: [codeql, debug]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x86_64
+            os: ubuntu-26.04
+            artifact: conductor-linux-x86_64-debug
+            deb_arch: amd64
+            rpm_arch: x86_64
+          - name: Linux arm64
+            os: ubuntu-26.04-arm
+            artifact: conductor-linux-arm64-debug
+            deb_arch: arm64
+            rpm_arch: aarch64
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: package-input
+      - name: Install RPM packaging tools
+        run: sudo apt-get update && sudo apt-get install --yes rpm rpm2cpio cpio elfutils
+      - name: Read workspace version
+        id: version
+        run: echo "value=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')" >> "$GITHUB_OUTPUT"
+      - name: Build packages from the matching debug binary
+        run: scripts/package-linux.sh '${{ matrix.deb_arch }}' '${{ matrix.rpm_arch }}' '${{ steps.version.outputs.value }}' package-input/conductor packaging-output "$GITHUB_SHA" debug
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: conductor-linux-packages-${{ matrix.rpm_arch }}-debug
+          path: packaging-output/*
+          if-no-files-found: error
+          retention-days: 30

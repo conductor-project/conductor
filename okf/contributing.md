@@ -3,7 +3,7 @@ type: Reference
 title: Contributing and maintaining knowledge
 description: Repository contribution policy is authoritative in AGENTS.md; OKF pages provide descriptive source-linked knowledge.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: 79594cf7977e9703bc6876ce5bbd7719edfb4b3e
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../AGENTS.md
@@ -14,6 +14,18 @@ sources:
     title: Pull request checks
   - resource: ../.github/workflows/merge.yml
     title: Post-merge release checks
+  - resource: ../scripts/package-linux.sh
+    title: Native package orchestration and binary identity checks
+  - resource: ../packaging/debian/postinst
+    title: Debian post-install lifecycle
+  - resource: ../packaging/debian/prerm
+    title: Debian pre-removal lifecycle
+  - resource: ../packaging/debian/postrm
+    title: Debian post-removal lifecycle
+  - resource: ../packaging/rpm/conductor.spec
+    title: RPM package specification and lifecycle
+  - resource: ../docs/package-install.md
+    title: Operator package installation and verification
 ---
 
 # Policy authority
@@ -25,10 +37,13 @@ that file. Read `dependency-decisions.md` before changing dependencies.
 
 # Checks
 
-The PR workflow runs dependency policy, formatting, all-target debug builds,
-Clippy, and workspace debug tests on the configured OS matrix. Release builds
-and tests run only in the post-merge workflow, except when reproducing a
-specific CI failure. Follow the exact check commands in `AGENTS.md` rather than
+The PR workflow runs Rust CodeQL analysis, dependency policy, formatting,
+all-target debug builds, Clippy, and workspace debug tests on native Linux
+x86_64/arm64 and macOS runners. It packages debug binaries from same-run
+artifacts without signing credentials. The post-merge workflow runs CodeQL,
+release builds/tests, and Linux package construction from matching binary
+artifacts; package signatures and provenance are restricted to that trusted
+workflow. Follow the exact local check commands in `AGENTS.md` rather than
 using this summary as a policy source.
 
 # Documentation maintenance

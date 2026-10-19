@@ -8,8 +8,10 @@ network access; they are not sandboxed by default.
 
 ## Platforms and prerequisites
 
-The current CI exercises Linux x86_64 and Apple silicon macOS. Linux arm64 has
-not been qualified; Intel macOS is outside the current CI scope. See the
+The current CI exercises Linux x86_64, Linux arm64, and Apple silicon macOS;
+Intel macOS is outside the current CI scope. Package files are checked on the
+native Linux runners, but target-distribution installation and runtime
+qualification are not established by those jobs. See the
 [platform and evidence guide](okf/platforms-and-evidence.md) for the limits of
 those claims. This repository does not publish downloadable binaries or
 package-manager installs. [Install Rustup](https://rustup.rs/) for your OS,
@@ -451,6 +453,15 @@ token. Plain HTTP to non-loopback hosts is rejected. Use
 Resource-oriented CLI commands use concise human output by default; use
 `--output json` for JSON output. `conductor completions SHELL` generates
 completion scripts for Bash, Elvish, Fish, PowerShell, and Zsh.
+
+## Linux packages
+
+The first planned Debian/RPM packages target Debian 13 and Rocky Linux 10 on
+x86_64 and arm64. No packages have been published yet. Packages will preserve
+operator configuration and persistent state, and require an explicit
+configuration and manual service start. See the [package installation and
+verification guide](docs/package-install.md) for the install, upgrade,
+removal, checksum, signature, and provenance procedures.
 
 ## Next steps
 

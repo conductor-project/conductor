@@ -3,13 +3,21 @@ type: Reference
 title: Platform support and evidence
 description: Platform claims are scoped to source, tests, workflows, and the exact execution environment that produced evidence.
 status: stable
-source_revision: a739b4c20dd8e81ded656dfa7bb9859f48d73f9e
+source_revision: ad530e7f6283fb4fc51c94ef3aaf7bff924f6e2e
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../.github/workflows/pr.yml
     title: Pull request debug workflow
   - resource: ../.github/workflows/merge.yml
     title: Post-merge release workflow
+  - resource: ../packaging/rpm/conductor.spec
+    title: RPM payload construction and lifecycle hooks
+  - resource: ../packaging/debian/postinst
+    title: Debian package post-install behavior
+  - resource: ../packaging/debian/prerm
+    title: Debian package pre-removal behavior
+  - resource: ../packaging/debian/postrm
+    title: Debian package post-removal behavior
   - resource: ../crates/conductor-worker/src/lib.rs
     title: Host inventory collection
   - resource: ../crates/conductor/tests/macos_multiprocess.rs
@@ -26,15 +34,19 @@ sources:
 
 | Target | CI status | Scope and limit |
 | --- | --- | --- |
-| Linux x86_64 | PR and post-merge jobs | Debug and release builds/tests on Ubuntu; Linux-only cgroup v2 and Landlock checks run here. |
+| Linux x86_64 | PR and post-merge jobs; local target checks | Debug/release builds and tests, plus package construction and binary-identity checks on Ubuntu 26.04. Debian 13 `.deb` lifecycle passed on a native host, and Debian 13 `.deb` plus Rocky Linux 10.2 `.rpm` debug-package upgrades passed in local systemd containers. Rocky `.rpm` install/runtime/remove/reinstall also passed. Upgrades from a supported published release remain unqualified. See [Debian evidence](../docs/package-install.md#local-debian-13-x86_64-qualification-2026-10-19) and [Rocky evidence](../docs/package-install.md#local-rocky-linux-10-x86_64-qualification-2026-10-19). |
+| Linux arm64 | PR and post-merge jobs; local target fixtures | Native debug/release builds and tests, plus package construction and binary-identity checks on Ubuntu 26.04 arm64. Debian 13 and Rocky Linux 10 arm64 install/remove/reinstall, systemd start/stop, and 0.1.0-to-0.1.1 upgrade were verified in local arm64 Docker fixtures; see [package evidence](../docs/package-install.md#local-arm64-qualification-2026-10-19). |
 | Apple silicon macOS | PR and post-merge jobs | Debug and release builds/tests on the current macOS runner; Intel macOS is explicitly skipped. |
-| Linux arm64 | Not in current matrix | Build and runtime qualification are not established by these workflows. |
 | Intel macOS | Not in current matrix | Do not infer support from Apple silicon results. |
 
-The PR workflow runs debug checks. The merge workflow runs release tests and
-builds after merge. A passing CI job establishes the specific checks it ran on
-that runner and commit; it is not universal hardware, kernel, filesystem, or
-network evidence.
+The PR workflow runs CodeQL, debug checks, and non-published debug packages.
+The merge workflow runs CodeQL, release tests/builds, and signed/attested
+package artifacts on trusted pushes to `main` and `release/*`. Package checks
+compare the binary extracted from each package to the matching workflow
+artifact. A passing CI job establishes the specific checks it ran on that
+runner and commit; it is not universal hardware, kernel, filesystem, network,
+or target-distribution installation evidence. See the [package installation
+guide](../docs/package-install.md) for target distributions and operator steps.
 
 The configuration accepts `worker_concurrency` from 1 through 64. This is an
 admission ceiling per worker, not a measured 64-run capacity qualification or
