@@ -292,6 +292,9 @@ binary's preflight before installing or starting it. Start the manager before
 workers. If migration begins, do not downgrade; restore the matching backup
 and reconcile surviving workloads. See the [upgrade compatibility policy and
 rollback sequence](okf/operations-and-recovery.md#upgrade-compatibility-policy).
+If a worker's protocol version or required capabilities are incompatible with
+the manager, the poll returns HTTP `426` and the worker exits with a diagnostic
+to install matching Conductor versions rather than retrying indefinitely.
 
 Stopping a run is different from stopping the daemon. To stop the daemon, press
 Ctrl-C in Terminal A and wait for its shutdown to finish. Job definitions and

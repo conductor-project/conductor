@@ -131,6 +131,7 @@ pub enum TransportError {
     InvalidEndpoint,
     InvalidIdentity,
     Protocol(ProtocolNegotiationError),
+    IncompatibleProtocol,
     Unavailable,
     QueueFull,
     WorkerConflict,
@@ -149,6 +150,7 @@ impl std::fmt::Display for TransportError {
             }
             Self::InvalidIdentity => "worker transport client identity is invalid",
             Self::Protocol(_) => "worker and manager do not share a supported transport protocol",
+            Self::IncompatibleProtocol => "worker and manager protocol versions or required capabilities are incompatible; install matching Conductor versions",
             Self::Unavailable => "remote worker is unavailable",
             Self::QueueFull => "remote worker command queue is full",
             Self::WorkerConflict => {
@@ -211,6 +213,11 @@ async fn poll_worker(
     };
     match session.poll(request).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Err(StatusCode::UPGRADE_REQUIRED) => (
+            StatusCode::UPGRADE_REQUIRED,
+            "worker and manager protocol versions or required capabilities are incompatible",
+        )
+            .into_response(),
         Err(status) => (status, "worker poll rejected").into_response(),
     }
 }
@@ -279,6 +286,7 @@ fn map_transport_error(error: TransportError) -> WorkerPortError {
         TransportError::InvalidEndpoint
         | TransportError::InvalidIdentity
         | TransportError::Protocol(_)
+        | TransportError::IncompatibleProtocol
         | TransportError::WorkerConflict
         | TransportError::WorkerLimitReached
         | TransportError::InvalidCommand
@@ -1220,6 +1228,29 @@ mod tests {
             .await
             .expect("oversized route response");
         assert_eq!(oversized.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn incompatible_protocol_poll_returns_actionable_upgrade_diagnostic() {
+        let hub = WorkerTransportHub::default();
+        hub.register_worker(
+            WorkerDescriptor::new(worker_id("worker-a"), 4, true).with_incarnation(9),
+            offer(3),
+        )
+        .expect("register worker");
+        let router = hub.router(Arc::new(TestAuthenticator(Some(worker_id("worker-a")))));
+        let response = router
+            .oneshot(request(
+                serde_json::to_vec(&poll_request("worker-a", 2)).expect("serialize poll"),
+            ))
+            .await
+            .expect("incompatible poll response");
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        let body = axum::body::to_bytes(response.into_body(), 256)
+            .await
+            .expect("read upgrade diagnostic");
+        let diagnostic = String::from_utf8(body.to_vec()).expect("UTF-8 diagnostic");
+        assert!(diagnostic.contains("protocol versions or required capabilities"));
     }
 
     #[tokio::test]

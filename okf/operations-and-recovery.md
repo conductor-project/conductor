@@ -186,7 +186,7 @@ development builds are not a supported upgrade source.
 | --- | --- | --- |
 | CLI binary | `0.0.1` | Upgrade all manager and worker binaries together to the same stable release. Untagged builds are unsupported upgrade baselines. |
 | HTTP API | `v1` | Routes are versioned under `/v1`. No cross-release client/server window has been validated; use matching release versions. |
-| Manager-worker transport | Protocol `3` | Protocol negotiation checks version overlap and required capabilities. Mixed Conductor release versions are not a supported operating mode until separately qualified. |
+| Manager-worker transport | Protocol `3` | Negotiation requires an overlapping version and all required capabilities. An incompatible worker poll returns HTTP `426` with a compatibility diagnostic and the worker exits; install matching Conductor versions. Mixed release versions are not a supported operating mode until separately qualified. |
 | Manager database | Schema `12` | Each source migration step is transactional and the current code migrates known earlier markers. This does not prove a real previous-release upgrade. No downgrade is supported after migration. |
 | Worker database | Schema `4` | Independently versioned and migrated during worker startup. This does not prove a real previous-release upgrade. No downgrade is supported after migration. |
 

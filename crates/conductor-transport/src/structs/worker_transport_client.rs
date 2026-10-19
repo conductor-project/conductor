@@ -1,5 +1,17 @@
 use super::*;
 
+fn transport_error_for_status(status: reqwest::StatusCode) -> TransportError {
+    if status == reqwest::StatusCode::UPGRADE_REQUIRED {
+        TransportError::IncompatibleProtocol
+    } else {
+        TransportError::Http
+    }
+}
+
+fn is_permanent_poll_error(error: TransportError) -> bool {
+    matches!(error, TransportError::IncompatibleProtocol)
+}
+
 /// Client certificate credentials and HTTPS endpoint for one worker.
 pub struct WorkerTransportClient {
     pub(super) endpoint: Url,
@@ -121,7 +133,7 @@ impl WorkerTransportClient {
             .await
             .map_err(|_| TransportError::Http)?;
         if !response.status().is_success() {
-            return Err(TransportError::Http);
+            return Err(transport_error_for_status(response.status()));
         }
         if response
             .content_length()
@@ -288,6 +300,7 @@ impl WorkerTransportClient {
                         }
                     }
                 }
+                Err(error) if is_permanent_poll_error(error) => return Err(error),
                 Err(_) => {
                     failures = failures.saturating_add(1);
                     tokio::select! {
@@ -301,5 +314,30 @@ impl WorkerTransportClient {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upgrade_required_response_is_protocol_incompatibility_not_network_failure() {
+        assert_eq!(
+            transport_error_for_status(reqwest::StatusCode::UPGRADE_REQUIRED),
+            TransportError::IncompatibleProtocol
+        );
+        assert_eq!(
+            transport_error_for_status(reqwest::StatusCode::SERVICE_UNAVAILABLE),
+            TransportError::Http
+        );
+        assert_eq!(
+            TransportError::IncompatibleProtocol.to_string(),
+            "worker and manager protocol versions or required capabilities are incompatible; install matching Conductor versions"
+        );
+        assert!(is_permanent_poll_error(
+            TransportError::IncompatibleProtocol
+        ));
+        assert!(!is_permanent_poll_error(TransportError::Http));
     }
 }
