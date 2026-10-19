@@ -29,41 +29,39 @@ concurrency:
 
 jobs:
   promote:
-    name: Verify and prepare release
+    name: Verify release candidate
     runs-on: ubuntu-26.04
     permissions:
       actions: read
       attestations: read
-      contents: write
+      contents: read
+    outputs:
+      version: ${{ steps.candidate.outputs.version }}
+      line: ${{ steps.candidate.outputs.line }}
+      sha: ${{ steps.candidate.outputs.sha }}
+      run_id: ${{ steps.run.outputs.id }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           ref: ${{ github.event_name == 'push' && github.ref || inputs.tag }}
           fetch-depth: 0
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event_name == 'push' && github.event.repository.default_branch || github.sha }}
+          path: workflow-source
+          fetch-depth: 1
       - name: Verify release tag, authorized branch, and version
         id: candidate
         env:
           RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          version=${RELEASE_TAG#v}
           manifest_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
-          [[ "$manifest_version" == "$version" ]]
-          major=$(sed -E 's/^v([0-9]+)\.([0-9]+)\.([0-9]+)$/\1/' <<<"$RELEASE_TAG")
-          minor=$(sed -E 's/^v([0-9]+)\.([0-9]+)\.([0-9]+)$/\2/' <<<"$RELEASE_TAG")
-          sha=$(git rev-parse "${RELEASE_TAG}^{commit}")
-          line="$major.$minor"
-          if git merge-base --is-ancestor "$sha" origin/main; then
-            branch=main
-          else
-            branch="release/$line"
-          fi
-          git merge-base --is-ancestor "$sha" "origin/$branch"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "line=$line" >> "$GITHUB_OUTPUT"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          candidate=$(python3 "$GITHUB_WORKSPACE/workflow-source/scripts/resolve-release-ref.py" "$GITHUB_WORKSPACE" "$RELEASE_TAG" "$manifest_version")
+          echo "version=$(jq -r .version <<<"$candidate")" >> "$GITHUB_OUTPUT"
+          echo "sha=$(jq -r .sha <<<"$candidate")" >> "$GITHUB_OUTPUT"
+          echo "line=$(jq -r .line <<<"$candidate")" >> "$GITHUB_OUTPUT"
+          echo "branch=$(jq -r .branch <<<"$candidate")" >> "$GITHUB_OUTPUT"
       - name: Find successful trusted build for exact source commit
         id: run
         env:
@@ -118,8 +116,7 @@ jobs:
           gh attestation verify --help >/dev/null
           for arch in x86_64 aarch64; do
             dir="candidate/conductor-linux-packages-${arch}-release"
-            (cd "$dir" && sha256sum --check SHA256SUMS)
-            python3 scripts/verify-release-candidate.py "$dir" "$VERSION" "$SOURCE_SHA" "$arch"
+            python3 "$GITHUB_WORKSPACE/workflow-source/scripts/verify-release-candidate.py" "$dir" "$VERSION" "$SOURCE_SHA" "$arch"
             for package in "$dir"/*.deb "$dir"/*.rpm; do
               cosign verify-blob --bundle "${package}.sigstore.json" --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/merge.yml@refs/heads/${BRANCH}" --certificate-oidc-issuer https://token.actions.githubusercontent.com "$package"
               gh attestation verify "$package" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/merge.yml"
@@ -128,129 +125,38 @@ jobs:
           printf '%s\n' "$SOURCE_SHA" > candidate/SOURCE-COMMIT
           printf 'Tag: %s\nSource commit: %s\nVerified merge run: %s\n' "$RELEASE_TAG" "$SOURCE_SHA" "${{ steps.run.outputs.id }}" > candidate/RELEASE-PROVENANCE.txt
       - name: Stage verified release assets
-        if: github.event_name == 'workflow_dispatch' && (inputs.action == 'publish' || inputs.action == 'approval-rehearsal')
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action != 'rehearse')
         run: |
           set -euo pipefail
           mkdir release-assets
-          cp candidate/conductor-linux-packages-*-release/* release-assets/
+          for arch in aarch64 x86_64; do
+            dir="candidate/conductor-linux-packages-${arch}-release"
+            if [[ "$arch" == aarch64 ]]; then
+              cp "$dir/BUILD-INFO.json" release-assets/BUILD-INFO.json
+              cp "$dir/SHA256SUMS" release-assets/SHA256SUMS
+            else
+              cp "$dir/BUILD-INFO.json" release-assets/BUILD-INFO-x86_64.json
+              sed 's/  BUILD-INFO.json$/  BUILD-INFO-x86_64.json/' \
+                "$dir/SHA256SUMS" > release-assets/SHA256SUMS-x86_64
+            fi
+            for package in "$dir"/*.deb "$dir"/*.rpm; do
+              cp "$package" release-assets/
+              cp "${package}.sigstore.json" release-assets/
+            done
+          done
           cp candidate/SOURCE-COMMIT candidate/RELEASE-PROVENANCE.txt release-assets/
-      - name: Verify existing draft matches verified candidate
-        if: github.event_name == 'workflow_dispatch' && inputs.action == 'publish'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' | grep -qx true
-          gh release download "$RELEASE_TAG" --dir /tmp/published-candidate
-          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/expected-assets
-          find /tmp/published-candidate -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/actual-assets
-          diff -u /tmp/expected-assets /tmp/actual-assets
-          while IFS= read -r file; do cmp "release-assets/$file" "/tmp/published-candidate/$file"; done < /tmp/expected-assets
+          (cd release-assets && sha256sum --check SHA256SUMS SHA256SUMS-x86_64)
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        if: github.event_name == 'workflow_dispatch' && (inputs.action == 'publish' || inputs.action == 'approval-rehearsal')
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.action == 'prepare' || inputs.action == 'publish' || inputs.action == 'approval-rehearsal'))
         with:
           name: verified-release-assets
           path: release-assets/*
           if-no-files-found: error
-          retention-days: 1
-      - name: Create or resume verified draft release
-        if: github.event_name == 'push' || inputs.action == 'prepare'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
-          VERSION: ${{ steps.candidate.outputs.version }}
-          RUN_ID: ${{ steps.run.outputs.id }}
-          SOURCE_SHA: ${{ steps.candidate.outputs.sha }}
-        run: |
-          set -euo pipefail
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            cat > /tmp/release-notes.md <<EOF
-          Verified Conductor release candidate for $VERSION.
-
-          ## Compatibility and upgrade
-
-          This release belongs to the ${{ steps.candidate.outputs.line }} support line. Upgrade manager and worker binaries together. Review the [package installation and upgrade guide](https://github.com/${GITHUB_REPOSITORY}/blob/${RELEASE_TAG}/docs/package-install.md) before upgrading. No database downgrade is supported; use a verified backup and the documented restore procedure for recovery.
-
-          ## Packages and verification
-
-          Debian and RPM packages are provided for x86_64 and arm64. Verify package checksums, Cosign bundles, and GitHub artifact attestations using the package installation guide.
-
-          ## Known limitations
-
-          This release does not provide a hosted APT or DNF repository. Installations require operator-managed package downloads and service configuration.
-
-          Source commit: $SOURCE_SHA
-          Trusted Merge workflow run: $RUN_ID
-          EOF
-            gh release create "$RELEASE_TAG" --draft --title "Conductor $VERSION" --notes-file /tmp/release-notes.md
-          fi
-          gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' | grep -qx true
-          for dir in candidate/conductor-linux-packages-*-release; do
-            for file in "$dir"/*; do
-              name=$(basename "$file")
-              if gh release download "$RELEASE_TAG" --pattern "$name" --dir /tmp/release-existing >/dev/null 2>&1; then
-                cmp "$file" "/tmp/release-existing/$name"
-              else
-                gh release upload "$RELEASE_TAG" "$file"
-              fi
-            done
-          done
-          for file in candidate/SOURCE-COMMIT candidate/RELEASE-PROVENANCE.txt; do
-            name=$(basename "$file")
-            if gh release download "$RELEASE_TAG" --pattern "$name" --dir /tmp/release-existing >/dev/null 2>&1; then
-              cmp "$file" "/tmp/release-existing/$name"
-            else
-              gh release upload "$RELEASE_TAG" "$file"
-            fi
-          done
-          find candidate/conductor-linux-packages-*-release -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/expected-assets
-          printf '%s\n' SOURCE-COMMIT RELEASE-PROVENANCE.txt >> /tmp/expected-assets
-          sort -o /tmp/expected-assets /tmp/expected-assets
-          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort > /tmp/actual-assets
-          diff -u /tmp/expected-assets /tmp/actual-assets
+          retention-days: 90
       - name: Rehearsal completed without release writes
         if: github.event_name == 'workflow_dispatch' && inputs.action == 'rehearse'
         run: echo "Candidate verification succeeded; no release or tag was created or changed."
 
-  publish:
-    name: Protected publication gate
-    if: github.event_name == 'workflow_dispatch' && (inputs.action == 'publish' || inputs.action == 'approval-rehearsal')
-    needs: promote
-    runs-on: ubuntu-26.04
-    environment: release-publication
-    permissions:
-      actions: read
-      contents: write
-    steps:
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
-        if: inputs.action == 'publish'
-        with:
-          name: verified-release-assets
-          path: verified-release-assets
-      - name: Verify release publication environment is protected
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          rules=$(gh api "repos/${GITHUB_REPOSITORY}/environments/release-publication" --jq '.protection_rules // []')
-          jq -e 'any(.[]; .type == "required_reviewers" and (.reviewers | length > 0))' <<<"$rules"
-          jq -e 'any(.[]; .type == "required_reviewers" and .prevent_self_review == true)' <<<"$rules"
-      - name: Complete approval rehearsal without publishing
-        if: inputs.action == 'approval-rehearsal'
-        run: echo "Protected environment approval succeeded; no release was published."
-      - name: Publish the existing draft
-        if: inputs.action == 'publish'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ inputs.tag }}
-        run: |
-          set -euo pipefail
-          draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')
-          [[ "$draft" == true ]]
-          gh release download "$RELEASE_TAG" --dir /tmp/final-release-assets
-          find verified-release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/expected-assets
-          find /tmp/final-release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/actual-assets
-          diff -u /tmp/expected-assets /tmp/actual-assets
-          while IFS= read -r file; do cmp "verified-release-assets/$file" "/tmp/final-release-assets/$file"; done < /tmp/expected-assets
-          gh release edit "$RELEASE_TAG" --draft=false
+  draft:
+    name: Create or resume verified draft
+... (+121 lines) [see remaining: rtk proxy git show 'origin/main:.github/workflows/publish-release.yml' | tail -n +162]
