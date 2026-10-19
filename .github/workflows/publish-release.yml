@@ -128,12 +128,27 @@ jobs:
           printf '%s\n' "$SOURCE_SHA" > candidate/SOURCE-COMMIT
           printf 'Tag: %s\nSource commit: %s\nVerified merge run: %s\n' "$RELEASE_TAG" "$SOURCE_SHA" "${{ steps.run.outputs.id }}" > candidate/RELEASE-PROVENANCE.txt
       - name: Stage verified release assets
-        if: github.event_name == 'workflow_dispatch' && (inputs.action == 'publish' || inputs.action == 'approval-rehearsal')
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.action != 'rehearse')
         run: |
           set -euo pipefail
           mkdir release-assets
-          cp candidate/conductor-linux-packages-*-release/* release-assets/
+          for arch in aarch64 x86_64; do
+            dir="candidate/conductor-linux-packages-${arch}-release"
+            if [[ "$arch" == aarch64 ]]; then
+              cp "$dir/BUILD-INFO.json" release-assets/BUILD-INFO.json
+              cp "$dir/SHA256SUMS" release-assets/SHA256SUMS
+            else
+              cp "$dir/BUILD-INFO.json" release-assets/BUILD-INFO-x86_64.json
+              sed 's/  BUILD-INFO.json$/  BUILD-INFO-x86_64.json/' \
+                "$dir/SHA256SUMS" > release-assets/SHA256SUMS-x86_64
+            fi
+            for package in "$dir"/*.deb "$dir"/*.rpm; do
+              cp "$package" release-assets/
+              cp "${package}.sigstore.json" release-assets/
+            done
+          done
           cp candidate/SOURCE-COMMIT candidate/RELEASE-PROVENANCE.txt release-assets/
+          (cd release-assets && sha256sum --check SHA256SUMS SHA256SUMS-x86_64)
       - name: Verify existing draft matches verified candidate
         if: github.event_name == 'workflow_dispatch' && inputs.action == 'publish'
         env:
@@ -186,17 +201,7 @@ jobs:
             gh release create "$RELEASE_TAG" --draft --title "Conductor $VERSION" --notes-file /tmp/release-notes.md
           fi
           gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' | grep -qx true
-          for dir in candidate/conductor-linux-packages-*-release; do
-            for file in "$dir"/*; do
-              name=$(basename "$file")
-              if gh release download "$RELEASE_TAG" --pattern "$name" --dir /tmp/release-existing >/dev/null 2>&1; then
-                cmp "$file" "/tmp/release-existing/$name"
-              else
-                gh release upload "$RELEASE_TAG" "$file"
-              fi
-            done
-          done
-          for file in candidate/SOURCE-COMMIT candidate/RELEASE-PROVENANCE.txt; do
+          for file in release-assets/*; do
             name=$(basename "$file")
             if gh release download "$RELEASE_TAG" --pattern "$name" --dir /tmp/release-existing >/dev/null 2>&1; then
               cmp "$file" "/tmp/release-existing/$name"
@@ -204,9 +209,7 @@ jobs:
               gh release upload "$RELEASE_TAG" "$file"
             fi
           done
-          find candidate/conductor-linux-packages-*-release -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/expected-assets
-          printf '%s\n' SOURCE-COMMIT RELEASE-PROVENANCE.txt >> /tmp/expected-assets
-          sort -o /tmp/expected-assets /tmp/expected-assets
+          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/expected-assets
           gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort > /tmp/actual-assets
           diff -u /tmp/expected-assets /tmp/actual-assets
       - name: Rehearsal completed without release writes

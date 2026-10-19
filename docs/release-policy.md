@@ -53,7 +53,10 @@ that environment before using publication. The workflow verifies detached
 Cosign signatures over the `.deb` and `.rpm` bytes and verifies GitHub artifact
 attestations for those same files before promotion. Its release assets include
 the package signature bundles, build metadata, checksums, source commit, and
-the trusted workflow run identifier.
+the trusted workflow run identifier. Architecture-specific metadata and
+checksum assets avoid filename collisions: `BUILD-INFO.json` and `SHA256SUMS`
+are for aarch64/arm64, while x86_64 uses `BUILD-INFO-x86_64.json` and
+`SHA256SUMS-x86_64`.
 Configuration of GitHub rulesets is an administrator action and must be
 verified in repository settings; workflow checks alone do not protect a tag
 from being moved or deleted.
