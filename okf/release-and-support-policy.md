@@ -3,7 +3,7 @@ type: Reference
 title: Release and support policy
 description: Supported line policy and release/security procedures, distinguished from configured GitHub protections and completed release evidence.
 status: planned
-source_revision: 3acfd9a517491bb9d9909bee6c636c2645bb0a34
+source_revision: f65d8adf7bace42a0ff888c2374e84d05331f11d
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../docs/release-policy.md
@@ -101,6 +101,17 @@ This revision checks out the default branch's verifier scripts for tag pushes
 and the selected workflow revision for manual dispatches, keeping candidate
 source separate from the validation code. Draft preparation and publication
 steps were skipped; `v0.0.1` remained a draft.
+
+After PRs #180 and #181 merged, the no-write rehearsal ran against main
+revision `f65d8adf7bace42a0ff888c2374e84d05331f11d` as run
+[`39268211011`](https://github.com/conductor-project/conductor/actions/runs/39268211011).
+It selected the successful `Merge` run for the exact `v0.0.1` tag commit,
+downloaded both architecture artifacts, and verified package metadata,
+checksums, Cosign signatures, and attestations. The release-asset staging step
+and both release-writing jobs were skipped. A post-run inspection confirmed
+that `v0.0.1` is still a draft with no publication timestamp. This run verifies
+the merged permission split and no-write path; it does not test the protected
+approval gate or maintenance-line promotion.
 
 The release-reference resolver is covered by
 `python3 scripts/test-resolve-release-ref.py` (5 tests passed). Temporary local
