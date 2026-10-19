@@ -3,7 +3,7 @@ type: Reference
 title: Release and support policy
 description: Supported line policy and release/security procedures, distinguished from configured GitHub protections and completed release evidence.
 status: planned
-source_revision: 949131c83b86c9492b817d4a364a05d5a90495b0
+source_revision: d345c8f3009fed2e922ef70c62f504b83c776940
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../docs/release-policy.md
@@ -40,14 +40,50 @@ both architecture artifacts contained `BUILD-INFO.json` and `SHA256SUMS`.
 It left a [draft release](https://github.com/conductor-project/conductor/releases/tag/untagged-f1328f563f1c0633652d)
 tagged `v0.0.1` with the complete aarch64 asset set and no x86_64 metadata;
 nothing was published. The follow-up change assigns unique names to x86_64
-metadata and checksums while preserving the existing aarch64 asset bytes. Its
-CI and a successful `prepare` rerun are still pending.
+metadata and checksums while preserving the existing aarch64 asset bytes.
+PR #174's PR workflow run `39247026626` passed CodeQL, debug checks on Linux
+x86_64, macOS, and Linux arm64, and both Linux package jobs.
+
+On 2026-10-19, this draft-preparation command ran as GitHub Actions run
+[`39250145368`](https://github.com/conductor-project/conductor/actions/runs/39250145368)
+from main revision `d345c8f3009fed2e922ef70c62f504b83c776940`. It selected the
+successful `Merge` run `39243996603` for the exact tag commit and passed
+metadata, checksum, Cosign signature, and GitHub attestation verification for
+both architectures. It resumed the existing [draft release](https://github.com/conductor-project/conductor/releases/tag/untagged-f1328f563f1c0633652d).
+The draft now has 14 release assets: Debian and RPM packages for x86_64 and
+arm64, their four Sigstore bundles, architecture-specific build metadata and
+checksum files, source commit, and release provenance. GitHub displays 16
+assets total including its two generated source archives. Existing aarch64
+asset bytes were reused; the x86_64 names are `BUILD-INFO-x86_64.json` and
+`SHA256SUMS-x86_64`.
+
+```sh
+gh workflow run publish-release.yml --ref main --field tag=v0.0.1 --field action=prepare
+```
+
+The no-write rehearsal used this command and completed successfully as run
+[`39250467897`](https://github.com/conductor-project/conductor/actions/runs/39250467897).
+It revalidated the exact-run packages, checksums, signatures, and attestations;
+the release-writing and protected-publication jobs were skipped. The draft is
+still unpublished.
+
+```sh
+gh workflow run publish-release.yml --ref main --field tag=v0.0.1 --field action=rehearse
+```
+
+The approval rehearsal has not run. Repository Settings showed no configured
+GitHub environments on 2026-10-19, so `release-publication` has no required
+reviewers or self-review protection. Repository administrators must configure
+that environment with eligible release maintainers and prevent self-review,
+then verify the settings before an approval rehearsal or publication. The
+workflow's in-job check is not a substitute for this repository-level control.
 
 The checked-in pull request workflow runs debug checks; the post-merge workflow
 runs release tests and builds on Linux x86_64 and macOS and packages Linux
 x86_64 and arm64. The release workflow consumes those signed, attested
-artifacts. No maintenance-line release or publication rehearsal has been
-recorded, and no version is supported until its verified release is published.
+artifacts. No maintenance-line release or protected approval rehearsal has
+been recorded, and no version is supported until its verified release is
+published.
 
 GitHub repository settings were inspected on 2026-10-19. The active `Protect
 Main` ruleset applies to `refs/heads/main` and only contains deletion and
