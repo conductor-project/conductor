@@ -3,7 +3,7 @@ type: Reference
 title: Worker commands, reports, and reconnect
 description: Workers poll bounded command batches and send durable reports with acknowledgements; session freshness and incarnation fence stale traffic.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: bafe31e2fc936b3290dca62fe5f68258e1c42244
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/lib.rs
@@ -96,10 +96,10 @@ multi-host failure behavior.
 
 The current wire protocol is version 3 with explicit capabilities for
 assignment generations, command deduplication, ordered reports, worker
-incarnations, and worker resource inventory. It is independent of the manager and worker SQLite schema
-versions. Use the current source and tests for the message contract; historical
-design text describing acknowledgements, gap buffering, or compaction is not
-an additional current protocol guarantee.
+incarnations, and worker resource inventory. It is independent of the manager
+and worker SQLite schema versions. Use the current source and tests for the
+message contract; historical design text describing acknowledgements, gap
+buffering, or compaction is not an additional current protocol guarantee.
 
 `incompatible_protocol_poll_returns_actionable_upgrade_diagnostic` verifies
 the manager's HTTP `426` response text; the worker client status-mapping test
