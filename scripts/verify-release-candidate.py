@@ -90,11 +90,22 @@ def main() -> int:
             if digest != info["binarySha256"]:
                 raise SystemExit("package binary does not match the digest in BUILD-INFO.json")
 
-    expected_sum_names = sorted([deb.name, rpm.name, "BUILD-INFO.json"])
+    expected_sum_names = {deb.name, rpm.name, "BUILD-INFO.json"}
     sums = (directory / "SHA256SUMS").read_text(encoding="utf-8").splitlines()
-    listed = sorted(line.split(maxsplit=1)[1].lstrip("* ") for line in sums if line.strip())
-    if listed != expected_sum_names:
+    entries: dict[str, str] = {}
+    for line in sums:
+        if not line.strip():
+            continue
+        match = re.fullmatch(r"([0-9a-f]{64})  (.+)", line)
+        if match is None or match.group(2) in entries:
+            raise SystemExit("SHA256SUMS contains an invalid or duplicate entry")
+        entries[match.group(2)] = match.group(1)
+    if set(entries) != expected_sum_names:
         raise SystemExit("SHA256SUMS does not list exactly the release packages and build metadata")
+    for name, expected_digest in entries.items():
+        actual_digest = hashlib.sha256((directory / name).read_bytes()).hexdigest()
+        if actual_digest != expected_digest:
+            raise SystemExit(f"SHA256SUMS digest does not match {name}")
     return 0
 
 
