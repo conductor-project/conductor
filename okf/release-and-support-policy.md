@@ -3,7 +3,7 @@ type: Reference
 title: Release and support policy
 description: Supported line policy and release/security procedures, distinguished from configured GitHub protections and completed release evidence.
 status: planned
-source_revision: d345c8f3009fed2e922ef70c62f504b83c776940
+source_revision: ae824f0a6ed7242e589b340243d46897c3b67877
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../docs/release-policy.md
@@ -12,6 +12,12 @@ sources:
     title: Pull request checks
   - resource: ../.github/workflows/merge.yml
     title: Post-merge release checks
+  - resource: ../.github/workflows/publish-release.yml
+    title: Tagged release promotion and publication gates
+  - resource: ../scripts/resolve-release-ref.py
+    title: Release tag and authorized-line resolver
+  - resource: ../scripts/test-resolve-release-ref.py
+    title: Unprivileged release-reference fixtures
   - resource: ../AGENTS.md
     title: Repository contribution and protection requirements
 ---
@@ -71,8 +77,36 @@ still unpublished.
 gh workflow run publish-release.yml --ref main --field tag=v0.0.1 --field action=rehearse
 ```
 
+After PRs #176 and #177 merged, the no-write rehearsal was repeated against
+the merged workflow at `ae824f0a6ed7242e589b340243d46897c3b67877`. GitHub Actions
+run [39255361441](https://github.com/conductor-project/conductor/actions/runs/39255361441)
+completed successfully. It selected the successful `Merge` run `39243996603`
+for tag commit `09f4af5e35b73fc54130c58daea4ae9fe87d7ace`, verified both
+architecture package sets, checksums, Cosign signatures, and attestations, and
+logged `Candidate verification succeeded; no release or tag was created or
+changed.` The protected publication job was skipped. A post-run inspection
+confirmed that `v0.0.1` remains a draft with no publication timestamp.
+
+After PR #179 merged, the no-write rehearsal ran against release-workflow
+revision `372ba25f7dc941ab779fe792055e0c607e029e4c` on the
+`codex/issue-147-rehearsal-evidence` branch as run
+[`39259649886`](https://github.com/conductor-project/conductor/actions/runs/39259649886).
+It passed the tag resolver, exact-run artifact selection, and package,
+checksum, Cosign signature, and attestation verification for both architectures.
+This revision checks out the default branch's verifier scripts for tag pushes
+and the selected workflow revision for manual dispatches, keeping candidate
+source separate from the validation code. Draft preparation and publication
+steps were skipped; `v0.0.1` remained a draft.
+
+The release-reference resolver is covered by
+`python3 scripts/test-resolve-release-ref.py` (5 tests passed). Temporary local
+Git fixtures exercise current-line tags, maintenance-line tags, shared commits,
+invalid tag syntax, version mismatch, missing tags, and unauthorized branches.
+These fixtures do not install packages or require privileged access.
+
 The approval rehearsal has not run. Repository Settings showed no configured
-GitHub environments on 2026-10-19, so `release-publication` has no required
+GitHub environments on 2026-10-19, and the environment API returned 404 for
+`release-publication` after this rehearsal. It therefore has no required
 reviewers or self-review protection. Repository administrators must configure
 that environment with eligible release maintainers and prevent self-review,
 then verify the settings before an approval rehearsal or publication. The

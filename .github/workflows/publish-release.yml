@@ -40,30 +40,23 @@ jobs:
         with:
           ref: ${{ github.event_name == 'push' && github.ref || inputs.tag }}
           fetch-depth: 0
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event_name == 'push' && github.event.repository.default_branch || github.sha }}
+          path: workflow-source
+          fetch-depth: 1
       - name: Verify release tag, authorized branch, and version
         id: candidate
         env:
           RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
         run: |
           set -euo pipefail
-          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-          version=${RELEASE_TAG#v}
           manifest_version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')
-          [[ "$manifest_version" == "$version" ]]
-          major=$(sed -E 's/^v([0-9]+)\.([0-9]+)\.([0-9]+)$/\1/' <<<"$RELEASE_TAG")
-          minor=$(sed -E 's/^v([0-9]+)\.([0-9]+)\.([0-9]+)$/\2/' <<<"$RELEASE_TAG")
-          sha=$(git rev-parse "${RELEASE_TAG}^{commit}")
-          line="$major.$minor"
-          if git merge-base --is-ancestor "$sha" origin/main; then
-            branch=main
-          else
-            branch="release/$line"
-          fi
-          git merge-base --is-ancestor "$sha" "origin/$branch"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-          echo "line=$line" >> "$GITHUB_OUTPUT"
-          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+          candidate=$(python3 "$GITHUB_WORKSPACE/workflow-source/scripts/resolve-release-ref.py" "$GITHUB_WORKSPACE" "$RELEASE_TAG" "$manifest_version")
+          echo "version=$(jq -r .version <<<"$candidate")" >> "$GITHUB_OUTPUT"
+          echo "sha=$(jq -r .sha <<<"$candidate")" >> "$GITHUB_OUTPUT"
+          echo "line=$(jq -r .line <<<"$candidate")" >> "$GITHUB_OUTPUT"
+          echo "branch=$(jq -r .branch <<<"$candidate")" >> "$GITHUB_OUTPUT"
       - name: Find successful trusted build for exact source commit
         id: run
         env:
@@ -118,7 +111,7 @@ jobs:
           gh attestation verify --help >/dev/null
           for arch in x86_64 aarch64; do
             dir="candidate/conductor-linux-packages-${arch}-release"
-            python3 scripts/verify-release-candidate.py "$dir" "$VERSION" "$SOURCE_SHA" "$arch"
+            python3 "$GITHUB_WORKSPACE/workflow-source/scripts/verify-release-candidate.py" "$dir" "$VERSION" "$SOURCE_SHA" "$arch"
             for package in "$dir"/*.deb "$dir"/*.rpm; do
               cosign verify-blob --bundle "${package}.sigstore.json" --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/merge.yml@refs/heads/${BRANCH}" --certificate-oidc-issuer https://token.actions.githubusercontent.com "$package"
               gh attestation verify "$package" --repo "$GITHUB_REPOSITORY" --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/merge.yml"
