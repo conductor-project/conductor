@@ -1,4 +1,30 @@
 use super::*;
+use serde::Serialize;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerStorageStatus {
+    pub runs: u64,
+    pub completed_runs: u64,
+    pub active_or_unresolved_runs: u64,
+    pub log_records: u64,
+    pub unpruned_log_runs: u64,
+    pub completed_unpruned_log_runs: u64,
+    pub pruned_log_records: u64,
+    pub worker_commands: u64,
+    pub accepted_commands: u64,
+    pub reports_pending_acknowledgement: u64,
+    pub acknowledged_commands: u64,
+    pub report_sequence_rows: u64,
+    pub report_sequence_high_water: u64,
+    pub estimated_unpruned_log_bytes_upper_bound: u64,
+    pub sqlite_page_count: u64,
+    pub sqlite_freelist_pages: u64,
+    pub sqlite_page_size_bytes: u64,
+    pub log_retention_runs: usize,
+    pub log_max_bytes_per_stream: u64,
+    pub cleanup_batch_limit: usize,
+}
 
 pub struct WorkerService {
     pub(super) worker_id: WorkerId,
@@ -21,6 +47,123 @@ pub struct WorkerService {
 }
 
 impl WorkerService {
+    /// Inspect an existing worker database without migrating or changing its contents.
+    pub fn inspect_storage_read_only(
+        state_directory: impl AsRef<Path>,
+        log_policy: LogPolicy,
+    ) -> io::Result<WorkerStorageStatus> {
+        if log_policy.max_bytes_per_stream == 0
+            || log_policy.max_bytes_per_stream > MAX_LOG_MAX_BYTES_PER_STREAM
+            || log_policy.retention_runs > MAX_LOG_RETENTION_RUNS
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker log limits are outside the supported range",
+            ));
+        }
+        let database_path = state_directory.as_ref().join("worker.sqlite3");
+        let metadata = fs::symlink_metadata(&database_path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "worker database path must be a regular file",
+            ));
+        }
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar_path = database_path.as_os_str().to_owned();
+            sidecar_path.push(suffix);
+            match fs::symlink_metadata(Path::new(&sidecar_path)) {
+                Ok(sidecar_metadata)
+                    if sidecar_metadata.file_type().is_symlink() || !sidecar_metadata.is_file() =>
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "worker SQLite sidecar path must be a regular file",
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let connection =
+            Connection::open_with_flags(&database_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(storage_error)?;
+        connection
+            .busy_timeout(BUSY_TIMEOUT)
+            .map_err(storage_error)?;
+        let version = connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .map_err(storage_error)?;
+        if version != SCHEMA_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "worker database schema is not supported by this binary",
+            ));
+        }
+        connection
+            .execute_batch("BEGIN DEFERRED")
+            .map_err(storage_error)?;
+        let count = |sql: &str| -> io::Result<u64> {
+            let value = connection
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .map_err(storage_error)?;
+            u64::try_from(value).map_err(|_| io::Error::other("worker storage count is invalid"))
+        };
+        let page_count = |name: &str| -> io::Result<u64> {
+            let value = connection
+                .pragma_query_value(None, name, |row| row.get::<_, i64>(0))
+                .map_err(storage_error)?;
+            u64::try_from(value)
+                .map_err(|_| io::Error::other("worker SQLite page count is invalid"))
+        };
+        let completed_unpruned_log_runs = count(
+            "SELECT COUNT(*) FROM run_logs
+             WHERE pruned = 0 AND stdout_closed = 1 AND stderr_closed = 1",
+        )?;
+        let unpruned_log_runs = count("SELECT COUNT(*) FROM run_logs WHERE pruned = 0")?;
+        let status = WorkerStorageStatus {
+            runs: count("SELECT COUNT(*) FROM runs")?,
+            completed_runs: count(
+                "SELECT COUNT(*) FROM runs
+                 WHERE state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
+            )?,
+            active_or_unresolved_runs: count(
+                "SELECT COUNT(*) FROM runs
+                 WHERE state IN ('requested', 'starting', 'running', 'stopping', 'unknown')",
+            )?,
+            log_records: count("SELECT COUNT(*) FROM run_logs")?,
+            unpruned_log_runs,
+            completed_unpruned_log_runs,
+            pruned_log_records: count("SELECT COUNT(*) FROM run_logs WHERE pruned = 1")?,
+            worker_commands: count("SELECT COUNT(*) FROM worker_commands")?,
+            accepted_commands: count(
+                "SELECT COUNT(*) FROM worker_commands WHERE state = 'accepted'",
+            )?,
+            reports_pending_acknowledgement: count(
+                "SELECT COUNT(*) FROM worker_commands WHERE state = 'completed'",
+            )?,
+            acknowledged_commands: count(
+                "SELECT COUNT(*) FROM worker_commands WHERE state = 'acknowledged'",
+            )?,
+            report_sequence_rows: count("SELECT COUNT(*) FROM worker_report_state")?,
+            report_sequence_high_water: count(
+                "SELECT COALESCE(MAX(sequence), 0) FROM worker_report_state",
+            )?,
+            estimated_unpruned_log_bytes_upper_bound: unpruned_log_runs
+                .saturating_mul(2)
+                .saturating_mul(log_policy.max_bytes_per_stream),
+            sqlite_page_count: page_count("page_count")?,
+            sqlite_freelist_pages: page_count("freelist_count")?,
+            sqlite_page_size_bytes: page_count("page_size")?,
+            log_retention_runs: log_policy.retention_runs,
+            log_max_bytes_per_stream: log_policy.max_bytes_per_stream,
+            cleanup_batch_limit: MAX_LOG_RETENTION_BATCH_RUNS,
+        };
+        connection.execute_batch("COMMIT").map_err(storage_error)?;
+        Ok(status)
+    }
+
     pub fn open(
         state_directory: impl AsRef<Path>,
         worker_id: WorkerId,

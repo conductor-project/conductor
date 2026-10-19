@@ -53,8 +53,12 @@ retained without expiry so duplicate start/command delivery can replay its
 stored result. `worker_report_state` sequence counters are retained per
 incarnation so manager reconnects can resume report delivery. No worker command,
 report, or run-history compaction policy currently exists; these tables can
-grow with completed work. `conductor storage inspect` is manager-only and does
-not report worker database counts or sizes.
+grow with completed work. `conductor storage inspect --worker-data-dir PATH`
+reports worker run/command/report counts and SQLite database file/page sizes.
+Its unpruned-log byte measurement is an upper bound from the configured
+per-stream cap, including active log pairs, not an exact scan of log files. As
+with manager inspection, read-only SQLite connections may create WAL
+coordination sidecar files.
 
 `GET /v1/runs/{runId}/logs` requires `stream=stdout` or `stderr`; `offset`
 defaults to 0 and `limit` defaults to 4,096 bytes, with a range of 1 to 65,536.

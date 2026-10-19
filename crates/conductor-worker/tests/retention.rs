@@ -148,6 +148,58 @@ fn pruned_count(directory: &TempDir) -> i64 {
 }
 
 #[test]
+fn read_only_storage_inspection_reports_runs_delivery_and_log_limits() {
+    let directory = TempDir::new();
+    seed_completed_runs(&directory, 3);
+    let database_path = directory.path().join("worker.sqlite3");
+    let connection = Connection::open(&database_path).expect("open worker fixture database");
+    connection
+        .execute(
+            "INSERT INTO worker_commands
+                (command_id, worker_id, worker_incarnation, command_json, state, result_json, report_sequence, accepted_at_ms)
+             VALUES ('accepted', 'worker-1', 1, '{}', 'accepted', NULL, NULL, 1),
+                    ('completed', 'worker-1', 1, '{}', 'completed', '{}', 1, 2),
+                    ('acknowledged', 'worker-1', 1, '{}', 'acknowledged', '{}', 2, 3)",
+            [],
+        )
+        .expect("insert command delivery fixtures");
+    connection
+        .execute(
+            "UPDATE worker_report_state SET sequence = 2 WHERE incarnation = 1",
+            [],
+        )
+        .expect("advance report sequence");
+    drop(connection);
+    let database_before = fs::read(&database_path).expect("read worker database before inspect");
+
+    let status = WorkerService::inspect_storage_read_only(
+        directory.path(),
+        LogPolicy {
+            max_bytes_per_stream: 1_024,
+            retention_runs: 2,
+        },
+    )
+    .expect("inspect worker storage read-only");
+
+    assert_eq!(status.runs, 3);
+    assert_eq!(status.completed_runs, 3);
+    assert_eq!(status.completed_unpruned_log_runs, 3);
+    assert_eq!(status.worker_commands, 3);
+    assert_eq!(status.accepted_commands, 1);
+    assert_eq!(status.reports_pending_acknowledgement, 1);
+    assert_eq!(status.acknowledged_commands, 1);
+    assert_eq!(status.report_sequence_rows, 2);
+    assert_eq!(status.report_sequence_high_water, 2);
+    assert_eq!(status.estimated_unpruned_log_bytes_upper_bound, 6_144);
+    assert_eq!(status.log_retention_runs, 2);
+    assert_eq!(status.log_max_bytes_per_stream, 1_024);
+    assert_eq!(
+        fs::read(&database_path).expect("re-read worker database"),
+        database_before
+    );
+}
+
+#[test]
 fn completed_log_cleanup_is_batched_and_resumes_after_worker_restart() {
     let directory = TempDir::new();
     seed_completed_runs(&directory, 140);

@@ -241,7 +241,7 @@ use pending_persistence::PendingPersistence;
 
 #[path = "structs/worker_service.rs"]
 mod worker_service;
-pub use worker_service::WorkerService;
+pub use worker_service::{WorkerService, WorkerStorageStatus};
 
 #[cfg(test)]
 #[path = "reader_reaper_tests.rs"]

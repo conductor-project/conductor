@@ -474,6 +474,7 @@ dependencies = [
  "nix",
  "reqwest",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "sysinfo",

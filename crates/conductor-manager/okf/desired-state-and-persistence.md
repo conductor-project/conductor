@@ -60,19 +60,20 @@ current deployment state are retained by their existing contracts. Service
 attempts and port leases stay while referenced by current state. This change
 does not set expiry windows for any idempotency or replay evidence.
 
-`conductor storage inspect --manager-data-dir ...` reports bounded counts,
+`conductor storage inspect --manager-data-dir ...` reports bounded manager counts,
 eligible rows beyond the configured target, permanent metadata counts, SQLite
 page count/freelist, and manager database/WAL/shared-memory file sizes. The
 inspection does not migrate or change database contents. SQLite may create its
 WAL coordination sidecar files when opening a read-only connection. Deleting
 rows places pages on SQLite's freelist but does not shrink the database file;
 SQLite reuses those pages on later writes. Physical compaction is not performed
-automatically. Inspection is manager-only: it does not open the worker
-database, count worker run/command/report rows, or claim a bound for them. The
-worker retains run observations and command results to preserve command replay,
-and keeps report sequence state for reconnect delivery. These worker records
-currently have no expiry or compaction policy; worker log files have the
-separate bounded policy in the worker knowledge page.
+automatically. Add `--worker-data-dir ...` to inspect worker run/log/command/
+report-sequence counts and SQLite file/page measurements. The worker command
+and report records currently have no expiry or compaction policy; worker log
+files have the separate bounded policy in the worker knowledge page. The log
+byte figure is an upper bound derived from unpruned log pairs, including active
+runs, and the configured per-stream cap; it does not scan log files or report
+their exact aggregate byte size.
 
 Before upgrading, stop the daemon and take a consistent backup of manager
 state and worker state/logs. Start only binaries whose worker transport

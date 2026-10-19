@@ -35,11 +35,15 @@ and identity path to `backup create` with `--include-path`; restore creates a
 new destination with manager and worker state below it and never replaces an
 existing path. Each restored component remains held from startup until explicit
 recovery clearance.
-`conductor storage inspect --manager-data-dir PATH` reads the current manager
-database without migration or writes. It reports retained and eligible history
+`conductor storage inspect` accepts `--manager-data-dir PATH`,
+`--worker-data-dir PATH`, or both. It reads the selected database(s) without
+migration or writes. Manager output includes retained and eligible history
 counts, permanent idempotency and audit counts, SQLite page/free-page counts,
-and database, WAL, and shared-memory file sizes. Pass the manager's configured
-`--completed-run-retention` value to estimate eligible rows beyond the target.
+and database, WAL, and shared-memory file sizes. Worker output includes run,
+log, command, report-sequence counts, SQLite page/free-page counts, file sizes,
+and an upper bound for all unpruned log-pair bytes, including active runs. Pass the configured
+`--completed-run-retention`, `--log-retention-runs`, and
+`--log-max-bytes-per-stream` values when overriding the defaults.
 `conductor agent --config PATH [--role all|manager|worker]` starts the daemon.
 `--role` overrides the role in the JSON file but does not bypass validation.
 `conductor context create|list|show|use|delete` manages named connection
