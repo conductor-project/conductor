@@ -3,7 +3,7 @@ type: Reference
 title: Release and support policy
 description: Supported line policy and release/security procedures, distinguished from configured GitHub protections and completed release evidence.
 status: planned
-source_revision: 4020412ddbcf5f1b2a18fb89c8cab9e450d3e7a3
+source_revision: 6442ff8482ca55766cb413dd1203acb34e587c76
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../docs/release-policy.md
@@ -119,13 +119,11 @@ Git fixtures exercise current-line tags, maintenance-line tags, shared commits,
 invalid tag syntax, version mismatch, missing tags, and unauthorized branches.
 These fixtures do not install packages or require privileged access.
 
-The `release-publication` GitHub environment was created on 2026-10-19, but the
-environment API returned an empty `protection_rules` list when checked. It has
-no required reviewers or self-review protection, so the approval rehearsal has
-not run. Configure required reviewers from the release maintainers and enable
-prevent-self-review before rehearsal or publication. Because the current
-repository has only one visible administrator/maintainer, a second eligible
-reviewer must be available to approve a job initiated by that maintainer. The
+The `release-publication` GitHub environment was created on 2026-10-19. Its
+current configuration has one required reviewer and allows self-review, as
+selected for this sole-maintainer repository. This satisfies the workflow's
+required-reviewer check; the approval rehearsal has not yet run. The environment
+still requires a manual approval before the publication job proceeds. The
 workflow's in-job check is not a substitute for this repository-level control.
 
 The checked-in pull request workflow runs debug checks; the post-merge workflow
