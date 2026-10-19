@@ -3,7 +3,7 @@ type: Reference
 title: Release and support policy
 description: Supported line policy and release/security procedures, distinguished from configured GitHub protections and completed release evidence.
 status: planned
-source_revision: f45869e5079441dea220b9cc36c2379df5147302
+source_revision: c3d5046cfce0725634c8da0130002f4f7efbfdc6
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../docs/release-policy.md
