@@ -48,8 +48,11 @@ the authorized line, and successful checks for the exact tagged commit. The
 `Merge` run for the tag commit; it performs no Conductor build. A pushed tag
 can only create a draft release. Publication is a separate manual action and
 requires the `release-publication` environment to have required reviewers and
-self-review prevention configured. Administrators must configure and verify
-that environment before using publication. The workflow verifies detached
+an eligible approval. Enable self-review prevention when another eligible
+maintainer is available. In a sole-maintainer repository, the configured
+maintainer may approve their own manually dispatched release job. Administrators
+must configure and verify that environment before using publication. Self-
+approval does not provide independent review. The workflow verifies detached
 Cosign signatures over the `.deb` and `.rpm` bytes and verifies GitHub artifact
 attestations for those same files before promotion. Its release assets include
 the package signature bundles, build metadata, checksums, source commit, and
