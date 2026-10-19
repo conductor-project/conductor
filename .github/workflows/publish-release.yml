@@ -17,6 +17,7 @@ on:
         options:
           - rehearse
           - prepare
+          - approval-rehearsal
           - publish
 
 permissions:
@@ -75,7 +76,11 @@ jobs:
           branch="$BRANCH"
           runs=$(gh run list --workflow merge.yml --branch "$branch" --commit "$SHA" --limit 100 --json databaseId,headSha,headBranch,status,conclusion)
           run_id=$(jq -r --arg sha "$SHA" --arg branch "$branch" '[.[] | select(.headSha == $sha and .headBranch == $branch and .status == "completed" and .conclusion == "success")] | sort_by(.databaseId) | last | .databaseId // empty' <<<"$runs")
-          [[ -n "$run_id" ]]
+          if [[ -z "$run_id" ]]; then
+            echo "No successful Merge workflow run was found for $SHA on authorized branch $branch." >&2
+            echo "Inspect that exact commit's Merge run, fix or rerun its release checks, and dispatch this workflow again after it succeeds." >&2
+            exit 1
+          fi
           echo "id=$run_id" >> "$GITHUB_OUTPUT"
       - name: Download exact-run package artifacts
         env:
@@ -83,10 +88,22 @@ jobs:
           RUN_ID: ${{ steps.run.outputs.id }}
         run: |
           set -euo pipefail
+          artifacts=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}/artifacts" --jq '[.artifacts[] | select(.expired == false) | .name]')
+          for name in conductor-linux-packages-x86_64-release conductor-linux-packages-aarch64-release; do
+            if ! jq -e --arg name "$name" 'index($name) != null' <<<"$artifacts" >/dev/null; then
+              echo "Required artifact $name is missing or expired in trusted Merge run $RUN_ID." >&2
+              echo "Recovery: run 'gh run rerun $RUN_ID' to regenerate artifacts for the same source commit, wait for success, then dispatch Publish release with action=prepare." >&2
+              exit 1
+            fi
+          done
           mkdir -p candidate
           gh run download "$RUN_ID" --dir candidate
           [[ -d candidate/conductor-linux-packages-x86_64-release ]]
           [[ -d candidate/conductor-linux-packages-aarch64-release ]]
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+        with:
+          cosign-release: v3.1.3
       - name: Verify package metadata, checksums, signatures, and attestations
         env:
           GH_TOKEN: ${{ github.token }}
@@ -97,7 +114,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --yes dpkg-dev rpm
+          sudo apt-get install --yes dpkg-dev rpm cpio
           gh attestation verify --help >/dev/null
           for arch in x86_64 aarch64; do
             dir="candidate/conductor-linux-packages-${arch}-release"
@@ -110,10 +127,33 @@ jobs:
           done
           printf '%s\n' "$SOURCE_SHA" > candidate/SOURCE-COMMIT
           printf 'Tag: %s\nSource commit: %s\nVerified merge run: %s\n' "$RELEASE_TAG" "$SOURCE_SHA" "${{ steps.run.outputs.id }}" > candidate/RELEASE-PROVENANCE.txt
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@ba7bc0a3fef59531c69a25acd34668d6d3fe6f22 # v4.1.0
+      - name: Stage verified release assets
+        if: github.event_name == 'workflow_dispatch' && (inputs.action == 'publish' || inputs.action == 'approval-rehearsal')
+        run: |
+          set -euo pipefail
+          mkdir release-assets
+          cp candidate/conductor-linux-packages-*-release/* release-assets/
+          cp candidate/SOURCE-COMMIT candidate/RELEASE-PROVENANCE.txt release-assets/
+      - name: Verify existing draft matches verified candidate
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'publish'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' | grep -qx true
+          gh release download "$RELEASE_TAG" --dir /tmp/published-candidate
+          find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/expected-assets
+          find /tmp/published-candidate -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/actual-assets
+          diff -u /tmp/expected-assets /tmp/actual-assets
+          while IFS= read -r file; do cmp "release-assets/$file" "/tmp/published-candidate/$file"; done < /tmp/expected-assets
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: github.event_name == 'workflow_dispatch' && (inputs.action == 'publish' || inputs.action == 'approval-rehearsal')
         with:
-          cosign-release: v3.1.3
+          name: verified-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 1
       - name: Create or resume verified draft release
         if: github.event_name == 'push' || inputs.action == 'prepare'
         env:
@@ -124,7 +164,27 @@ jobs:
           SOURCE_SHA: ${{ steps.candidate.outputs.sha }}
         run: |
           set -euo pipefail
-          gh release view "$RELEASE_TAG" >/dev/null 2>&1 || gh release create "$RELEASE_TAG" --draft --title "Conductor $VERSION" --notes "Verified Conductor release candidate.\n\nSource: $SOURCE_SHA\nTrusted merge workflow run: $RUN_ID\nPackages were promoted from that run without rebuilding."
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            cat > /tmp/release-notes.md <<EOF
+          Verified Conductor release candidate for $VERSION.
+
+          ## Compatibility and upgrade
+
+          This release belongs to the ${{ steps.candidate.outputs.line }} support line. Upgrade manager and worker binaries together. Review the [package installation and upgrade guide](https://github.com/${GITHUB_REPOSITORY}/blob/${RELEASE_TAG}/docs/package-install.md) before upgrading. No database downgrade is supported; use a verified backup and the documented restore procedure for recovery.
+
+          ## Packages and verification
+
+          Debian and RPM packages are provided for x86_64 and arm64. Verify package checksums, Cosign bundles, and GitHub artifact attestations using the package installation guide.
+
+          ## Known limitations
+
+          This release does not provide a hosted APT or DNF repository. Installations require operator-managed package downloads and service configuration.
+
+          Source commit: $SOURCE_SHA
+          Trusted Merge workflow run: $RUN_ID
+          EOF
+            gh release create "$RELEASE_TAG" --draft --title "Conductor $VERSION" --notes-file /tmp/release-notes.md
+          fi
           gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' | grep -qx true
           for dir in candidate/conductor-linux-packages-*-release; do
             for file in "$dir"/*; do
@@ -154,14 +214,20 @@ jobs:
         run: echo "Candidate verification succeeded; no release or tag was created or changed."
 
   publish:
-    name: Publish approved draft
-    if: github.event_name == 'workflow_dispatch' && inputs.action == 'publish'
+    name: Protected publication gate
+    if: github.event_name == 'workflow_dispatch' && (inputs.action == 'publish' || inputs.action == 'approval-rehearsal')
     needs: promote
     runs-on: ubuntu-26.04
     environment: release-publication
     permissions:
+      actions: read
       contents: write
     steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        if: inputs.action == 'publish'
+        with:
+          name: verified-release-assets
+          path: verified-release-assets
       - name: Verify release publication environment is protected
         env:
           GH_TOKEN: ${{ github.token }}
@@ -170,7 +236,11 @@ jobs:
           rules=$(gh api "repos/${GITHUB_REPOSITORY}/environments/release-publication" --jq '.protection_rules // []')
           jq -e 'any(.[]; .type == "required_reviewers" and (.reviewers | length > 0))' <<<"$rules"
           jq -e 'any(.[]; .type == "required_reviewers" and .prevent_self_review == true)' <<<"$rules"
+      - name: Complete approval rehearsal without publishing
+        if: inputs.action == 'approval-rehearsal'
+        run: echo "Protected environment approval succeeded; no release was published."
       - name: Publish the existing draft
+        if: inputs.action == 'publish'
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag }}
@@ -178,4 +248,9 @@ jobs:
           set -euo pipefail
           draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')
           [[ "$draft" == true ]]
+          gh release download "$RELEASE_TAG" --dir /tmp/final-release-assets
+          find verified-release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/expected-assets
+          find /tmp/final-release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/actual-assets
+          diff -u /tmp/expected-assets /tmp/actual-assets
+          while IFS= read -r file; do cmp "verified-release-assets/$file" "/tmp/final-release-assets/$file"; done < /tmp/expected-assets
           gh release edit "$RELEASE_TAG" --draft=false

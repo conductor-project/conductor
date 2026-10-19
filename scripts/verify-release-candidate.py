@@ -3,10 +3,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -58,6 +60,35 @@ def main() -> int:
         raise SystemExit("RPM package version does not match")
     if run("rpm", "-qp", "--queryformat", "%{ARCH}", str(rpm)) != architecture:
         raise SystemExit("RPM package architecture does not match")
+
+    with tempfile.TemporaryDirectory(prefix="conductor-release-verify-") as temporary:
+        root = Path(temporary)
+        deb_root = root / "deb"
+        deb_root.mkdir()
+        run("dpkg-deb", "--extract", str(deb), str(deb_root))
+        deb_binary = deb_root / "usr/bin/conductor"
+        rpm_root = root / "rpm"
+        rpm_root.mkdir()
+        rpm_archive = subprocess.run(
+            ["rpm2cpio", str(rpm)], check=True, capture_output=True
+        ).stdout
+        subprocess.run(
+            ["cpio", "-idm", "--quiet"],
+            cwd=rpm_root,
+            input=rpm_archive,
+            check=True,
+            capture_output=True,
+        )
+        rpm_binary = rpm_root / "usr/bin/conductor"
+        for package_format, embedded_binary in (
+            ("Debian", deb_binary),
+            ("RPM", rpm_binary),
+        ):
+            if not embedded_binary.is_file():
+                raise SystemExit(f"{package_format} package omits the Conductor binary")
+            digest = hashlib.sha256(embedded_binary.read_bytes()).hexdigest()
+            if digest != info["binarySha256"]:
+                raise SystemExit("package binary does not match the digest in BUILD-INFO.json")
 
     expected_sum_names = sorted([deb.name, rpm.name, "BUILD-INFO.json"])
     sums = (directory / "SHA256SUMS").read_text(encoding="utf-8").splitlines()

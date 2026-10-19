@@ -24,15 +24,18 @@ preceding minor support window with a 12-month minimum, maintainer ownership,
 backport and embargo procedures, and immutable publication. The release
 workflow verifies and promotes packages from the exact successful `Merge` run
 without rebuilding; tag pushes create drafts, while publishing requires the
-configured `release-publication` environment. No version is supported until
-its verified release is published.
+configured `release-publication` environment. The workflow includes a no-write
+approval rehearsal and fails with an exact-run recovery command when transient
+artifacts are missing or expired. No version is supported until its verified
+release is published.
 
 The reviewed repository revision has no release tags or maintenance branches.
 The checked-in pull request workflow runs debug checks; the post-merge workflow
 runs release tests and builds on Linux x86_64 and macOS and packages Linux
 x86_64 and arm64. The release workflow consumes those signed, attested
 artifacts. No maintenance-line release or publication rehearsal has been
-recorded.
+recorded. Local checks and PR CI for the promotion workflow passed; it has not
+yet been exercised against a real `v0.0.1` tag.
 
 GitHub repository settings were inspected on 2026-10-19. The active `Protect
 Main` ruleset applies to `refs/heads/main` and only contains deletion and
