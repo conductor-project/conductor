@@ -153,12 +153,18 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' | grep -qx true
-          gh release download "$RELEASE_TAG" --dir /tmp/published-candidate
+          releases=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100")
+          release_id=$(jq -r --arg tag "$RELEASE_TAG" '[.[] | select(.tag_name == $tag and .draft)] | first | .id // empty' <<<"$releases")
+          [[ -n "$release_id" ]] || { echo "No draft release exists for $RELEASE_TAG." >&2; exit 1; }
+          release=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")
           find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/expected-assets
-          find /tmp/published-candidate -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/actual-assets
+          jq -r '.assets[].name' <<<"$release" | sort > /tmp/actual-assets
           diff -u /tmp/expected-assets /tmp/actual-assets
-          while IFS= read -r file; do cmp "release-assets/$file" "/tmp/published-candidate/$file"; done < /tmp/expected-assets
+          while IFS= read -r file; do
+            expected="sha256:$(sha256sum "release-assets/$file" | cut -d ' ' -f1)"
+            actual=$(jq -r --arg name "$file" '[.assets[] | select(.name == $name) | .digest] | first // empty' <<<"$release")
+            [[ -n "$actual" && "$actual" == "$expected" ]] || { echo "Draft asset $file does not match the verified candidate." >&2; exit 1; }
+          done < /tmp/expected-assets
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (inputs.action == 'prepare' || inputs.action == 'publish' || inputs.action == 'approval-rehearsal'))
         with:
@@ -217,14 +223,23 @@ jobs:
           gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' | grep -qx true
           for file in release-assets/*; do
             name=$(basename "$file")
-            if gh release download "$RELEASE_TAG" --pattern "$name" --dir /tmp/release-existing >/dev/null 2>&1; then
-              cmp "$file" "/tmp/release-existing/$name"
+            releases=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100")
+            release_id=$(jq -r --arg tag "$RELEASE_TAG" '[.[] | select(.tag_name == $tag and .draft)] | first | .id // empty' <<<"$releases")
+            [[ -n "$release_id" ]] || { echo "No draft release exists for $RELEASE_TAG." >&2; exit 1; }
+            release=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")
+            actual=$(jq -r --arg name "$name" '[.assets[] | select(.name == $name) | .digest] | first // empty' <<<"$release")
+            if [[ -n "$actual" ]]; then
+              expected="sha256:$(sha256sum "$file" | cut -d ' ' -f1)"
+              [[ "$actual" == "$expected" ]] || { echo "Existing draft asset $name differs from the verified candidate." >&2; exit 1; }
             else
               gh release upload "$RELEASE_TAG" "$file"
             fi
           done
           find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/expected-assets
-          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort > /tmp/actual-assets
+          releases=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100")
+          release_id=$(jq -r --arg tag "$RELEASE_TAG" '[.[] | select(.tag_name == $tag and .draft)] | first | .id // empty' <<<"$releases")
+          [[ -n "$release_id" ]] || { echo "No draft release exists for $RELEASE_TAG." >&2; exit 1; }
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --jq '.assets[].name' | sort > /tmp/actual-assets
           diff -u /tmp/expected-assets /tmp/actual-assets
 
   publish:
@@ -268,11 +283,19 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')
-          [[ "$draft" == true ]]
-          gh release download "$RELEASE_TAG" --dir /tmp/final-release-assets
+          releases=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100")
+          release_id=$(jq -r --arg tag "$RELEASE_TAG" '[.[] | select(.tag_name == $tag and .draft)] | first | .id // empty' <<<"$releases")
+          [[ -n "$release_id" ]] || { echo "No draft release exists for $RELEASE_TAG." >&2; exit 1; }
+          release=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")
+          [[ "$(jq -r '.draft' <<<"$release")" == true ]]
+          [[ "$(jq -r '.tag_name' <<<"$release")" == "$RELEASE_TAG" ]]
           find verified-release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/expected-assets
-          find /tmp/final-release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/actual-assets
+          jq -r '.assets[].name' <<<"$release" | sort > /tmp/actual-assets
           diff -u /tmp/expected-assets /tmp/actual-assets
-          while IFS= read -r file; do cmp "verified-release-assets/$file" "/tmp/final-release-assets/$file"; done < /tmp/expected-assets
-          gh release edit "$RELEASE_TAG" --draft=false
+          while IFS= read -r file; do
+            expected="sha256:$(sha256sum "verified-release-assets/$file" | cut -d ' ' -f1)"
+            actual=$(jq -r --arg name "$file" '[.assets[] | select(.name == $name) | .digest] | first // empty' <<<"$release")
+            [[ -n "$actual" && "$actual" == "$expected" ]] || { echo "Draft asset $file does not match the verified candidate." >&2; exit 1; }
+          done < /tmp/expected-assets
+          published=$(gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --field draft=false)
+          [[ "$(jq -r '.draft' <<<"$published")" == false ]]
