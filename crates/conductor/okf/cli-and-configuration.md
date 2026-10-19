@@ -14,6 +14,8 @@ sources:
     title: Named connection contexts
   - resource: ../src/backup_cli.rs
     title: Offline backup, restore, and recovery clearance
+  - resource: ../src/storage_cli.rs
+    title: Read-only manager storage inspection
   - resource: ../../../examples/local.json
     title: Local configuration
   - resource: ../../../examples/manager.json
@@ -33,6 +35,11 @@ and identity path to `backup create` with `--include-path`; restore creates a
 new destination with manager and worker state below it and never replaces an
 existing path. Each restored component remains held from startup until explicit
 recovery clearance.
+`conductor storage inspect --manager-data-dir PATH` reads the current manager
+database without migration or writes. It reports retained and eligible history
+counts, permanent idempotency and audit counts, SQLite page/free-page counts,
+and database, WAL, and shared-memory file sizes. Pass the manager's configured
+`--completed-run-retention` value to estimate eligible rows beyond the target.
 `conductor agent --config PATH [--role all|manager|worker]` starts the daemon.
 `--role` overrides the role in the JSON file but does not bypass validation.
 `conductor context create|list|show|use|delete` manages named connection
@@ -72,8 +79,9 @@ are missing. The supported roles are combined `all`, standalone `manager`, and
 standalone `worker`.
 
 The all-role example configures `listen`, manager and worker state dirs, worker
-ID/concurrency, access mode, request and log limits, and optional cgroup and
-Landlock settings. Manager configuration adds a separate worker transport
+ID/concurrency, access mode, request and log limits, completed-run retention,
+and optional cgroup and Landlock settings. `completed_run_retention` defaults
+to 10,000 and accepts 1 through 1,000,000. Manager configuration adds a separate worker transport
 listener, manager identity, resource domains, labels, and additional worker
 descriptors. Worker configuration specifies the manager HTTPS endpoint, CA,
 worker state/ID, and either an enrollment credential or existing identity.

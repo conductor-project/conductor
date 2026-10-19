@@ -48,7 +48,13 @@ from the durable `run_logs.pruned` markers. If interrupted after removing a
 file but before recording the marker, a later pass treats the missing file as
 already removed and records progress. Active runs' logs remain subject to the
 per-stream cap; SQLite run and retention metadata are managed separately and
-can continue to grow.
+can continue to grow. Worker run observations and `worker_commands` results are
+retained without expiry so duplicate start/command delivery can replay its
+stored result. `worker_report_state` sequence counters are retained per
+incarnation so manager reconnects can resume report delivery. No worker command,
+report, or run-history compaction policy currently exists; these tables can
+grow with completed work. `conductor storage inspect` is manager-only and does
+not report worker database counts or sizes.
 
 `GET /v1/runs/{runId}/logs` requires `stream=stdout` or `stderr`; `offset`
 defaults to 0 and `limit` defaults to 4,096 bytes, with a range of 1 to 65,536.

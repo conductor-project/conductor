@@ -14,6 +14,8 @@ sources:
     title: Persistence and restart tests
   - resource: ../../conductor/src/backup_cli.rs
     title: Offline SQLite snapshot and restore validation
+  - resource: ../../conductor/src/storage_cli.rs
+    title: Read-only storage inspection
   - resource: ../../conductor/tests/backup_cli.rs
     title: Backup round-trip and recovery-hold tests
 ---
@@ -35,6 +37,42 @@ inaccessible, or newer than the supported schema. Use
 create a consistent SQLite snapshot. The command takes the manager state lock,
 uses SQLite's online backup API, and checks snapshot integrity and schema
 version. It does not change the source database.
+
+## Run-history retention
+
+The manager keeps the newest `completed_run_retention` eligible terminal runs
+(10,000 by default; configurable range 1 through 1,000,000). A cleanup pass
+deletes at most 128 runs. Cleanup runs once at manager startup and after a
+terminal observation is persisted; `moreEligible` progress is written as a
+structured manager event. It removes acknowledged command-outbox rows only
+with their deleted run.
+
+Eligibility requires a terminal run with no idempotency key, pending command,
+current service-attempt reference, or service-port lease. Active and unknown
+runs, idempotency-keyed runs, and runs with those references remain stored.
+Run IDs use a monotonic persisted sequence that cleanup never decrements, so
+removed IDs stay reserved. Audit events and execution-idempotency records are
+permanent; this policy does not globally bound those tables. Worker command and
+report history remains worker-owned and is not deleted by manager cleanup.
+Acknowledged manager commands are deleted only with their eligible run;
+pending commands stay protected. Job ID reservations, job revisions, and
+current deployment state are retained by their existing contracts. Service
+attempts and port leases stay while referenced by current state. This change
+does not set expiry windows for any idempotency or replay evidence.
+
+`conductor storage inspect --manager-data-dir ...` reports bounded counts,
+eligible rows beyond the configured target, permanent metadata counts, SQLite
+page count/freelist, and manager database/WAL/shared-memory file sizes. The
+inspection does not migrate or change database contents. SQLite may create its
+WAL coordination sidecar files when opening a read-only connection. Deleting
+rows places pages on SQLite's freelist but does not shrink the database file;
+SQLite reuses those pages on later writes. Physical compaction is not performed
+automatically. Inspection is manager-only: it does not open the worker
+database, count worker run/command/report rows, or claim a bound for them. The
+worker retains run observations and command results to preserve command replay,
+and keeps report sequence state for reconnect delivery. These worker records
+currently have no expiry or compaction policy; worker log files have the
+separate bounded policy in the worker knowledge page.
 
 Before upgrading, stop the daemon and take a consistent backup of manager
 state and worker state/logs. Start only binaries whose worker transport
