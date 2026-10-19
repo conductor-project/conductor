@@ -12,6 +12,12 @@ sources:
     title: Pull request checks
   - resource: ../.github/workflows/merge.yml
     title: Post-merge release checks
+  - resource: ../.github/workflows/publish-release.yml
+    title: Tagged release promotion and publication gates
+  - resource: ../scripts/resolve-release-ref.py
+    title: Release tag and authorized-line resolver
+  - resource: ../scripts/test-resolve-release-ref.py
+    title: Unprivileged release-reference fixtures
   - resource: ../AGENTS.md
     title: Repository contribution and protection requirements
 ---
@@ -80,6 +86,12 @@ architecture package sets, checksums, Cosign signatures, and attestations, and
 logged `Candidate verification succeeded; no release or tag was created or
 changed.` The protected publication job was skipped. A post-run inspection
 confirmed that `v0.0.1` remains a draft with no publication timestamp.
+
+The release-reference resolver is covered by
+`python3 scripts/test-resolve-release-ref.py` (5 tests passed). Temporary local
+Git fixtures exercise current-line tags, maintenance-line tags, shared commits,
+invalid tag syntax, version mismatch, missing tags, and unauthorized branches.
+These fixtures do not install packages or require privileged access.
 
 The approval rehearsal has not run. Repository Settings showed no configured
 GitHub environments on 2026-10-19, and the environment API returned 404 for
