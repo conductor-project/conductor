@@ -264,6 +264,37 @@ run history persist. A daemon restart can leave an ambiguous run in `unknown`;
 Conductor does not automatically replay it. See
 [operations and recovery](okf/operations-and-recovery.md).
 
+## Manager history and storage inspection
+
+Inspect manager and/or worker retained history, delivery counts, SQLite
+freelist pages, and database/WAL file sizes without migrating or changing
+database contents:
+
+```sh
+./target/debug/conductor storage inspect \
+  --manager-data-dir /var/lib/conductor/manager \
+  --worker-data-dir /var/lib/conductor/worker \
+  --completed-run-retention 10000
+```
+
+`completed_run_retention` defaults to 10,000 and accepts values from 1 through
+1,000,000. Cleanup removes eligible terminal runs in batches of at most 128.
+Idempotency-keyed runs, runs with pending commands, service references, or port
+leases are retained. Run identifiers stay reserved by the monotonic run
+sequence. Audit events and execution idempotency records are permanent. The
+inspection reports SQLite free pages, but does not shrink the database file;
+SQLite reuses those pages for later writes. A read-only SQLite connection may
+create WAL coordination sidecar files when they do not already exist. The
+completed-run target applies to eligible run rows, not permanent or protected
+metadata. Add `--worker-data-dir` to inspect worker run/command/report counts,
+SQLite page and file sizes, and the estimated upper bound for unpruned log
+pairs, including active runs. Set `--log-retention-runs` and
+`--log-max-bytes-per-stream` to
+match the worker configuration when calculating that estimate. Worker run
+observations, command results, and report sequence state are retained for replay
+and reconnect safety and currently have no expiry or compaction policy. Worker
+log files use their separate `log_retention_runs` setting.
+
 ## Offline backup and restore
 
 Stop Conductor and every worker before planned maintenance. Create and verify a

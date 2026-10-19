@@ -10,6 +10,7 @@
   },
   "log_max_bytes_per_stream": 8388608,
   "log_retention_runs": 100,
+  "completed_run_retention": 10000,
   "request_timeout_ms": 10000,
   "cgroup_v2": {
     "enabled": false

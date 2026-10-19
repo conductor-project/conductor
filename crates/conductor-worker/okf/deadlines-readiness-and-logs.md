@@ -3,7 +3,7 @@ type: Reference
 title: Worker deadlines, readiness, logs, and inventory
 description: Supervisors enforce execution deadlines, collect bounded streams, report readiness, and advertise host capabilities.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: 7365053
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/lib.rs
@@ -41,9 +41,24 @@ configured range 1 byte to 1 GiB). Once the cap is reached, additional bytes
 are discarded while draining continues, and that stream is marked truncated.
 The worker retains logs for the newest `log_retention_runs` completed runs
 (100 by default; configured range 0 to 10,000). Pruning waits for both streams
-to close and preserves run history. Active runs' logs remain subject to the
+to close and preserves run history. Each pass removes at most 128 eligible run
+log pairs. A structured `log_retention_progress` event reports the number of
+runs pruned and whether another batch remains; the next cleanup pass resumes
+from the durable `run_logs.pruned` markers. If interrupted after removing a
+file but before recording the marker, a later pass treats the missing file as
+already removed and records progress. Active runs' logs remain subject to the
 per-stream cap; SQLite run and retention metadata are managed separately and
-can continue to grow.
+can continue to grow. Worker run observations and `worker_commands` results are
+retained without expiry so duplicate start/command delivery can replay its
+stored result. `worker_report_state` sequence counters are retained per
+incarnation so manager reconnects can resume report delivery. No worker command,
+report, or run-history compaction policy currently exists; these tables can
+grow with completed work. `conductor storage inspect --worker-data-dir PATH`
+reports worker run/command/report counts and SQLite database file/page sizes.
+Its unpruned-log byte measurement is an upper bound from the configured
+per-stream cap, including active log pairs, not an exact scan of log files. As
+with manager inspection, read-only SQLite connections may create WAL
+coordination sidecar files.
 
 `GET /v1/runs/{runId}/logs` requires `stream=stdout` or `stderr`; `offset`
 defaults to 0 and `limit` defaults to 4,096 bytes, with a range of 1 to 65,536.

@@ -35,6 +35,10 @@ pub const CURRENT_SCHEMA_VERSION: i64 = SCHEMA_VERSION;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const MAX_PENDING_COMMANDS_PER_WORKER: usize = 32;
 const MAX_PENDING_NON_CONTROL_COMMANDS_PER_WORKER: usize = 24;
+pub const DEFAULT_COMPLETED_RUN_RETENTION: usize = 10_000;
+pub const MIN_COMPLETED_RUN_RETENTION: usize = 1;
+pub const MAX_COMPLETED_RUN_RETENTION: usize = 1_000_000;
+pub const MAX_HISTORY_CLEANUP_BATCH: usize = 128;
 const MAX_SERVICE_RESTARTS: u32 = 5;
 const SERVICE_RESTART_BASE_BACKOFF_MS: u64 = 250;
 const SERVICE_RESTART_MAX_BACKOFF_MS: u64 = 30_000;
@@ -394,6 +398,7 @@ pub enum RepositoryOpenError {
     Io(io::Error),
     UnsupportedSchemaVersion(i64),
     InvalidLegacySchema,
+    InvalidRetentionPolicy,
     TimestampUnavailable,
 }
 
@@ -417,6 +422,7 @@ impl std::fmt::Display for RepositoryOpenError {
             Self::InvalidLegacySchema => {
                 f.write_str("manager database has an invalid legacy schema")
             }
+            Self::InvalidRetentionPolicy => f.write_str("manager history retention is invalid"),
             Self::TimestampUnavailable => f.write_str("system time is unavailable"),
         }
     }
@@ -426,7 +432,9 @@ impl std::error::Error for RepositoryOpenError {}
 
 #[path = "structs/sqlite_job_repository.rs"]
 mod sqlite_job_repository;
-pub use sqlite_job_repository::SqliteJobRepository;
+pub use sqlite_job_repository::{
+    HistoryPruneProgress, HistoryRetentionStatus, SqliteJobRepository,
+};
 
 fn prepare_database_file(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
