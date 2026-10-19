@@ -105,6 +105,7 @@ rpm_top="$work/rpmbuild"
 mkdir -p "$rpm_top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
 tar -C "$work" -czf "$rpm_top/SOURCES/conductor-package.tar.gz" root
 cat > "$rpm_top/SPECS/conductor.spec" <<EOF
+%global debug_package %{nil}
 Name: conductor
 Version: $version
 Release: 1
