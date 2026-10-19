@@ -3,7 +3,7 @@ type: Reference
 title: Contributing and maintaining knowledge
 description: Repository contribution policy is authoritative in AGENTS.md; OKF pages provide descriptive source-linked knowledge.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: af3ccc56e689b1dfa2dd2cf6ed4eca188135e6e4
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../AGENTS.md

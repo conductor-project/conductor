@@ -3,7 +3,7 @@ type: Reference
 title: Platform support and evidence
 description: Platform claims are scoped to source, tests, workflows, and the exact execution environment that produced evidence.
 status: stable
-source_revision: a739b4c20dd8e81ded656dfa7bb9859f48d73f9e
+source_revision: af3ccc56e689b1dfa2dd2cf6ed4eca188135e6e4
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../.github/workflows/pr.yml
