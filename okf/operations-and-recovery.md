@@ -169,10 +169,10 @@ recovery decision have been verified.
 
 ## Upgrade compatibility policy
 
-The current source reports Conductor `0.1.0`, HTTP API `v1`, manager-worker
+The current source reports Conductor `0.0.1`, HTTP API `v1`, manager-worker
 protocol `3`, manager database schema `12`, and worker database schema `4`.
 Manager and worker databases have independent schema sequences. The release
-policy intends `0.1.x` as the first stable line, then support for the latest
+policy intends `0.0.x` as the first stable line, then support for the latest
 and immediately preceding minor lines for 12 months from each line's first
 stable release. No release tag has been published, so there is not yet a
 previous supported release to use as a real upgrade baseline. Untagged
@@ -180,7 +180,7 @@ development builds are not a supported upgrade source.
 
 | Compatibility boundary | Current source value | Policy |
 | --- | --- | --- |
-| CLI binary | `0.1.0` | Upgrade all manager and worker binaries together to the same stable release. Untagged builds are unsupported upgrade baselines. |
+| CLI binary | `0.0.1` | Upgrade all manager and worker binaries together to the same stable release. Untagged builds are unsupported upgrade baselines. |
 | HTTP API | `v1` | Routes are versioned under `/v1`. No cross-release client/server window has been validated; use matching release versions. |
 | Manager-worker transport | Protocol `3` | Protocol negotiation checks version overlap and required capabilities. Mixed Conductor release versions are not a supported operating mode until separately qualified. |
 | Manager database | Schema `12` | Each source migration step is transactional and the current code migrates known earlier markers. This does not prove a real previous-release upgrade. No downgrade is supported after migration. |
@@ -189,8 +189,8 @@ development builds are not a supported upgrade source.
 The release policy and the upgrade evidence are separate: the policy defines
 which stable lines are intended to receive support, while a supported upgrade
 path still requires a published source release and exercised fixtures from
-that release. Once `0.1.0` is published as the first stable release, it becomes
-the baseline for later `0.1.x` patch upgrades. A later minor release must
+that release. Once `0.0.1` is published as the first stable release, it becomes
+the baseline for later `0.0.x` patch upgrades. A later minor release must
 exercise the preceding supported line before claiming upgrade compatibility.
 
 Run `conductor upgrade preflight` with the manager and worker data directories

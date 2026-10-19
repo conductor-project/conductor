@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "conductor"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "axum",
  "axum-server",
@@ -391,7 +391,7 @@ dependencies = [
 
 [[package]]
 name = "conductor-api"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "conductor-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "conductor-manager"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
  "conductor-core",
@@ -431,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "conductor-process"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "conductor-core",
  "conductor-worker",
@@ -443,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "conductor-transport"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "axum",
  "axum-server",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "conductor-worker"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "conductor-core",
  "nix",

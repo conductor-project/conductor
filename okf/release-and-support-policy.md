@@ -18,16 +18,21 @@ sources:
 
 # Policy and current evidence
 
-[`docs/release-policy.md`](../docs/release-policy.md) defines the intended
-first `0.1.x` line, the current and immediately preceding minor support window
-with a 12-month minimum, maintainer ownership, backport and embargo procedures,
-and immutable publication. No version is supported until its verified release
-is published.
+[`docs/release-policy.md`](../docs/release-policy.md) defines `0.0.1` as the
+first intended release on the `0.0.x` line, the current and immediately
+preceding minor support window with a 12-month minimum, maintainer ownership,
+backport and embargo procedures, and immutable publication. The release
+workflow verifies and promotes packages from the exact successful `Merge` run
+without rebuilding; tag pushes create drafts, while publishing requires the
+configured `release-publication` environment. No version is supported until
+its verified release is published.
 
 The reviewed repository revision has no release tags or maintenance branches.
 The checked-in pull request workflow runs debug checks; the post-merge workflow
-runs release tests and builds on Linux x86_64 and macOS. Neither workflow
-currently produces packages or proves maintenance-line coverage.
+runs release tests and builds on Linux x86_64 and macOS and packages Linux
+x86_64 and arm64. The release workflow consumes those signed, attested
+artifacts. No maintenance-line release or publication rehearsal has been
+recorded.
 
 GitHub repository settings were inspected on 2026-10-19. The active `Protect
 Main` ruleset applies to `refs/heads/main` and only contains deletion and
