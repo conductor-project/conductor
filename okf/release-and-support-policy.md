@@ -3,7 +3,7 @@ type: Reference
 title: Release and support policy
 description: Supported line policy and release/security procedures, distinguished from configured GitHub protections and completed release evidence.
 status: planned
-source_revision: 6442ff8482ca55766cb413dd1203acb34e587c76
+source_revision: 848190fed82842c54506dad31a6b6a5e49ce0214
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../docs/release-policy.md
@@ -119,12 +119,18 @@ Git fixtures exercise current-line tags, maintenance-line tags, shared commits,
 invalid tag syntax, version mismatch, missing tags, and unauthorized branches.
 These fixtures do not install packages or require privileged access.
 
-The `release-publication` GitHub environment was created on 2026-10-19. Its
-current configuration has one required reviewer and allows self-review, as
-selected for this sole-maintainer repository. This satisfies the workflow's
-required-reviewer check; the approval rehearsal has not yet run. The environment
-still requires a manual approval before the publication job proceeds. The
-workflow's in-job check is not a substitute for this repository-level control.
+After PR #184 merged, the protected no-write approval rehearsal ran on main
+revision `848190fed82842c54506dad31a6b6a5e49ce0214` as run
+[`39276031693`](https://github.com/conductor-project/conductor/actions/runs/39276031693).
+It selected the successful exact-commit `Merge` run, verified both package
+architectures, checksums, Cosign signatures, and GitHub attestations, and staged
+the verified assets. The configured `release-publication` environment had one
+required reviewer and allowed self-review under the sole-maintainer policy; the
+maintainer approved the rehearsal. The environment check and no-publish
+rehearsal step passed, while the draft-creation and publish steps were skipped.
+A post-run check confirmed `v0.0.1` remains a draft with no publication
+timestamp. This validates candidate verification and the approval gate, but
+does not qualify maintenance-line promotion or publish a supported release.
 
 The checked-in pull request workflow runs debug checks; the post-merge workflow
 runs release tests and builds on Linux x86_64 and macOS and packages Linux
