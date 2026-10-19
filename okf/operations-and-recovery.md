@@ -3,7 +3,7 @@ type: Runbook
 title: Operations and recovery
 description: Use health and readiness correctly, plan graceful shutdown, and resolve uncertain work after restart.
 status: stable
-source_revision: 1700588a0495855ed6a69855c9143554e5055d6a
+source_revision: afcacf3b2c0f277e6b9b2c75f01592a9b1d536a9
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../crates/conductor-api/src/lib.rs
@@ -218,8 +218,8 @@ gate; it does not test a separately running remote worker or an upgrade from a
 published prior release. The recovery command records operator confirmation and
 does not independently inspect external processes.
 
-Local debug verification on the working tree based on source revision
-`1700588a0495855ed6a69855c9143554e5055d6a`:
+Local debug verification on source revision
+`afcacf3b2c0f277e6b9b2c75f01592a9b1d536a9`:
 
 - `python3 scripts/check-dependency-policy.py` — passed.
 - `cargo fmt --all -- --check` — passed.
