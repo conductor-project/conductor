@@ -113,7 +113,12 @@ never overwrites an existing destination. The restored manager and worker
 state live under `DESTINATION/manager` and `DESTINATION/worker`; included files
 live under `DESTINATION/included/NNNN`. An interrupted or invalid restore is
 discarded from its private staging directory and does not replace a usable
-installation.
+installation. Restored directories use mode `0700` and files use mode `0600`,
+owned by the account that ran the restore. If the daemon uses a different
+service account, assign the restored state directories to that account before
+startup. Set ownership and permissions for included configuration and identity
+files separately; do not recursively change the entire destination without
+reviewing its contents.
 
 Every restored component creates `.conductor-recovery-required` in its state
 directory. Manager, worker, and combined `all` processes refuse startup while

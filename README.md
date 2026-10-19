@@ -308,6 +308,21 @@ worker, and `all` roles refuse to start until surviving workers and workloads
 are fenced and uncertain outcomes have been reviewed. After those checks,
 clear each hold explicitly (pass both paths when both roles were restored):
 
+Restored directories are mode `0700` and files are mode `0600`, owned by the
+account that ran the restore. If the daemon runs under a different service
+account, assign the restored state directories to that account before startup;
+set ownership and permissions for included configuration and identity files
+separately. For the packaged `conductor` account, for example:
+
+```sh
+sudo chown -R conductor:conductor \
+  /var/lib/conductor/restored/manager \
+  /var/lib/conductor/restored/worker
+```
+
+Do this only after checking the destination paths and which account should own
+each item.
+
 ```sh
 ./target/debug/conductor backup recovery-resolve \
   --manager-data-dir /var/lib/conductor/restored/manager \
