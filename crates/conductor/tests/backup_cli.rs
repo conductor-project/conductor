@@ -449,7 +449,7 @@ fn restore_rejects_unsafe_archive_paths_links_and_invalid_sqlite_without_publish
     let manifest = serde_json::json!({
         "formatVersion": 1,
         "createdAtUnixSeconds": 1,
-        "binaryVersion": "0.1.0",
+        "binaryVersion": env!("CARGO_PKG_VERSION"),
         "managerIncluded": true,
         "managerSchemaVersion": 12,
         "workerIncluded": false,
@@ -512,7 +512,7 @@ fn restore_rejects_unsafe_archive_paths_links_and_invalid_sqlite_without_publish
     let schema_manifest = serde_json::json!({
         "formatVersion": 1,
         "createdAtUnixSeconds": 1,
-        "binaryVersion": "0.1.0",
+        "binaryVersion": env!("CARGO_PKG_VERSION"),
         "managerIncluded": true,
         "managerSchemaVersion": 12,
         "workerIncluded": false,

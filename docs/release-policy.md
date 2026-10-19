@@ -7,7 +7,8 @@ policy does not authorize direct pushes or protection bypasses.
 
 ## Supported lines
 
-The first intended stable release line is `0.1.x`. The repository currently
+The first intended stable release is `0.0.1`, the start of the `0.0.x`
+line. The repository currently
 has no published release tags or maintenance branches, so no version is
 supported until its verified release is published.
 
@@ -21,7 +22,7 @@ the release notes and README and provide upgrade or mitigation guidance.
 
 | Line | Authorized tags | Branch | Status |
 | --- | --- | --- | --- |
-| First line | `v0.1.Z` | `main`, then `release/0.1` when cut | Planned; not yet published |
+| First line | `v0.0.Z` | `main`, then `release/0.0` when cut | Planned; not yet published |
 | Later minor `X.Y` | `vX.Y.Z` | `main`, then `release/X.Y` when supported as the preceding line | Not yet selected |
 
 The table records policy, not evidence that a release or branch exists.
@@ -42,7 +43,17 @@ release: require pull requests and the same required verification checks on
 `v*` tags against unauthorized creation, deletion, and updates; and restrict
 release approval/publication to repository maintainers. The release workflow
 must independently verify tag syntax, version agreement, commit ancestry on
-the authorized line, and successful checks for the exact tagged commit.
+the authorized line, and successful checks for the exact tagged commit. The
+`Publish release` workflow promotes package files from the exact successful
+`Merge` run for the tag commit; it performs no Conductor build. A pushed tag
+can only create a draft release. Publication is a separate manual action and
+requires the `release-publication` environment to have required reviewers and
+self-review prevention configured. Administrators must configure and verify
+that environment before using publication. The workflow verifies detached
+Cosign signatures over the `.deb` and `.rpm` bytes and verifies GitHub artifact
+attestations for those same files before promotion. Its release assets include
+the package signature bundles, build metadata, checksums, source commit, and
+the trusted workflow run identifier.
 Configuration of GitHub rulesets is an administrator action and must be
 verified in repository settings; workflow checks alone do not protect a tag
 from being moved or deleted.
@@ -112,6 +123,33 @@ release.
 Publication is resumable only when an existing asset matches the expected
 bytes. A conflicting asset or tag fails; published tags and assets are never
 rewritten. Correct a faulty patch with a new version and an advisory update.
+The release workflow's `rehearse` dispatch validates the existing tag, branch,
+exact-run artifacts, package metadata, checksums, signatures, and attestations
+without creating or changing a release. `prepare` creates or resumes a draft;
+`approval-rehearsal` sends the candidate through the protected publication
+environment and confirms approval without publishing; `publish` publishes the
+draft only after that environment approval.
+
+Run a rehearsal and prepare a draft with:
+
+```sh
+gh workflow run publish-release.yml --ref main --field tag=v0.0.1 --field action=rehearse
+gh workflow run publish-release.yml --ref main --field tag=v0.0.1 --field action=prepare
+gh workflow run publish-release.yml --ref main --field tag=v0.0.1 --field action=approval-rehearsal
+gh workflow run publish-release.yml --ref main --field tag=v0.0.1 --field action=publish
+```
+
+Inspect the draft and artifacts before dispatching `action=publish`; the
+protected environment still requires an eligible approval. Repeat the same
+sequence for a supported maintenance-line tag after its release branch exists.
+Post-merge run artifacts are retained for up to 90 days; the prepared draft
+release is the durable candidate. If an artifact has expired, the promotion
+workflow fails with the trusted run ID. Recover by rerunning that exact
+successful `Merge` run (`gh run rerun RUN_ID`), waiting for the same source
+commit's release checks and packages to pass, then dispatching `action=prepare`
+again. Promotion still consumes the refreshed run artifacts and never builds
+Conductor. This preserves the source commit identity while regenerating the
+temporary candidate files.
 
 ## Required rehearsals and records
 
