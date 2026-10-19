@@ -484,9 +484,11 @@ fn inspect_archive(
     source: &mut (impl Read + Seek),
     archive_size: u64,
 ) -> io::Result<BackupManifest> {
+    let scratch = TempDir::create(&std::env::temp_dir(), "conductor-inspect")?;
     source.seek(SeekFrom::Start(0))?;
     let mut archive = Archive::new(source);
     let mut observed = BTreeMap::<String, (u64, String)>::new();
+    let mut database_snapshots = BTreeMap::<String, PathBuf>::new();
     let mut manifest_bytes = None;
     let mut total_size = 0_u64;
     let mut entries = archive.entries()?;
@@ -520,8 +522,28 @@ fn inspect_archive(
             .filter(|size| *size <= archive_size)
             .ok_or_else(|| invalid("backup archive entry sizes exceed the archive file"))?;
         let size = entry.size();
-        let digest = hash_reader(&mut entry)?;
-        if observed.insert(name, (size, hex_digest(&digest))).is_some() {
+        let snapshot_path = match name.as_str() {
+            "manager/manager.sqlite3" => Some(scratch.0.join("manager.sqlite3")),
+            "worker/worker.sqlite3" => Some(scratch.0.join("worker.sqlite3")),
+            _ => None,
+        };
+        let digest = if let Some(path) = snapshot_path.as_ref() {
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(path)?;
+            let digest = hash_reader_and_write(&mut entry, &mut file)?;
+            file.sync_all()?;
+            database_snapshots.insert(name.clone(), path.clone());
+            digest
+        } else {
+            hex_digest(&hash_reader(&mut entry)?)
+        };
+        if observed.insert(name, (size, digest)).is_some() {
             return Err(invalid("backup archive contains duplicate paths"));
         }
     }
@@ -564,6 +586,22 @@ fn inspect_archive(
         let root = safe_archive_path(Path::new(&source.archive_root))?;
         if !root.starts_with("included/") || !source.source_path.starts_with('/') {
             return Err(invalid("backup included-source metadata is invalid"));
+        }
+    }
+    for (path, expected_version) in [
+        ("manager/manager.sqlite3", manifest.manager_schema_version),
+        ("worker/worker.sqlite3", manifest.worker_schema_version),
+    ] {
+        if let Some(expected_version) = expected_version {
+            let snapshot = database_snapshots
+                .get(path)
+                .ok_or_else(|| invalid("backup database is missing"))?;
+            let actual_version = read_user_version(snapshot)?;
+            if actual_version != expected_version {
+                return Err(invalid(
+                    "backup database schema does not match its manifest",
+                ));
+            }
         }
     }
     Ok(manifest)
@@ -763,6 +801,20 @@ fn hash_reader(reader: &mut impl Read) -> io::Result<[u8; 32]> {
         hash.update(&buffer[..read]);
     }
     Ok(hash.finalize().into())
+}
+
+fn hash_reader_and_write(reader: &mut impl Read, output: &mut impl Write) -> io::Result<String> {
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+        output.write_all(&buffer[..read])?;
+    }
+    Ok(hex_digest(&hash.finalize().into()))
 }
 
 fn hex_digest(digest: &[u8; 32]) -> String {

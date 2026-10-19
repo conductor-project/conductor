@@ -458,12 +458,16 @@ fn restore_rejects_unsafe_archive_paths_links_and_invalid_sqlite_without_publish
     archive
         .into_inner()
         .expect("finish invalid database archive");
-    assert_success(run(&[
+    let inspect = run(&[
         "backup",
         "inspect",
         "--input",
         invalid_sqlite.to_str().unwrap(),
-    ]));
+    ]);
+    assert!(
+        !inspect.status.success(),
+        "inspection must reject invalid SQLite even when its manifest checksum matches"
+    );
     let destination = temp.0.join("invalid-sqlite-restore");
     let restore = run(&[
         "backup",
@@ -484,5 +488,48 @@ fn restore_rejects_unsafe_archive_paths_links_and_invalid_sqlite_without_publish
                 .to_string_lossy()
                 .starts_with(".conductor-restore-")),
         "failed restore staging directory is cleaned up"
+    );
+
+    let schema_source = temp.0.join("schema-source");
+    let schema_database = make_database(&schema_source, "manager.sqlite3", 11);
+    let schema_database_bytes = fs::read(schema_database).expect("read schema fixture");
+    let schema_digest = Sha256::digest(&schema_database_bytes);
+    let schema_sha256 = schema_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let schema_manifest = serde_json::json!({
+        "formatVersion": 1,
+        "createdAtUnixSeconds": 1,
+        "binaryVersion": "0.1.0",
+        "managerIncluded": true,
+        "managerSchemaVersion": 12,
+        "workerIncluded": false,
+        "workerSchemaVersion": null,
+        "files": [{"path":"manager/manager.sqlite3","size":schema_database_bytes.len(),"sha256":schema_sha256}],
+        "includedSources": []
+    });
+    let schema_mismatch = temp.0.join("schema-mismatch.tar");
+    let mut archive = Builder::new(File::create(&schema_mismatch).expect("create schema archive"));
+    append_file(
+        &mut archive,
+        "manager/manager.sqlite3",
+        &schema_database_bytes,
+    );
+    append_file(
+        &mut archive,
+        "manifest.json",
+        &serde_json::to_vec(&schema_manifest).expect("encode schema manifest"),
+    );
+    archive.into_inner().expect("finish schema archive");
+    let inspect = run(&[
+        "backup",
+        "inspect",
+        "--input",
+        schema_mismatch.to_str().unwrap(),
+    ]);
+    assert!(
+        !inspect.status.success(),
+        "inspection must reject a schema marker that disagrees with the SQLite database"
     );
 }
