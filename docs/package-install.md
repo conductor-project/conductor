@@ -150,10 +150,10 @@ inspection could not resolve the host name, so independent post-run inspection
 was not completed. The exact systemd and kernel versions were not recorded.
 
 This is Debian 13 x86_64 `.deb` lifecycle evidence for this debug package and
-host only. It does not qualify Rocky Linux 10 x86_64 `.rpm`, an x86_64 package
-upgrade, a published release, or production-host behavior. The fixture was run
-locally by explicit authorization; privileged package and systemd fixtures
-remain excluded from GitHub workflows.
+host only. It does not qualify Rocky Linux 10 x86_64 `.rpm`, a Debian x86_64
+package upgrade, a published release, or production-host behavior. The fixture
+was run locally by explicit authorization; privileged package and systemd
+fixtures remain excluded from GitHub workflows.
 
 ### Local Rocky Linux 10 x86_64 qualification (2026-10-19)
 
@@ -178,8 +178,9 @@ The container used the cached `docker.io/rockylinux/rockylinux:10` amd64 image
 systemd 257 (`257-23.el10_2.2.rocky.0.1-gb237c67`), curl, and procps-ng
 installed. Fortress was Debian 13 x86_64 with Podman 5.4.2, cgroup v2, and
 kernel `6.12.113+deb13-amd64`. The minimal Rocky image sets `tsflags=nodocs`;
-the test cleared that DNF option for package installation so the packaged
-example configuration was available for the service test.
+the install/remove/reinstall fixture cleared that DNF option for package
+installation. In the upgrade fixture, DNF still omitted documentation, so the
+operator config was seeded from the source example that the RPM packages.
 
 The test image installed systemd with `dnf -y install systemd curl procps-ng`.
 The lifecycle commands inside the container were:
@@ -206,6 +207,36 @@ container, temporary image, or staging directory left on Fortress.
 
 This qualifies Rocky Linux 10.2 x86_64 `.rpm` install/runtime/removal and
 reinstall behavior for this debug package in a systemd container. It does not
-qualify an x86_64 package upgrade, a published release, or production-host
-behavior. The fixture was run locally; privileged package and systemd fixtures
-remain excluded from GitHub workflows.
+qualify a published release or production-host behavior. The fixture was run
+locally; privileged package and systemd fixtures remain excluded from GitHub
+workflows.
+
+### Local Rocky Linux 10 x86_64 upgrade qualification (2026-10-19)
+
+The upgrade fixture used the exact `0.1.0` RPM from workflow run 44 described
+above, then upgraded it with a temporary local `0.1.1` debug RPM built from PR
+head `f5f6de25db7a0ada61e4d60b1b7110f48c6d1439`. Only the temporary source
+copy's `conductor` crate version was changed; repository files were not
+modified for the fixture. `BUILD-INFO.json` recorded version `0.1.1`, target
+`x86_64`, debug profile, and binary SHA-256
+`02ed069d4c9dcab1b75c3f4c3a9f7ca80c06d1ab71b4311a01bf4c88aa97c495`. The
+RPM SHA-256 was
+`177318c45e69b03df2342d3da77d0eb8e014744e65b5aff43244c9f73c2505d7`.
+
+The disposable systemd image was built from the cached Rocky base image
+`0b5329d806d053ad65ab6b21fc3e49f1025e970cd826547a01a93b3ce9012796` and
+used Rocky Linux 10.2 x86_64, systemd
+`257-23.el10_2.2.rocky.0.1-gb237c67`, and Podman 5.4.2 on Fortress. After
+installing the 0.1.0 RPM, the fixture configured the service from the package
+example, started it, and confirmed `/healthz`. It recorded MainPID `137`, then
+seeded a state marker and recorded the config and state hashes. DNF upgraded to
+`0.1.1-1.x86_64`; the service remained active and healthy with MainPID `137`,
+and both hashes remained unchanged. An explicit stop/start also passed the
+health check. The container, generated image, Rust builder image, and staging
+directory were removed; a follow-up inspection found none remaining. The
+user-pulled Rocky base image was retained.
+
+This demonstrates local x86_64 RPM upgrade mechanics with debug fixtures; it
+does not qualify an upgrade from a supported published release, a published
+release, or production-host behavior. The privileged fixture ran locally and
+is excluded from GitHub workflows.
