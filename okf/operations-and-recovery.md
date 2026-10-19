@@ -3,7 +3,7 @@ type: Runbook
 title: Operations and recovery
 description: Use health and readiness correctly, plan graceful shutdown, and resolve uncertain work after restart.
 status: stable
-source_revision: ae824f0a6ed7242e589b340243d46897c3b67877
+source_revision: 1700588a0495855ed6a69855c9143554e5055d6a
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../crates/conductor-api/src/lib.rs
@@ -198,25 +198,34 @@ a release-to-release upgrade.
 
 The binary-level test
 `failed_upgrade_restores_matching_backup_and_keeps_recovery_hold_until_confirmed`
-also exercises a failed candidate preflight, restore from the matching
-pre-upgrade manager/worker backup, and startup blocking until the operator
-confirms worker fencing and unknown-outcome review. It verifies that state
-written after the backup is absent after restore. This isolated CLI fixture
-proves the backup/recovery gate behavior; it does not exercise a live surviving
-worker or reconcile a running workload.
+exercises a failed candidate preflight, restore from the matching pre-upgrade
+manager/worker backup, and startup blocking until the operator confirms worker
+fencing and unknown-outcome review. It verifies that state written after the
+backup is absent after restore.
 
-Local debug verification on source revision
-`ae824f0a6ed7242e589b340243d46897c3b67877` plus the migration and recovery
-tests in this change:
+`actual_binary_recovery_hold_blocks_restore_while_a_workload_survives_failure`
+starts the real combined daemon, records an offline backup, runs a long-lived
+workload, and kills the daemon while the workload remains alive. After simulating
+an unsupported schema from the failed upgrade, the test restores the matching
+backup and verifies startup remains blocked while that workload survives. It
+then explicitly fences the workload, clears the hold, and confirms the restored
+job definition is available. The post-backup run is absent, as expected for this
+restore point. This test exercises workload survival and the operator fencing
+gate; it does not test a separately running remote worker or an upgrade from a
+published prior release. The recovery command records operator confirmation and
+does not independently inspect external processes.
+
+Local debug verification on the working tree based on source revision
+`1700588a0495855ed6a69855c9143554e5055d6a`:
 
 - `python3 scripts/check-dependency-policy.py` — passed.
 - `cargo fmt --all -- --check` — passed.
 - `cargo clippy --workspace --locked --all-targets --all-features -- -D warnings` — passed.
-- `cargo test --workspace --locked --all-targets --all-features` — 271 tests passed across 27 suites with local loopback permission.
+- `cargo test --workspace --locked --all-targets --all-features` — 272 tests passed across 27 suites, including the live-workload recovery drill.
 
-This is local debug test evidence only. No release build/test, stable previous-
-release upgrade, package qualification, or recovery drill with a live surviving
-worker/workload is claimed here.
+This is local debug evidence. No release build/test, stable previous-release
+upgrade, package qualification, or recovery drill with a separately running
+remote worker is claimed here.
 
 The release policy and the upgrade evidence are separate: the policy defines
 which stable lines are intended to receive support, while a supported upgrade

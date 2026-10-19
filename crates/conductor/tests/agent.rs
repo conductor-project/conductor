@@ -381,6 +381,16 @@ fn signal(child: &Agent, name: &str) {
     assert!(status.success(), "kill -{name} failed");
 }
 
+fn process_is_running(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("inspect process")
+        .success()
+}
+
 fn failed(config: &Path, role: Option<&str>) -> Output {
     command(config, role)
         .output()
@@ -2933,6 +2943,193 @@ fn actual_binary_preserves_jobs_after_normal_and_abrupt_restart() {
     assert_eq!(status, 200, "{body}");
     signal(&child, "TERM");
     wait_for_exit(&mut child);
+}
+
+#[test]
+fn actual_binary_recovery_hold_blocks_restore_while_a_workload_survives_failure() {
+    let path = TempDir::new("upgrade-recovery-surviving-workload");
+    let pid_file = path.join("surviving-workload.pid");
+    let _process_guard = ProcessGuard(pid_file.clone());
+    let (mut child, address) = start(&path, "all", None);
+    let command = format!("echo $$ > '{}'; exec /bin/sleep 60", pid_file.display());
+    let job = serde_json::json!({
+        "id":"recovery-surviving-workload",
+        "command":["/bin/sh", "-c", command],
+        "cwd":"/tmp",
+        "terminationGraceMs":100,
+    });
+    let (status, body) = http(
+        address,
+        "POST",
+        "/v1/jobs",
+        Some("application/json"),
+        &serde_json::to_vec(&job).unwrap(),
+    );
+    assert_eq!(status, 201, "{body}");
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
+
+    let archive = path.join("pre-upgrade.tar");
+    let backup = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args(["backup", "create", "--manager-data-dir"])
+        .arg(path.join("manager"))
+        .args(["--worker-data-dir"])
+        .arg(path.join("worker"))
+        .args(["--output"])
+        .arg(&archive)
+        .output()
+        .expect("create stopped manager/worker backup");
+    assert!(
+        backup.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&backup.stdout),
+        String::from_utf8_lossy(&backup.stderr)
+    );
+
+    let (mut child, address) = start(&path, "all", None);
+    let (status, accepted) = http(
+        address,
+        "POST",
+        "/v1/jobs/recovery-surviving-workload/runs",
+        None,
+        &[],
+    );
+    assert_eq!(status, 202, "{accepted}");
+    let run_id = serde_json::from_str::<serde_json::Value>(&accepted).unwrap()["runId"]
+        .as_str()
+        .expect("accepted run ID")
+        .to_owned();
+    wait_for_run_state(address, &run_id, &["running"], Duration::from_secs(5));
+    let pid_deadline = Instant::now() + Duration::from_secs(3);
+    while !pid_file.is_file() {
+        assert!(
+            Instant::now() < pid_deadline,
+            "workload PID was not recorded"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let workload_pid = fs::read_to_string(&pid_file)
+        .expect("read workload PID")
+        .trim()
+        .parse::<u32>()
+        .expect("valid workload PID");
+    assert!(
+        process_is_running(workload_pid),
+        "workload must be running before the simulated failure"
+    );
+
+    signal(&child, "KILL");
+    wait_for_failure_exit(&mut child, Duration::from_secs(5));
+    assert!(
+        process_is_running(workload_pid),
+        "the test workload must survive the daemon crash"
+    );
+
+    let manager_database = path.join("manager/manager.sqlite3");
+    Connection::open(&manager_database)
+        .expect("open failed-upgrade manager database")
+        .pragma_update(None, "user_version", 77_i64)
+        .expect("model an unsupported schema after failed migration");
+    let preflight = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args(["upgrade", "preflight", "--manager-data-dir"])
+        .arg(path.join("manager"))
+        .args(["--worker-data-dir"])
+        .arg(path.join("worker"))
+        .args(["--output", "json"])
+        .output()
+        .expect("run upgrade preflight");
+    assert!(!preflight.status.success());
+    let report: serde_json::Value =
+        serde_json::from_slice(&preflight.stdout).expect("JSON preflight report");
+    assert_eq!(report["schemaMarkersSupported"], false);
+    assert_eq!(report["databases"][0]["state"], "unsupported");
+
+    let restored = path.join("restored-after-failure");
+    let restore = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args(["backup", "restore", "--input"])
+        .arg(&archive)
+        .args(["--destination"])
+        .arg(&restored)
+        .output()
+        .expect("restore matching pre-upgrade backup");
+    assert!(
+        restore.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&restore.stdout),
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    let restored_config = write_config_dirs(
+        &path.join("restored-config"),
+        "all",
+        "127.0.0.1:0",
+        &restored.join("manager"),
+        &restored.join("worker"),
+        "",
+    );
+    let blocked_start = failed(&restored_config, None);
+    assert!(!blocked_start.status.success());
+    assert!(
+        String::from_utf8_lossy(&blocked_start.stderr)
+            .contains("worker fencing and unknown-outcome review"),
+        "stderr: {}",
+        String::from_utf8_lossy(&blocked_start.stderr)
+    );
+    assert!(
+        process_is_running(workload_pid),
+        "restored state must remain blocked while the old workload survives"
+    );
+
+    let fence = Command::new("kill")
+        .args(["-KILL", &workload_pid.to_string()])
+        .status()
+        .expect("fence surviving workload");
+    assert!(fence.success(), "workload fencing command failed");
+    let fence_deadline = Instant::now() + Duration::from_secs(5);
+    while process_is_running(workload_pid) {
+        assert!(Instant::now() < fence_deadline, "workload did not stop");
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let resolved = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args(["backup", "recovery-resolve", "--manager-data-dir"])
+        .arg(restored.join("manager"))
+        .args(["--worker-data-dir"])
+        .arg(restored.join("worker"))
+        .args([
+            "--confirm-workers-fenced",
+            "--confirm-unknown-outcomes-reviewed",
+        ])
+        .output()
+        .expect("clear recovery hold after workload fencing");
+    assert!(
+        resolved.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&resolved.stdout),
+        String::from_utf8_lossy(&resolved.stderr)
+    );
+    let (mut restored_agent, restored_address) = start_config(restored_config, None);
+    let (status, body) = http(
+        restored_address,
+        "GET",
+        "/v1/jobs/recovery-surviving-workload",
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = http(
+        restored_address,
+        "GET",
+        &format!("/v1/runs/{run_id}"),
+        None,
+        &[],
+    );
+    assert_eq!(
+        status, 404,
+        "the restored snapshot predates this run: {body}"
+    );
+    signal(&restored_agent, "INT");
+    wait_for_exit(&mut restored_agent);
+    fs::remove_file(&pid_file).expect("remove fenced workload PID fixture");
 }
 
 #[test]
