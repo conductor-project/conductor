@@ -3028,8 +3028,30 @@ fn actual_binary_recovery_hold_blocks_restore_while_a_workload_survives_failure(
     let manager_database = path.join("manager/manager.sqlite3");
     Connection::open(&manager_database)
         .expect("open failed-upgrade manager database")
-        .pragma_update(None, "user_version", 77_i64)
-        .expect("model an unsupported schema after failed migration");
+        .execute_batch(
+            "DROP TABLE audit_events;
+             CREATE TABLE audit_events (unexpected TEXT);
+             PRAGMA user_version = 11;",
+        )
+        .expect("prepare a conflicting audit schema for the schema 11 migration");
+    let failed_migration = failed(&path.join("agent.json"), None);
+    assert!(
+        !failed_migration.status.success(),
+        "migration should fail against the conflicting audit schema"
+    );
+    assert!(
+        String::from_utf8_lossy(&failed_migration.stderr).contains("occurred_at_ms"),
+        "stderr: {}",
+        String::from_utf8_lossy(&failed_migration.stderr)
+    );
+    let schema_after_failure: i64 = Connection::open(&manager_database)
+        .expect("reopen manager database after failed migration")
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .expect("read schema marker after failed migration");
+    assert_eq!(
+        schema_after_failure, 11,
+        "failed migration must leave the schema marker unchanged"
+    );
     let preflight = Command::new(env!("CARGO_BIN_EXE_conductor"))
         .args(["upgrade", "preflight", "--manager-data-dir"])
         .arg(path.join("manager"))
@@ -3038,11 +3060,14 @@ fn actual_binary_recovery_hold_blocks_restore_while_a_workload_survives_failure(
         .args(["--output", "json"])
         .output()
         .expect("run upgrade preflight");
-    assert!(!preflight.status.success());
+    assert!(
+        preflight.status.success(),
+        "known schema with a migration path should be reported for migration"
+    );
     let report: serde_json::Value =
         serde_json::from_slice(&preflight.stdout).expect("JSON preflight report");
-    assert_eq!(report["schemaMarkersSupported"], false);
-    assert_eq!(report["databases"][0]["state"], "unsupported");
+    assert_eq!(report["schemaMarkersSupported"], true);
+    assert_eq!(report["databases"][0]["state"], "migration_required");
 
     let restored = path.join("restored-after-failure");
     let restore = Command::new(env!("CARGO_BIN_EXE_conductor"))

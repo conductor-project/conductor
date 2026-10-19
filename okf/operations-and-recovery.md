@@ -205,12 +205,15 @@ backup is absent after restore.
 
 `actual_binary_recovery_hold_blocks_restore_while_a_workload_survives_failure`
 starts the real combined daemon, records an offline backup, runs a long-lived
-workload, and kills the daemon while the workload remains alive. After simulating
-an unsupported schema from the failed upgrade, the test restores the matching
-backup and verifies startup remains blocked while that workload survives. It
-then explicitly fences the workload, clears the hold, and confirms the restored
-job definition is available. The post-backup run is absent, as expected for this
-restore point. This test exercises workload survival and the operator fencing
+workload, and kills the daemon while the workload remains alive. It then plants
+a conflicting audit-table schema at marker 11 and starts the real daemon again;
+the migration fails on the missing `occurred_at_ms` column and leaves marker 11
+unchanged. Preflight still reports that known marker as requiring migration.
+The test restores the matching backup and verifies startup remains blocked while
+the workload survives. It then explicitly fences the workload, clears the hold,
+and confirms the restored job definition is available. The post-backup run is
+absent, as expected for this restore point. This test exercises a real
+transactional migration failure, workload survival, and the operator fencing
 gate; it does not test a separately running remote worker or an upgrade from a
 published prior release. The recovery command records operator confirmation and
 does not independently inspect external processes.
