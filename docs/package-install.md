@@ -117,3 +117,40 @@ state-marker hashes remained unchanged, and an explicit stop/start succeeded
 afterward. These checks establish package lifecycle behavior for arm64 in these
 Docker fixtures; they do not establish x86_64 target-distribution behavior,
 release compatibility, database migration safety, or production-host behavior.
+
+### Local Debian 13 x86_64 qualification (2026-10-19)
+
+The `conductor_0.1.0_amd64.deb` package from PR workflow run
+[39226570066](https://github.com/conductor-project/conductor/actions/runs/39226570066)
+(artifact `conductor-linux-packages-x86_64-debug`, artifact ID `12174860463`)
+was installed directly on a native Debian 13 x86_64 host. The artifact was a
+debug package built from source merge revision
+`6305eb47ce8535a2741c489c1b4db516e5f4e556`, which merged PR head
+`ad530e7f6283fb4fc51c94ef3aaf7bff924f6e2e` into `41e3d28322471ca4d195bfa2d402e1cd21775ce5`.
+The downloaded workflow artifact digest was
+`sha256:675dde74f5decadce2536384f759a3f3a9220609eb5cf900a042b105af88e160`;
+the Debian package SHA-256 was
+`24a7133c58f23b59b9701d37a06a7e88c8a5a3a7fd78256d7df66cbc97f07ba0`.
+Workflow checksum verification passed for the package bundle. Package metadata
+reported version `0.1.0` and architecture `amd64`; the matching binary hash in
+`BUILD-INFO` was
+`6e11f40b0941675899c3ad9340c1d297e7d738a17174e57abe1b38a15233333e`.
+
+Fresh installation created the service account and installed the executable
+root-owned with mode 0755. The unit remained inactive and disabled after
+installation. With isolated temporary manager/worker state and a dynamically
+allocated loopback listener configured, explicit service start returned HTTP
+200 from `/healthz`; the daemon ran as `conductor`. After stop, the state marker
+and config hashes were unchanged. `dpkg -r`, reinstall, and `dpkg --purge`
+removed package-owned executable/unit files while preserving the test config
+and state through removal and reinstall. Reinstall also left the unit inactive
+and disabled. The fixture reported `cleanup=passed` and removed its temporary
+paths, test-created state/config, and service account. A follow-up SSH cleanup
+inspection could not resolve the host name, so independent post-run inspection
+was not completed. The exact systemd and kernel versions were not recorded.
+
+This is Debian 13 x86_64 `.deb` lifecycle evidence for this debug package and
+host only. It does not qualify Rocky Linux 10 x86_64 `.rpm`, an x86_64 package
+upgrade, a published release, or production-host behavior. The fixture was run
+locally by explicit authorization; privileged package and systemd fixtures
+remain excluded from GitHub workflows.

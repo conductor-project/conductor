@@ -3,7 +3,7 @@ type: Qualification plan
 title: Package installation and recovery acceptance
 description: Planned local lifecycle qualification for the selected Debian and RPM package targets.
 status: planned
-source_revision: 86124327e9ac93a6efddcf6583d9e30b95f8ade0
+source_revision: ad530e7f6283fb4fc51c94ef3aaf7bff924f6e2e
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../scripts/demo-agent.py
@@ -16,20 +16,23 @@ sources:
 
 # Scope and evidence boundary
 
-This page records the fixture design for issue #137. It is a plan, not a
-qualification report. No package lifecycle result is claimed here. Record each
-run's source revision, package and binary SHA-256 values, distribution release,
-architecture, runtime image digest, exact commands, observed results, and
-limitations in a separate evidence record.
+This page records the fixture design for issue #137 and tracks qualification
+gaps. Qualification results are recorded in
+[`docs/package-install.md`](../docs/package-install.md); this plan does not
+replace those evidence records. Record each run's source revision, package and
+binary SHA-256 values, distribution release, architecture, runtime image
+digest or host identification, exact commands, observed results, and
+limitations.
 
-The current local qualification target is arm64/aarch64 on Debian 13 and Rocky
-Linux 10, using the `.deb` and `.rpm` produced for the same source revision.
-This reflects the available Apple silicon host. It does not establish x86_64
-package runtime support. CI may build and inspect x86_64 artifacts; privileged
-package installation, systemd, and lifecycle fixtures stay out of GitHub
-Actions. Use an isolated local VM or container that actually runs systemd and
-supports the target package manager. Do not change the host's package database,
-service account, or systemd configuration.
+Current evidence covers arm64/aarch64 Debian 13 and Rocky Linux 10 in local
+systemd containers, plus Debian 13 x86_64 `.deb` lifecycle on a native host.
+Rocky Linux 10 x86_64 `.rpm` lifecycle and x86_64 package upgrade remain
+unqualified. CI may build and inspect x86_64 artifacts; privileged package
+installation, systemd, and lifecycle fixtures stay out of GitHub Actions. Use
+an isolated local VM or container that actually runs systemd and supports the
+target package manager. When direct host qualification is explicitly
+authorized, isolate its config/state and guarantee cleanup of package files,
+service account, and systemd state.
 
 Final execution depends on the package workflow and artifacts from #132, the
 compatibility and preflight behavior from #134, and the diagnostics coverage
@@ -80,8 +83,8 @@ runtime/systemd evidence.
 For each run, capture:
 
 - source commit and workflow run URL;
-- target distribution/version, `arm64`/`aarch64` architecture, runtime image
-  digest, and systemd version;
+- target distribution/version, architecture, runtime image digest or host
+  identification, and systemd version;
 - package filenames, package SHA-256 values, package metadata, and matching
   binary SHA-256;
 - scenario identifier, redacted commands, bounded timestamps, exit codes, and
