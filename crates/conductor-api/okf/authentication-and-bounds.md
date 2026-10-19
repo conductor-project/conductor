@@ -115,7 +115,7 @@ freshness is `unknown` before manager-enriched inventory is available. The
 bounded label vocabulary keeps the current series count below 40; this is an
 implementation bound, not a general Prometheus cardinality guarantee.
 
-Manager audit events are append-only rows in schema version 12, ordered by a
+Manager audit events are append-only rows in schema version 13, ordered by a
 database sequence. HTTP mutation outcomes record principal, fixed action name,
 resource type/ID, success or failure, HTTP status, and timestamp. They omit
 request bodies, query strings, headers, credentials, commands, and environment

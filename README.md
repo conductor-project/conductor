@@ -231,6 +231,21 @@ commands, logs, and request contents. Remote storage sizes are not available;
 use the explicitly offline `conductor storage inspect` command against local
 data directories when the daemon is stopped.
 
+## MVP5 Iroh peer identity groundwork
+
+An authenticated operator can create a network domain with separate private
+IPv4 pools for workers and future service addresses, then inspect its bounded
+peer allocation status through the manager API. Workers enroll their public
+Iroh endpoint ID over the existing mTLS control channel; the manager binds it
+to the authenticated worker identity and assigns a leased address. The Iroh
+private key stays on the worker.
+
+This milestone slice provides durable identity, address allocation, expiry,
+and revocation state. It does not yet route workload packets: the Iroh adapter,
+TUN interface, and host route lifecycle are separate MVP5 implementation and
+qualification work. See the [overlay architecture](okf/overlay-networking-architecture.md)
+and [manager/API contracts](crates/conductor-manager/okf/desired-state-and-persistence.md).
+
 ## Command output and recovery
 
 The manager and combined `all` role expose the management API; a standalone

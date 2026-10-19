@@ -31,9 +31,10 @@ are a requirement. The selected stack is one Iroh endpoint per worker, the
 `tun-rs` OS TUN interface, a Conductor-owned layer-3 packet adapter, and
 manager-distributed direct underlay candidates. Relays, public/default address
 discovery, and automatic NAT traversal are disabled for the initial topology.
-The implementation PRs add the worker packet path and privilege boundary, but
-cross-host behavior has not been qualified. Issue #156 must prove the direct
-packet path before support claims change.
+Issue #153 implements manager-owned identity and address allocation. Issue
+#154 implements the worker packet path and privilege boundary. Cross-host
+behavior has not been qualified; issue #156 must prove the direct packet path
+before support claims change.
 
 ## Goal and boundary
 
@@ -220,16 +221,15 @@ authenticated manager-worker path. The current platform page records Linux
 x86_64, Linux arm64, and Apple silicon CI, but no independent-host overlay
 qualification.
 
-The implementation uses Iroh and `tun-rs` as dependencies. The two-host
-qualification must exercise manager-enrolled endpoint identities, direct-only
-TUN packet forwarding, the selected Iroh datagram/stream framing contract, and
-a request/reply application probe while relays and public discovery are
-unavailable. Measure MTU, reconnect, throughput, and packet loss; verify the
-direct UDP prerequisites and bounded failure when they are not met. Keep the
-dependency versions, enabled features, transitive footprint, and third-party
-safety boundary in the dependency decision. Treat the adapter and privileged
-route lifecycle as substantial Conductor implementation, not functionality
-supplied by Iroh.
+PR #187 adds the pinned Iroh release and manager identity/address contracts;
+PR #188 adds `tun-rs`, the Conductor packet adapter, and privileged route
+lifecycle. The two-host qualification must exercise manager-enrolled endpoint
+identities, direct-only TUN packet forwarding, the selected Iroh
+datagram/stream framing contract, and a request/reply application probe while
+relays and public discovery are unavailable. Measure MTU, reconnect,
+throughput, and packet loss; verify the direct UDP prerequisites and bounded
+failure when they are not met. Keep versions, enabled features, transitive
+footprint, and third-party safety boundaries in the dependency decision.
 
 This source review did not run tests, construct an overlay, validate a
 privileged helper, or access a two-host testbed. No network behavior or

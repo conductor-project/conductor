@@ -92,6 +92,17 @@ pub use command_id::CommandId;
 mod worker_id;
 pub use worker_id::WorkerId;
 
+#[path = "structs/overlay_network.rs"]
+mod overlay_network;
+pub use overlay_network::{
+    OverlayEndpointId, OverlayNetworkDomainConfig, OverlayPeer, OverlayPeerAssignment,
+    OverlayPeerConfiguration, OverlayPeerObservation, OverlayPeerObservationStatus,
+    OverlayPeerState,
+};
+#[path = "structs/network_domain_id.rs"]
+mod network_domain_id;
+pub use network_domain_id::NetworkDomainId;
+
 /// Transport-neutral command sent by a manager to one worker.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(

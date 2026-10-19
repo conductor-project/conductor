@@ -31,7 +31,7 @@ page is canonical; do not restore independent prose contracts at the old path.
 | [`mvp2-disconnect-policies.md`](../docs/mvp2-disconnect-policies.md) | [Worker freshness and replay](../crates/conductor-transport/okf/commands-reports-and-reconnect.md); [uncertain manager allocations](../crates/conductor-manager/okf/scheduling-and-services.md); [operator resolution](../crates/conductor-api/okf/routes-and-contracts.md#resolving-an-uncertain-run) | Retained; policy claims audited against current implementation |
 | [`mvp2-execution-model.md`](../docs/mvp2-execution-model.md) | [Core execution model](../crates/conductor-core/okf/execution-resources-and-protocol.md); [manager scheduling/services](../crates/conductor-manager/okf/scheduling-and-services.md); [worker readiness](../crates/conductor-worker/okf/deadlines-readiness-and-logs.md); [process enforcement](../crates/conductor-process/okf/cgroups-and-landlock.md) | Retained |
 | [`mvp2-multi-node-qualification.md`](../docs/mvp2-multi-node-qualification.md) | [Current platform evidence, retained debug/direct harness invocation, and qualification limits](platforms-and-evidence.md); [same-host multiprocess test](../crates/conductor/tests/macos_multiprocess.rs) | Retained; direct mode is not host-resolver or independent-host evidence |
-| [`mvp2-protocol-and-schema-versions.md`](../docs/mvp2-protocol-and-schema-versions.md) | [Protocol v1](../crates/conductor-transport/okf/commands-reports-and-reconnect.md); [manager schema 12 and backup](../crates/conductor-manager/okf/desired-state-and-persistence.md); [worker schema 4](../crates/conductor-worker/okf/supervision-and-recovery.md) | Retained; legacy 5/3 schema numbers were stale |
+| [`mvp2-protocol-and-schema-versions.md`](../docs/mvp2-protocol-and-schema-versions.md) | [Protocol v1](../crates/conductor-transport/okf/commands-reports-and-reconnect.md); [manager schema 13 and backup](../crates/conductor-manager/okf/desired-state-and-persistence.md); [worker schema 4](../crates/conductor-worker/okf/supervision-and-recovery.md) | Retained; legacy 5/3 schema numbers were stale |
 | [`mvp2-submission-contract.md`](../docs/mvp2-submission-contract.md) | [API methods, bodies, preconditions, and errors](../crates/conductor-api/okf/routes-and-contracts.md); [manager state](../crates/conductor-manager/okf/desired-state-and-persistence.md); [core request models](../crates/conductor-core/okf/identifiers-and-contracts.md) | Retained |
 | [`operator-access.md`](../docs/operator-access.md) | [API token setup, complete config, header, checks, and rotation](../crates/conductor-api/okf/authentication-and-bounds.md); [self-hosted proxy boundary](self-hosting.md) | Retained |
 | [`operator-cli.md`](../docs/operator-cli.md) | [conductor CLI](../crates/conductor/okf/cli-and-configuration.md); [operator examples](../crates/conductor/okf/operator-commands.md); [API routes](../crates/conductor-api/okf/routes-and-contracts.md) | Retained |
@@ -63,7 +63,7 @@ sections maps as follows:
 
 # Factual reconciliation performed
 
-- Manager schema version is 12; worker schema version is 4 in the reviewed
+- Manager schema version is 13; worker schema version is 4 in the reviewed
   source. The prior version 5/3 documentation is replaced by those references.
 - Host inventory and platform statements are scoped to current code and CI;
   Linux arm64 and Intel macOS are not represented as qualified.

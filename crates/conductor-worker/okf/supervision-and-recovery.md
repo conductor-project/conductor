@@ -42,7 +42,7 @@ manager keeps the corresponding reservation until an operator resolves it.
 
 The worker database has its own migration series; current source sets
 `SCHEMA_VERSION` to **4** in `src/lib.rs`. It is independent of manager schema
-version 12. Worker records include runs/logs, metadata/incarnation, accepted
+version 13. Worker records include runs/logs, metadata/incarnation, accepted
 commands, and report state.
 
 The `conductor upgrade preflight` command reads the worker's `PRAGMA user_version`

@@ -91,9 +91,11 @@ cancelled, and no routed deployment-owned testbed evidence is available.
 The [MVP5 overlay architecture](overlay-networking-architecture.md) proposes
 Linux x86_64 and arm64 as its initial implementation targets, with Apple
 silicon macOS retaining host-network-only mode until its network interface,
-route cleanup, restart, and cross-host behavior are separately tested. This is
-design scope only: no overlay implementation or independent-host network
-qualification is claimed.
+route cleanup, restart, and cross-host behavior are separately tested. MVP5
+issue #153 implements manager-side peer identity, private address allocation,
+leases, and mTLS control endpoints. The Iroh packet adapter, host interface,
+route lifecycle, and independent-host network qualification remain unimplemented
+in this source revision; no overlay traffic or platform support is claimed.
 
 Historical benchmark or qualification reports must retain their exact commit,
 OS, architecture, build profile, runner, workload, and command. Such reports

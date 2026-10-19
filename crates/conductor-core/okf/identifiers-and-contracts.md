@@ -28,6 +28,12 @@ before they reach storage or transport. A run ID is not an operating-system
 process ID. A worker ID is stable across connections; its incarnation
 distinguishes a worker restart and fences stale sessions.
 
+Overlay contracts add a stable network-domain ID and a canonical lowercase
+hexadecimal Iroh endpoint public ID. Peer assignments use IPv4 addresses and
+monotonic peer/network generations. Configuration snapshots contain public
+peer identities only; secret endpoint keys remain worker-local. These shared
+types describe control-plane state and do not implement packet transport.
+
 # Job contracts
 
 Raw request data is converted to validated job data before execution. A job

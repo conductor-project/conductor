@@ -30,7 +30,7 @@ SQLite repository methods serialize manager transactions and persist the
 manager's view of state. Worker observations are received through the port and
 reconciled; worker-local accepted commands, run logs, and process state remain
 owned by the worker. The manager DB schema version in this reviewed source is
-12. See [persistence and migrations](desired-state-and-persistence.md).
+13. See [persistence and migrations](desired-state-and-persistence.md).
 
 # Evidence
 

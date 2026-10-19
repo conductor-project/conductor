@@ -178,6 +178,17 @@ fn service(path: &TempDir) -> JobService {
     JobService::open_sqlite(path.database()).expect("open manager database")
 }
 
+fn drop_overlay_tables_for_legacy_fixture(connection: &Connection) {
+    connection
+        .execute_batch(
+            "DROP TABLE IF EXISTS overlay_peer_observations;
+             DROP TABLE IF EXISTS overlay_endpoint_history;
+             DROP TABLE IF EXISTS overlay_peers;
+             DROP TABLE IF EXISTS overlay_network_domains;",
+        )
+        .expect("remove schema 13 overlay tables from legacy fixture");
+}
+
 fn service_revision_draft(command_arg: &str) -> JobRevisionDraft {
     let json = format!(
         r#"{{
@@ -1633,6 +1644,7 @@ fn schema_nine_migration_backfills_indexed_service_owners() {
              PRAGMA user_version = 9;",
         )
         .unwrap();
+    drop_overlay_tables_for_legacy_fixture(&legacy);
     drop(legacy);
 
     let migrated = service(&directory);
@@ -1901,10 +1913,12 @@ fn schema_ten_migration_creates_persistent_worker_drains() {
     let directory = TempDir::new();
     let manager = service(&directory);
     drop(manager);
-    Connection::open(directory.database())
-        .unwrap()
+    let legacy = Connection::open(directory.database()).unwrap();
+    legacy
         .execute_batch("DROP TABLE worker_drains; PRAGMA user_version = 10;")
         .unwrap();
+    drop_overlay_tables_for_legacy_fixture(&legacy);
+    drop(legacy);
     let migrated = SqliteJobRepository::open(directory.database()).unwrap();
     let worker_id = WorkerId::new("worker-migrated-drain").unwrap();
     assert!(migrated.get_worker_drain(&worker_id).unwrap().is_none());
@@ -2975,6 +2989,7 @@ fn schema_five_migrates_execution_tables_without_losing_jobs() {
              PRAGMA user_version = 5;",
         )
         .unwrap();
+    drop_overlay_tables_for_legacy_fixture(&connection);
     drop(connection);
 
     let migrated = service(&directory);
@@ -2987,7 +3002,7 @@ fn schema_five_migrates_execution_tables_without_losing_jobs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     assert!(table_exists(&connection, "job_revisions"));
     assert!(table_exists(&connection, "job_deployments"));
     assert!(table_exists(&connection, "execution_idempotency"));
@@ -3007,6 +3022,7 @@ fn schema_six_adds_durable_scheduling_tables() {
              PRAGMA user_version = 6;",
         )
         .unwrap();
+    drop_overlay_tables_for_legacy_fixture(&connection);
     drop(connection);
 
     let _migrated = service(&directory);
@@ -3014,7 +3030,7 @@ fn schema_six_adds_durable_scheduling_tables() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     assert!(table_exists(&connection, "service_instances"));
     assert!(table_exists(&connection, "allocations"));
     assert!(table_exists(&connection, "scheduling_sequence"));
@@ -3029,6 +3045,7 @@ fn schema_seven_migrates_service_attempt_state() {
     connection
         .execute_batch("DROP TABLE service_attempts; PRAGMA user_version = 7;")
         .unwrap();
+    drop_overlay_tables_for_legacy_fixture(&connection);
     drop(connection);
 
     let _migrated = service(&directory);
@@ -3036,7 +3053,7 @@ fn schema_seven_migrates_service_attempt_state() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     assert!(table_exists(&connection, "service_attempts"));
 }
 
@@ -3143,7 +3160,7 @@ fn legacy_schema_migrates_transactionally_and_repeated_startup_is_stable() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read migrated schema and fixture");
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     assert_eq!(created_at, 1234);
     assert_eq!(deleted_at, None);
 }
@@ -3193,7 +3210,7 @@ fn schema_two_migration_adds_idempotency_and_indexed_run_order() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     assert!(columns.iter().any(|column| column == "idempotency_key"));
     assert!(columns.iter().any(|column| column == "request_fingerprint"));
     assert!(columns.iter().any(|column| column == "run_order"));
@@ -3247,6 +3264,7 @@ fn failed_schema_two_migration_rolls_back_partial_changes() {
              PRAGMA user_version = 2;",
         )
         .unwrap();
+    drop_overlay_tables_for_legacy_fixture(&connection);
     drop(connection);
 
     assert!(JobService::open_sqlite(directory.database()).is_err());
@@ -3300,6 +3318,7 @@ fn schema_four_identity_layout_migrates_with_command_outbox_without_losing_token
              PRAGMA user_version = 4;",
         )
         .unwrap();
+    drop_overlay_tables_for_legacy_fixture(&connection);
     drop(connection);
 
     let migrated = SqliteJobRepository::open(directory.database()).unwrap();
@@ -3314,7 +3333,7 @@ fn schema_four_identity_layout_migrates_with_command_outbox_without_losing_token
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     let outbox_exists = table_exists(&connection, "manager_commands");
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     assert!(outbox_exists);
 }
 
@@ -3340,6 +3359,7 @@ fn schema_four_command_layout_migrates_with_identity_tables_without_resetting_se
              PRAGMA user_version = 4;",
         )
         .unwrap();
+    drop_overlay_tables_for_legacy_fixture(&connection);
     drop(connection);
 
     let _migrated = SqliteJobRepository::open(directory.database()).unwrap();
@@ -3355,7 +3375,7 @@ fn schema_four_command_layout_migrates_with_identity_tables_without_resetting_se
         )
         .unwrap();
     let identity_exists = table_exists(&connection, "worker_identities");
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
     assert_eq!(sequence, 17);
     assert!(identity_exists);
 }
@@ -3651,7 +3671,7 @@ fn version_one_manager_database_migrates_runs_and_accepts_timeout_specs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 }
 
 struct FullWorker(WorkerId);

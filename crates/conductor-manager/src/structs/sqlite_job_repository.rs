@@ -333,6 +333,187 @@ impl CommandJournal for SqliteJobRepository {
     }
 }
 
+const MAX_OVERLAY_PEERS_PER_DOMAIN: usize = 128;
+const MAX_OVERLAY_LEASE_MS: i64 = 5 * 60 * 1_000;
+const OVERLAY_CLOCK_SKEW_MS: i64 = 30_000;
+
+fn parse_overlay_pool(value: &str) -> Result<ipnet::Ipv4Net, OverlayNetworkError> {
+    let pool = value
+        .parse::<ipnet::Ipv4Net>()
+        .map_err(|_| OverlayNetworkError::InvalidAddressPool)?;
+    let address = pool.addr();
+    let private = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+        .iter()
+        .filter_map(|range| range.parse::<ipnet::Ipv4Net>().ok())
+        .any(|range| range.contains(&address) && range.prefix_len() <= pool.prefix_len());
+    if !private || pool.network() != address || !(16..=30).contains(&pool.prefix_len()) {
+        return Err(OverlayNetworkError::InvalidAddressPool);
+    }
+    Ok(pool)
+}
+
+fn next_overlay_generation(current: i64) -> Result<i64, OverlayNetworkError> {
+    current
+        .checked_add(1)
+        .filter(|generation| *generation > 0)
+        .ok_or(OverlayNetworkError::StorageUnavailable)
+}
+
+fn overlay_pools_overlap(left: &ipnet::Ipv4Net, right: &ipnet::Ipv4Net) -> bool {
+    u32::from(left.network()) <= u32::from(right.broadcast())
+        && u32::from(right.network()) <= u32::from(left.broadcast())
+}
+
+fn overlay_address(value: i64) -> Result<std::net::Ipv4Addr, OverlayNetworkError> {
+    let value = u32::try_from(value).map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+    Ok(std::net::Ipv4Addr::from(value))
+}
+
+struct OverlayPeerAssignmentRow {
+    network_domain_id: String,
+    worker_id: String,
+    endpoint_id: String,
+    worker_address: i64,
+    peer_generation: i64,
+    network_generation: i64,
+    expires_at_ms: i64,
+    state: String,
+    quarantine_until_ms: Option<i64>,
+}
+
+fn overlay_peer_assignment(
+    row: OverlayPeerAssignmentRow,
+) -> Result<conductor_core::OverlayPeerAssignment, OverlayNetworkError> {
+    use conductor_core::{NetworkDomainId, OverlayEndpointId, OverlayPeerState, WorkerId};
+
+    Ok(conductor_core::OverlayPeerAssignment {
+        network_domain_id: NetworkDomainId::new(row.network_domain_id)
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+        worker_id: WorkerId::new(row.worker_id)
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+        endpoint_id: OverlayEndpointId::new(row.endpoint_id)
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+        worker_address: overlay_address(row.worker_address)?,
+        peer_generation: u64::try_from(row.peer_generation)
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+        network_generation: u64::try_from(row.network_generation)
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+        expires_at_ms: row.expires_at_ms,
+        state: match row.state.as_str() {
+            "active" => OverlayPeerState::Active,
+            "quarantined" => OverlayPeerState::Quarantined,
+            _ => return Err(OverlayNetworkError::StorageUnavailable),
+        },
+        quarantine_until_ms: row.quarantine_until_ms,
+    })
+}
+
+fn find_overlay_address(
+    transaction: &rusqlite::Transaction<'_>,
+    pool: ipnet::Ipv4Net,
+) -> Result<i64, OverlayNetworkError> {
+    let mut used = BTreeSet::new();
+    let mut statement = transaction
+        .prepare("SELECT worker_address FROM overlay_peers")
+        .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+    for address in rows {
+        used.insert(address.map_err(|_| OverlayNetworkError::StorageUnavailable)?);
+    }
+    drop(statement);
+
+    let first = u32::from(pool.network()) + 1;
+    let last = u32::from(pool.broadcast()) - 1;
+    for address in first..=last {
+        let candidate = i64::from(address);
+        if !used.contains(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(OverlayNetworkError::AddressPoolExhausted)
+}
+
+fn expire_overlay_peers(
+    transaction: &rusqlite::Transaction<'_>,
+    network_domain_id: &conductor_core::NetworkDomainId,
+    now_ms: i64,
+) -> Result<(), OverlayNetworkError> {
+    let mut statement = transaction
+        .prepare(
+            "SELECT worker_id, endpoint_id, peer_generation, expires_at_ms FROM overlay_peers
+             WHERE network_domain_id = ?1 AND state = 'active' AND expires_at_ms <= ?2",
+        )
+        .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+    let rows = statement
+        .query_map(params![network_domain_id.as_str(), now_ms], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+    let expired = rows
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+    drop(statement);
+    if expired.is_empty() {
+        return Ok(());
+    }
+    for (worker_id, endpoint_id, peer_generation, expires_at_ms) in &expired {
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO overlay_endpoint_history
+                 (network_domain_id, endpoint_id, worker_id, peer_generation, retired_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    network_domain_id.as_str(),
+                    endpoint_id,
+                    worker_id,
+                    peer_generation,
+                    expires_at_ms
+                ],
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "UPDATE overlay_peers SET state = 'quarantined', quarantine_until_ms = ?1
+                 WHERE network_domain_id = ?2 AND worker_id = ?3 AND state = 'active'",
+                params![
+                    expires_at_ms.saturating_add(OVERLAY_CLOCK_SKEW_MS),
+                    network_domain_id.as_str(),
+                    worker_id
+                ],
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "DELETE FROM overlay_peer_observations WHERE network_domain_id = ?1 AND worker_id = ?2",
+                params![network_domain_id.as_str(), worker_id],
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+    }
+    let current: Option<i64> = transaction
+        .query_row(
+            "SELECT network_generation FROM overlay_network_domains WHERE network_domain_id = ?1",
+            [network_domain_id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+    let current = current.ok_or(OverlayNetworkError::DomainNotFound)?;
+    transaction
+        .execute(
+            "UPDATE overlay_network_domains SET network_generation = ?1 WHERE network_domain_id = ?2",
+            params![next_overlay_generation(current)?, network_domain_id.as_str()],
+        )
+        .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+    Ok(())
+}
+
 impl JobRepository for SqliteJobRepository {
     fn record_audit_event(&self, event: &AuditEventInput) -> Result<(), ExecutionStoreError> {
         if !matches!(
@@ -476,6 +657,737 @@ impl JobRepository for SqliteJobRepository {
             )
             .map_err(|_| ExecutionStoreError::StorageUnavailable)?;
         Ok(metrics)
+    }
+
+    fn create_overlay_network_domain(
+        &self,
+        config: &conductor_core::OverlayNetworkDomainConfig,
+        now_ms: i64,
+    ) -> Result<(), OverlayNetworkError> {
+        if now_ms < 0 {
+            return Err(OverlayNetworkError::InvalidAddressPool);
+        }
+        let worker_pool = parse_overlay_pool(&config.worker_address_pool)?;
+        let service_pool = parse_overlay_pool(&config.service_address_pool)?;
+        if overlay_pools_overlap(&worker_pool, &service_pool) {
+            return Err(OverlayNetworkError::AddressPoolOverlap);
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let domain_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM overlay_network_domains WHERE network_domain_id = ?1)",
+                [config.network_domain_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        if domain_exists {
+            return Err(OverlayNetworkError::DomainExists);
+        }
+        let mut statement = transaction
+            .prepare(
+                "SELECT worker_address_pool, service_address_pool FROM overlay_network_domains",
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        for row in rows {
+            let (existing_worker, existing_service) =
+                row.map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+            let existing_worker = parse_overlay_pool(&existing_worker)?;
+            let existing_service = parse_overlay_pool(&existing_service)?;
+            if overlay_pools_overlap(&worker_pool, &existing_worker)
+                || overlay_pools_overlap(&worker_pool, &existing_service)
+                || overlay_pools_overlap(&service_pool, &existing_worker)
+                || overlay_pools_overlap(&service_pool, &existing_service)
+            {
+                return Err(OverlayNetworkError::AddressPoolOverlap);
+            }
+        }
+        drop(statement);
+        let inserted = transaction.execute(
+            "INSERT OR IGNORE INTO overlay_network_domains
+             (network_domain_id, worker_address_pool, service_address_pool, network_generation, created_at_ms)
+             VALUES (?1, ?2, ?3, 1, ?4)",
+            params![
+                config.network_domain_id.as_str(),
+                worker_pool.to_string(),
+                service_pool.to_string(),
+                now_ms
+            ],
+        ).map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        if inserted == 0 {
+            return Err(OverlayNetworkError::DomainExists);
+        }
+        transaction
+            .commit()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)
+    }
+
+    fn get_overlay_network_domain(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+    ) -> Result<Option<conductor_core::OverlayNetworkDomainConfig>, OverlayNetworkError> {
+        use conductor_core::NetworkDomainId;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        connection
+            .query_row(
+                "SELECT network_domain_id, worker_address_pool, service_address_pool
+                 FROM overlay_network_domains WHERE network_domain_id = ?1",
+                [network_domain_id.as_str()],
+                |row| {
+                    Ok(conductor_core::OverlayNetworkDomainConfig {
+                        network_domain_id: NetworkDomainId::new(row.get::<_, String>(0)?)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        worker_address_pool: row.get(1)?,
+                        service_address_pool: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)
+    }
+
+    fn register_overlay_peer(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        worker_id: &WorkerId,
+        endpoint_id: &conductor_core::OverlayEndpointId,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<conductor_core::OverlayPeerAssignment, OverlayNetworkError> {
+        if now_ms < 0
+            || expires_at_ms <= now_ms
+            || expires_at_ms.saturating_sub(now_ms) > MAX_OVERLAY_LEASE_MS
+        {
+            return Err(OverlayNetworkError::InvalidLease);
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let identity_is_active: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM worker_identities
+                 WHERE worker_id = ?1 AND revoked_at_ms IS NULL)",
+                [worker_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        if !identity_is_active {
+            return Err(OverlayNetworkError::IdentityUnavailable);
+        }
+        let pool_text = transaction
+            .query_row(
+                "SELECT worker_address_pool FROM overlay_network_domains
+                 WHERE network_domain_id = ?1",
+                [network_domain_id.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?
+            .ok_or(OverlayNetworkError::DomainNotFound)?;
+        let pool = parse_overlay_pool(&pool_text)?;
+        expire_overlay_peers(&transaction, network_domain_id, now_ms)?;
+        let mut network_generation = transaction
+            .query_row(
+                "SELECT network_generation FROM overlay_network_domains WHERE network_domain_id = ?1",
+                [network_domain_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+
+        // Expired quarantine records release addresses but preserve endpoint tombstones.
+        transaction
+            .execute(
+                "DELETE FROM overlay_peer_observations WHERE network_domain_id = ?1
+                 AND worker_id IN (SELECT worker_id FROM overlay_peers
+                     WHERE network_domain_id = ?1 AND state = 'quarantined'
+                     AND quarantine_until_ms <= ?2)",
+                params![network_domain_id.as_str(), now_ms],
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "DELETE FROM overlay_peers WHERE network_domain_id = ?1
+                 AND state = 'quarantined' AND quarantine_until_ms <= ?2",
+                params![network_domain_id.as_str(), now_ms],
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+
+        let existing = transaction
+            .query_row(
+                "SELECT endpoint_id, worker_address, peer_generation, expires_at_ms, state, quarantine_until_ms
+                 FROM overlay_peers WHERE network_domain_id = ?1 AND worker_id = ?2",
+                params![network_domain_id.as_str(), worker_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+
+        let (address, peer_generation) = if let Some((
+            old_endpoint,
+            address,
+            old_generation,
+            _old_expiry,
+            state,
+            _quarantine,
+        )) = existing
+        {
+            if state != "active" {
+                return Err(OverlayNetworkError::PeerQuarantined);
+            }
+            if old_endpoint == endpoint_id.as_str() {
+                network_generation = next_overlay_generation(network_generation)?;
+                transaction
+                    .execute(
+                        "UPDATE overlay_peers SET expires_at_ms = ?1
+                         WHERE network_domain_id = ?2 AND worker_id = ?3 AND state = 'active'",
+                        params![
+                            expires_at_ms,
+                            network_domain_id.as_str(),
+                            worker_id.as_str()
+                        ],
+                    )
+                    .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+                (address, old_generation)
+            } else {
+                let retired: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM overlay_endpoint_history
+                         WHERE network_domain_id = ?1 AND endpoint_id = ?2)",
+                        params![network_domain_id.as_str(), endpoint_id.as_str()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+                if retired {
+                    return Err(OverlayNetworkError::EndpointIdentityReplay);
+                }
+                let assigned: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM overlay_peers
+                         WHERE network_domain_id = ?1 AND endpoint_id = ?2 AND worker_id != ?3)",
+                        params![
+                            network_domain_id.as_str(),
+                            endpoint_id.as_str(),
+                            worker_id.as_str()
+                        ],
+                        |row| row.get(0),
+                    )
+                    .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+                if assigned {
+                    return Err(OverlayNetworkError::EndpointIdentityConflict);
+                }
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO overlay_endpoint_history
+                         (network_domain_id, endpoint_id, worker_id, peer_generation, retired_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            network_domain_id.as_str(),
+                            old_endpoint,
+                            worker_id.as_str(),
+                            old_generation,
+                            now_ms
+                        ],
+                    )
+                    .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+                let next_generation = next_overlay_generation(old_generation)?;
+                network_generation = next_overlay_generation(network_generation)?;
+                transaction
+                    .execute(
+                        "UPDATE overlay_peers SET endpoint_id = ?1, peer_generation = ?2,
+                         expires_at_ms = ?3, state = 'active', quarantine_until_ms = NULL
+                         WHERE network_domain_id = ?4 AND worker_id = ?5",
+                        params![
+                            endpoint_id.as_str(),
+                            next_generation,
+                            expires_at_ms,
+                            network_domain_id.as_str(),
+                            worker_id.as_str()
+                        ],
+                    )
+                    .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+                transaction
+                    .execute(
+                        "DELETE FROM overlay_peer_observations WHERE network_domain_id = ?1 AND worker_id = ?2",
+                        params![network_domain_id.as_str(), worker_id.as_str()],
+                    )
+                    .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+                (address, next_generation)
+            }
+        } else {
+            let retired: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM overlay_endpoint_history
+                     WHERE network_domain_id = ?1 AND endpoint_id = ?2)",
+                    params![network_domain_id.as_str(), endpoint_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+            if retired {
+                return Err(OverlayNetworkError::EndpointIdentityReplay);
+            }
+            let assigned: bool = transaction
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM overlay_peers
+                     WHERE network_domain_id = ?1 AND endpoint_id = ?2)",
+                    params![network_domain_id.as_str(), endpoint_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+            if assigned {
+                return Err(OverlayNetworkError::EndpointIdentityConflict);
+            }
+            let count: i64 = transaction
+                .query_row(
+                    "SELECT COUNT(*) FROM overlay_peers WHERE network_domain_id = ?1",
+                    [network_domain_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+            if count >= MAX_OVERLAY_PEERS_PER_DOMAIN as i64 {
+                return Err(OverlayNetworkError::PeerLimitReached);
+            }
+            let last_generation: Option<i64> = transaction
+                .query_row(
+                    "SELECT MAX(peer_generation) FROM overlay_endpoint_history
+                     WHERE network_domain_id = ?1 AND worker_id = ?2",
+                    params![network_domain_id.as_str(), worker_id.as_str()],
+                    |row| row.get(0),
+                )
+                .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+            let peer_generation = next_overlay_generation(last_generation.unwrap_or(0))?;
+            let address = find_overlay_address(&transaction, pool)?;
+            network_generation = next_overlay_generation(network_generation)?;
+            transaction
+                .execute(
+                    "INSERT INTO overlay_peers
+                     (network_domain_id, worker_id, endpoint_id, worker_address, peer_generation,
+                      expires_at_ms, state, quarantine_until_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'active', NULL)",
+                    params![
+                        network_domain_id.as_str(),
+                        worker_id.as_str(),
+                        endpoint_id.as_str(),
+                        address,
+                        peer_generation,
+                        expires_at_ms
+                    ],
+                )
+                .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+            (address, peer_generation)
+        };
+
+        transaction
+            .execute(
+                "UPDATE overlay_network_domains SET network_generation = ?1 WHERE network_domain_id = ?2",
+                params![network_generation, network_domain_id.as_str()],
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let result = overlay_peer_assignment(OverlayPeerAssignmentRow {
+            network_domain_id: network_domain_id.as_str().to_owned(),
+            worker_id: worker_id.as_str().to_owned(),
+            endpoint_id: endpoint_id.as_str().to_owned(),
+            worker_address: address,
+            peer_generation,
+            network_generation,
+            expires_at_ms,
+            state: "active".to_owned(),
+            quarantine_until_ms: None,
+        })?;
+        transaction
+            .commit()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        Ok(result)
+    }
+
+    fn revoke_overlay_peer(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        worker_id: &WorkerId,
+        now_ms: i64,
+    ) -> Result<bool, OverlayNetworkError> {
+        if now_ms < 0 {
+            return Err(OverlayNetworkError::InvalidLease);
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let current = transaction
+            .query_row(
+                "SELECT endpoint_id, worker_address, peer_generation, expires_at_ms, state, quarantine_until_ms
+                 FROM overlay_peers WHERE network_domain_id = ?1 AND worker_id = ?2",
+                params![network_domain_id.as_str(), worker_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let Some((endpoint, _address, generation, expiry, state, _already_quarantined_until)) =
+            current
+        else {
+            return Err(OverlayNetworkError::PeerNotFound);
+        };
+        if state == "quarantined" {
+            transaction
+                .commit()
+                .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+            return Ok(false);
+        }
+        let effective_quarantine = expiry.max(now_ms).saturating_add(OVERLAY_CLOCK_SKEW_MS);
+        transaction
+            .execute(
+                "UPDATE overlay_peers SET state = 'quarantined', quarantine_until_ms = ?1
+                 WHERE network_domain_id = ?2 AND worker_id = ?3 AND state = 'active'",
+                params![
+                    effective_quarantine,
+                    network_domain_id.as_str(),
+                    worker_id.as_str()
+                ],
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO overlay_endpoint_history
+                 (network_domain_id, endpoint_id, worker_id, peer_generation, retired_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    network_domain_id.as_str(),
+                    endpoint,
+                    worker_id.as_str(),
+                    generation,
+                    now_ms
+                ],
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let generation: i64 = transaction
+            .query_row(
+                "SELECT network_generation FROM overlay_network_domains WHERE network_domain_id = ?1",
+                [network_domain_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?
+            .ok_or(OverlayNetworkError::DomainNotFound)?;
+        let next = next_overlay_generation(generation)?;
+        transaction
+            .execute(
+                "UPDATE overlay_network_domains SET network_generation = ?1 WHERE network_domain_id = ?2",
+                params![next, network_domain_id.as_str()],
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        Ok(true)
+    }
+
+    fn overlay_peer_configuration(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        worker_id: &WorkerId,
+        now_ms: i64,
+    ) -> Result<Option<conductor_core::OverlayPeerConfiguration>, OverlayNetworkError> {
+        use conductor_core::{OverlayPeer, OverlayPeerConfiguration};
+        if now_ms < 0 {
+            return Err(OverlayNetworkError::InvalidLease);
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        expire_overlay_peers(&transaction, network_domain_id, now_ms)?;
+        let current = transaction
+            .query_row(
+                "SELECT p.worker_address, p.peer_generation, p.expires_at_ms, d.network_generation
+                 FROM overlay_peers p JOIN overlay_network_domains d USING (network_domain_id)
+                 WHERE p.network_domain_id = ?1 AND p.worker_id = ?2
+                   AND p.state = 'active' AND p.expires_at_ms > ?3
+                   AND EXISTS (SELECT 1 FROM worker_identities i
+                       WHERE i.worker_id = p.worker_id AND i.revoked_at_ms IS NULL)",
+                params![network_domain_id.as_str(), worker_id.as_str(), now_ms],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let Some((address, peer_generation, expires_at_ms, network_generation)) = current else {
+            transaction
+                .commit()
+                .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+            return Ok(None);
+        };
+        let mut statement = transaction
+            .prepare(
+                "SELECT worker_id, endpoint_id, worker_address, peer_generation
+                 FROM overlay_peers WHERE network_domain_id = ?1 AND worker_id != ?2
+                   AND state = 'active' AND expires_at_ms > ?3
+                 ORDER BY worker_address LIMIT ?4",
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let rows = statement
+            .query_map(
+                params![
+                    network_domain_id.as_str(),
+                    worker_id.as_str(),
+                    now_ms,
+                    MAX_OVERLAY_PEERS_PER_DOMAIN as i64
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let peers = rows
+            .map(|row| {
+                let (worker, endpoint, address, generation) =
+                    row.map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+                Ok(OverlayPeer {
+                    worker_id: WorkerId::new(worker)
+                        .map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+                    endpoint_id: conductor_core::OverlayEndpointId::new(endpoint)
+                        .map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+                    worker_address: overlay_address(address)?,
+                    peer_generation: u64::try_from(generation)
+                        .map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+                })
+            })
+            .collect::<Result<Vec<_>, OverlayNetworkError>>()?;
+        drop(statement);
+        let configuration = OverlayPeerConfiguration {
+            network_domain_id: network_domain_id.clone(),
+            worker_id: worker_id.clone(),
+            worker_address: overlay_address(address)?,
+            peer_generation: u64::try_from(peer_generation)
+                .map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+            network_generation: u64::try_from(network_generation)
+                .map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+            expires_at_ms,
+            peers,
+        };
+        transaction
+            .commit()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        Ok(Some(configuration))
+    }
+
+    fn record_overlay_peer_observation(
+        &self,
+        observation: &conductor_core::OverlayPeerObservation,
+    ) -> Result<(), OverlayNetworkError> {
+        let peer_generation = i64::try_from(observation.peer_generation)
+            .map_err(|_| OverlayNetworkError::StaleGeneration)?;
+        let applied_generation = i64::try_from(observation.applied_network_generation)
+            .map_err(|_| OverlayNetworkError::StaleGeneration)?;
+        if observation.observed_at_ms < 0 {
+            return Err(OverlayNetworkError::ObservationConflict);
+        }
+        let status = match observation.status {
+            conductor_core::OverlayPeerObservationStatus::Applied => "applied",
+            conductor_core::OverlayPeerObservationStatus::Rejected => "rejected",
+            conductor_core::OverlayPeerObservationStatus::Unavailable => "unavailable",
+        };
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let (stored_peer_generation, network_generation) = transaction
+            .query_row(
+                "SELECT p.peer_generation, d.network_generation FROM overlay_peers p
+                 JOIN overlay_network_domains d USING (network_domain_id)
+                 WHERE p.network_domain_id = ?1 AND p.worker_id = ?2 AND p.state = 'active'",
+                params![
+                    observation.network_domain_id.as_str(),
+                    observation.worker_id.as_str()
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?
+            .ok_or(OverlayNetworkError::PeerNotFound)?;
+        if peer_generation != stored_peer_generation {
+            return Err(OverlayNetworkError::StaleGeneration);
+        }
+        if applied_generation > network_generation {
+            return Err(OverlayNetworkError::ObservationConflict);
+        }
+        let previous = transaction
+            .query_row(
+                "SELECT peer_generation, applied_network_generation, observed_at_ms, status
+                 FROM overlay_peer_observations WHERE network_domain_id = ?1 AND worker_id = ?2",
+                params![
+                    observation.network_domain_id.as_str(),
+                    observation.worker_id.as_str()
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        if let Some((old_peer, old_network, old_time, old_status)) = previous {
+            if old_peer > peer_generation
+                || (old_peer == peer_generation
+                    && (old_network > applied_generation || old_time > observation.observed_at_ms))
+            {
+                return Err(OverlayNetworkError::StaleGeneration);
+            }
+            if old_peer == peer_generation
+                && old_network == applied_generation
+                && old_time == observation.observed_at_ms
+                && old_status != status
+            {
+                return Err(OverlayNetworkError::ObservationConflict);
+            }
+        }
+        transaction
+            .execute(
+                "INSERT INTO overlay_peer_observations
+                 (network_domain_id, worker_id, peer_generation, applied_network_generation, observed_at_ms, status)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(network_domain_id, worker_id) DO UPDATE SET
+                   peer_generation = excluded.peer_generation,
+                   applied_network_generation = excluded.applied_network_generation,
+                   observed_at_ms = excluded.observed_at_ms,
+                   status = excluded.status",
+                params![observation.network_domain_id.as_str(), observation.worker_id.as_str(), peer_generation, applied_generation, observation.observed_at_ms, status],
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)
+    }
+
+    fn list_overlay_peers(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<Vec<conductor_core::OverlayPeerAssignment>, OverlayNetworkError> {
+        if !(1..=MAX_OVERLAY_PEERS_PER_DOMAIN).contains(&limit) || now_ms < 0 {
+            return Err(OverlayNetworkError::InvalidLease);
+        }
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        expire_overlay_peers(&transaction, network_domain_id, now_ms)?;
+        let generation: i64 = transaction
+            .query_row(
+                "SELECT network_generation FROM overlay_network_domains WHERE network_domain_id = ?1",
+                [network_domain_id.as_str()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?
+            .ok_or(OverlayNetworkError::DomainNotFound)?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT network_domain_id, worker_id, endpoint_id, worker_address, peer_generation,
+                        expires_at_ms, state, quarantine_until_ms
+                 FROM overlay_peers WHERE network_domain_id = ?1
+                   AND (state = 'active' OR quarantine_until_ms > ?3)
+                 ORDER BY worker_address LIMIT ?2",
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let rows = statement
+            .query_map(
+                params![network_domain_id.as_str(), limit as i64, now_ms],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                    ))
+                },
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let peers = rows.map(|row| {
+            let (domain, worker, endpoint, address, peer_generation, expiry, state, quarantine) =
+                row.map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+            overlay_peer_assignment(OverlayPeerAssignmentRow {
+                network_domain_id: domain,
+                worker_id: worker,
+                endpoint_id: endpoint,
+                worker_address: address,
+                peer_generation,
+                network_generation: generation,
+                expires_at_ms: expiry,
+                state,
+                quarantine_until_ms: quarantine,
+            })
+        }).collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        transaction
+            .commit()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        Ok(peers)
     }
 
     fn insert(&self, job: JobSpec) -> Result<(), JobStoreError> {
@@ -3277,6 +4189,76 @@ impl SqliteJobRepository {
                 [worker_id.as_str()],
             )
             .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        let mut statement = transaction
+            .prepare(
+                "SELECT network_domain_id, endpoint_id, peer_generation, expires_at_ms
+                 FROM overlay_peers WHERE worker_id = ?1 AND state = 'active'",
+            )
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        let rows = statement
+            .query_map([worker_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        let peers = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        drop(statement);
+        let mut affected_domains = BTreeSet::new();
+        for (domain, endpoint, generation, expires_at_ms) in peers {
+            transaction
+                .execute(
+                    "INSERT OR IGNORE INTO overlay_endpoint_history
+                     (network_domain_id, endpoint_id, worker_id, peer_generation, retired_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![domain, endpoint, worker_id.as_str(), generation, now_ms],
+                )
+                .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+            transaction
+                .execute(
+                    "UPDATE overlay_peers SET state = 'quarantined', quarantine_until_ms = ?1
+                     WHERE network_domain_id = ?2 AND worker_id = ?3 AND state = 'active'",
+                    params![
+                        expires_at_ms
+                            .max(now_ms)
+                            .saturating_add(OVERLAY_CLOCK_SKEW_MS),
+                        domain,
+                        worker_id.as_str()
+                    ],
+                )
+                .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+            transaction
+                .execute(
+                    "DELETE FROM overlay_peer_observations WHERE network_domain_id = ?1 AND worker_id = ?2",
+                    params![domain, worker_id.as_str()],
+                )
+                .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+            affected_domains.insert(domain);
+        }
+        for domain in affected_domains {
+            let generation: i64 = transaction
+                .query_row(
+                    "SELECT network_generation FROM overlay_network_domains WHERE network_domain_id = ?1",
+                    [&domain],
+                    |row| row.get(0),
+                )
+                .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+            let next = generation
+                .checked_add(1)
+                .filter(|next| *next > 0)
+                .ok_or(WorkerIdentityError::StorageUnavailable)?;
+            transaction
+                .execute(
+                    "UPDATE overlay_network_domains SET network_generation = ?1 WHERE network_domain_id = ?2",
+                    params![next, domain],
+                )
+                .map_err(|_| WorkerIdentityError::StorageUnavailable)?;
+        }
         transaction
             .execute(
                 "INSERT INTO audit_events(occurred_at_ms, principal, action, resource_type, resource_id, outcome, status_code)

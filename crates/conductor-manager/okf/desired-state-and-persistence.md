@@ -1,7 +1,7 @@
 ---
 type: Reference
 title: Manager desired state and persistence
-description: SQLite stores immutable job/revision records, mutable deployment state, run reservations, worker records, commands, allocations, and audit.
+description: SQLite stores immutable job/revision records, mutable deployment state, run reservations, worker records, commands, allocations, audit, and overlay membership.
 status: stable
 source_revision: db60ba9
 source_reviewed_at: 2026-10-19
@@ -29,7 +29,7 @@ and idempotency records, worker identities/inventory, command outbox rows,
 execution revisions, deployments, scheduling sequence, service instances and
 allocations, service attempts/catalog ownership, worker drains, and audit
 events. The exact tables evolve through transactional migrations. Current
-`SCHEMA_VERSION` is **12** in `src/lib.rs`; this number describes the manager DB
+`SCHEMA_VERSION` is **13** in `src/lib.rs`; this number describes the manager DB
 only and must not be reused for worker state.
 
 SQLite uses WAL mode and full synchronization. Startup migrates supported older
@@ -39,6 +39,31 @@ inaccessible, or newer than the supported schema. Use
 create a consistent SQLite snapshot. The command takes the manager state lock,
 uses SQLite's online backup API, and checks snapshot integrity and schema
 version. It does not change the source database.
+
+## Overlay peer identity groundwork
+
+Schema 13 adds manager-owned overlay network domains, worker endpoint IDs and
+durable IPv4 assignments, retired endpoint tombstones, and bounded latest
+worker observations. Domain creation accepts only canonical private IPv4
+CIDRs with disjoint worker and service pools; ranges cannot overlap pools in
+other domains. Worker allocations are serialized in an immediate SQLite
+transaction and capped at 128 peers per domain. The manager never stores an
+Iroh private key.
+
+Each endpoint ID is bound to one actively enrolled worker in a domain. Key
+replacement increments the worker peer generation while preserving its
+address. Revocation and lease expiry retire the endpoint ID and quarantine its
+address until the old lease plus 30 seconds of clock-skew allowance elapses.
+Retired endpoint IDs remain tombstoned after address reuse. A worker certificate
+revocation also quarantines all of that worker's overlay memberships. Config
+snapshots include only active, unexpired peers and are bounded to the domain's
+128-peer limit.
+
+These rows are in the normal manager SQLite snapshot and restore unit. No
+network-domain deletion operation is exposed; address pools and replay
+tombstones therefore remain reserved. This is identity and allocation state,
+not proof that a worker has installed a tunnel or withdrawn a route. The Iroh
+packet adapter and worker-side expiry enforcement are separate MVP5 work.
 
 ## Run-history retention
 
