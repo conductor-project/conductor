@@ -3,7 +3,7 @@ type: Verification Record
 title: Local CLI and diagnostics workflow evidence
 description: Debug CLI workflows and bounded diagnostics are exercised against real local agents on Apple silicon macOS, with portable integration coverage in the conductor crate.
 status: stable
-source_revision: 66e4f7f9a9612d73c59c63cc5b6127ea8b6943b6
+source_revision: 3385030665e0944ac7594e56795cc7944739246a
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../README.md
@@ -81,7 +81,8 @@ storage limitation. A second integration test points the export at an
 unreachable loopback port and verifies that all failed API sections report
 safe error codes and the overall result is `partial`.
 
-The required debug checks were run on this implementation:
+The required debug checks were run on this implementation and the #136
+acceptance fixtures:
 
 ```sh
 python3 scripts/check-dependency-policy.py
@@ -91,9 +92,13 @@ cargo test --workspace --locked --all-targets --all-features
 ```
 
 Dependency policy, formatting, and Clippy passed. The workspace test command
-passed 264 tests across 27 suites in 35.24 seconds. After the final
-human-readable section summary edit, formatting, Clippy, and all four
-`service_discovery_cli` integration tests passed again. These are local debug
+passed. The `service_discovery_cli` fixtures cover degraded readiness, stale
+and unknown workers, unavailable capacity, pending persistence, unresolved
+runs, pending allocation delivery, placement blockers, label redaction,
+operator-token authorization, item bounds, and a slow section that exceeds the
+export deadline. The `storage_cli` fixture creates retained completed runs and
+verifies the offline inspection report explains unpruned log pressure. Both
+focused integration suites also passed separately. These are local debug
 results; this revision has not yet been verified by GitHub CI.
 
 # Scope and limits
