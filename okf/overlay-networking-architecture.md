@@ -77,6 +77,26 @@ technical overview](https://github.com/slackhq/nebula), [ZeroTier One
 licensing and architecture](https://github.com/zerotier/ZeroTierOne), and
 [OpenZiti architecture](https://github.com/openziti/ziti).
 
+## Existing Iroh-to-IP implementations
+
+Several Rust projects already connect Iroh to a virtual IP interface. They
+reduce uncertainty around packet framing and TUN integration, but none matches
+Conductor's manager-owned identity, durable allocation, and worker lifecycle
+contracts as a drop-in component.
+
+| Project | Reusable capability | Gap for Conductor |
+| --- | --- | --- |
+| [iroh-lan](https://github.com/rustonbsd/iroh-lan) | MIT-licensed Rust library and TUN-backed layer-3 network over Iroh; the repository includes a library example and virtual IPv4 subnet. | Designed for ephemeral LANs discovered by shared name/password. It has no manager-enrolled WorkerId binding, durable address reservations, lease expiry, or revocation contract; peers must also use compatible protocol versions. Inspect as the first packet-path prototype/reference, not as the membership or allocation authority. |
+| [iron](https://github.com/lucascherzer/iron) | Rust TUN interface routing packets over Iroh, with persistent endpoint keys and source-address checks. | IPv6-only address mapping, root-run daemon, and no manager-controlled durable membership/address lifecycle. Useful for packet-path comparison, not a direct MVP5 fit. |
+| [Tunnet](https://github.com/tunnetio/Tunnet) | Rust-native Iroh mesh product with managed IP allocation, a full agent/control plane, and an embeddable Rust SDK. | The published SDK documents peer streams and managed enrollment; adopting the complete managed network also introduces its external identity/control-plane model. Its components have different licenses, including AGPL-3.0-only for control-plane and persistence components. Assess only if Conductor is willing to replace its own overlay control plane. |
+| [ezvpn](https://github.com/flexaccessdev/ezvpn) | Rust TUN-over-Iroh implementation with assigned client addresses and direct/relay paths. | Server-centered client access; it explicitly drops client-to-client packets and does not provide a durable peer mesh. It can inform framing and MTU choices, not supply the needed topology. |
+
+These projects are prior art rather than evidence of Conductor compatibility or
+production qualification. Review their exact source revisions, protocol and
+license before reusing code. A `tun-rs`-style device crate can supply OS TUN
+plumbing but does not supply peer mapping, manager authorization, allocation,
+or packet lifecycle behavior.
+
 ## Protocol and ownership contracts
 
 The initial network is an explicitly configured IPv4 overlay. IPv6 is not
@@ -193,17 +213,18 @@ authenticated manager-worker path. The current platform page records Linux
 x86_64, Linux arm64, and Apple silicon CI, but no independent-host overlay
 qualification.
 
-Before adding Iroh as a dependency, prototype the minimum packet path on two
-Linux hosts: manager-enrolled endpoint identities, a TUN interface, Iroh QUIC
-datagrams or a bounded packet framing scheme, a self-hosted relay fallback,
-and a request/reply application probe. Measure direct and relayed MTU,
-reconnect, throughput, and packet loss. Verify compile compatibility with
-Rust 1.99.1, dependency footprint, feature flags, and third-party safety
-boundary. Treat the adapter and privileged route lifecycle as substantial
-implementation work, not as functionality supplied by Iroh. If the packet
-path fails the prototype, revise the Rust-native backend or the milestone's
-addressed-IP acceptance before implementation proceeds; Iroh peer connectivity
-alone does not provide the required host overlay.
+Before adding Iroh as a dependency, inspect the `iroh-lan` packet path and
+prototype the minimum Conductor-owned path on two Linux hosts: manager-enrolled
+endpoint identities, TUN packet forwarding, Iroh QUIC datagrams or a bounded
+packet framing scheme, a self-hosted relay fallback, and a request/reply
+application probe. Measure direct and relayed MTU, reconnect, throughput, and
+packet loss. Verify compile compatibility with Rust 1.99.1, dependency
+footprint, feature flags, and third-party safety boundary. Treat the adapter
+and privileged route lifecycle as substantial implementation work, not as
+functionality supplied by Iroh. If the packet path fails the prototype, revise
+the Rust-native backend or the milestone's addressed-IP acceptance before
+implementation proceeds; Iroh peer connectivity alone does not provide the
+required host overlay.
 
 This source review did not run tests, construct an overlay, validate a
 privileged helper, or access a two-host testbed. No network behavior or
