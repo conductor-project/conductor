@@ -87,6 +87,17 @@ logged `Candidate verification succeeded; no release or tag was created or
 changed.` The protected publication job was skipped. A post-run inspection
 confirmed that `v0.0.1` remains a draft with no publication timestamp.
 
+After PR #179 merged, the no-write rehearsal ran against release-workflow
+revision `372ba25f7dc941ab779fe792055e0c607e029e4c` on the
+`codex/issue-147-rehearsal-evidence` branch as run
+[`39259649886`](https://github.com/conductor-project/conductor/actions/runs/39259649886).
+It passed the tag resolver, exact-run artifact selection, and package,
+checksum, Cosign signature, and attestation verification for both architectures.
+This revision checks out the default branch's verifier scripts for tag pushes
+and the selected workflow revision for manual dispatches, keeping candidate
+source separate from the validation code. Draft preparation and publication
+steps were skipped; `v0.0.1` remained a draft.
+
 The release-reference resolver is covered by
 `python3 scripts/test-resolve-release-ref.py` (5 tests passed). Temporary local
 Git fixtures exercise current-line tags, maintenance-line tags, shared commits,
