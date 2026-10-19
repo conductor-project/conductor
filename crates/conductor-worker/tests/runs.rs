@@ -685,6 +685,49 @@ fn version_one_schema_migration_preserves_run_history_and_log_metadata() {
 }
 
 #[test]
+fn failed_version_one_migration_rolls_back_log_table_creation() {
+    let directory = TempDir::new();
+    let database = directory.0.join("worker.sqlite3");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE runs (legacy_id TEXT PRIMARY KEY NOT NULL, state TEXT NOT NULL);
+             INSERT INTO runs VALUES ('legacy', 'succeeded');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    drop(connection);
+
+    let error = WorkerService::open(
+        &directory.0,
+        WorkerId::new("worker-1").unwrap(),
+        1,
+        Arc::new(TestBackend::default()),
+    );
+    assert!(error.is_err());
+
+    let connection = Connection::open(database).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    let run: (String, String) = connection
+        .query_row("SELECT legacy_id, state FROM runs", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    let log_table_exists: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'run_logs')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, 1);
+    assert_eq!(run, ("legacy".into(), "succeeded".into()));
+    assert!(!log_table_exists);
+}
+
+#[test]
 fn future_worker_schema_fails_with_version_and_keeps_existing_data() {
     let directory = TempDir::new();
     let database = directory.0.join("worker.sqlite3");
