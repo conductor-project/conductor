@@ -105,7 +105,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: package-input
       - name: Install RPM packaging tools
-        run: sudo apt-get update && sudo apt-get install --yes rpm rpm2cpio cpio
+        run: sudo apt-get update && sudo apt-get install --yes rpm rpm2cpio cpio elfutils
       - name: Read workspace version
         id: version
         run: echo "value=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["workspace"]["package"]["version"])')" >> "$GITHUB_OUTPUT"
