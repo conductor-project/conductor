@@ -55,6 +55,7 @@ struct PreflightReport {
     api_version: u8,
     schema_markers_supported: bool,
     databases: Vec<DatabaseStatus>,
+    required_maintenance_actions: Vec<&'static str>,
 }
 
 pub fn run(args: UpgradeArgs) -> ExitCode {
@@ -99,6 +100,7 @@ pub fn run(args: UpgradeArgs) -> ExitCode {
         manager_worker_protocol_version: conductor_core::CURRENT_PROTOCOL_VERSION,
         api_version: 1,
         schema_markers_supported,
+        required_maintenance_actions: maintenance_actions(&databases),
         databases,
     };
     if emit(output, &report).is_err() {
@@ -109,6 +111,24 @@ pub fn run(args: UpgradeArgs) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+fn maintenance_actions(databases: &[DatabaseStatus]) -> Vec<&'static str> {
+    if databases.iter().any(|database| !database.marker_supported) {
+        return vec![
+            "Do not start the candidate against these databases; use a compatible Conductor binary or restore a matching verified backup.",
+        ];
+    }
+    if databases
+        .iter()
+        .any(|database| database.state == "migration_required")
+    {
+        return vec![
+            "Drain workers, stop workers before the manager, and create a verified backup of both roles and their identity/configuration before migration.",
+            "Install matching manager and worker binaries; start the manager first, then workers, and inspect run and deployment state before resuming work.",
+        ];
+    }
+    Vec::new()
 }
 
 fn status(component: &'static str, schema_version: Option<i64>, current: i64) -> DatabaseStatus {
@@ -161,6 +181,9 @@ fn emit(output: OutputFormat, report: &PreflightReport) -> io::Result<()> {
                     "{} database: {} (current schema {}; {})",
                     database.component, version, database.current_schema_version, database.state
                 )?;
+            }
+            for action in &report.required_maintenance_actions {
+                writeln!(stdout, "Required maintenance: {action}")?;
             }
             Ok(())
         }

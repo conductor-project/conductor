@@ -242,9 +242,13 @@ using the candidate binary, after draining work and stopping the daemons. It
 opens existing SQLite files read-only and reports whether their schema markers
 are understood by that binary. An older marker is reported as
 `migration_required`, not as proof that the database is valid or that a release
-upgrade is supported. It does not run migrations, inspect active remote peers,
-validate workload compatibility, or establish package/distribution support.
-The report's API and transport versions describe this binary only.
+upgrade is supported. JSON and human output include required maintenance
+actions: unsupported markers must be resolved with a compatible binary or a
+matching verified backup; supported older markers require a verified joint
+backup and an explicit manager/worker restart to apply migration. Preflight
+does not run migrations, inspect active remote peers, validate workload
+compatibility, or establish package/distribution support. The report's API and
+transport versions describe this binary only.
 
 ### Planned upgrade and rollback sequence
 

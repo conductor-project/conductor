@@ -295,6 +295,8 @@ rollback sequence](okf/operations-and-recovery.md#upgrade-compatibility-policy).
 If a worker's protocol version or required capabilities are incompatible with
 the manager, the poll returns HTTP `426` and the worker exits with a diagnostic
 to install matching Conductor versions rather than retrying indefinitely.
+Preflight JSON includes `requiredMaintenanceActions`; human output prints the
+same guidance for unsupported schemas or required migrations.
 
 Stopping a run is different from stopping the daemon. To stop the daemon, press
 Ctrl-C in Terminal A and wait for its shutdown to finish. Job definitions and

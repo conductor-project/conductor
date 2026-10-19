@@ -62,7 +62,9 @@ without opening the daemon or applying migrations. It requires
 `--manager-data-dir`, `--worker-data-dir`, or both; use `--output json` for a
 machine-readable report. A report about an existing database is local evidence
 only and does not validate active remote peers, installed packages, or
-distribution support. See the [upgrade compatibility policy](../../../okf/operations-and-recovery.md#upgrade-compatibility-policy).
+distribution support. JSON reports include `requiredMaintenanceActions`;
+human output prints the same guidance for unsupported schemas or required
+migrations. See the [upgrade compatibility policy](../../../okf/operations-and-recovery.md#upgrade-compatibility-policy).
 
 Context commands use concise human output consistently, including create, list,
 show, use, and delete. Add `--output json` before or after the subcommand for
