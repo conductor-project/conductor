@@ -3,7 +3,7 @@ type: Reference
 title: Release and support policy
 description: Supported line policy and release/security procedures, distinguished from configured GitHub protections and completed release evidence.
 status: current
-source_revision: 2fcba9ade6809642b4e20889b5e81664c5478b3e
+source_revision: 906b9ae70d634572cbe1067b74ad6e2576b74881
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../docs/release-policy.md
@@ -138,18 +138,21 @@ does not qualify maintenance-line promotion or publish a supported release.
 The checked-in pull request workflow runs debug checks; the post-merge workflow
 runs release tests and builds on Linux x86_64 and macOS and packages Linux
 x86_64 and arm64. The release workflow consumes those signed, attested
-artifacts. No maintenance-line release or maintenance-line approval rehearsal
-has been recorded. `v0.0.1` is the first supported stable release.
+artifacts. `v0.0.1` is the first supported stable release; `release/0.0` was
+cut from its exact source commit. A `v0.0.2` maintenance candidate has passed
+package and protected approval rehearsals but remains unpublished.
 
-GitHub repository settings were inspected on 2026-10-19. The active `Protect
-Main` ruleset applies to `refs/heads/main` and only contains deletion and
-non-fast-forward restrictions. It does not require pull requests or CI checks.
-The classic branch-protection endpoint reports that `main` is not protected,
-and no tag-targeting ruleset is configured. These settings do not satisfy the
-release-policy protection requirements; repository administrators must
-configure and re-verify pull request, required-check, maintenance-branch, and
-tag protections before publishing releases. This observation records current
-settings, not a claim that the settings cannot change.
+The 2026-10-19 snapshot below recorded the settings before release protections
+were configured. The current rulesets were re-verified after configuration:
+`Protect Main` (ruleset `25306426`) applies to `refs/heads/main`,
+`Protect Release Lines` (ruleset `25432069`) applies to
+`refs/heads/release/**`, and `Protect Release Tags` (ruleset `25432073`)
+applies to `refs/tags/v*`. Both branch rulesets require pull requests, the
+required CodeQL/debug/package checks, and prevent branch deletion and
+non-fast-forward updates. The tag ruleset restricts tag creation, deletion,
+and updates to repository administrators. The `release-publication`
+environment requires a reviewer and permits self-review under the
+sole-maintainer policy. These settings remain subject to administrator review.
 
 Release-line, backport, embargo, emergency-approval, upgrade, artifact, and
 rehearsal procedures are policy requirements. A policy statement is not
@@ -166,5 +169,32 @@ digests against the exact-run candidate before publishing the draft.
 The release contains Debian and RPM packages for x86_64 and arm64, signing
 bundles, checksums, build metadata, source commit, and release provenance. Its
 source commit is `09f4af5e35b73fc54130c58daea4ae9fe87d7ace`; the trusted `Merge`
-run is `39243996603`. No maintenance-line release has been published or
-rehearsed, and `release/0.0` has not been cut.
+run is `39243996603`.
+
+## Maintenance-line candidate rehearsal
+
+The `release/0.0` branch was cut from the exact `v0.0.1` commit
+`09f4af5e35b73fc54130c58daea4ae9fe87d7ace`. PR #196 updated the maintenance
+line to version `0.0.2` and backported the trusted release workflow. Its merge
+commit is `a973e5bd5c4fd93e35ebb24f6b082d1232e4e6cd`. The branch's exact-source
+[`Merge` run 39318398440](https://github.com/conductor-project/conductor/actions/runs/39318398440)
+passed CodeQL, release checks on Linux x86_64, Linux arm64, and macOS, and
+package jobs for both Linux architectures. The package jobs signed the Debian
+and RPM files with GitHub OIDC and created artifact attestations.
+
+Tag `v0.0.2` points to that maintenance commit. The prepare workflow at main
+revision `906b9ae70d634572cbe1067b74ad6e2576b74881` ran as
+[`Publish release` run 39323221618](https://github.com/conductor-project/conductor/actions/runs/39323221618).
+It selected the exact successful `Merge` run above, verified both
+architectures' metadata, checksums, signatures, and attestations, then created
+the [private draft release](https://github.com/conductor-project/conductor/releases/tag/untagged-4356aeb8e8215905e355)
+with 14 expected assets. The draft remains unpublished; `v0.0.1` remains the
+latest public release.
+
+The protected approval rehearsal ran as
+[`Publish release` run 39323463282](https://github.com/conductor-project/conductor/actions/runs/39323463282).
+The configured `release-publication` environment reviewer approved the
+`approval-rehearsal` action. Candidate verification and the environment gate
+passed, the no-publish step completed, and the publication step was skipped.
+This validates the maintenance-line promotion and approval path without
+publishing `v0.0.2`.

@@ -8,7 +8,8 @@ policy does not authorize direct pushes or protection bypasses.
 ## Supported lines
 
 The first stable release, `0.0.1`, was published on 2026-10-19 and starts the
-`0.0.x` line. No maintenance branch has been cut yet.
+`0.0.x` line. The `release/0.0` maintenance branch was cut from the exact
+`v0.0.1` commit, `09f4af5e35b73fc54130c58daea4ae9fe87d7ace`.
 
 Conductor supports the latest minor line and the immediately preceding minor
 line. Each minor line receives at least 12 months
@@ -20,12 +21,12 @@ the release notes and README and provide upgrade or mitigation guidance.
 
 | Line | Authorized tags | Branch | Status |
 | --- | --- | --- | --- |
-| First line | `v0.0.Z` | `main`, then `release/0.0` when cut | Supported; `v0.0.1` published 2026-10-19 |
+| First line | `v0.0.Z` | `main` and `release/0.0` | Supported; `v0.0.1` published; `v0.0.2` is a verified unpublished draft candidate |
 | Later minor `X.Y` | `vX.Y.Z` | `main`, then `release/X.Y` when supported as the preceding line | Not yet selected |
 
-The table distinguishes published releases from branches that have not yet
-been cut. Maintainers update the status and support dates when a release line
-is opened, published, or retired.
+The table distinguishes published releases from unpublished draft candidates.
+Maintainers update the status and support dates when a release line is opened,
+published, or retired.
 
 ## Branches, tags, and release authority
 
@@ -65,9 +66,16 @@ protected environment. The temporary verified-asset artifact waits for
 approval for up to 90 days; if it expires, rerun `prepare` to reverify the
 exact trusted `Merge` artifacts and refresh the draft, then request publication
 again.
-Configuration of GitHub rulesets is an administrator action and must be
-verified in repository settings; workflow checks alone do not protect a tag
-from being moved or deleted.
+On 2026-10-19, repository administrators configured and verified `Protect
+Main` for `refs/heads/main`, `Protect Release Lines` for `refs/heads/release/**`,
+and `Protect Release Tags` for `refs/tags/v*`. The branch rulesets require
+pull requests and the required CodeQL, debug test, and Linux package checks,
+and prevent deletion and non-fast-forward updates. The tag ruleset restricts
+tag creation, deletion, and updates to repository administrators. The
+`release-publication` environment has a required maintainer reviewer and
+allows sole-maintainer self-approval, as recorded in the release evidence.
+Administrators must re-verify these settings after any governance change;
+workflow checks alone do not protect a tag from being moved or deleted.
 
 ## Fixes and backports
 
@@ -127,9 +135,9 @@ Release publication promotes only packages produced and verified for the
 exact tag commit by the trusted release workflow. Publish packages, checksums,
 signatures, build/source provenance, and release notes covering compatibility,
 upgrade steps, known limitations, affected/fixed versions, and mitigations.
-Do not rebuild packages inside the promotion job. The approved signing and
-trust-bootstrap mechanism must be documented before the first production
-release.
+Do not rebuild packages inside the promotion job. The signing and
+trust-bootstrap mechanism is documented in the package installation guide and
+is included with each published package.
 
 Publication is resumable only when an existing asset matches the expected
 bytes. A conflicting asset or tag fails; published tags and assets are never
@@ -165,12 +173,13 @@ temporary candidate files.
 ## Required rehearsals and records
 
 The first current-line release, `v0.0.1`, passed the exact-run verification and
-protected publication flow. The published release and its evidence are recorded
-in [`okf/release-and-support-policy.md`](../okf/release-and-support-policy.md).
-Before publishing a maintenance-line release, rehearse that backport through
-the same verification and artifact gates. Record the originating fix,
-adaptations, exact commits, checks, package architectures,
-compatibility/upgrade results, and publication status. Run an embargo rehearsal
+protected publication flow. Its evidence and the maintenance-line rehearsal
+are recorded in [`okf/release-and-support-policy.md`](../okf/release-and-support-policy.md).
+The `v0.0.2` maintenance candidate passed exact-source release checks and a
+protected approval rehearsal; it remains an unpublished draft. Record the
+originating fix, adaptations, exact commits, checks, package architectures,
+compatibility/upgrade results, and publication status for each maintenance
+release. Run an embargo rehearsal
 that tests private access, log and artifact redaction, coordinated public
 integration, and advisory publication without exposing a real vulnerability.
 Run a faulty-release exercise that issues a new patch version while preserving
