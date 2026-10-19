@@ -449,5 +449,6 @@ completion scripts for Bash, Elvish, Fish, PowerShell, and Zsh.
 - [Configure authenticated operator access](okf/configuration.md#operator-access)
 - [Submit jobs and manage services](okf/jobs-and-services.md)
 - [Explore the repository and crate knowledge bundles](OKF.md)
+- [Release support and security backport policy](docs/release-policy.md)
 - [Contribute](AGENTS.md) · [Apache 2.0 license](LICENSE.md)
 - [Support and issue tracker](https://github.com/conductor-project/conductor/issues)
