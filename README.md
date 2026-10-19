@@ -285,11 +285,12 @@ identity file or directory needed to reconnect the installation:
 The archive contains consistent SQLite snapshots, worker run logs, and the
 explicitly included files. It is created with owner-only permissions and
 includes a versioned manifest with file sizes and SHA-256 checksums. The
-manifest detects accidental corruption; it does not authenticate who created
-the archive. Protect and encrypt backup storage according to your deployment's
-credential-handling policy. Symlinks, special files, invalid paths, unsupported
-schemas, and checksum mismatches are rejected. Manager/worker state paths may
-not also be passed as included paths.
+manifest detects accidental corruption; inspection also checks SQLite
+integrity and confirms each database schema marker matches the manifest. These
+checks do not authenticate who created the archive. Protect and encrypt backup
+storage according to your deployment's credential-handling policy. Symlinks,
+special files, invalid paths, unsupported schemas, and checksum mismatches are
+rejected. Manager/worker state paths may not also be passed as included paths.
 
 Restore only into a new directory; the command never replaces an existing
 destination. It validates the archive before publishing the restored tree:

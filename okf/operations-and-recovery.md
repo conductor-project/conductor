@@ -3,7 +3,7 @@ type: Runbook
 title: Operations and recovery
 description: Use health and readiness correctly, plan graceful shutdown, and resolve uncertain work after restart.
 status: stable
-source_revision: 7a0fd655b1c16087368c309c7285f587fbbe8387
+source_revision: cbbaffdd5b1994fa3be2c7df7cd3336934d3b2dd
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../crates/conductor-api/src/lib.rs
@@ -101,11 +101,12 @@ paths.
 The `.tar` bundle has a versioned JSON manifest containing the producing
 binary version, manager and worker schema markers, every file path, byte size,
 and SHA-256 digest. `backup inspect` validates the complete archive without
-extracting it. The digest detects accidental corruption but is not a signature
-and does not authenticate the archive's origin. Treat the bundle as secret
-material: it may contain private identity keys and credentials. Store it with
-owner-only access and use an independently approved encryption and off-host
-retention process when required by the deployment.
+extracting it, including SQLite integrity and agreement between each database's
+schema marker and the manifest. The digest detects accidental corruption but
+is not a signature and does not authenticate the archive's origin. Treat the
+bundle as secret material: it may contain private identity keys and credentials.
+Store it with owner-only access and use an independently approved encryption
+and off-host retention process when required by the deployment.
 
 `backup restore` validates paths, entry types, checksums, SQLite integrity, and
 schema compatibility before publishing into a new destination directory. It
