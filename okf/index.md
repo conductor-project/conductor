@@ -16,6 +16,7 @@ surrounding repository checkout.
 - [Jobs and services](jobs-and-services.md) - HTTP submission, run lifecycle, and service deployments.
 - [Service discovery](service-discovery.md) - DNS listener access, host resolver setup, and rollback.
 - [Operations and recovery](operations-and-recovery.md) - readiness, shutdown, persistence, diagnosis, and recovery.
+- [Package installation and recovery acceptance](package-lifecycle-acceptance.md) - planned local package lifecycle scenarios and evidence requirements.
 - [Platforms and evidence](platforms-and-evidence.md) - supported targets, enforcement boundaries, and qualification evidence.
 - [README walkthrough evidence](walkthrough-evidence.md) - recorded local debug-only first-job and cancellation run.
 
