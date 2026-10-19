@@ -114,7 +114,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install --yes dpkg-dev rpm cpio
+          sudo apt-get install --yes dpkg-dev rpm rpm2cpio cpio
           gh attestation verify --help >/dev/null
           for arch in x86_64 aarch64; do
             dir="candidate/conductor-linux-packages-${arch}-release"
