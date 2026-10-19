@@ -85,3 +85,35 @@ Those checks do not prove that a host installed or started the package. Record i
 upgrade, removal, and runtime results only from a Debian 13 or Rocky Linux 10
 system with systemd, including architecture and package hash. Release and
 package runtime claims must cite that evidence.
+
+### Local arm64 qualification (2026-10-19)
+
+On Apple silicon with Docker Desktop 29.8.1, the `debian:13` and
+`rockylinux/rockylinux:10` images were verified as `linux/arm64`. Disposable
+systemd-enabled containers exercised the arm64 PR debug packages from workflow
+run 39204575826 (source `dd4a473de781604ab3f7d31f07402138b04e5bbc`):
+
+| Distribution | Package | SHA-256 |
+| --- | --- | --- |
+| Debian 13 arm64 | `conductor_0.1.0_arm64.deb` | `b6b44413ce6fe35675af68d12eb5dc5fdcaf676ddc50378d2e4410c191335da8` |
+| Rocky Linux 10 arm64 | `conductor-0.1.0-1.aarch64.rpm` | `c72d51006bd6d886b96856473a9e11d10bf1ae060ccf2eafd5ca94b863e2170c` |
+
+Both formats passed fresh install, `conductor --version`, service-account and
+payload checks, no automatic enable/start, explicit `systemctl start` and
+`stop`, removal, and reinstall while preserving seeded operator configuration
+and state. A separate debug 0.1.1 binary was built from the same source with a
+temporary workspace package-version override and wrapped with
+`scripts/package-linux.sh`; its artifacts are a local upgrade fixture, not
+release artifacts:
+
+| Package | SHA-256 |
+| --- | --- |
+| `conductor_0.1.1_arm64.deb` | `d968a0e65803b06430170306506e70ff3b30da53d02be63c0197ede3905d211f` |
+| `conductor-0.1.1-1.aarch64.rpm` | `42ccc86d9877a2094698ebbc6eb749a133caab55bc93477c64a6b1103324ef3a` |
+
+The 0.1.0-to-0.1.1 upgrade passed on both distributions. The configured service
+remained active with the same main PID through package upgrade, the config and
+state-marker hashes remained unchanged, and an explicit stop/start succeeded
+afterward. These checks establish package lifecycle behavior for arm64 in these
+Docker fixtures; they do not establish x86_64 target-distribution behavior,
+release compatibility, database migration safety, or production-host behavior.

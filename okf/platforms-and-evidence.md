@@ -34,8 +34,8 @@ sources:
 
 | Target | CI status | Scope and limit |
 | --- | --- | --- |
-| Linux x86_64 | PR and post-merge jobs | Debug/release builds and tests, plus package construction and binary-identity checks on Ubuntu 26.04. Distribution installation/runtime qualification is separate. |
-| Linux arm64 | PR and post-merge jobs | Native debug/release builds and tests, plus package construction and binary-identity checks on Ubuntu 26.04 arm64. Distribution installation/runtime qualification is separate. |
+| Linux x86_64 | PR and post-merge jobs | Debug/release builds and tests, plus package construction and binary-identity checks on Ubuntu 26.04. Debian/RPM target-distribution install/runtime checks have not been run locally. |
+| Linux arm64 | PR and post-merge jobs; local target fixtures | Native debug/release builds and tests, plus package construction and binary-identity checks on Ubuntu 26.04 arm64. Debian 13 and Rocky Linux 10 arm64 install/remove/reinstall, systemd start/stop, and 0.1.0-to-0.1.1 upgrade were verified in local arm64 Docker fixtures; see [package evidence](../docs/package-install.md#local-arm64-qualification-2026-10-19). |
 | Apple silicon macOS | PR and post-merge jobs | Debug and release builds/tests on the current macOS runner; Intel macOS is explicitly skipped. |
 | Intel macOS | Not in current matrix | Do not infer support from Apple silicon results. |
 
