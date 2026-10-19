@@ -3,7 +3,7 @@ type: Runbook
 title: Operations and recovery
 description: Use health and readiness correctly, plan graceful shutdown, and resolve uncertain work after restart.
 status: stable
-source_revision: db60ba9
+source_revision: 66e4f7f9a9612d73c59c63cc5b6127ea8b6943b6
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../crates/conductor-api/src/lib.rs
@@ -22,6 +22,8 @@ sources:
     title: Worker schema inspection and migrations
   - resource: ../crates/conductor/src/backup_cli.rs
     title: Offline backup and restore commands
+  - resource: ../crates/conductor/src/diagnostics_cli.rs
+    title: Bounded remote diagnostics export
   - resource: ../crates/conductor/tests/backup_cli.rs
     title: Backup integrity and recovery-hold coverage
   - resource: ../scripts/demo-agent.py
@@ -228,6 +230,39 @@ from #133, including its fencing and recovery-hold requirements. Package
 scripts do not restart services, so the operator controls the point where a
 migration can begin. Package lifecycle guidance must keep this boundary
 explicit.
+
+# Bounded diagnostics export
+
+`conductor diagnostics --output json export` collects `/healthz`, `/readyz`,
+the authorized `/v1/workers` response, and `/v1/metrics` concurrently through
+the typed API client. `--deadline-seconds` sets each request's bound from 1 to
+300 seconds (default 15). The client also enforces its configured response-byte
+cap. Export schema version 1 has per-section `collected` or `unavailable`
+status, safe error codes, and an overall `complete` or `partial` result. The
+overall status summarizes the four remote API collectors; the storage section
+remains explicitly unavailable because the remote API does not expose local
+database details.
+The top-level `versions` field records the binary, HTTP API, and
+manager-worker protocol versions; capability lists remain in the health and
+readiness sections.
+Worker summaries are limited to 128 items, capability lists to 32 entries,
+metric aggregates to 64 samples, findings to 128, and serialized output to
+256 KiB. Omitted worker and metric counts are reported.
+
+The worker allowlist contains stable worker IDs, freshness, availability,
+degraded/draining state, numeric slot counts, unresolved-run and persistence
+counts, and observation timestamps. Labels, inventory, resource-domain data,
+service addresses, commands, logs, environment values, credentials, and
+request contents are not serialized. Prometheus labels are converted only for
+explicitly allowlisted allocation and deployment-blocker metrics. Findings
+describe observed states and do not claim an unverified cause. Stale means the
+manager has a last-seen timestamp but currently considers the observation
+stale; missing freshness metadata is reported as `unknown`.
+
+Remote storage sizes and database paths are intentionally unavailable through
+this export. Stop the relevant daemon and use the local `conductor storage
+inspect` command for offline storage inspection. This is separate from remote
+diagnostics and does not collect or export database contents.
 
 # Audit and metrics
 

@@ -1,9 +1,9 @@
 ---
 type: Verification Record
-title: Local MVP3 CLI workflow evidence
-description: Debug CLI workflows are exercised against real local agents on Apple silicon macOS, with portable integration coverage in the conductor crate.
+title: Local CLI and diagnostics workflow evidence
+description: Debug CLI workflows and bounded diagnostics are exercised against real local agents on Apple silicon macOS, with portable integration coverage in the conductor crate.
 status: stable
-source_revision: b5f8e8614fbdc2134fb3f4405a42e03caa3097b3
+source_revision: 66e4f7f9a9612d73c59c63cc5b6127ea8b6943b6
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../README.md
@@ -20,6 +20,8 @@ sources:
     title: Worker inventory and drain integration tests
   - resource: ../crates/conductor/tests/service_discovery_cli.rs
     title: Service endpoint and diagnostics integration tests
+  - resource: ../crates/conductor/src/diagnostics_cli.rs
+    title: Versioned bounded diagnostics export and safe projection
 ---
 
 # Environment
@@ -70,6 +72,29 @@ workspace test command passed 247 tests across 22 suites in 65.74 seconds.
 Linux and macOS debug CI passed for the service and diagnostics CLI changes in
 PR #145. That CI does not perform release builds or privileged multi-host
 qualification.
+
+The bounded `conductor diagnostics export` was added at source revision
+`66e4f7f9a9612d73c59c63cc5b6127ea8b6943b6`. Its live-agent integration test
+plants a worker label and confirms that neither its key nor value appears in
+the export. It also checks the schema/version fields and explicit remote
+storage limitation. A second integration test points the export at an
+unreachable loopback port and verifies that all failed API sections report
+safe error codes and the overall result is `partial`.
+
+The required debug checks were run on this implementation:
+
+```sh
+python3 scripts/check-dependency-policy.py
+cargo fmt --all -- --check
+cargo clippy --workspace --locked --all-targets --all-features -- -D warnings
+cargo test --workspace --locked --all-targets --all-features
+```
+
+Dependency policy, formatting, and Clippy passed. The workspace test command
+passed 264 tests across 27 suites in 35.24 seconds. After the final
+human-readable section summary edit, formatting, Clippy, and all four
+`service_discovery_cli` integration tests passed again. These are local debug
+results; this revision has not yet been verified by GitHub CI.
 
 # Scope and limits
 
