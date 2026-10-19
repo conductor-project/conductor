@@ -154,3 +154,58 @@ host only. It does not qualify Rocky Linux 10 x86_64 `.rpm`, an x86_64 package
 upgrade, a published release, or production-host behavior. The fixture was run
 locally by explicit authorization; privileged package and systemd fixtures
 remain excluded from GitHub workflows.
+
+### Local Rocky Linux 10 x86_64 qualification (2026-10-19)
+
+The `conductor-0.1.0-1.x86_64.rpm` package from the same PR workflow run 44 and
+artifact `conductor-linux-packages-x86_64-debug` (ID `12174860463`, archive
+digest
+`sha256:675dde74f5decadce2536384f759a3f3a9220609eb5cf900a042b105af88e160`)
+was installed in a disposable Rocky Linux 10.2 x86_64 systemd container on
+Fortress. Source merge revision was
+`6305eb47ce8535a2741c489c1b4db516e5f4e556`, merging PR head
+`ad530e7f6283fb4fc51c94ef3aaf7bff924f6e2e` into
+`41e3d28322471ca4d195bfa2d402e1cd21775ce5`. The RPM SHA-256 was
+`db85b4c3ad5541743ac91c32671a11e4da2ef550ab80154a746912b5dd318789`; the
+matching binary SHA-256 from `BUILD-INFO.json` was
+`6e11f40b0941675899c3ad9340c1d297e7d738a17174e57abe1b38a15233333e`. The
+workflow artifact checksum and RPM metadata (`0.1.0`, `x86_64`) were verified
+before installation.
+
+The container used the cached `docker.io/rockylinux/rockylinux:10` amd64 image
+(image ID
+`0b5329d806d053ad65ab6b21fc3e49f1025e970cd826547a01a93b3ce9012796`) with
+systemd 257 (`257-23.el10_2.2.rocky.0.1-gb237c67`), curl, and procps-ng
+installed. Fortress was Debian 13 x86_64 with Podman 5.4.2, cgroup v2, and
+kernel `6.12.113+deb13-amd64`. The minimal Rocky image sets `tsflags=nodocs`;
+the test cleared that DNF option for package installation so the packaged
+example configuration was available for the service test.
+
+The test image installed systemd with `dnf -y install systemd curl procps-ng`.
+The lifecycle commands inside the container were:
+
+```sh
+dnf -y --setopt=tsflags= install /artifacts/conductor-0.1.0-1.x86_64.rpm
+systemctl start conductor.service
+curl --silent --show-error --fail http://127.0.0.1:8080/healthz
+systemctl stop conductor.service
+dnf -y remove conductor
+dnf -y --setopt=tsflags= install /artifacts/conductor-0.1.0-1.x86_64.rpm
+dnf -y remove conductor
+```
+
+Fresh install left the unit inactive and disabled, created the `conductor`
+account, installed `/usr/bin/conductor` as `root:root` mode 0755, and the
+installed binary hash matched `BUILD-INFO.json`. After configuring the packaged
+example, explicit `systemctl start` passed the `/healthz` check and the service
+ran as `conductor`; `systemctl stop` succeeded. `dnf remove` preserved the
+operator config and a seeded state marker. Reinstall left the service inactive
+and disabled and preserved both hashes; final removal also preserved them. The
+fixture reported `cleanup=passed`; a separate read-only check found no test
+container, temporary image, or staging directory left on Fortress.
+
+This qualifies Rocky Linux 10.2 x86_64 `.rpm` install/runtime/removal and
+reinstall behavior for this debug package in a systemd container. It does not
+qualify an x86_64 package upgrade, a published release, or production-host
+behavior. The fixture was run locally; privileged package and systemd fixtures
+remain excluded from GitHub workflows.

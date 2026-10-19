@@ -34,7 +34,7 @@ sources:
 
 | Target | CI status | Scope and limit |
 | --- | --- | --- |
-| Linux x86_64 | PR and post-merge jobs; local Debian host | Debug/release builds and tests, plus package construction and binary-identity checks on Ubuntu 26.04. Debian 13 x86_64 `.deb` 0.1.0 debug install, service start/stop, remove/reinstall/purge, and state/config preservation passed on a native host; Rocky Linux 10 x86_64 `.rpm` and x86_64 upgrade remain unqualified. See [package evidence](../docs/package-install.md#local-debian-13-x86_64-qualification-2026-10-19). |
+| Linux x86_64 | PR and post-merge jobs; local target checks | Debug/release builds and tests, plus package construction and binary-identity checks on Ubuntu 26.04. Debian 13 `.deb` lifecycle passed on a native host, and Rocky Linux 10.2 `.rpm` install/runtime/remove/reinstall passed in a local systemd container. An x86_64 package upgrade remains unqualified; see [Debian evidence](../docs/package-install.md#local-debian-13-x86_64-qualification-2026-10-19) and [Rocky evidence](../docs/package-install.md#local-rocky-linux-10-x86_64-qualification-2026-10-19). |
 | Linux arm64 | PR and post-merge jobs; local target fixtures | Native debug/release builds and tests, plus package construction and binary-identity checks on Ubuntu 26.04 arm64. Debian 13 and Rocky Linux 10 arm64 install/remove/reinstall, systemd start/stop, and 0.1.0-to-0.1.1 upgrade were verified in local arm64 Docker fixtures; see [package evidence](../docs/package-install.md#local-arm64-qualification-2026-10-19). |
 | Apple silicon macOS | PR and post-merge jobs | Debug and release builds/tests on the current macOS runner; Intel macOS is explicitly skipped. |
 | Intel macOS | Not in current matrix | Do not infer support from Apple silicon results. |

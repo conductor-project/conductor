@@ -25,14 +25,15 @@ digest or host identification, exact commands, observed results, and
 limitations.
 
 Current evidence covers arm64/aarch64 Debian 13 and Rocky Linux 10 in local
-systemd containers, plus Debian 13 x86_64 `.deb` lifecycle on a native host.
-Rocky Linux 10 x86_64 `.rpm` lifecycle and x86_64 package upgrade remain
-unqualified. CI may build and inspect x86_64 artifacts; privileged package
-installation, systemd, and lifecycle fixtures stay out of GitHub Actions. Use
-an isolated local VM or container that actually runs systemd and supports the
-target package manager. When direct host qualification is explicitly
-authorized, isolate its config/state and guarantee cleanup of package files,
-service account, and systemd state.
+systemd containers, Debian 13 x86_64 `.deb` lifecycle on a native host, and
+Rocky Linux 10.2 x86_64 `.rpm` install/runtime/remove/reinstall in a local
+systemd container. An x86_64 package upgrade remains unqualified. CI may build
+and inspect x86_64 artifacts; privileged package installation, systemd, and
+lifecycle fixtures stay out of GitHub Actions. Use an isolated local VM or
+container that actually runs systemd and supports the target package manager.
+When direct host qualification is explicitly authorized, isolate its
+config/state and guarantee cleanup of package files, service account, and
+systemd state.
 
 Final execution depends on the package workflow and artifacts from #132, the
 compatibility and preflight behavior from #134, and the diagnostics coverage
