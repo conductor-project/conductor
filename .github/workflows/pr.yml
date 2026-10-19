@@ -61,7 +61,9 @@ jobs:
       - name: Check dependency policy
         run: python3 scripts/check-dependency-policy.py
       - name: Test release-candidate verifier
-        run: python3 scripts/test-verify-release-candidate.py
+        run: |
+          python3 scripts/test-verify-release-candidate.py
+          python3 scripts/test-resolve-release-ref.py
       - name: Check formatting
         run: cargo +1.99.1 fmt --all -- --check
       - name: Build debug
