@@ -16,6 +16,10 @@ sources:
     title: Recovery and idempotency tests
   - resource: ../../conductor/src/upgrade_cli.rs
     title: Read-only schema marker preflight
+  - resource: ../../conductor/src/backup_cli.rs
+    title: Worker database and retained-log backup
+  - resource: ../../conductor/tests/backup_cli.rs
+    title: Worker state and log restore coverage
 ---
 
 # Durable acceptance
@@ -44,6 +48,17 @@ commands, and report state.
 The `conductor upgrade preflight` command reads the worker's `PRAGMA user_version`
 through a read-only connection. It does not start the worker, migrate its
 database, inspect the tables, or establish that retained logs can be restored.
+
+Offline backup takes the worker state lock and snapshots `worker.sqlite3`
+through SQLite's backup API. It also includes retained files under `runs/`.
+WAL/SHM sidecars are not copied separately. Restore validates the database
+integrity and schema marker and installs the worker state into a new destination
+without replacing existing files. Include worker identity and CA files
+explicitly when they are needed to reconnect; they may be outside the worker
+state directory. A restored worker remains held from startup until the
+operator has fenced surviving workload processes, reviewed unknown outcomes,
+checked identity changes, and clears its recovery hold with
+`conductor backup recovery-resolve --worker-data-dir ...`.
 
 ## Failure boundary
 

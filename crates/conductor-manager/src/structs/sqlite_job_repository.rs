@@ -3,6 +3,35 @@ use super::*;
 /// Manager-owned SQLite repository. One serialized connection keeps access bounded and simple.
 pub struct SqliteJobRepository {
     pub(super) connection: Mutex<Connection>,
+    completed_run_retention: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistoryPruneProgress {
+    pub eligible_runs: usize,
+    pub removed_runs: usize,
+    pub more_eligible: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryRetentionStatus {
+    pub completed_runs: u64,
+    pub active_or_unresolved_runs: u64,
+    pub eligible_runs: u64,
+    pub idempotency_protected_runs: u64,
+    pub pending_commands: u64,
+    pub current_service_attempts: u64,
+    pub service_port_leases: u64,
+    pub manager_commands: u64,
+    pub audit_events: u64,
+    pub execution_idempotency_records: u64,
+    pub eligible_runs_to_prune: u64,
+    pub sqlite_page_count: u64,
+    pub sqlite_freelist_pages: u64,
+    pub sqlite_page_size_bytes: u64,
+    pub completed_run_retention: usize,
+    pub cleanup_batch_limit: usize,
 }
 
 impl CommandJournal for SqliteJobRepository {
@@ -152,6 +181,7 @@ impl CommandJournal for SqliteJobRepository {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| CommandStoreError::StorageUnavailable)?;
         let mut observed_ids = Vec::with_capacity(entries.len());
+        let mut terminal_observation_updated = false;
         for entry in entries {
             let incoming = &entry.observation;
             if incoming.worker_id() != worker_id
@@ -208,17 +238,25 @@ impl CommandJournal for SqliteJobRepository {
             }
             let serialized =
                 serde_json::to_string(&newer).map_err(|_| CommandStoreError::StorageUnavailable)?;
-            transaction
+            let changed = transaction
                 .execute(
                     "UPDATE runs SET observation_json = ?1, revision = ?2, state = ?3
                      WHERE run_id = ?4 AND revision < ?2 AND state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
                     params![serialized, newer.revision() as i64, newer.state().as_str(), newer.run_id().as_str()],
                 )
                 .map_err(|_| CommandStoreError::StorageUnavailable)?;
+            terminal_observation_updated |= changed == 1 && newer.state().is_terminal();
         }
         transaction
             .commit()
             .map_err(|_| CommandStoreError::StorageUnavailable)?;
+        drop(connection);
+        if terminal_observation_updated && self.prune_completed_run_history().is_err() {
+            eprintln!(
+                "{{\"timestampMs\":{},\"severity\":\"warning\",\"component\":\"manager\",\"event\":\"run_history_retention_failed\"}}",
+                now_ms().unwrap_or_default(),
+            );
+        }
         Ok(observed_ids)
     }
 
@@ -2681,17 +2719,105 @@ impl JobRepository for SqliteJobRepository {
             .connection
             .lock()
             .map_err(|_| RunStoreError::StorageUnavailable)?;
-        connection.execute(
+        let changed = connection.execute(
             "UPDATE runs SET observation_json = ?1, revision = ?2, state = ?3 WHERE run_id = ?4 AND revision < ?2 AND state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
             params![serialized, observation.revision() as i64, observation.state().as_str(), observation.run_id().as_str()],
         ).map_err(|_| RunStoreError::StorageUnavailable)?;
+        drop(connection);
+        if changed == 1
+            && observation.state().is_terminal()
+            && self.prune_completed_run_history().is_err()
+        {
+            eprintln!(
+                "{{\"timestampMs\":{},\"severity\":\"warning\",\"component\":\"manager\",\"event\":\"run_history_retention_failed\"}}",
+                now_ms().unwrap_or_default(),
+            );
+        }
         Ok(())
     }
 }
 
 impl SqliteJobRepository {
+    /// Inspect an existing manager database without migrating or changing its contents.
+    /// SQLite may create its WAL coordination sidecar files during the read-only connection.
+    pub fn inspect_read_only(
+        path: impl AsRef<Path>,
+        completed_run_retention: usize,
+    ) -> Result<HistoryRetentionStatus, RepositoryOpenError> {
+        if !(MIN_COMPLETED_RUN_RETENTION..=MAX_COMPLETED_RUN_RETENTION)
+            .contains(&completed_run_retention)
+        {
+            return Err(RepositoryOpenError::InvalidRetentionPolicy);
+        }
+        let metadata = fs::symlink_metadata(path.as_ref()).map_err(RepositoryOpenError::Io)?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(RepositoryOpenError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "manager database path must be a regular file",
+            )));
+        }
+        for suffix in ["-wal", "-shm"] {
+            let mut sidecar_path = path.as_ref().as_os_str().to_owned();
+            sidecar_path.push(suffix);
+            match fs::symlink_metadata(Path::new(&sidecar_path)) {
+                Ok(sidecar_metadata)
+                    if sidecar_metadata.file_type().is_symlink() || !sidecar_metadata.is_file() =>
+                {
+                    return Err(RepositoryOpenError::Io(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "manager SQLite sidecar path must be a regular file",
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(RepositoryOpenError::Io(error)),
+            }
+        }
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(RepositoryOpenError::Sqlite)?;
+        connection
+            .busy_timeout(SQLITE_BUSY_TIMEOUT)
+            .map_err(RepositoryOpenError::Sqlite)?;
+        let version = connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .map_err(RepositoryOpenError::Sqlite)?;
+        if version != SCHEMA_VERSION {
+            return Err(RepositoryOpenError::InvalidLegacySchema);
+        }
+        connection
+            .execute_batch("BEGIN DEFERRED")
+            .map_err(RepositoryOpenError::Sqlite)?;
+        let repository = Self {
+            connection: Mutex::new(connection),
+            completed_run_retention,
+        };
+        let status = repository
+            .history_retention_status()
+            .map_err(|_| RepositoryOpenError::Sqlite(rusqlite::Error::InvalidQuery))?;
+        repository
+            .connection
+            .lock()
+            .map_err(|_| RepositoryOpenError::Sqlite(rusqlite::Error::InvalidQuery))?
+            .execute_batch("COMMIT")
+            .map_err(RepositoryOpenError::Sqlite)?;
+        Ok(status)
+    }
+
     /// Open or create the manager database, enable durable local settings, and migrate it.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, RepositoryOpenError> {
+        Self::open_with_retention(path, DEFAULT_COMPLETED_RUN_RETENTION)
+    }
+
+    /// Open or create the manager database with a bounded completed-run history policy.
+    pub fn open_with_retention(
+        path: impl AsRef<Path>,
+        completed_run_retention: usize,
+    ) -> Result<Self, RepositoryOpenError> {
+        if !(MIN_COMPLETED_RUN_RETENTION..=MAX_COMPLETED_RUN_RETENTION)
+            .contains(&completed_run_retention)
+        {
+            return Err(RepositoryOpenError::InvalidRetentionPolicy);
+        }
         prepare_database_file(path.as_ref()).map_err(RepositoryOpenError::Io)?;
         let connection = Connection::open_with_flags(
             path,
@@ -2736,6 +2862,195 @@ impl SqliteJobRepository {
 
         Ok(Self {
             connection: Mutex::new(connection),
+            completed_run_retention,
+        })
+    }
+
+    /// Remove one bounded batch of eligible completed-run history.
+    ///
+    /// Runs with idempotency keys, unresolved delivery, or live service references
+    /// remain stored. The run sequence remains monotonic, so removed run IDs are
+    /// still permanently reserved.
+    pub fn prune_completed_run_history(&self) -> Result<HistoryPruneProgress, RunStoreError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let eligible_count = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM runs AS r
+                 WHERE r.state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')
+                   AND r.idempotency_key IS NULL
+                   AND NOT EXISTS (
+                       SELECT 1 FROM manager_commands AS c
+                       WHERE c.run_id = r.run_id AND c.state = 'pending'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM service_attempts AS a WHERE a.current_run_id = r.run_id
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM service_port_leases AS l WHERE l.run_id = r.run_id
+                   )",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let eligible_runs =
+            usize::try_from(eligible_count).map_err(|_| RunStoreError::StorageUnavailable)?;
+        let candidates = {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT r.run_id FROM runs AS r
+                     WHERE r.state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')
+                       AND r.idempotency_key IS NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM manager_commands AS c
+                           WHERE c.run_id = r.run_id AND c.state = 'pending'
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM service_attempts AS a WHERE a.current_run_id = r.run_id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM service_port_leases AS l WHERE l.run_id = r.run_id
+                       )
+                     ORDER BY r.run_order DESC
+                     LIMIT ?1 OFFSET ?2",
+                )
+                .map_err(|_| RunStoreError::StorageUnavailable)?;
+            statement
+                .query_map(
+                    params![
+                        i64::try_from(MAX_HISTORY_CLEANUP_BATCH + 1)
+                            .map_err(|_| RunStoreError::StorageUnavailable)?,
+                        i64::try_from(self.completed_run_retention)
+                            .map_err(|_| RunStoreError::StorageUnavailable)?
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|_| RunStoreError::StorageUnavailable)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| RunStoreError::StorageUnavailable)?
+        };
+        let more_eligible = candidates.len() > MAX_HISTORY_CLEANUP_BATCH;
+        let run_ids = candidates
+            .into_iter()
+            .take(MAX_HISTORY_CLEANUP_BATCH)
+            .collect::<Vec<_>>();
+        for run_id in &run_ids {
+            transaction
+                .execute(
+                    "DELETE FROM manager_commands WHERE run_id = ?1 AND state = 'acknowledged'",
+                    [run_id],
+                )
+                .map_err(|_| RunStoreError::StorageUnavailable)?;
+            let removed = transaction
+                .execute(
+                    "DELETE FROM runs WHERE run_id = ?1
+                       AND state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')
+                       AND idempotency_key IS NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM manager_commands AS c
+                           WHERE c.run_id = runs.run_id AND c.state = 'pending'
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM service_attempts AS a WHERE a.current_run_id = runs.run_id
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM service_port_leases AS l WHERE l.run_id = runs.run_id
+                       )",
+                    [run_id],
+                )
+                .map_err(|_| RunStoreError::StorageUnavailable)?;
+            if removed != 1 {
+                return Err(RunStoreError::StorageUnavailable);
+            }
+        }
+        transaction
+            .commit()
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let progress = HistoryPruneProgress {
+            eligible_runs,
+            removed_runs: run_ids.len(),
+            more_eligible,
+        };
+        if progress.removed_runs > 0 {
+            eprintln!(
+                "{{\"timestampMs\":{},\"severity\":\"info\",\"component\":\"manager\",\"event\":\"run_history_retention_progress\",\"eligibleRuns\":{},\"removedRuns\":{},\"retentionRuns\":{},\"moreEligible\":{}}}",
+                now_ms().unwrap_or_default(),
+                progress.eligible_runs,
+                progress.removed_runs,
+                self.completed_run_retention,
+                progress.more_eligible,
+            );
+        }
+        Ok(progress)
+    }
+
+    /// Return bounded, nonsensitive counts and SQLite page-reclamation measurements.
+    pub fn history_retention_status(&self) -> Result<HistoryRetentionStatus, RunStoreError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| RunStoreError::StorageUnavailable)?;
+        let count = |sql: &str| -> Result<u64, RunStoreError> {
+            connection
+                .query_row(sql, [], |row| row.get::<_, i64>(0))
+                .map_err(|_| RunStoreError::StorageUnavailable)
+                .and_then(|value| {
+                    u64::try_from(value).map_err(|_| RunStoreError::StorageUnavailable)
+                })
+        };
+        let page_count = |name: &str| -> Result<u64, RunStoreError> {
+            connection
+                .pragma_query_value(None, name, |row| row.get::<_, i64>(0))
+                .map_err(|_| RunStoreError::StorageUnavailable)
+                .and_then(|value| {
+                    u64::try_from(value).map_err(|_| RunStoreError::StorageUnavailable)
+                })
+        };
+        let eligible_runs = count(
+            "SELECT COUNT(*) FROM runs AS r
+             WHERE r.state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')
+               AND r.idempotency_key IS NULL
+               AND NOT EXISTS (SELECT 1 FROM manager_commands AS c WHERE c.run_id = r.run_id AND c.state = 'pending')
+               AND NOT EXISTS (SELECT 1 FROM service_attempts AS a WHERE a.current_run_id = r.run_id)
+               AND NOT EXISTS (SELECT 1 FROM service_port_leases AS l WHERE l.run_id = r.run_id)",
+        )?;
+        Ok(HistoryRetentionStatus {
+            completed_runs: count(
+                "SELECT COUNT(*) FROM runs
+                 WHERE state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
+            )?,
+            active_or_unresolved_runs: count(
+                "SELECT COUNT(*) FROM runs
+                 WHERE state NOT IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')",
+            )?,
+            eligible_runs,
+            idempotency_protected_runs: count(
+                "SELECT COUNT(*) FROM runs
+                 WHERE state IN ('succeeded', 'failed', 'cancelled', 'timed_out', 'abandoned')
+                   AND idempotency_key IS NOT NULL",
+            )?,
+            pending_commands: count(
+                "SELECT COUNT(*) FROM manager_commands WHERE state = 'pending'",
+            )?,
+            current_service_attempts: count(
+                "SELECT COUNT(*) FROM service_attempts WHERE current_run_id IS NOT NULL",
+            )?,
+            service_port_leases: count("SELECT COUNT(*) FROM service_port_leases")?,
+            manager_commands: count("SELECT COUNT(*) FROM manager_commands")?,
+            audit_events: count("SELECT COUNT(*) FROM audit_events")?,
+            execution_idempotency_records: count("SELECT COUNT(*) FROM execution_idempotency")?,
+            eligible_runs_to_prune: eligible_runs
+                .saturating_sub(self.completed_run_retention as u64),
+            sqlite_page_count: page_count("page_count")?,
+            sqlite_freelist_pages: page_count("freelist_count")?,
+            sqlite_page_size_bytes: page_count("page_size")?,
+            completed_run_retention: self.completed_run_retention,
+            cleanup_batch_limit: MAX_HISTORY_CLEANUP_BATCH,
         })
     }
 

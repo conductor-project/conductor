@@ -3473,7 +3473,7 @@ fn manager_admission_reserves_job_and_worker_capacity_transactionally() {
 #[test]
 fn idempotency_keys_replay_across_capacity_completion_and_database_reopen() {
     let directory = TempDir::new();
-    let repository = SqliteJobRepository::open(directory.database()).unwrap();
+    let repository = SqliteJobRepository::open_with_retention(directory.database(), 1).unwrap();
     repository.insert(job("first")).unwrap();
     repository.insert(job("other")).unwrap();
     let worker = WorkerId::new("local").unwrap();
@@ -3503,9 +3503,45 @@ fn idempotency_keys_replay_across_capacity_completion_and_database_reopen() {
         )
         .unwrap();
     repository.record_observation(&terminal).unwrap();
+
+    let complete_unkeyed_run = |repository: &SqliteJobRepository| {
+        let admission = repository
+            .create_run(&JobId::new("other").unwrap(), &worker, 1, None)
+            .unwrap();
+        let command = admission.command.as_ref().unwrap();
+        repository
+            .acknowledge_command(
+                &command.command_id,
+                &command.target_worker_id,
+                command.target_worker_incarnation,
+                r#"{"accepted":true}"#,
+            )
+            .unwrap();
+        let requested = repository.get_run(admission.spec.id()).unwrap().unwrap();
+        let completed = requested
+            .next_revision(
+                RunState::Succeeded,
+                Some(requested.requested_at_ms()),
+                Some(requested.requested_at_ms() + 1),
+                Some(0),
+                None,
+                None,
+            )
+            .unwrap();
+        repository.record_observation(&completed).unwrap();
+        admission.spec.id().clone()
+    };
+    let oldest_unkeyed = complete_unkeyed_run(&repository);
+    let newest_unkeyed = complete_unkeyed_run(&repository);
+    assert_eq!(
+        repository.history_retention_status().unwrap().eligible_runs,
+        1
+    );
+    assert!(repository.get_run(&oldest_unkeyed).unwrap().is_none());
+    assert!(repository.get_run(&newest_unkeyed).unwrap().is_some());
     drop(repository);
 
-    let reopened = SqliteJobRepository::open(directory.database()).unwrap();
+    let reopened = SqliteJobRepository::open_with_retention(directory.database(), 1).unwrap();
     let replay = reopened
         .create_run(&JobId::new("first").unwrap(), &worker, 1, Some("retry-1"))
         .unwrap();

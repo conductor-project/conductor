@@ -12,6 +12,8 @@ conductor-worker.workspace = true
 conductor-process.workspace = true
 conductor-api.workspace = true
 conductor-transport.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
 axum-server.workspace = true
 reqwest.workspace = true
 serde.workspace = true
@@ -25,6 +27,7 @@ base64.workspace = true
 getrandom.workspace = true
 zeroize.workspace = true
 nix.workspace = true
+tar.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 close_fds.workspace = true
@@ -36,7 +39,6 @@ close_fds.workspace = true
 axum.workspace = true
 axum-server.workspace = true
 reqwest.workspace = true
-rusqlite.workspace = true
 
 [lints]
 workspace = true

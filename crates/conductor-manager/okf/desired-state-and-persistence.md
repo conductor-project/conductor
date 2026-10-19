@@ -14,6 +14,12 @@ sources:
     title: Persistence and restart tests
   - resource: ../../conductor/src/upgrade_cli.rs
     title: Read-only schema marker preflight
+  - resource: ../../conductor/src/backup_cli.rs
+    title: Offline SQLite snapshot and restore validation
+  - resource: ../../conductor/src/storage_cli.rs
+    title: Read-only storage inspection
+  - resource: ../../conductor/tests/backup_cli.rs
+    title: Backup round-trip and recovery-hold tests
 ---
 
 # Durable state
@@ -28,8 +34,48 @@ only and must not be reused for worker state.
 
 SQLite uses WAL mode and full synchronization. Startup migrates supported older
 schemas transactionally, and fails closed when a database is corrupt,
-inaccessible, or newer than the supported schema. Back up a consistent DB/WAL
-state with the daemon stopped.
+inaccessible, or newer than the supported schema. Use
+`conductor backup create --manager-data-dir ...` with the daemon stopped to
+create a consistent SQLite snapshot. The command takes the manager state lock,
+uses SQLite's online backup API, and checks snapshot integrity and schema
+version. It does not change the source database.
+
+## Run-history retention
+
+The manager keeps the newest `completed_run_retention` eligible terminal runs
+(10,000 by default; configurable range 1 through 1,000,000). A cleanup pass
+deletes at most 128 runs. Cleanup runs once at manager startup and after a
+terminal observation is persisted; `moreEligible` progress is written as a
+structured manager event. It removes acknowledged command-outbox rows only
+with their deleted run.
+
+Eligibility requires a terminal run with no idempotency key, pending command,
+current service-attempt reference, or service-port lease. Active and unknown
+runs, idempotency-keyed runs, and runs with those references remain stored.
+Run IDs use a monotonic persisted sequence that cleanup never decrements, so
+removed IDs stay reserved. Audit events and execution-idempotency records are
+permanent; this policy does not globally bound those tables. Worker command and
+report history remains worker-owned and is not deleted by manager cleanup.
+Acknowledged manager commands are deleted only with their eligible run;
+pending commands stay protected. Job ID reservations, job revisions, and
+current deployment state are retained by their existing contracts. Service
+attempts and port leases stay while referenced by current state. This change
+does not set expiry windows for any idempotency or replay evidence.
+
+`conductor storage inspect --manager-data-dir ...` reports bounded manager counts,
+eligible rows beyond the configured target, permanent metadata counts, SQLite
+page count/freelist, and manager database/WAL/shared-memory file sizes. The
+inspection does not migrate or change database contents. SQLite may create its
+WAL coordination sidecar files when opening a read-only connection. Deleting
+rows places pages on SQLite's freelist but does not shrink the database file;
+SQLite reuses those pages on later writes. Physical compaction is not performed
+automatically. Add `--worker-data-dir ...` to inspect worker run/log/command/
+report-sequence counts and SQLite file/page measurements. The worker command
+and report records currently have no expiry or compaction policy; worker log
+files have the separate bounded policy in the worker knowledge page. The log
+byte figure is an upper bound derived from unpruned log pairs, including active
+runs, and the configured per-stream cap; it does not scan log files or report
+their exact aggregate byte size.
 
 The `conductor upgrade preflight` command reads only `PRAGMA user_version` via
 a read-only connection. It does not validate table structure or prove that a
@@ -43,6 +89,14 @@ migrates, an older binary that cannot read that schema must not be pointed at
 it. Restore the matching pre-upgrade database backup before rolling binaries
 back; doing so discards writes made after that backup. Confirm jobs, runs, and
 retained logs before resuming traffic.
+
+Restoring manager state places the database in a new destination and creates a
+recovery hold. Manager and `all` startup remain blocked until an operator has
+fenced surviving workers/workloads, reviewed active and unknown runs, checked
+identity changes, and explicitly runs `conductor backup recovery-resolve`.
+When worker state was also restored, clear both recovery holds together. The
+marker prevents automatic replay from a stale manager snapshot; the CLI's
+confirmation is an operator assertion, not remote process verification.
 
 # Transactions and ownership
 
