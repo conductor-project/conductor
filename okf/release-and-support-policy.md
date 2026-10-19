@@ -27,12 +27,18 @@ is published.
 The reviewed repository revision has no release tags or maintenance branches.
 The checked-in pull request workflow runs debug checks; the post-merge workflow
 runs release tests and builds on Linux x86_64 and macOS. Neither workflow
-currently produces packages or proves maintenance-line coverage. GitHub
-branch/tag rulesets are administrator configuration and are not established by
-these documents. See the issue/PR evidence before claiming they are configured
-or rehearsed.
+currently produces packages or proves maintenance-line coverage.
+
+GitHub repository settings were inspected on 2026-10-19. The active `Protect
+Main` ruleset applies to `refs/heads/main` and only contains deletion and
+non-fast-forward restrictions. It does not require pull requests or CI checks.
+The classic branch-protection endpoint reports that `main` is not protected,
+and no tag-targeting ruleset is configured. These settings do not satisfy the
+release-policy protection requirements; repository administrators must
+configure and re-verify pull request, required-check, maintenance-branch, and
+tag protections before publishing releases. This observation records current
+settings, not a claim that the settings cannot change.
 
 Release-line, backport, embargo, emergency-approval, upgrade, artifact, and
 rehearsal procedures are policy requirements. A policy statement is not
-evidence that a release was published, a rehearsal was run, or a repository
-ruleset was enabled.
+evidence that a release was published or a rehearsal was run.
