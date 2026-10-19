@@ -3,7 +3,7 @@ type: Runbook
 title: Operations and recovery
 description: Use health and readiness correctly, plan graceful shutdown, and resolve uncertain work after restart.
 status: stable
-source_revision: e7e17917291459f16a2d9a53fcd03a7f29ae3271
+source_revision: 636059dbca9a89b34a6133c701a9df5a121c8a4b
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../crates/conductor-api/src/lib.rs
@@ -82,35 +82,65 @@ and [worker persistence page](../crates/conductor-worker/okf/supervision-and-rec
 
 The current source reports Conductor `0.1.0`, HTTP API `v1`, manager-worker
 protocol `3`, manager database schema `12`, and worker database schema `4`.
-Manager and worker databases have independent schema sequences. During a
-planned upgrade, stop all manager and worker processes, make a consistent
-backup, and upgrade their binaries together to the same Conductor version.
-Mixed-version operation is unsupported; no zero-downtime or automatic rollback
-is promised. Database migrations run only when a role starts. A downgrade is
-not supported after migration; restore the matching pre-upgrade backup before
-starting an older binary.
+Manager and worker databases have independent schema sequences. The release
+policy intends `0.1.x` as the first stable line, then support for the latest
+and immediately preceding minor lines for 12 months from each line's first
+stable release. No release tag has been published, so there is not yet a
+previous supported release to use as a real upgrade baseline. Untagged
+development builds are not a supported upgrade source.
 
 | Compatibility boundary | Current source value | Policy |
 | --- | --- | --- |
-| CLI binary | `0.1.0` | Upgrade manager and worker binaries together; no prior release is supported yet. |
-| HTTP API | `v1` | The operator client uses versioned `/v1` routes; no cross-release compatibility window is published. |
-| Manager-worker transport | Protocol `3` | Negotiation checks protocol overlap, but supported mixed binary versions are not established; use matching releases. |
-| Manager database | Schema `12` | Forward migrations are transactional; no downgrade is supported. |
-| Worker database | Schema `4` | Independently versioned and migrated on worker startup; no downgrade is supported. |
+| CLI binary | `0.1.0` | Upgrade all manager and worker binaries together to the same stable release. Untagged builds are unsupported upgrade baselines. |
+| HTTP API | `v1` | Routes are versioned under `/v1`. No cross-release client/server window has been validated; use matching release versions. |
+| Manager-worker transport | Protocol `3` | Protocol negotiation checks version overlap and required capabilities. Mixed Conductor release versions are not a supported operating mode until separately qualified. |
+| Manager database | Schema `12` | Each source migration step is transactional and the current code migrates known earlier markers. This does not prove a real previous-release upgrade. No downgrade is supported after migration. |
+| Worker database | Schema `4` | Independently versioned and migrated during worker startup. This does not prove a real previous-release upgrade. No downgrade is supported after migration. |
 
-There are no published version tags yet, so the project has no previous
-supported release baseline or validated upgrade window. Pre-release snapshots
-are not a supported upgrade source. The first supported release must establish
-the baseline and provide real prior-release fixtures before a later release can
-claim upgrade compatibility. Until then, schema migration code coverage is not
-evidence of a supported release-to-release upgrade.
+The release policy and the upgrade evidence are separate: the policy defines
+which stable lines are intended to receive support, while a supported upgrade
+path still requires a published source release and exercised fixtures from
+that release. Once `0.1.0` is published as the first stable release, it becomes
+the baseline for later `0.1.x` patch upgrades. A later minor release must
+exercise the preceding supported line before claiming upgrade compatibility.
 
 Run `conductor upgrade preflight` with the manager and worker data directories
-after stopping the daemon. It opens existing SQLite files read-only and reports
-whether their schema markers are understood by the current binary. It does not
-run migrations, inspect active remote peers, validate workload compatibility,
-or establish package/distribution support. The report's API and transport
-versions describe this binary only.
+using the candidate binary, after draining work and stopping the daemons. It
+opens existing SQLite files read-only and reports whether their schema markers
+are understood by that binary. An older marker is reported as
+`migration_required`, not as proof that the database is valid or that a release
+upgrade is supported. It does not run migrations, inspect active remote peers,
+validate workload compatibility, or establish package/distribution support.
+The report's API and transport versions describe this binary only.
+
+### Planned upgrade and rollback sequence
+
+1. Read the release notes and confirm the source and target are inside the
+   published support window. Do not upgrade from an untagged development build.
+2. Drain each worker through the manager and wait for drain completion. Inspect
+   unresolved runs and service deployments; do not treat an unknown outcome as
+   safe to replay.
+3. Stop workers, then stop the manager after it has stopped assigning work.
+   Include manager and worker databases, logs, configuration, and identity
+   material in one consistent backup set. Verify the backup before proceeding.
+4. Run the candidate binary's `upgrade preflight` against both stopped data
+   directories. Resolve an unsupported marker or inspection error before
+   replacing binaries. A `migration_required` result means only that the
+   current source has a migration path for that marker.
+5. Install matching manager and worker binaries without starting them
+   implicitly. Start the manager first, confirm readiness, then start workers.
+   Inspect run, deployment, and recovery state before resuming normal work.
+
+Before any migration starts, rollback may use the previous binary with the
+unchanged databases. Once migration has started, do not downgrade the binary or
+database. Stop the processes, restore the matching manager/worker backup set
+and its configuration/identity, then fence surviving workers and workloads and
+resolve unknown outcomes before scheduling resumes. Restoring a backup can
+discard writes made after it; follow the offline backup and restore procedure
+from #133, including its fencing and recovery-hold requirements. Package
+scripts do not restart services, so the operator controls the point where a
+migration can begin. Package lifecycle guidance must keep this boundary
+explicit.
 
 # Audit and metrics
 

@@ -275,8 +275,12 @@ invalid schema blocks the upgrade. Migrations run only when the corresponding
 role is explicitly started. The preflight reads local files only: it does not
 verify versions of running remote workers or package/distribution
 compatibility. Keep manager and worker binaries on the same Conductor version
-during an upgrade, and use the compatibility policy in the [operations
-runbook](okf/operations-and-recovery.md).
+during an upgrade. Drain workers, stop workers before the manager, back up
+both roles and their identity/configuration as one set, and run the candidate
+binary's preflight before installing or starting it. Start the manager before
+workers. If migration begins, do not downgrade; restore the matching backup
+and reconcile surviving workloads. See the [upgrade compatibility policy and
+rollback sequence](okf/operations-and-recovery.md#upgrade-compatibility-policy).
 
 Stopping a run is different from stopping the daemon. To stop the daemon, press
 Ctrl-C in Terminal A and wait for its shutdown to finish. Job definitions and
