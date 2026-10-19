@@ -38,6 +38,8 @@ use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const SCHEMA_VERSION: i64 = 4;
+/// Current worker database schema understood by this build.
+pub const CURRENT_SCHEMA_VERSION: i64 = SCHEMA_VERSION;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_PERSISTENCE_BUDGET: Duration = Duration::from_secs(2);
 const PERSISTENCE_BLOCKING_CAPACITY: usize = 2;
