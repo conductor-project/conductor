@@ -3,7 +3,7 @@ type: Reference
 title: Release and support policy
 description: Supported line policy and release/security procedures, distinguished from configured GitHub protections and completed release evidence.
 status: planned
-source_revision: 1bab63614c220a72f5f6d5e51be0920d6abe4bc3
+source_revision: 949131c83b86c9492b817d4a364a05d5a90495b0
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../docs/release-policy.md
@@ -29,13 +29,25 @@ approval rehearsal and fails with an exact-run recovery command when transient
 artifacts are missing or expired. No version is supported until its verified
 release is published.
 
-The reviewed repository revision has no release tags or maintenance branches.
+Tag `v0.0.1` points to main commit `09f4af5e35b73fc54130c58daea4ae9fe87d7ace`.
+Its exact [`Merge` run](https://github.com/conductor-project/conductor/actions/runs/39243996603)
+passed CodeQL, release tests, and package jobs; both architecture-specific
+package artifacts were present and unexpired. The tag-triggered
+[`Publish release` run](https://github.com/conductor-project/conductor/actions/runs/39246314442)
+verified the packages,
+checksums, signatures, and attestations, then failed while resuming the draft:
+both architecture artifacts contained `BUILD-INFO.json` and `SHA256SUMS`.
+It left a [draft release](https://github.com/conductor-project/conductor/releases/tag/untagged-f1328f563f1c0633652d)
+tagged `v0.0.1` with the complete aarch64 asset set and no x86_64 metadata;
+nothing was published. The follow-up change assigns unique names to x86_64
+metadata and checksums while preserving the existing aarch64 asset bytes. Its
+CI and a successful `prepare` rerun are still pending.
+
 The checked-in pull request workflow runs debug checks; the post-merge workflow
 runs release tests and builds on Linux x86_64 and macOS and packages Linux
 x86_64 and arm64. The release workflow consumes those signed, attested
 artifacts. No maintenance-line release or publication rehearsal has been
-recorded. Local checks and PR CI for the promotion workflow passed; it has not
-yet been exercised against a real `v0.0.1` tag.
+recorded, and no version is supported until its verified release is published.
 
 GitHub repository settings were inspected on 2026-10-19. The active `Protect
 Main` ruleset applies to `refs/heads/main` and only contains deletion and
