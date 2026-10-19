@@ -3,7 +3,7 @@ type: Runbook
 title: Operations and recovery
 description: Use health and readiness correctly, plan graceful shutdown, and resolve uncertain work after restart.
 status: stable
-source_revision: cbbaffdd5b1994fa3be2c7df7cd3336934d3b2dd
+source_revision: 85020c5ecd991df26e79057e9e7702189a723d20
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../crates/conductor-api/src/lib.rs
@@ -85,8 +85,8 @@ workers, retained `runs/` logs. SQLite's online backup API produces a
 consistent database image while Conductor's OS-backed state lock proves that
 the corresponding daemon role is stopped. Backup creation rejects a busy
 manager or worker lock. It copies other regular files below each selected
-state directory, but excludes the lock file and SQLite WAL/SHM sidecars because
-the database snapshot already contains committed state.
+state directory, but excludes the lock file and SQLite WAL/SHM/rollback-journal
+sidecars because the database snapshot already contains a consistent state.
 
 Configuration and identity material may live outside state directories and is
 not discovered automatically. Pass each required configuration file,
