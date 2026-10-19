@@ -15,7 +15,7 @@ output_dir=$5
 source_revision=$6
 profile=$7
 
-[[ -x "$binary" && -f "$binary" ]] || { echo "binary artifact is missing or not executable" >&2; exit 1; }
+[[ -f "$binary" ]] || { echo "binary artifact is missing" >&2; exit 1; }
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.+~]+)?$ ]] || { echo "invalid package version" >&2; exit 1; }
 [[ "$source_revision" =~ ^[0-9a-f]{40}$ ]] || { echo "invalid source revision" >&2; exit 1; }
 [[ "$profile" == debug || "$profile" == release ]] || { echo "invalid build profile" >&2; exit 1; }
@@ -29,6 +29,7 @@ for tool in dpkg-deb rpmbuild rpm rpm2cpio cpio sha256sum tar readelf sort; do
   command -v "$tool" >/dev/null || { echo "required packaging tool is unavailable" >&2; exit 1; }
 done
 
+chmod 0755 "$binary"
 binary_version=$("$binary" --version)
 [[ "$binary_version" == "conductor $version" ]] || { echo "binary version does not match package version" >&2; exit 1; }
 max_glibc_symbol=$(readelf --version-info "$binary" | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sort -Vu | tail -n 1 || true)
