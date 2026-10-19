@@ -264,6 +264,111 @@ run history persist. A daemon restart can leave an ambiguous run in `unknown`;
 Conductor does not automatically replay it. See
 [operations and recovery](okf/operations-and-recovery.md).
 
+## Manager history and storage inspection
+
+Inspect manager and/or worker retained history, delivery counts, SQLite
+freelist pages, and database/WAL file sizes without migrating or changing
+database contents:
+
+```sh
+./target/debug/conductor storage inspect \
+  --manager-data-dir /var/lib/conductor/manager \
+  --worker-data-dir /var/lib/conductor/worker \
+  --completed-run-retention 10000
+```
+
+`completed_run_retention` defaults to 10,000 and accepts values from 1 through
+1,000,000. Cleanup removes eligible terminal runs in batches of at most 128.
+Idempotency-keyed runs, runs with pending commands, service references, or port
+leases are retained. Run identifiers stay reserved by the monotonic run
+sequence. Audit events and execution idempotency records are permanent. The
+inspection reports SQLite free pages, but does not shrink the database file;
+SQLite reuses those pages for later writes. A read-only SQLite connection may
+create WAL coordination sidecar files when they do not already exist. The
+completed-run target applies to eligible run rows, not permanent or protected
+metadata. Add `--worker-data-dir` to inspect worker run/command/report counts,
+SQLite page and file sizes, and the estimated upper bound for unpruned log
+pairs, including active runs. Set `--log-retention-runs` and
+`--log-max-bytes-per-stream` to
+match the worker configuration when calculating that estimate. Worker run
+observations, command results, and report sequence state are retained for replay
+and reconnect safety and currently have no expiry or compaction policy. Worker
+log files use their separate `log_retention_runs` setting.
+
+## Offline backup and restore
+
+Stop Conductor and every worker before planned maintenance. Create and verify a
+backup with explicit manager/worker state paths, plus every configuration and
+identity file or directory needed to reconnect the installation:
+
+```sh
+./target/debug/conductor backup create \
+  --manager-data-dir /var/lib/conductor/manager \
+  --worker-data-dir /var/lib/conductor/worker \
+  --include-path /etc/conductor/agent.json \
+  --include-path /var/lib/conductor/manager-identity \
+  --include-path /etc/conductor/worker-identity.pem \
+  --output /var/backups/conductor-maintenance.tar
+./target/debug/conductor backup inspect \
+  --input /var/backups/conductor-maintenance.tar
+```
+
+The archive contains consistent SQLite snapshots, worker run logs, and the
+explicitly included files. It is created with owner-only permissions and
+includes a versioned manifest with file sizes and SHA-256 checksums. The
+manifest detects accidental corruption; inspection also checks SQLite
+integrity and confirms each database schema marker matches the manifest. These
+checks do not authenticate who created the archive. Protect and encrypt backup
+storage according to your deployment's credential-handling policy. Symlinks,
+special files, invalid paths, unsupported schemas, and checksum mismatches are
+rejected. Manager/worker state paths may not also be passed as included paths.
+
+Restore only into a new directory; the command never replaces an existing
+destination. It validates the archive before publishing the restored tree:
+
+```sh
+./target/debug/conductor backup restore \
+  --input /var/backups/conductor-maintenance.tar \
+  --destination /var/lib/conductor/restored
+```
+
+The restored state is at `restored/manager` and `restored/worker`; explicit
+included files are under `restored/included/NNNN`. Update the restored
+configuration to use those state paths and the restored identity files. A
+restore creates a recovery hold in every restored component, so manager,
+worker, and `all` roles refuse to start until surviving workers and workloads
+are fenced and uncertain outcomes have been reviewed. After those checks,
+clear each hold explicitly (pass both paths when both roles were restored):
+
+Restored directories are mode `0700` and files are mode `0600`, owned by the
+account that ran the restore. If the daemon runs under a different service
+account, assign the restored state directories to that account before startup;
+set ownership and permissions for included configuration and identity files
+separately. For the packaged `conductor` account, for example:
+
+```sh
+sudo chown -R conductor:conductor \
+  /var/lib/conductor/restored/manager \
+  /var/lib/conductor/restored/worker
+```
+
+Do this only after checking the destination paths and which account should own
+each item.
+
+```sh
+./target/debug/conductor backup recovery-resolve \
+  --manager-data-dir /var/lib/conductor/restored/manager \
+  --worker-data-dir /var/lib/conductor/restored/worker \
+  --confirm-workers-fenced \
+  --confirm-unknown-outcomes-reviewed
+```
+
+Restoring an older snapshot discards writes after its backup time. The recovery
+hold does not prove that external processes stopped or undo their effects; do
+not resume scheduling until the operator has checked those conditions. See the
+[backup and recovery runbook](okf/operations-and-recovery.md#offline-backup-and-restore)
+for the complete procedure.
+
 ## Configure operator connections
 
 The operator CLI supports named connection contexts. Contexts store the manager

@@ -3,7 +3,7 @@ type: Runbook
 title: Operations and recovery
 description: Use health and readiness correctly, plan graceful shutdown, and resolve uncertain work after restart.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
+source_revision: 85020c5ecd991df26e79057e9e7702189a723d20
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../crates/conductor-api/src/lib.rs
@@ -14,6 +14,10 @@ sources:
     title: Worker recovery and shutdown
   - resource: ../crates/conductor/tests/agent.rs
     title: Lifecycle integration coverage
+  - resource: ../crates/conductor/src/backup_cli.rs
+    title: Offline backup and restore commands
+  - resource: ../crates/conductor/tests/backup_cli.rs
+    title: Backup integrity and recovery-hold coverage
   - resource: ../scripts/demo-agent.py
     title: Isolated real-binary lifecycle demo
 ---
@@ -66,11 +70,94 @@ closure, not success; it releases the held reservation. Do not report an
 `unknown` or `abandoned` run as successful. See the [API route guide](../crates/conductor-api/okf/routes-and-contracts.md#resolving-an-uncertain-run)
 for the request and conflict behavior.
 
-Back up manager SQLite state with the daemon stopped. Startup fails closed on
-corrupt, inaccessible, or newer-than-supported database schemas. The current
-source declares manager schema version 12 and worker schema version 4; see the
-[schema migration pages](../crates/conductor-manager/okf/desired-state-and-persistence.md)
-and [worker persistence page](../crates/conductor-worker/okf/supervision-and-recovery.md).
+The manager schema is version 12 and worker schema version 4 in the reviewed
+source. Their migration sequences are independent; see the [manager schema
+page](../crates/conductor-manager/okf/desired-state-and-persistence.md) and
+[worker persistence page](../crates/conductor-worker/okf/supervision-and-recovery.md).
+Startup fails closed on corrupt, inaccessible, or newer-than-supported
+schemas.
+
+# Offline backup and restore
+
+The supported backup unit is an offline Conductor snapshot: one or both role
+state directories, including the manager/worker SQLite database and, for
+workers, retained `runs/` logs. SQLite's online backup API produces a
+consistent database image while Conductor's OS-backed state lock proves that
+the corresponding daemon role is stopped. Backup creation rejects a busy
+manager or worker lock. It copies other regular files below each selected
+state directory, but excludes the lock file and SQLite WAL/SHM/rollback-journal
+sidecars because the database snapshot already contains a consistent state.
+
+Configuration and identity material may live outside state directories and is
+not discovered automatically. Pass each required configuration file,
+certificate, private key, CA directory, and long-lived credential with one or
+more `--include-path` arguments. Review the manifest's source-to-archive
+mapping. Included paths must not overlap a selected manager/worker state
+directory. Links, sockets, devices, and other non-regular files are rejected.
+The archive stores included items under `included/NNNN`, so a restored
+configuration must be updated to point at the restored state and identity
+paths.
+
+The `.tar` bundle has a versioned JSON manifest containing the producing
+binary version, manager and worker schema markers, every file path, byte size,
+and SHA-256 digest. `backup inspect` validates the complete archive without
+extracting it, including SQLite integrity and agreement between each database's
+schema marker and the manifest. The digest detects accidental corruption but
+is not a signature and does not authenticate the archive's origin. Treat the
+bundle as secret material: it may contain private identity keys and credentials.
+Store it with owner-only access and use an independently approved encryption
+and off-host retention process when required by the deployment.
+
+`backup restore` validates paths, entry types, checksums, SQLite integrity, and
+schema compatibility before publishing into a new destination directory. It
+never overwrites an existing destination. The restored manager and worker
+state live under `DESTINATION/manager` and `DESTINATION/worker`; included files
+live under `DESTINATION/included/NNNN`. An interrupted or invalid restore is
+discarded from its private staging directory and does not replace a usable
+installation. Restored directories use mode `0700` and files use mode `0600`,
+owned by the account that ran the restore. If the daemon uses a different
+service account, assign the restored state directories to that account before
+startup. Set ownership and permissions for included configuration and identity
+files separately; do not recursively change the entire destination without
+reviewing its contents.
+
+Every restored component creates `.conductor-recovery-required` in its state
+directory. Manager, worker, and combined `all` processes refuse startup while
+their marker exists. This prevents restored state from silently accepting
+stale commands, replaying work, or treating stale authority as current while
+workers or workloads may have survived. Before clearing it, stop or fence all
+surviving workers and workload processes, compare the restored manager and
+worker histories, inspect active and `unknown` runs, check identity/certificate
+changes, and resolve external effects using the deployment's recovery process.
+Then run `conductor backup recovery-resolve` for every restored state directory
+with both explicit confirmation flags. The command records an operator assertion; it does not inspect remote
+hosts or verify that processes stopped. Backup age defines the potential data
+loss window, not whether execution occurred. Unknown outcomes remain uncertain
+until investigated; do not claim they did not run based only on an older
+backup.
+
+Example sequence:
+
+```sh
+conductor backup create --manager-data-dir /var/lib/conductor/manager \
+  --worker-data-dir /var/lib/conductor/worker \
+  --include-path /etc/conductor/agent.json \
+  --include-path /var/lib/conductor/manager-identity \
+  --include-path /etc/conductor/worker-identity.pem \
+  --output /var/backups/conductor-maintenance.tar
+conductor backup inspect --input /var/backups/conductor-maintenance.tar
+conductor backup restore --input /var/backups/conductor-maintenance.tar \
+  --destination /var/lib/conductor/restored
+conductor backup recovery-resolve \
+  --manager-data-dir /var/lib/conductor/restored/manager \
+  --worker-data-dir /var/lib/conductor/restored/worker \
+  --confirm-workers-fenced --confirm-unknown-outcomes-reviewed
+```
+
+The CLI does not automatically rewrite configuration paths, fence remote
+workers, terminate workloads, or roll databases backward in place. Keep the
+original state untouched until restored state, included credentials, and the
+recovery decision have been verified.
 
 # Audit and metrics
 

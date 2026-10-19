@@ -38,6 +38,8 @@ use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 const BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 const SCHEMA_VERSION: i64 = 4;
+/// Current worker database schema understood by this build.
+pub const CURRENT_SCHEMA_VERSION: i64 = SCHEMA_VERSION;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_PERSISTENCE_BUDGET: Duration = Duration::from_secs(2);
 const PERSISTENCE_BLOCKING_CAPACITY: usize = 2;
@@ -239,7 +241,7 @@ use pending_persistence::PendingPersistence;
 
 #[path = "structs/worker_service.rs"]
 mod worker_service;
-pub use worker_service::WorkerService;
+pub use worker_service::{WorkerService, WorkerStorageStatus};
 
 #[cfg(test)]
 #[path = "reader_reaper_tests.rs"]
@@ -389,11 +391,21 @@ fn close_log_stream(state: &SharedWorkerState, run_id: &str, stream: LogStream) 
     Ok(())
 }
 
+const MAX_LOG_RETENTION_BATCH_RUNS: usize = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LogRetentionProgress {
+    pruned_runs: usize,
+    more_eligible: bool,
+}
+
 fn prune_completed_logs_shared(
     state: &SharedWorkerState,
     log_directory: &Path,
     retention_runs: usize,
-) -> io::Result<()> {
+) -> io::Result<LogRetentionProgress> {
+    let retention_offset = i64::try_from(retention_runs)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid log retention count"))?;
     let candidates = {
         let worker_state = state
             .0
@@ -404,16 +416,21 @@ fn prune_completed_logs_shared(
             .prepare(
                 "SELECT run_id FROM run_logs
                  WHERE pruned = 0 AND stdout_closed = 1 AND stderr_closed = 1
-                 ORDER BY completed_at_ms DESC, run_id DESC LIMIT -1 OFFSET ?1",
+                 ORDER BY completed_at_ms DESC, run_id DESC LIMIT ?1 OFFSET ?2",
             )
             .map_err(storage_error)?;
         statement
-            .query_map([retention_runs as i64], |row| row.get::<_, String>(0))
+            .query_map(
+                params![(MAX_LOG_RETENTION_BATCH_RUNS + 1) as i64, retention_offset],
+                |row| row.get::<_, String>(0),
+            )
             .map_err(storage_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(storage_error)?
     };
-    for id in candidates {
+    let more_eligible = candidates.len() > MAX_LOG_RETENTION_BATCH_RUNS;
+    let pruned_runs = candidates.len().min(MAX_LOG_RETENTION_BATCH_RUNS);
+    for id in candidates.into_iter().take(pruned_runs) {
         for stream in [LogStream::Stdout, LogStream::Stderr] {
             let path = log_directory.join(format!("{id}.{}", stream.as_str()));
             match fs::symlink_metadata(&path) {
@@ -440,7 +457,20 @@ fn prune_completed_logs_shared(
             )
             .map_err(storage_error)?;
     }
-    Ok(())
+    let progress = LogRetentionProgress {
+        pruned_runs,
+        more_eligible,
+    };
+    if progress.pruned_runs > 0 {
+        eprintln!(
+            "{{\"timestampMs\":{},\"severity\":\"info\",\"component\":\"worker\",\"event\":\"log_retention_progress\",\"prunedRuns\":{},\"retentionRuns\":{},\"moreEligible\":{}}}",
+            now_ms().unwrap_or_default(),
+            progress.pruned_runs,
+            retention_runs,
+            progress.more_eligible,
+        );
+    }
+    Ok(progress)
 }
 
 fn persist_terminal_observation(

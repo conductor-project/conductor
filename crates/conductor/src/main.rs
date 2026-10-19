@@ -1,3 +1,4 @@
+mod backup_cli;
 mod contexts;
 mod deployment_cli;
 mod diagnostics_cli;
@@ -6,6 +7,7 @@ mod operator_cli;
 mod run_cli;
 mod service_cli;
 mod state_lock;
+mod storage_cli;
 mod worker_cli;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -67,6 +69,10 @@ enum Commands {
     Service(service_cli::ServiceArgs),
     /// Check manager health, readiness, and metrics.
     Diagnostics(diagnostics_cli::DiagnosticsArgs),
+    /// Create, inspect, or restore offline state backups.
+    Backup(backup_cli::BackupArgs),
+    /// Inspect manager storage and history-retention status.
+    Storage(storage_cli::StorageArgs),
     /// Generate shell completion scripts for the implemented CLI commands.
     Completions {
         #[arg(value_enum)]
@@ -171,6 +177,8 @@ struct Config {
     log_max_bytes_per_stream: u64,
     #[serde(default = "default_log_retention_runs")]
     log_retention_runs: usize,
+    #[serde(default = "default_completed_run_retention")]
+    completed_run_retention: usize,
     #[serde(default = "default_request_timeout_ms")]
     request_timeout_ms: u64,
     #[serde(default)]
@@ -287,6 +295,19 @@ fn default_log_retention_runs() -> usize {
     conductor_worker::DEFAULT_LOG_RETENTION_RUNS
 }
 
+fn default_completed_run_retention() -> usize {
+    conductor_manager::DEFAULT_COMPLETED_RUN_RETENTION
+}
+
+fn report_run_history_retention(repository: &conductor_manager::SqliteJobRepository) {
+    if repository.prune_completed_run_history().is_err() {
+        eprintln!(
+            "{{\"timestampMs\":{},\"severity\":\"warning\",\"component\":\"manager\",\"event\":\"run_history_retention_failed\"}}",
+            timestamp_ms(),
+        );
+    }
+}
+
 fn default_request_timeout_ms() -> u64 {
     conductor_api::DEFAULT_REQUEST_TIMEOUT.as_millis() as u64
 }
@@ -350,6 +371,8 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Commands::Worker(args) => return Ok(worker_cli::run(args)),
         Commands::Service(args) => return Ok(service_cli::run(args)),
         Commands::Diagnostics(args) => return Ok(diagnostics_cli::run(args)),
+        Commands::Backup(args) => return Ok(backup_cli::run(args)),
+        Commands::Storage(args) => return Ok(storage_cli::run(args)),
         Commands::Completions { shell } => {
             let mut command = Cli::command();
             clap_complete::generate(shell, &mut command, "conductor", &mut std::io::stdout());
@@ -364,6 +387,8 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         } => {
             let worker_id = WorkerId::new(worker_id)?;
             let manager_data_dir = state_lock::prepare_directory(&manager_data_dir)?;
+            backup_cli::ensure_no_recovery_hold(&manager_data_dir)
+                .map_err(|_| "restored manager state requires recovery clearance")?;
             let manager = Arc::new(conductor_manager::SqliteJobRepository::open(
                 manager_data_dir.join("manager.sqlite3"),
             )?);
@@ -397,6 +422,8 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         } => {
             let worker_id = WorkerId::new(worker_id)?;
             let manager_data_dir = state_lock::prepare_directory(&manager_data_dir)?;
+            backup_cli::ensure_no_recovery_hold(&manager_data_dir)
+                .map_err(|_| "restored manager state requires recovery clearance")?;
             let manager = conductor_manager::SqliteJobRepository::open(
                 manager_data_dir.join("manager.sqlite3"),
             )?;
@@ -512,9 +539,14 @@ fn run_all(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let listen = *required(&config.listen, "listen")?;
     let dns_config = service_dns_config(config.service_dns.as_ref())?;
     let _state_locks = StateLocks::acquire(manager_data_dir, worker_data_dir)?;
-    let manager = Arc::new(conductor_manager::JobService::open_sqlite(
+    backup_cli::ensure_no_recovery_hold(manager_data_dir)?;
+    backup_cli::ensure_no_recovery_hold(worker_data_dir)?;
+    let manager_repository = Arc::new(conductor_manager::SqliteJobRepository::open_with_retention(
         manager_data_dir.join("manager.sqlite3"),
+        config.completed_run_retention,
     )?);
+    report_run_history_retention(&manager_repository);
+    let manager = Arc::new(conductor_manager::JobService::new(manager_repository));
     let worker = Arc::new(conductor_worker::WorkerService::open_with_log_policy(
         worker_data_dir,
         worker_id,
@@ -628,11 +660,17 @@ fn run_manager(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let api_access = api_access_policy(&config)?;
     let _state_locks = StateLocks::acquire_manager(manager_data_dir)
         .map_err(|error| format!("manager state lock could not be acquired: {error}"))?;
+    backup_cli::ensure_no_recovery_hold(manager_data_dir)
+        .map_err(|_| "restored manager state requires recovery clearance")?;
 
     let repository = Arc::new(
-        conductor_manager::SqliteJobRepository::open(manager_data_dir.join("manager.sqlite3"))
-            .map_err(|error| format!("manager repository could not be opened: {error}"))?,
+        conductor_manager::SqliteJobRepository::open_with_retention(
+            manager_data_dir.join("manager.sqlite3"),
+            config.completed_run_retention,
+        )
+        .map_err(|error| format!("manager repository could not be opened: {error}"))?,
     );
+    report_run_history_retention(&repository);
     let manager = Arc::new(conductor_manager::JobService::new(repository.clone()));
     let authority = Arc::new(
         conductor_transport::CertificateAuthority::open_or_create(identity_dir).map_err(
@@ -838,6 +876,8 @@ fn run_worker(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let ca_path = required(&config.manager_ca_file, "manager_ca_file")?;
     let endpoint = required(&config.manager_endpoint, "manager_endpoint")?;
     let _state_locks = StateLocks::acquire_worker(worker_data_dir)?;
+    backup_cli::ensure_no_recovery_hold(worker_data_dir)
+        .map_err(|_| "restored worker state requires recovery clearance")?;
     let ca = fs::read(ca_path).map_err(|_| "manager CA certificate could not be read")?;
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -1314,6 +1354,14 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     let worker_role = matches!(config.role, Role::Worker | Role::All);
     let manager_role = matches!(config.role, Role::Manager | Role::All);
 
+    if manager_role
+        && !(conductor_manager::MIN_COMPLETED_RUN_RETENTION
+            ..=conductor_manager::MAX_COMPLETED_RUN_RETENTION)
+            .contains(&config.completed_run_retention)
+    {
+        return Err("completed_run_retention is outside the supported range".into());
+    }
+
     match config.role {
         Role::All => {
             if config.worker_transport_listen.is_some()
@@ -1713,6 +1761,7 @@ mod tests {
             service_dns: None,
             log_max_bytes_per_stream: conductor_worker::DEFAULT_LOG_MAX_BYTES_PER_STREAM,
             log_retention_runs: conductor_worker::DEFAULT_LOG_RETENTION_RUNS,
+            completed_run_retention: conductor_manager::DEFAULT_COMPLETED_RUN_RETENTION,
             request_timeout_ms: default_request_timeout_ms(),
             cgroup_v2: CgroupV2Config::default(),
             landlock: super::LandlockConfig::default(),
@@ -1730,6 +1779,31 @@ mod tests {
         config.manager_server_name = Some("localhost".to_owned());
         config.worker_transport_capacity = Some(2);
         config
+    }
+
+    #[test]
+    fn completed_run_retention_has_a_bounded_default_and_configured_range() {
+        let deserialized: Config = serde_json::from_str(
+            r#"{"role":"all","listen":"127.0.0.1:8080","api_access":{"mode":"local"}}"#,
+        )
+        .expect("all-role configuration uses retention default");
+        assert_eq!(
+            deserialized.completed_run_retention,
+            conductor_manager::DEFAULT_COMPLETED_RUN_RETENTION
+        );
+
+        let mut config = config("127.0.0.1:8080");
+        validate(&config).expect("default retention is valid");
+
+        config.completed_run_retention = conductor_manager::MIN_COMPLETED_RUN_RETENTION;
+        validate(&config).expect("minimum retention is valid");
+        config.completed_run_retention = conductor_manager::MAX_COMPLETED_RUN_RETENTION;
+        validate(&config).expect("maximum retention is valid");
+
+        config.completed_run_retention = 0;
+        assert!(validate(&config).is_err());
+        config.completed_run_retention = conductor_manager::MAX_COMPLETED_RUN_RETENTION + 1;
+        assert!(validate(&config).is_err());
     }
 
     #[test]
