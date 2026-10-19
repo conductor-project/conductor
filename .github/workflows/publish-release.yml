@@ -118,7 +118,6 @@ jobs:
           gh attestation verify --help >/dev/null
           for arch in x86_64 aarch64; do
             dir="candidate/conductor-linux-packages-${arch}-release"
-            (cd "$dir" && sha256sum --check SHA256SUMS)
             python3 scripts/verify-release-candidate.py "$dir" "$VERSION" "$SOURCE_SHA" "$arch"
             for package in "$dir"/*.deb "$dir"/*.rpm; do
               cosign verify-blob --bundle "${package}.sigstore.json" --certificate-identity "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/merge.yml@refs/heads/${BRANCH}" --certificate-oidc-issuer https://token.actions.githubusercontent.com "$package"

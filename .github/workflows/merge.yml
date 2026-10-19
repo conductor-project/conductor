@@ -60,6 +60,8 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-${{ runner.arch }}-release-rust-1.99.1-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+      - name: Test release-candidate verifier
+        run: python3 scripts/test-verify-release-candidate.py
       - name: Install Rust 1.99.1
         run: rustup toolchain install 1.99.1 --profile minimal
       - name: Test release
