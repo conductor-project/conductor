@@ -49,6 +49,33 @@ pub const DEFAULT_LOG_RETENTION_RUNS: usize = 100;
 pub const MAX_LOG_MAX_BYTES_PER_STREAM: u64 = 1024 * 1024 * 1024;
 pub const MAX_LOG_RETENTION_RUNS: usize = 10_000;
 
+/// Read the worker schema marker without opening the database for writes or running migrations.
+/// `None` means that the database file does not exist yet.
+pub fn inspect_schema_version(data_dir: &Path) -> io::Result<Option<i64>> {
+    let database_path = data_dir.join("worker.sqlite3");
+    let metadata = match fs::symlink_metadata(&database_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => {
+            return Err(io::Error::other("worker database could not be inspected"));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::other("worker database could not be inspected"));
+    }
+    let resolved_path = fs::canonicalize(&database_path)
+        .map_err(|_| io::Error::other("worker database could not be inspected"))?;
+    let connection = Connection::open_with_flags(
+        resolved_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|_| io::Error::other("worker database could not be inspected"))?;
+    let version = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|_| io::Error::other("worker database could not be inspected"))?;
+    Ok(Some(version))
+}
+
 /// Worker execution seam implemented by the host-specific process crate.
 pub trait ExecutionBackend: Send + Sync {
     /// Spawn one job in a dedicated process group with stdin closed and output piped.

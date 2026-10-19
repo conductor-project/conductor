@@ -8,6 +8,7 @@ mod run_cli;
 mod service_cli;
 mod state_lock;
 mod storage_cli;
+mod upgrade_cli;
 mod worker_cli;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -69,6 +70,8 @@ enum Commands {
     Service(service_cli::ServiceArgs),
     /// Check manager health, readiness, and metrics.
     Diagnostics(diagnostics_cli::DiagnosticsArgs),
+    /// Inspect local version and database upgrade compatibility.
+    Upgrade(upgrade_cli::UpgradeArgs),
     /// Create, inspect, or restore offline state backups.
     Backup(backup_cli::BackupArgs),
     /// Inspect manager storage and history-retention status.
@@ -371,6 +374,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Commands::Worker(args) => return Ok(worker_cli::run(args)),
         Commands::Service(args) => return Ok(service_cli::run(args)),
         Commands::Diagnostics(args) => return Ok(diagnostics_cli::run(args)),
+        Commands::Upgrade(args) => return Ok(upgrade_cli::run(args)),
         Commands::Backup(args) => return Ok(backup_cli::run(args)),
         Commands::Storage(args) => return Ok(storage_cli::run(args)),
         Commands::Completions { shell } => {

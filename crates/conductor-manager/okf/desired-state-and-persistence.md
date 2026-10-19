@@ -3,7 +3,7 @@ type: Reference
 title: Manager desired state and persistence
 description: SQLite stores immutable job/revision records, mutable deployment state, run reservations, worker records, commands, allocations, and audit.
 status: stable
-source_revision: 7365053
+source_revision: db60ba9
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/lib.rs
@@ -12,6 +12,8 @@ sources:
     title: Manager repository operations
   - resource: ../tests/jobs.rs
     title: Persistence and restart tests
+  - resource: ../../conductor/src/upgrade_cli.rs
+    title: Read-only schema marker preflight
   - resource: ../../conductor/src/backup_cli.rs
     title: Offline SQLite snapshot and restore validation
   - resource: ../../conductor/src/storage_cli.rs
@@ -74,6 +76,11 @@ files have the separate bounded policy in the worker knowledge page. The log
 byte figure is an upper bound derived from unpruned log pairs, including active
 runs, and the configured per-stream cap; it does not scan log files or report
 their exact aggregate byte size.
+
+The `conductor upgrade preflight` command reads only `PRAGMA user_version` via
+a read-only connection. It does not validate table structure or prove that a
+database is recoverable; successful marker inspection is not a substitute for
+a backup or a migration test.
 
 Before upgrading, stop the daemon and take a consistent backup of manager
 state and worker state/logs. Start only binaries whose worker transport

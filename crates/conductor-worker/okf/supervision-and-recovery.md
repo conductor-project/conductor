@@ -3,7 +3,7 @@ type: Reference
 title: Worker supervision and recovery
 description: The worker persists command acceptance and observations around run supervision, then reconciles uncertain work on restart.
 status: stable
-source_revision: 7a0fd655b1c16087368c309c7285f587fbbe8387
+source_revision: db60ba9
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/lib.rs
@@ -14,6 +14,8 @@ sources:
     title: Per-run supervision state
   - resource: ../tests/runs.rs
     title: Recovery and idempotency tests
+  - resource: ../../conductor/src/upgrade_cli.rs
+    title: Read-only schema marker preflight
   - resource: ../../conductor/src/backup_cli.rs
     title: Worker database and retained-log backup
   - resource: ../../conductor/tests/backup_cli.rs
@@ -42,6 +44,10 @@ The worker database has its own migration series; current source sets
 `SCHEMA_VERSION` to **4** in `src/lib.rs`. It is independent of manager schema
 version 12. Worker records include runs/logs, metadata/incarnation, accepted
 commands, and report state.
+
+The `conductor upgrade preflight` command reads the worker's `PRAGMA user_version`
+through a read-only connection. It does not start the worker, migrate its
+database, inspect the tables, or establish that retained logs can be restored.
 
 Offline backup takes the worker state lock and snapshots `worker.sqlite3`
 through SQLite's backup API. It also includes retained files under `runs/`.

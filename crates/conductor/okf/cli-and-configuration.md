@@ -3,7 +3,7 @@ type: Reference
 title: conductor CLI and configuration
 description: Clap commands select daemon operation, named operator contexts, and strict JSON configuration selects role-specific listeners, state, and identity paths.
 status: stable
-source_revision: 7365053
+source_revision: db60ba9
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/main.rs
@@ -12,6 +12,8 @@ sources:
     title: Operator subcommands and flags
   - resource: ../src/contexts.rs
     title: Named connection contexts
+  - resource: ../src/upgrade_cli.rs
+    title: Local upgrade preflight
   - resource: ../src/backup_cli.rs
     title: Offline backup, restore, and recovery clearance
   - resource: ../src/storage_cli.rs
@@ -54,6 +56,13 @@ context explicitly, otherwise the selected default applies. Explicit
 the matching context settings. With no saved context, the operator defaults
 to unauthenticated local loopback. Plain HTTP is limited to loopback; remote
 HTTP requires HTTPS, and remote operator use requires a token file.
+
+`conductor upgrade preflight` reads one or both local SQLite schema markers
+without opening the daemon or applying migrations. It requires
+`--manager-data-dir`, `--worker-data-dir`, or both; use `--output json` for a
+machine-readable report. A report about an existing database is local evidence
+only and does not validate active remote peers, installed packages, or
+distribution support. See the [upgrade compatibility policy](../../../okf/operations-and-recovery.md#upgrade-compatibility-policy).
 
 Context commands use concise human output consistently, including create, list,
 show, use, and delete. Add `--output json` before or after the subcommand for
