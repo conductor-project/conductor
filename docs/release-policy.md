@@ -7,13 +7,11 @@ policy does not authorize direct pushes or protection bypasses.
 
 ## Supported lines
 
-The first intended stable release is `0.0.1`, the start of the `0.0.x`
-line. The repository currently
-has no published release tags or maintenance branches, so no version is
-supported until its verified release is published.
+The first stable release, `0.0.1`, was published on 2026-10-19 and starts the
+`0.0.x` line. No maintenance branch has been cut yet.
 
-After releases begin, Conductor supports the latest minor line and the
-immediately preceding minor line. Each minor line receives at least 12 months
+Conductor supports the latest minor line and the immediately preceding minor
+line. Each minor line receives at least 12 months
 of support from its first stable release. If that minimum extends beyond the
 period when it is one of the two newest minor lines, support continues through
 the minimum period. Support applies to the latest patch in each supported line;
@@ -22,12 +20,12 @@ the release notes and README and provide upgrade or mitigation guidance.
 
 | Line | Authorized tags | Branch | Status |
 | --- | --- | --- | --- |
-| First line | `v0.0.Z` | `main`, then `release/0.0` when cut | Planned; not yet published |
+| First line | `v0.0.Z` | `main`, then `release/0.0` when cut | Supported; `v0.0.1` published 2026-10-19 |
 | Later minor `X.Y` | `vX.Y.Z` | `main`, then `release/X.Y` when supported as the preceding line | Not yet selected |
 
-The table records policy, not evidence that a release or branch exists.
-Maintainers update the status and support dates when a release line is opened,
-published, or retired.
+The table distinguishes published releases from branches that have not yet
+been cut. Maintainers update the status and support dates when a release line
+is opened, published, or retired.
 
 ## Branches, tags, and release authority
 
@@ -166,12 +164,15 @@ temporary candidate files.
 
 ## Required rehearsals and records
 
-Before production publication, rehearse a current-line release and a supported
-maintenance-line backport through the same verification and artifact gates.
-Record the originating fix, adaptations, exact commits, checks, package
-architectures, compatibility/upgrade results, and publication status. Run an
-embargo rehearsal that tests private access, log and artifact redaction,
-coordinated public integration, and advisory publication without exposing a
-real vulnerability. Run a faulty-release exercise that issues a new patch
-version while preserving the earlier bytes. Keep rehearsal artifacts clearly
-identified as non-production and do not create a misleading public release.
+The first current-line release, `v0.0.1`, passed the exact-run verification and
+protected publication flow. The published release and its evidence are recorded
+in [`okf/release-and-support-policy.md`](../okf/release-and-support-policy.md).
+Before publishing a maintenance-line release, rehearse that backport through
+the same verification and artifact gates. Record the originating fix,
+adaptations, exact commits, checks, package architectures,
+compatibility/upgrade results, and publication status. Run an embargo rehearsal
+that tests private access, log and artifact redaction, coordinated public
+integration, and advisory publication without exposing a real vulnerability.
+Run a faulty-release exercise that issues a new patch version while preserving
+the earlier bytes. Keep rehearsal artifacts clearly identified as
+non-production and do not create a misleading public release.

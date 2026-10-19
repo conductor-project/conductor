@@ -4,9 +4,10 @@ The first packages target Debian 13 (amd64, arm64) and Rocky Linux 10
 (x86_64, aarch64). Package files are built around the exact binary from the
 matching workflow run. The packaging step does not compile Conductor.
 
-There is currently no published package release. When packages are published,
-download the package, its architecture-specific checksum file, Sigstore
-signature bundle, and build provenance from the same GitHub Release. The
+The first published package release is
+[`v0.0.1`](https://github.com/conductor-project/conductor/releases/tag/v0.0.1).
+Download the package, its architecture-specific checksum file, Sigstore
+signature bundle, and build provenance from that GitHub Release. The
 `aarch64`/arm64 files use `SHA256SUMS` and `BUILD-INFO.json`; the x86_64 files
 use `SHA256SUMS-x86_64` and `BUILD-INFO-x86_64.json`. Verify the checksum
 first, then the signature and provenance before installation:
