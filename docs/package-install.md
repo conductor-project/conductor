@@ -277,3 +277,101 @@ This demonstrates local x86_64 RPM upgrade mechanics with debug fixtures; it
 does not qualify an upgrade from a supported published release, a published
 release, or production-host behavior. The privileged fixture ran locally and
 is excluded from GitHub workflows.
+
+### Published v0.0.1 to v0.0.2 candidate upgrade qualification (2026-10-19)
+
+The baseline packages were the published x86_64 assets from `v0.0.1`, source
+commit `09f4af5e35b73fc54130c58daea4ae9fe87d7ace`, verified merge run
+`39243996603`. Both package hashes matched the release's `SHA256SUMS-x86_64`:
+
+| Baseline package | SHA-256 |
+| --- | --- |
+| `conductor_0.0.1_amd64.deb` | `ad7572c16605103a7241cf27c3dcf93628641d27cab9aef04a1b1018a6356494` |
+| `conductor-0.0.1-1.x86_64.rpm` | `4b39b971614a7b0f925169bdce382e5c91e27d20f2b9df05a87cdde80cfbe35e` |
+
+The successor candidate was a local debug build of source commit
+`379e733869ac68ceb0523590ee6158e3bd6ea067`. In a temporary source copy only,
+the workspace version and its seven workspace lockfile entries were changed
+from `0.0.1` to `0.0.2`. Rust 1.99.1 built the `conductor` binary in the
+`debug` profile, and `scripts/package-linux.sh` produced both packages. The
+build-info binary SHA-256 was
+`70f24b8049080403eb31794f85c507ac9294b60c853f4e1362f144a7f3cfd3e9`.
+
+| Candidate package | SHA-256 |
+| --- | --- |
+| `conductor_0.0.2_amd64.deb` | `ba13942a90a39195bd6cdf751bb773574323145a098cdde19ce1a633a2886a85` |
+| `conductor-0.0.2-1.x86_64.rpm` | `f610c352105e9a256ba647063ddabfd7eeb5ece6dea7a0eb736d62230a731d28` |
+
+On Fortress x86_64 (Debian 13, Podman 5.4.2), disposable systemd containers
+used Debian image
+`99339bdd341ab316eeae3dcf870b98bc7243d99269d01666b0f49a565c1399da`
+(systemd `257.13-1~deb13u1`) and Rocky Linux 10.2 image
+`0b5329d806d053ad65ab6b21fc3e49f1025e970cd826547a01a93b3ce9012796`
+(systemd `257-23.el10_2.2.rocky.0.1`). For each distribution the fixture:
+
+1. Installed the published `0.0.1` package, explicitly configured and started
+   the service, and confirmed `/healthz`.
+2. Used the `0.0.1` CLI to submit `mvp3-first-job` and retain its succeeded
+   `run-1` observation (`exitCode: 0`, worker ID `local-worker`). It registered
+   `mvp3-demo-service`, created revision 1, and applied a one-replica deployment
+   that reached `ready` at generation 1.
+3. Suspended the deployment at generation 2 and stopped the daemon. It upgraded
+   the package with `dpkg -i conductor_0.0.2_amd64.deb` or
+   `dnf upgrade conductor-0.0.2-1.x86_64.rpm`, then explicitly started the
+   service and confirmed `/healthz`.
+4. Queried jobs, `run-1`, deployment state, workers, and SQLite schema markers
+   through the candidate CLI and SQLite. Both jobs and the succeeded run
+   observation remained; manager and worker schemas remained 12 and 4. The
+   deployment remained suspended at generation 2 until explicitly resumed,
+   then reached `ready` at generation 3 with a new service run. The stable
+   worker ID remained `local-worker`; its runtime incarnation advanced from 1
+   to 2 after restart. `/etc/conductor/agent.json` kept SHA-256
+   `3b6b5bda362aee2042896d51d942f2651be5718bf76ba7ea805ea9fad8c60935` on both
+   systems.
+
+The fixture used these CLI operations against `http://127.0.0.1:8080`:
+
+```sh
+conductor job submit /fixtures/src/examples/cli-job.json \
+  --idempotency-key mvp4-upgrade-once-1 --server http://127.0.0.1:8080 \
+  --wait --output json
+conductor job register /fixtures/src/examples/cli-service-job.json \
+  --server http://127.0.0.1:8080 --output json
+conductor job revision create mvp3-demo-service /tmp/revision.json \
+  --idempotency-key mvp4-upgrade-revision-1 --server http://127.0.0.1:8080 \
+  --output json
+conductor deployment apply mvp3-demo-service /tmp/deployment.json \
+  --idempotency-key mvp4-upgrade-deployment-1 \
+  --server http://127.0.0.1:8080 --wait --wait-timeout-seconds 60 --output json
+conductor deployment suspend mvp3-demo-service --generation 1 \
+  --idempotency-key mvp4-upgrade-suspend-1 \
+  --server http://127.0.0.1:8080 --wait --wait-timeout-seconds 60 --output json
+systemctl stop conductor
+# Install the 0.0.2 package with dpkg or DNF, then:
+systemctl start conductor
+conductor job list --server http://127.0.0.1:8080 --output json
+conductor run inspect run-1 --server http://127.0.0.1:8080 --output json
+conductor deployment inspect mvp3-demo-service \
+  --server http://127.0.0.1:8080 --output json
+conductor worker list --server http://127.0.0.1:8080 --output json
+```
+
+`revision.json` substituted the distribution's `sha256sum /bin/sleep` for the
+zero digest in `examples/cli-service-revision.json`; `deployment.json` set one
+replica. The complete outputs and package build metadata were kept on Fortress
+under `/var/tmp/conductor-mvp4-upgrade-candidate-379e733` during the run.
+
+The first post-upgrade resume response reported `service_restart_budget_exhausted`
+while a follow-up deployment inspection observed `ready` with the replacement
+run active. On Debian, `deployment resume --wait` returned `rollout_failed`;
+on Rocky, the initial no-wait response was `pending`. Operators must poll the
+deployment after resume and act on its converged state. This transient response
+is recorded as observed, not treated as a clean first-attempt rollout.
+
+The fixtures used actual published `v0.0.1` packages and exercised package
+upgrade mechanics from them, but the `0.0.2` packages were local unsigned debug
+candidates, not published release artifacts. This is local x86_64 evidence for
+Debian 13 `.deb` and Rocky Linux 10.2 `.rpm`; it does not qualify arm64, a
+published `v0.0.2` release, a production host, or mixed-version manager/worker
+operation. The privileged package and systemd fixtures ran only on Fortress;
+none were added to GitHub workflows.
