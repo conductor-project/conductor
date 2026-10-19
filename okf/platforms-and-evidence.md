@@ -3,13 +3,21 @@ type: Reference
 title: Platform support and evidence
 description: Platform claims are scoped to source, tests, workflows, and the exact execution environment that produced evidence.
 status: stable
-source_revision: 0e44f259353c89f26aae98a3a9cb8deb8defad25
+source_revision: 79594cf7977e9703bc6876ce5bbd7719edfb4b3e
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../.github/workflows/pr.yml
     title: Pull request debug workflow
   - resource: ../.github/workflows/merge.yml
     title: Post-merge release workflow
+  - resource: ../packaging/rpm/conductor.spec
+    title: RPM payload construction and lifecycle hooks
+  - resource: ../packaging/debian/postinst
+    title: Debian package post-install behavior
+  - resource: ../packaging/debian/prerm
+    title: Debian package pre-removal behavior
+  - resource: ../packaging/debian/postrm
+    title: Debian package post-removal behavior
   - resource: ../crates/conductor-worker/src/lib.rs
     title: Host inventory collection
   - resource: ../crates/conductor/tests/macos_multiprocess.rs

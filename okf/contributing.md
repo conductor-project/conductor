@@ -3,7 +3,7 @@ type: Reference
 title: Contributing and maintaining knowledge
 description: Repository contribution policy is authoritative in AGENTS.md; OKF pages provide descriptive source-linked knowledge.
 status: stable
-source_revision: 0e44f259353c89f26aae98a3a9cb8deb8defad25
+source_revision: 79594cf7977e9703bc6876ce5bbd7719edfb4b3e
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../AGENTS.md
@@ -15,7 +15,15 @@ sources:
   - resource: ../.github/workflows/merge.yml
     title: Post-merge release checks
   - resource: ../scripts/package-linux.sh
-    title: Native package construction and binary identity checks
+    title: Native package orchestration and binary identity checks
+  - resource: ../packaging/debian/postinst
+    title: Debian post-install lifecycle
+  - resource: ../packaging/debian/prerm
+    title: Debian pre-removal lifecycle
+  - resource: ../packaging/debian/postrm
+    title: Debian post-removal lifecycle
+  - resource: ../packaging/rpm/conductor.spec
+    title: RPM package specification and lifecycle
   - resource: ../docs/package-install.md
     title: Operator package installation and verification
 ---
