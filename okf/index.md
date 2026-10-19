@@ -17,6 +17,7 @@ surrounding repository checkout.
 - [Service discovery](service-discovery.md) - DNS listener access, host resolver setup, and rollback.
 - [Operations and recovery](operations-and-recovery.md) - readiness, shutdown, persistence, diagnosis, and recovery.
 - [Platforms and evidence](platforms-and-evidence.md) - supported targets, enforcement boundaries, and qualification evidence.
+- [Release and support policy](release-and-support-policy.md) - supported release lines, backports, security handling, and publication rules.
 - [README walkthrough evidence](walkthrough-evidence.md) - recorded local debug-only first-job and cancellation run.
 
 ## Project structure
