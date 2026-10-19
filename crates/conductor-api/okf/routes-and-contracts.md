@@ -67,7 +67,9 @@ The exact methods, paths, body types, query parameters, and conditions are
 registered in `src/server.rs`. API tests are closest to the canonical behavior;
 the [README](../../../README.md) is a shorter successful one-shot flow.
 
-Overlay domain creation and peer revocation are audited operator mutations.
+Overlay domain creation requires an operator-configured HTTPS `relayUrl` and
+disjoint private IPv4 pools. Domain creation and peer revocation are audited
+operator mutations.
 Peer status contains public endpoint IDs, assigned addresses, generations,
 expiry, and quarantine state; it contains no Iroh private key. Worker identity
 enrollment, configuration delivery, and observations use the separate mTLS

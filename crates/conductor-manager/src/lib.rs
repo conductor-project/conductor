@@ -128,6 +128,7 @@ pub enum OverlayNetworkError {
     DomainExists,
     DomainNotFound,
     InvalidAddressPool,
+    InvalidRelayUrl,
     AddressPoolOverlap,
     AddressPoolExhausted,
     PeerLimitReached,
@@ -633,7 +634,7 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
             .prepare("SELECT event_sequence, occurred_at_ms, principal, action, resource_type, resource_id, outcome, status_code FROM audit_events LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
         connection
-            .prepare("SELECT network_domain_id, worker_address_pool, service_address_pool, network_generation FROM overlay_network_domains LIMIT 0")
+            .prepare("SELECT network_domain_id, relay_url, worker_address_pool, service_address_pool, network_generation FROM overlay_network_domains LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
         connection
             .prepare("SELECT network_domain_id, worker_id, endpoint_id, worker_address, peer_generation, expires_at_ms, state, quarantine_until_ms, direct_candidates_json, direct_candidates_expires_at_ms FROM overlay_peers LIMIT 0")
@@ -647,13 +648,39 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
         return Ok(());
     }
 
+    if version == 13 {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(MigrationError::Sqlite)?;
+        let relay_url_exists: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('overlay_network_domains') WHERE name = 'relay_url')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(MigrationError::Sqlite)?;
+        if !relay_url_exists {
+            transaction
+                .execute(
+                    "ALTER TABLE overlay_network_domains ADD COLUMN relay_url TEXT NOT NULL DEFAULT ''",
+                    [],
+                )
+                .map_err(MigrationError::Sqlite)?;
+        }
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(MigrationError::Sqlite)?;
+        transaction.commit().map_err(MigrationError::Sqlite)?;
+        return migrate(connection);
+    }
+
     if version == 12 {
         let transaction = connection
             .unchecked_transaction()
             .map_err(MigrationError::Sqlite)?;
         create_overlay_network_schema(&transaction).map_err(MigrationError::Sqlite)?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 13)
             .map_err(MigrationError::Sqlite)?;
         transaction.commit().map_err(MigrationError::Sqlite)?;
         return migrate(connection);
@@ -959,6 +986,7 @@ fn create_overlay_network_schema(transaction: &rusqlite::Transaction<'_>) -> rus
     transaction.execute_batch(
         "CREATE TABLE overlay_network_domains (
              network_domain_id TEXT PRIMARY KEY NOT NULL,
+             relay_url TEXT NOT NULL,
              worker_address_pool TEXT NOT NULL,
              service_address_pool TEXT NOT NULL,
              network_generation INTEGER NOT NULL CHECK (network_generation > 0),
@@ -2739,6 +2767,52 @@ mod audit_metrics_tests {
             None
         );
     }
+
+    #[test]
+    fn schema_thirteen_migration_adds_the_operator_relay_url() {
+        let database = TestDatabase::new();
+        drop(database.open());
+        {
+            let connection = rusqlite::Connection::open(&database.0).expect("open old database");
+            connection
+                .execute_batch(
+                    "ALTER TABLE overlay_network_domains DROP COLUMN relay_url;
+                     PRAGMA user_version = 13;",
+                )
+                .expect("restore schema 13 shape");
+        }
+        let repository = database.open();
+        let schema_version: i64 = repository
+            .connection
+            .lock()
+            .expect("lock migrated connection")
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read migrated schema version");
+        assert_eq!(schema_version, super::CURRENT_SCHEMA_VERSION);
+        repository
+            .create_overlay_network_domain(
+                &conductor_core::OverlayNetworkDomainConfig {
+                    network_domain_id: conductor_core::NetworkDomainId::new("migration-test")
+                        .expect("valid domain ID"),
+                    relay_url: "https://relay.example.test".to_owned(),
+                    worker_address_pool: "10.90.0.0/24".to_owned(),
+                    service_address_pool: "10.90.1.0/24".to_owned(),
+                },
+                1,
+            )
+            .expect("create domain with relay after migration");
+        assert_eq!(
+            repository
+                .get_overlay_network_domain(
+                    &conductor_core::NetworkDomainId::new("migration-test")
+                        .expect("valid domain ID")
+                )
+                .expect("read migrated domain")
+                .expect("domain exists")
+                .relay_url,
+            "https://relay.example.test"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2810,6 +2884,7 @@ mod overlay_network_tests {
     fn domain() -> OverlayNetworkDomainConfig {
         OverlayNetworkDomainConfig {
             network_domain_id: NetworkDomainId::new("overlay-a").expect("valid domain ID"),
+            relay_url: "https://relay.example.test".to_owned(),
             worker_address_pool: "10.88.0.0/24".to_owned(),
             service_address_pool: "10.88.1.0/24".to_owned(),
         }
@@ -2819,6 +2894,12 @@ mod overlay_network_tests {
     fn domain_pools_reject_public_or_overlapping_ranges() {
         let database = TestDatabase::new();
         let repository = database.open();
+        let mut invalid_relay = domain();
+        invalid_relay.relay_url = "http://relay.example.test".to_owned();
+        assert_eq!(
+            repository.create_overlay_network_domain(&invalid_relay, 1),
+            Err(OverlayNetworkError::InvalidRelayUrl)
+        );
         let mut invalid = domain();
         invalid.worker_address_pool = "192.0.2.0/24".to_owned();
         assert_eq!(
@@ -2870,6 +2951,11 @@ mod overlay_network_tests {
             .overlay_peer_configuration(&domain.network_domain_id, &first, 10)
             .expect("read peer config")
             .expect("active peer has config");
+        assert_eq!(
+            config.schema_version,
+            conductor_core::OVERLAY_PEER_CONFIGURATION_SCHEMA_VERSION
+        );
+        assert_eq!(config.relay_url, "https://relay.example.test");
         assert_eq!(config.peers.len(), 1);
         assert_eq!(config.peers[0].worker_id, second);
         drop(repository);
@@ -3213,6 +3299,7 @@ mod overlay_network_tests {
         let second = enroll(&repository, "worker-b", 2);
         let domain = OverlayNetworkDomainConfig {
             network_domain_id: NetworkDomainId::new("overlay-small").expect("valid domain ID"),
+            relay_url: "https://relay.example.test".to_owned(),
             worker_address_pool: "10.89.0.0/30".to_owned(),
             service_address_pool: "10.89.1.0/30".to_owned(),
         };

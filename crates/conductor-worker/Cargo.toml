@@ -15,7 +15,7 @@ nix.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 reqwest.workspace = true
-iroh.workspace = true
+conductor-overlay.workspace = true
 
 [lints]
 workspace = true

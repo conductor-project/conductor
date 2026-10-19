@@ -90,8 +90,8 @@ is not a user job API.
 
 Configuration uses `serde(deny_unknown_fields)`. Config is rejected before
 listeners or state are opened when keys are unknown or role-required values
-are missing. The supported roles are combined `all`, standalone `manager`, and
-standalone `worker`.
+are missing. The supported roles are combined `all`, standalone `manager`,
+standalone `worker`, and dedicated `relay`.
 
 The all-role example configures `listen`, manager and worker state dirs, worker
 ID/concurrency, access mode, request and log limits, completed-run retention,
@@ -100,8 +100,19 @@ to 10,000 and accepts 1 through 1,000,000. Manager configuration adds a separate
 listener, manager identity, resource domains, labels, and additional worker
 descriptors. Worker configuration specifies the manager HTTPS endpoint, CA,
 worker state/ID, and either an enrollment credential or existing identity.
+Relay configuration specifies `relay_http_listen`; the checked-in
+[`examples/relay.json`](../../../examples/relay.json) is a minimal relay node
+configuration. It serves plain HTTP and expects a trusted front proxy to
+provide public HTTPS and WebSocket upgrade support.
 Use the checked-in examples as complete field-level references rather than
 copying an outdated schema description.
+
+Linux standalone workers may additionally set both
+`worker_overlay_network_domain_id` and the absolute
+`worker_overlay_helper_binary` path to join an overlay domain. The helper owns
+the worker's TUN interface and routes; it is a separate process and should be
+installed with only `CAP_NET_ADMIN`. These fields are rejected for `all` and
+`manager` and `relay` roles. Other platforms reject overlay-enabled workers.
 
 # Path resolution
 

@@ -1,0 +1,24 @@
+[package]
+name = "conductor-overlay"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes.workspace = true
+conductor-core.workspace = true
+iroh.workspace = true
+iroh-base.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tun-rs.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink.workspace = true
+futures-util.workspace = true
+
+[lints]
+workspace = true

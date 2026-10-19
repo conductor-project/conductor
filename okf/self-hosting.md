@@ -48,11 +48,22 @@ generic demo cleanup.
 
 `role: all` is the straightforward single-host deployment. `role: manager`
 starts the loopback operator API and a separate HTTPS/mTLS worker listener.
+`role: relay` hosts Iroh's relay service behind a trusted TLS proxy.
 `role: worker` starts an outbound worker session; it does not require an
 inbound listener. Separate roles require explicit manager identity, enrollment,
 and endpoint configuration. See the [conductor CLI and composition bundle](../crates/conductor/okf/cli-and-configuration.md)
 and [transport identity bundle](../crates/conductor-transport/okf/enrollment-and-identity.md)
 for the exact configuration and enrollment behavior.
+
+On Linux, a standalone worker may opt into manager-assigned overlay networking
+with `worker_overlay_network_domain_id` and
+`worker_overlay_helper_binary`. Only the helper needs `CAP_NET_ADMIN`; do not
+grant that capability to the main agent or workload processes. Configure the
+manager's relay URL and overlay network domain before enabling workers. This
+does not start a relay inside worker mode. Run dedicated `role: relay` nodes
+using [`examples/relay.json`](../examples/relay.json); place them behind a
+trusted TLS reverse proxy that supports WebSocket upgrades and publish the
+proxy's HTTPS origin in the manager's network-domain configuration.
 
 The API listener is loopback-only. To permit remote operator access, use a
 trusted local TLS proxy and configure operator-token authentication. The

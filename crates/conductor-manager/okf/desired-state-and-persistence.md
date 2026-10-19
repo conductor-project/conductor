@@ -42,11 +42,13 @@ version. It does not change the source database.
 
 ## Overlay peer identity groundwork
 
-Schema 13 adds manager-owned overlay network domains, worker endpoint IDs and
+Schema 14 adds manager-owned overlay network domains with an operator-configured
+HTTPS Iroh relay URL, worker endpoint IDs and
 durable IPv4 assignments, retired endpoint tombstones, and bounded latest
 worker observations. Domain creation accepts only canonical private IPv4
 CIDRs with disjoint worker and service pools; ranges cannot overlap pools in
-other domains. Worker allocations are serialized in an immediate SQLite
+other domains. Relay URLs reject credentials, paths, query data, and fragments.
+Worker allocations are serialized in an immediate SQLite
 transaction and capped at 128 peers per domain. The manager never stores an
 Iroh private key.
 
@@ -56,8 +58,8 @@ address. Revocation and lease expiry retire the endpoint ID and quarantine its
 address until the old lease plus 30 seconds of clock-skew allowance elapses.
 Retired endpoint IDs remain tombstoned after address reuse. A worker certificate
 revocation also quarantines all of that worker's overlay memberships. Config
-snapshots include only active, unexpired peers and are bounded to the domain's
-128-peer limit.
+snapshots include a schema version, configured relay URL, and only active,
+unexpired peers; each snapshot is bounded to the domain's 128-peer limit.
 
 Schema 14 persists each worker's bounded direct UDP candidate advertisement.
 Workers submit candidate updates over mTLS with their current peer generation;

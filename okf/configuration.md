@@ -14,6 +14,8 @@ sources:
     title: Manager example
   - resource: ../examples/worker-one.json
     title: Worker example
+  - resource: ../examples/relay.json
+    title: Dedicated relay example
 ---
 
 # Configuration rules
@@ -29,6 +31,7 @@ for all currently accepted keys.
 | `all` | `listen`, manager/worker state dirs, `worker_id`, optional concurrency | Working directory for state, cgroup, and Landlock paths |
 | `manager` | Operator API, worker transport listener, manager identity and CA directory | Configuration file directory for role state and identity paths |
 | `worker` | Manager endpoint, CA, worker ID/state, enrollment or identity file | Configuration file directory for role state and identity paths |
+| `relay` | Iroh relay HTTP listener | No file paths |
 
 `api_access.token_file` is relative to the configuration file directory in all
 roles. In `all` mode, standalone identity fields are rejected. Absolute paths

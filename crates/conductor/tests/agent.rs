@@ -1196,6 +1196,56 @@ fn role_override_can_enable_combined_mode_and_standalone_roles_report_configurat
 }
 
 #[test]
+fn dedicated_relay_role_serves_health_and_shuts_down_cleanly() {
+    let directory = TempDir::new("relay-role");
+    let reservation = TcpListener::bind("127.0.0.1:0").expect("reserve local port");
+    let listen = reservation.local_addr().expect("reserved address");
+    drop(reservation);
+    let config = directory.join("relay.json");
+    fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "role": "relay",
+            "relay_http_listen": listen,
+        }))
+        .expect("encode relay config"),
+    )
+    .expect("write relay config");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args(["agent", "--config"])
+        .arg(&config)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start relay role");
+    let mut child = Agent(child);
+    let stderr = child.0.stderr.take().expect("relay stderr");
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        let _ = reader.read_line(&mut line);
+        let _ = sender.send(line);
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    });
+    let line = receiver
+        .recv_timeout(Duration::from_secs(5))
+        .expect("relay startup event before deadline");
+    let event: serde_json::Value = serde_json::from_str(&line).expect("structured relay event");
+    assert_eq!(event["component"], "relay", "{line}");
+    assert_eq!(event["event"], "relay_started", "{line}");
+    let address: SocketAddr = event["listen"]
+        .as_str()
+        .expect("relay listener address")
+        .parse()
+        .expect("socket address");
+    wait_for_http_status(address, "/healthz", 200, Duration::from_secs(5));
+    signal(&child, "INT");
+    wait_for_exit(&mut child);
+}
+
+#[test]
 fn standalone_manager_and_worker_run_an_authenticated_remote_one_shot() {
     let path = TempDir::new("standalone-remote-job");
     let manager_data_dir = path.join("manager-state");

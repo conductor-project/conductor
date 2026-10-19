@@ -1,6 +1,6 @@
 # Conductor contributor guidance
 
-Conductor is a daemon for submitting one-shot jobs and managing service deployments on hosts you operate. It supports a combined manager/worker process and separate manager and worker roles connected by authenticated transport. The process backend runs with the daemon user's host permissions and network access; it is not a security sandbox.
+Conductor is a daemon for submitting one-shot jobs and managing service deployments on hosts you operate. It supports a combined manager/worker process and separate manager, worker, and relay roles. Manager and worker roles connect by authenticated transport; relay nodes host Iroh's encrypted packet-forwarding service for worker connectivity. The process backend runs with the daemon user's host permissions and network access; it is not a security sandbox.
 
 ## Crates and dependency directions
 
@@ -10,9 +10,9 @@ Conductor is a daemon for submitting one-shot jobs and managing service deployme
 - `conductor-process`: host-specific process execution implementing the worker interface.
 - `conductor-api`: HTTP entrypoint and request/response mapping; handlers call manager operations.
 - `conductor-transport`: authenticated manager/worker transport implementing explicit command and report adapters.
-- `conductor`: CLI, configuration, composition, local manager/worker adapter, and shutdown.
+- `conductor`: CLI, configuration, composition, local manager/worker adapter, embedded relay role, and shutdown.
 
-Communication between manager and worker goes through explicit command/report interfaces. Keep PIDs and worker filesystem paths internal to the worker. Use stable job, run, and worker IDs at boundaries. The supported role selections are manager, worker, and all. The `all` role composes manager and worker in one process; standalone roles use authenticated transport. Keep this description aligned with the CLI and transport implementation.
+Communication between manager and worker goes through explicit command/report interfaces. Keep PIDs and worker filesystem paths internal to the worker. Use stable job, run, and worker IDs at boundaries. The supported role selections are manager, worker, relay, and all. The `all` role composes manager and worker in one process; standalone manager/worker roles use authenticated transport. The relay role is a dedicated process and is not started automatically by workers. Keep this description aligned with the CLI and transport implementation.
 
 ## Knowledge bundles
 

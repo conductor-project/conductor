@@ -353,6 +353,18 @@ fn parse_overlay_pool(value: &str) -> Result<ipnet::Ipv4Net, OverlayNetworkError
     Ok(pool)
 }
 
+fn valid_overlay_relay_url(value: &str) -> bool {
+    url::Url::parse(value).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && (url.path().is_empty() || url.path() == "/")
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
+}
+
 fn next_overlay_generation(current: i64) -> Result<i64, OverlayNetworkError> {
     current
         .checked_add(1)
@@ -668,6 +680,9 @@ impl JobRepository for SqliteJobRepository {
         if now_ms < 0 {
             return Err(OverlayNetworkError::InvalidAddressPool);
         }
+        if !valid_overlay_relay_url(&config.relay_url) {
+            return Err(OverlayNetworkError::InvalidRelayUrl);
+        }
         let worker_pool = parse_overlay_pool(&config.worker_address_pool)?;
         let service_pool = parse_overlay_pool(&config.service_address_pool)?;
         if overlay_pools_overlap(&worker_pool, &service_pool) {
@@ -716,10 +731,11 @@ impl JobRepository for SqliteJobRepository {
         drop(statement);
         let inserted = transaction.execute(
             "INSERT OR IGNORE INTO overlay_network_domains
-             (network_domain_id, worker_address_pool, service_address_pool, network_generation, created_at_ms)
-             VALUES (?1, ?2, ?3, 1, ?4)",
+             (network_domain_id, relay_url, worker_address_pool, service_address_pool, network_generation, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5)",
             params![
                 config.network_domain_id.as_str(),
+                config.relay_url,
                 worker_pool.to_string(),
                 service_pool.to_string(),
                 now_ms
@@ -744,15 +760,16 @@ impl JobRepository for SqliteJobRepository {
             .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
         connection
             .query_row(
-                "SELECT network_domain_id, worker_address_pool, service_address_pool
+                "SELECT network_domain_id, relay_url, worker_address_pool, service_address_pool
                  FROM overlay_network_domains WHERE network_domain_id = ?1",
                 [network_domain_id.as_str()],
                 |row| {
                     Ok(conductor_core::OverlayNetworkDomainConfig {
                         network_domain_id: NetworkDomainId::new(row.get::<_, String>(0)?)
                             .map_err(|_| rusqlite::Error::InvalidQuery)?,
-                        worker_address_pool: row.get(1)?,
-                        service_address_pool: row.get(2)?,
+                        relay_url: row.get(1)?,
+                        worker_address_pool: row.get(2)?,
+                        service_address_pool: row.get(3)?,
                     })
                 },
             )
@@ -1248,7 +1265,7 @@ impl JobRepository for SqliteJobRepository {
         expire_overlay_peers(&transaction, network_domain_id, now_ms)?;
         let current = transaction
             .query_row(
-                "SELECT p.worker_address, p.peer_generation, p.expires_at_ms, d.network_generation
+                "SELECT p.worker_address, p.peer_generation, p.expires_at_ms, d.network_generation, d.relay_url
                  FROM overlay_peers p JOIN overlay_network_domains d USING (network_domain_id)
                  WHERE p.network_domain_id = ?1 AND p.worker_id = ?2
                    AND p.state = 'active' AND p.expires_at_ms > ?3
@@ -1261,12 +1278,15 @@ impl JobRepository for SqliteJobRepository {
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
                     ))
                 },
             )
             .optional()
             .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
-        let Some((address, peer_generation, expires_at_ms, network_generation)) = current else {
+        let Some((address, peer_generation, expires_at_ms, network_generation, relay_url)) =
+            current
+        else {
             transaction
                 .commit()
                 .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
@@ -1334,8 +1354,10 @@ impl JobRepository for SqliteJobRepository {
             .collect::<Result<Vec<_>, OverlayNetworkError>>()?;
         drop(statement);
         let configuration = OverlayPeerConfiguration {
+            schema_version: conductor_core::OVERLAY_PEER_CONFIGURATION_SCHEMA_VERSION,
             network_domain_id: network_domain_id.clone(),
             worker_id: worker_id.clone(),
+            relay_url,
             worker_address: overlay_address(address)?,
             peer_generation: u64::try_from(peer_generation)
                 .map_err(|_| OverlayNetworkError::StorageUnavailable)?,

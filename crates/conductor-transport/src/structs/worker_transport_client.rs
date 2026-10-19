@@ -89,6 +89,67 @@ impl WorkerTransportClient {
         .await
     }
 
+    pub async fn register_overlay_identity(
+        &self,
+        domain_id: &conductor_core::NetworkDomainId,
+        endpoint_id: &conductor_core::OverlayEndpointId,
+    ) -> Result<conductor_core::OverlayPeerAssignment, TransportError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct EndpointRequest<'a> {
+            endpoint_id: &'a str,
+        }
+        self.json_request(
+            reqwest::Method::PUT,
+            &format!("v1/worker/network-domains/{}/identity", domain_id.as_str()),
+            Some(&EndpointRequest {
+                endpoint_id: endpoint_id.as_str(),
+            }),
+        )
+        .await
+    }
+
+    pub async fn overlay_configuration(
+        &self,
+        domain_id: &conductor_core::NetworkDomainId,
+    ) -> Result<conductor_core::OverlayPeerConfiguration, TransportError> {
+        self.json_request::<(), _>(
+            reqwest::Method::GET,
+            &format!("v1/worker/network-domains/{}", domain_id.as_str()),
+            None,
+        )
+        .await
+    }
+
+    pub async fn report_overlay_observation(
+        &self,
+        domain_id: &conductor_core::NetworkDomainId,
+        observation: &conductor_core::OverlayPeerObservation,
+    ) -> Result<(), TransportError> {
+        let url = self
+            .endpoint
+            .join(&format!(
+                "v1/worker/network-domains/{}/observation",
+                domain_id.as_str()
+            ))
+            .map_err(|_| TransportError::InvalidEndpoint)?;
+        let mut body = BoundedJsonBody(Vec::new());
+        serde_json::to_writer(&mut body, observation)
+            .map_err(|_| TransportError::InvalidCommand)?;
+        let response = self
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.0)
+            .send()
+            .await
+            .map_err(|_| TransportError::Http)?;
+        if response.status() != reqwest::StatusCode::NO_CONTENT {
+            return Err(transport_error_for_status(response.status()));
+        }
+        Ok(())
+    }
+
     pub(super) async fn send_report(
         &self,
         report: &WorkerReport,
@@ -118,20 +179,34 @@ impl WorkerTransportClient {
         RequestBody: Serialize,
         ResponseBody: for<'de> Deserialize<'de>,
     {
+        self.json_request(reqwest::Method::POST, path, Some(request))
+            .await
+    }
+
+    async fn json_request<RequestBody, ResponseBody>(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        request: Option<&RequestBody>,
+    ) -> Result<ResponseBody, TransportError>
+    where
+        RequestBody: Serialize,
+        ResponseBody: for<'de> Deserialize<'de>,
+    {
         let url = self
             .endpoint
             .join(path)
             .map_err(|_| TransportError::InvalidEndpoint)?;
-        let mut body = BoundedJsonBody(Vec::new());
-        serde_json::to_writer(&mut body, request).map_err(|_| TransportError::InvalidCommand)?;
-        let mut response = self
-            .client
-            .post(url)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(body.0)
-            .send()
-            .await
-            .map_err(|_| TransportError::Http)?;
+        let mut builder = self.client.request(method, url);
+        if let Some(request) = request {
+            let mut body = BoundedJsonBody(Vec::new());
+            serde_json::to_writer(&mut body, request)
+                .map_err(|_| TransportError::InvalidCommand)?;
+            builder = builder
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.0);
+        }
+        let mut response = builder.send().await.map_err(|_| TransportError::Http)?;
         if !response.status().is_success() {
             return Err(transport_error_for_status(response.status()));
         }
