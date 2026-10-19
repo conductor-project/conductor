@@ -150,10 +150,43 @@ inspection could not resolve the host name, so independent post-run inspection
 was not completed. The exact systemd and kernel versions were not recorded.
 
 This is Debian 13 x86_64 `.deb` lifecycle evidence for this debug package and
-host only. It does not qualify Rocky Linux 10 x86_64 `.rpm`, a Debian x86_64
-package upgrade, a published release, or production-host behavior. The fixture
-was run locally by explicit authorization; privileged package and systemd
-fixtures remain excluded from GitHub workflows.
+host only. It does not qualify Rocky Linux 10 x86_64 `.rpm`, a published
+release, or production-host behavior. The fixture was run locally by explicit
+authorization; privileged package and systemd fixtures remain excluded from
+GitHub workflows.
+
+### Local Debian 13 x86_64 upgrade qualification (2026-10-19)
+
+The upgrade fixture used `conductor_0.1.0_amd64.deb` from workflow run 44
+(artifact ID `12174860463`, archive digest
+`sha256:675dde74f5decadce2536384f759a3f3a9220609eb5cf900a042b105af88e160`),
+then upgraded it with a temporary local `0.1.1` debug `.deb` built from PR
+head `f5f6de25db7a0ada61e4d60b1b7110f48c6d1439`. Only the temporary source
+copy's `conductor` crate version was changed; repository files were not
+modified for the fixture. `BUILD-INFO.json` recorded version `0.1.1`, target
+`x86_64`, debug profile, and binary SHA-256
+`02ed069d4c9dcab1b75c3f4c3a9f7ca80c06d1ab71b4311a01bf4c88aa97c495`. The
+upgrade `.deb` SHA-256 was
+`aebcf3081c30028c7f884c00ddd49a62013ab663ed86d3c80f37c62579a872f2`.
+
+The disposable systemd container ran Debian GNU/Linux 13 (trixie) x86_64 with
+systemd `257.13-1~deb13u1`, using the already-cached Debian base image
+`99339bdd341ab316eeae3dcf870b98bc7243d99269d01666b0f49a565c1399da` and
+Podman 5.4.2 on Fortress. The minimal image lacked the package-declared
+`adduser` dependency, which was installed before `dpkg --configure -a`
+completed the 0.1.0 installation. The service remained inactive and disabled
+until the example configuration was installed and the unit was explicitly
+started. The fixture confirmed `/healthz`, recorded MainPID `196`, then seeded
+a state marker and recorded config/state hashes. Installing the 0.1.1 `.deb`
+left the service active and healthy with the same MainPID, and both hashes
+remained unchanged. An explicit stop/start also passed the health check. The
+container, generated image, imported base-image copy, Rust builder image, and
+staging directory were removed; the user-cached Debian image was retained.
+
+This demonstrates local x86_64 `.deb` upgrade mechanics with debug fixtures;
+it does not qualify an upgrade from a supported published release, a published
+release, or production-host behavior. The privileged fixture ran locally and
+is excluded from GitHub workflows.
 
 ### Local Rocky Linux 10 x86_64 qualification (2026-10-19)
 
