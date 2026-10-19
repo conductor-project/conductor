@@ -41,7 +41,12 @@ configured range 1 byte to 1 GiB). Once the cap is reached, additional bytes
 are discarded while draining continues, and that stream is marked truncated.
 The worker retains logs for the newest `log_retention_runs` completed runs
 (100 by default; configured range 0 to 10,000). Pruning waits for both streams
-to close and preserves run history. Active runs' logs remain subject to the
+to close and preserves run history. Each pass removes at most 128 eligible run
+log pairs. A structured `log_retention_progress` event reports the number of
+runs pruned and whether another batch remains; the next cleanup pass resumes
+from the durable `run_logs.pruned` markers. If interrupted after removing a
+file but before recording the marker, a later pass treats the missing file as
+already removed and records progress. Active runs' logs remain subject to the
 per-stream cap; SQLite run and retention metadata are managed separately and
 can continue to grow.
 

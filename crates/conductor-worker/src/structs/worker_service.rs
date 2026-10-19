@@ -1555,6 +1555,7 @@ impl WorkerService {
             &self.state_directory.join("runs"),
             self.log_policy.retention_runs,
         )
+        .map(|_| ())
     }
 
     pub(super) fn persist(&self, observation: &RunObservation) -> Result<(), WorkerError> {

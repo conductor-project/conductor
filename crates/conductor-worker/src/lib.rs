@@ -391,11 +391,21 @@ fn close_log_stream(state: &SharedWorkerState, run_id: &str, stream: LogStream) 
     Ok(())
 }
 
+const MAX_LOG_RETENTION_BATCH_RUNS: usize = 128;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LogRetentionProgress {
+    pruned_runs: usize,
+    more_eligible: bool,
+}
+
 fn prune_completed_logs_shared(
     state: &SharedWorkerState,
     log_directory: &Path,
     retention_runs: usize,
-) -> io::Result<()> {
+) -> io::Result<LogRetentionProgress> {
+    let retention_offset = i64::try_from(retention_runs)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid log retention count"))?;
     let candidates = {
         let worker_state = state
             .0
@@ -406,16 +416,21 @@ fn prune_completed_logs_shared(
             .prepare(
                 "SELECT run_id FROM run_logs
                  WHERE pruned = 0 AND stdout_closed = 1 AND stderr_closed = 1
-                 ORDER BY completed_at_ms DESC, run_id DESC LIMIT -1 OFFSET ?1",
+                 ORDER BY completed_at_ms DESC, run_id DESC LIMIT ?1 OFFSET ?2",
             )
             .map_err(storage_error)?;
         statement
-            .query_map([retention_runs as i64], |row| row.get::<_, String>(0))
+            .query_map(
+                params![(MAX_LOG_RETENTION_BATCH_RUNS + 1) as i64, retention_offset],
+                |row| row.get::<_, String>(0),
+            )
             .map_err(storage_error)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(storage_error)?
     };
-    for id in candidates {
+    let more_eligible = candidates.len() > MAX_LOG_RETENTION_BATCH_RUNS;
+    let pruned_runs = candidates.len().min(MAX_LOG_RETENTION_BATCH_RUNS);
+    for id in candidates.into_iter().take(pruned_runs) {
         for stream in [LogStream::Stdout, LogStream::Stderr] {
             let path = log_directory.join(format!("{id}.{}", stream.as_str()));
             match fs::symlink_metadata(&path) {
@@ -442,7 +457,177 @@ fn prune_completed_logs_shared(
             )
             .map_err(storage_error)?;
     }
-    Ok(())
+    let progress = LogRetentionProgress {
+        pruned_runs,
+        more_eligible,
+    };
+    if progress.pruned_runs > 0 {
+        eprintln!(
+            "{{\"timestampMs\":{},\"severity\":\"info\",\"component\":\"worker\",\"event\":\"log_retention_progress\",\"prunedRuns\":{},\"retentionRuns\":{},\"moreEligible\":{}}}",
+            now_ms().unwrap_or_default(),
+            progress.pruned_runs,
+            retention_runs,
+            progress.more_eligible,
+        );
+    }
+    Ok(progress)
+}
+
+#[cfg(test)]
+mod log_retention_tests {
+    use super::*;
+
+    #[test]
+    fn completed_log_pruning_is_batched_and_resumes_on_the_next_pass() {
+        let root = RetentionTestDirectory(std::env::temp_dir().join(format!(
+            "conductor-worker-retention-{}-{}",
+            std::process::id(),
+            NEXT_RETENTION_TEST_ID.fetch_add(1, Ordering::Relaxed),
+        )));
+        fs::create_dir_all(&root.0).expect("create temporary log directory");
+        let connection = Connection::open_in_memory().expect("open in-memory worker state");
+        connection
+            .execute_batch(
+                "CREATE TABLE runs (run_id TEXT PRIMARY KEY NOT NULL);
+                 CREATE TABLE run_logs (
+                     run_id TEXT PRIMARY KEY NOT NULL REFERENCES runs(run_id),
+                     stdout_closed INTEGER NOT NULL,
+                     stderr_closed INTEGER NOT NULL,
+                     pruned INTEGER NOT NULL DEFAULT 0,
+                     completed_at_ms INTEGER NOT NULL
+                 );",
+            )
+            .expect("create log state schema");
+        for index in 0..140 {
+            let run_id = format!("run-{index:03}");
+            connection
+                .execute("INSERT INTO runs (run_id) VALUES (?1)", [&run_id])
+                .expect("insert completed run");
+            connection
+                .execute(
+                    "INSERT INTO run_logs (run_id, stdout_closed, stderr_closed, pruned, completed_at_ms)
+                     VALUES (?1, 1, 1, 0, ?2)",
+                    params![run_id, index as i64],
+                )
+                .expect("insert completed log state");
+            for stream in ["stdout", "stderr"] {
+                fs::write(root.0.join(format!("{run_id}.{stream}")), b"log").expect("write log");
+            }
+        }
+        let state = SharedWorkerState(Mutex::new(WorkerState {
+            connection,
+            active_groups: BTreeMap::new(),
+        }));
+
+        let first = prune_completed_logs_shared(&state, &root.0, 1).expect("first retention pass");
+        assert_eq!(first.pruned_runs, MAX_LOG_RETENTION_BATCH_RUNS);
+        assert!(first.more_eligible);
+        assert_eq!(
+            fs::read_dir(&root.0).expect("read log directory").count(),
+            (140 - MAX_LOG_RETENTION_BATCH_RUNS) * 2
+        );
+
+        let second =
+            prune_completed_logs_shared(&state, &root.0, 1).expect("second retention pass");
+        assert_eq!(second.pruned_runs, 11);
+        assert!(!second.more_eligible);
+        assert_eq!(
+            fs::read_dir(&root.0).expect("read log directory").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn interrupted_log_removal_is_safe_to_retry() {
+        let root = RetentionTestDirectory(std::env::temp_dir().join(format!(
+            "conductor-worker-retention-retry-{}-{}",
+            std::process::id(),
+            NEXT_RETENTION_TEST_ID.fetch_add(1, Ordering::Relaxed),
+        )));
+        fs::create_dir_all(&root.0).expect("create temporary log directory");
+        let connection = Connection::open_in_memory().expect("open in-memory worker state");
+        connection
+            .execute_batch(
+                "CREATE TABLE runs (run_id TEXT PRIMARY KEY NOT NULL);
+                 CREATE TABLE run_logs (
+                     run_id TEXT PRIMARY KEY NOT NULL REFERENCES runs(run_id),
+                     stdout_closed INTEGER NOT NULL,
+                     stderr_closed INTEGER NOT NULL,
+                     pruned INTEGER NOT NULL DEFAULT 0,
+                     completed_at_ms INTEGER NOT NULL
+                 );",
+            )
+            .expect("create log state schema");
+        for (run_id, completed_at_ms) in [("old", 1), ("new", 2)] {
+            connection
+                .execute("INSERT INTO runs (run_id) VALUES (?1)", [run_id])
+                .expect("insert completed run");
+            connection
+                .execute(
+                    "INSERT INTO run_logs (run_id, stdout_closed, stderr_closed, pruned, completed_at_ms)
+                     VALUES (?1, 1, 1, 0, ?2)",
+                    params![run_id, completed_at_ms],
+                )
+                .expect("insert completed log state");
+        }
+        fs::write(root.0.join("old.stdout"), b"stdout").expect("write stdout log");
+        fs::create_dir(root.0.join("old.stderr")).expect("block stderr removal");
+        for stream in ["stdout", "stderr"] {
+            fs::write(root.0.join(format!("new.{stream}")), b"log").expect("write retained log");
+        }
+        let state = SharedWorkerState(Mutex::new(WorkerState {
+            connection,
+            active_groups: BTreeMap::new(),
+        }));
+
+        assert!(prune_completed_logs_shared(&state, &root.0, 1).is_err());
+        assert!(!root.0.join("old.stdout").exists());
+        assert!(
+            !state
+                .0
+                .lock()
+                .expect("lock worker state")
+                .connection
+                .query_row(
+                    "SELECT pruned FROM run_logs WHERE run_id = 'old'",
+                    [],
+                    |row| { row.get::<_, bool>(0) }
+                )
+                .expect("read interrupted marker")
+        );
+
+        fs::remove_dir(root.0.join("old.stderr")).expect("remove blocking directory");
+        let resumed = prune_completed_logs_shared(&state, &root.0, 1).expect("resume cleanup");
+        assert_eq!(resumed.pruned_runs, 1);
+        assert!(!resumed.more_eligible);
+        assert_eq!(
+            fs::read_dir(&root.0).expect("read log directory").count(),
+            2
+        );
+        assert!(
+            state
+                .0
+                .lock()
+                .expect("lock worker state")
+                .connection
+                .query_row(
+                    "SELECT pruned FROM run_logs WHERE run_id = 'old'",
+                    [],
+                    |row| { row.get::<_, bool>(0) }
+                )
+                .expect("read resumed marker")
+        );
+    }
+
+    struct RetentionTestDirectory(PathBuf);
+
+    impl Drop for RetentionTestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    static NEXT_RETENTION_TEST_ID: AtomicUsize = AtomicUsize::new(0);
 }
 
 fn persist_terminal_observation(
