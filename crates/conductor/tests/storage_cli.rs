@@ -119,3 +119,69 @@ fn storage_inspection_reports_json_without_changing_the_database() {
         worker_database_before
     );
 }
+
+#[test]
+fn storage_inspection_explains_unpruned_log_pressure_from_retained_worker_state() {
+    let directory = TempDir::new();
+    let worker_directory = directory.path().join("worker");
+    fs::create_dir(&worker_directory).expect("create worker data directory");
+    drop(
+        WorkerService::open(
+            &worker_directory,
+            conductor_core::WorkerId::new("worker-pressure").expect("valid worker ID"),
+            1,
+            Arc::new(TestBackend),
+        )
+        .expect("create worker database"),
+    );
+
+    let database = rusqlite::Connection::open(worker_directory.join("worker.sqlite3"))
+        .expect("open worker fixture database");
+    for index in 0..3 {
+        let run_id = format!("completed-{index}");
+        database
+            .execute(
+                "INSERT INTO runs (run_id, spec_json, observation_json, state, revision)
+                 VALUES (?1, '{}', '{}', 'succeeded', 1)",
+                [&run_id],
+            )
+            .expect("insert completed run");
+        database
+            .execute(
+                "INSERT INTO run_logs (run_id, stdout_closed, stderr_closed, completed_at_ms)
+                 VALUES (?1, 1, 1, 1)",
+                [&run_id],
+            )
+            .expect("insert completed log pair");
+    }
+    drop(database);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args([
+            "storage",
+            "inspect",
+            "--worker-data-dir",
+            worker_directory.to_str().expect("UTF-8 worker path"),
+            "--log-retention-runs",
+            "2",
+            "--log-max-bytes-per-stream",
+            "1024",
+            "--output",
+            "json",
+        ])
+        .output()
+        .expect("run storage inspection command");
+    assert!(
+        output.status.success(),
+        "storage inspection failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse storage inspection JSON");
+    assert_eq!(report["worker"]["completedUnprunedLogRuns"], 3);
+    assert_eq!(
+        report["worker"]["estimatedUnprunedLogBytesUpperBound"],
+        3 * 2 * 1024
+    );
+    assert_eq!(report["worker"]["logRetentionRuns"], 2);
+}

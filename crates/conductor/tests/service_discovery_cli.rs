@@ -62,6 +62,14 @@ impl Drop for Agent {
 }
 
 fn start_agent(root: &Path, role: &str) -> (Agent, SocketAddr) {
+    start_agent_with_api_access(root, role, serde_json::json!({"mode":"local"}))
+}
+
+fn start_agent_with_api_access(
+    root: &Path,
+    role: &str,
+    api_access: serde_json::Value,
+) -> (Agent, SocketAddr) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("reserve ephemeral API port");
     let address = listener.local_addr().expect("read API address");
     drop(listener);
@@ -70,7 +78,7 @@ fn start_agent(root: &Path, role: &str) -> (Agent, SocketAddr) {
         "role": role,
         "listen": address.to_string(),
         "manager_data_dir": root.join("manager"),
-        "api_access": { "mode": "local" },
+        "api_access": api_access,
     });
     if role == "all" {
         config["worker_data_dir"] = serde_json::json!(root.join("worker"));
@@ -210,6 +218,119 @@ impl Drop for MockDiscoveryServer {
             let _ = thread.join();
         }
     }
+}
+
+struct MockDiagnosticsServer {
+    address: SocketAddr,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl MockDiagnosticsServer {
+    fn start(workers: Vec<serde_json::Value>, metrics: String, worker_delay: Duration) -> Self {
+        let (address_tx, address_rx) = std::sync::mpsc::channel();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let thread = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build mock diagnostics runtime");
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind mock diagnostics API");
+                address_tx
+                    .send(listener.local_addr().expect("read mock API address"))
+                    .expect("send mock API address");
+                let router = Router::new()
+                    .route(
+                        "/healthz",
+                        get(|| async {
+                            Json(serde_json::json!({
+                                "status":"ok",
+                                "role":"manager",
+                                "capabilities":["jobs-v1","diagnostics-v1"]
+                            }))
+                        }),
+                    )
+                    .route(
+                        "/readyz",
+                        get(|| async {
+                            (
+                                StatusCode::SERVICE_UNAVAILABLE,
+                                Json(serde_json::json!({
+                                    "status":"degraded",
+                                    "role":"manager",
+                                    "capabilities":["jobs-v1"]
+                                })),
+                            )
+                        }),
+                    )
+                    .route(
+                        "/v1/workers",
+                        get(move || {
+                            let workers = workers.clone();
+                            async move {
+                                tokio::time::sleep(worker_delay).await;
+                                Json(workers)
+                            }
+                        }),
+                    )
+                    .route("/v1/metrics", get(move || async move { metrics.clone() }));
+                axum::serve(listener, router)
+                    .with_graceful_shutdown(async {
+                        let _ = shutdown_rx.await;
+                    })
+                    .await
+                    .expect("serve mock diagnostics API");
+            });
+        });
+        Self {
+            address: address_rx.recv().expect("receive mock diagnostics address"),
+            shutdown: Some(shutdown_tx),
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for MockDiagnosticsServer {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn mock_worker_status(worker_id: &str, overrides: serde_json::Value) -> serde_json::Value {
+    let mut worker = serde_json::json!({
+        "workerId":worker_id,
+        "incarnation":1,
+        "processExecution":true,
+        "capacity":1,
+        "usedSlots":1,
+        "liveProcesses":1,
+        "unknownRuns":1,
+        "pendingPersistence":1,
+        "availableSlots":0,
+        "available":false,
+        "degraded":false,
+        "draining":false,
+        "observedAtMs":1000,
+        "inventory":null,
+        "resourceDomainId":null,
+        "resourceDomainCapacity":null,
+        "labels":{"credential":"planted-private-label"},
+        "fresh":false,
+        "lastSeenAtMs":1000,
+        "serviceNetwork":null
+    });
+    if let (Some(target), Some(source)) = (worker.as_object_mut(), overrides.as_object()) {
+        target.extend(source.clone());
+    }
+    worker
 }
 
 fn mock_endpoints() -> serde_json::Value {
@@ -469,4 +590,235 @@ fn diagnostics_export_returns_explicit_partial_result_when_manager_is_unreachabl
             .iter()
             .any(|finding| { finding["code"] == "diagnostics_partial" })
     );
+}
+
+#[test]
+fn diagnostics_export_uses_operator_authorization_for_protected_observations() {
+    let _guard = lock_tests();
+    let root = TempDir::new();
+    let token_path = root.join("operator-token");
+    let token_output = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args(["create-operator-token", "--output"])
+        .arg(&token_path)
+        .output()
+        .expect("create operator token fixture");
+    assert!(token_output.status.success());
+    let token = fs::read_to_string(&token_path)
+        .expect("read operator token fixture")
+        .trim()
+        .to_owned();
+    let (_agent, address) = start_agent_with_api_access(
+        &root,
+        "all",
+        serde_json::json!({
+            "mode":"operator_token_file",
+            "token_file":token_path
+        }),
+    );
+
+    let unauthorized = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args([
+            "diagnostics",
+            "--server",
+            &format!("http://{address}"),
+            "--output",
+            "json",
+            "export",
+            "--deadline-seconds",
+            "2",
+        ])
+        .output()
+        .expect("run unauthenticated diagnostics export");
+    assert!(unauthorized.status.success());
+    let denied = json(&unauthorized);
+    assert_eq!(denied["collectionStatus"], "partial");
+    assert_eq!(denied["sections"]["workers"]["status"], "unavailable");
+    assert_eq!(
+        denied["sections"]["workers"]["errorCode"],
+        "operator_authentication_required"
+    );
+
+    let authorized = Command::new(env!("CARGO_BIN_EXE_conductor"))
+        .args([
+            "diagnostics",
+            "--server",
+            &format!("http://{address}"),
+            "--token-file",
+        ])
+        .arg(&token_path)
+        .args(["--output", "json", "export", "--deadline-seconds", "2"])
+        .output()
+        .expect("run authenticated diagnostics export");
+    assert!(
+        authorized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&authorized.stderr)
+    );
+    let report = json(&authorized);
+    assert_eq!(report["sections"]["workers"]["status"], "collected");
+    let encoded = String::from_utf8(authorized.stdout).expect("export UTF-8");
+    assert!(!encoded.contains(&token));
+}
+
+#[test]
+fn diagnostics_export_explains_worker_and_placement_blockers_without_exporting_labels() {
+    let _guard = lock_tests();
+    let metrics = concat!(
+        "conductor_pending_work{kind=\"allocations\"} 2\n",
+        "conductor_pending_work{kind=\"deployment\",reason=\"no_eligible_worker\"} 1\n",
+        "conductor_pending_work{kind=\"deployment\",reason=\"worker_capacity_exhausted\"} 1\n",
+    );
+    let server = MockDiagnosticsServer::start(
+        vec![
+            mock_worker_status("stale-worker", serde_json::json!({})),
+            mock_worker_status(
+                "unknown-worker",
+                serde_json::json!({
+                    "unknownRuns":0,
+                    "pendingPersistence":0,
+                    "availableSlots":1,
+                    "usedSlots":0,
+                    "liveProcesses":0,
+                    "available":true,
+                    "lastSeenAtMs":null
+                }),
+            ),
+        ],
+        metrics.to_owned(),
+        Duration::ZERO,
+    );
+    let output = command(
+        server.address,
+        &[
+            "diagnostics",
+            "--output",
+            "json",
+            "export",
+            "--deadline-seconds",
+            "2",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = json(&output);
+    assert_eq!(report["collectionStatus"], "complete");
+    assert_eq!(report["sections"]["readiness"]["data"]["ready"], false);
+    let worker = &report["sections"]["workers"]["data"]["workers"][0];
+    assert_eq!(worker["freshness"], "stale");
+    assert!(worker["observationAgeMs"].as_u64().unwrap() > 0);
+    assert_eq!(worker["availableSlots"], 0);
+    assert_eq!(worker["unknownRuns"], 1);
+    assert_eq!(worker["pendingPersistence"], 1);
+    assert_eq!(
+        report["sections"]["workers"]["data"]["workers"][1]["freshness"],
+        "unknown"
+    );
+    let findings = report["findings"].as_array().expect("diagnostic findings");
+    for expected in [
+        "manager_not_ready",
+        "worker_observation_stale",
+        "worker_no_available_slots",
+        "worker_unknown_runs",
+        "worker_pending_persistence",
+        "placement_pending",
+        "deployment_no_eligible_worker",
+        "deployment_worker_capacity_exhausted",
+    ] {
+        assert!(
+            findings.iter().any(|finding| finding["code"] == expected),
+            "missing finding {}: {:?}",
+            expected,
+            findings
+        );
+    }
+    let encoded = String::from_utf8(output.stdout).expect("export UTF-8");
+    assert!(!encoded.contains("credential"));
+    assert!(!encoded.contains("planted-private-label"));
+
+    let human = command(
+        server.address,
+        &["diagnostics", "export", "--deadline-seconds", "2"],
+    );
+    assert!(human.status.success());
+    let human = String::from_utf8(human.stdout).expect("human diagnostics UTF-8");
+    assert!(human.contains("readiness: collected (degraded)"));
+    assert!(human.contains("workers: collected"));
+    assert!(human.contains("storage: unavailable"));
+    assert!(human.contains("The worker reports unresolved runs"));
+}
+
+#[test]
+fn diagnostics_export_caps_items_and_returns_before_slow_sections_exceed_deadline() {
+    let _guard = lock_tests();
+    let workers = (0..130)
+        .map(|index| {
+            mock_worker_status(
+                &format!("worker-{index}"),
+                serde_json::json!({"unknownRuns":0,"pendingPersistence":0}),
+            )
+        })
+        .collect();
+    let server = MockDiagnosticsServer::start(workers, String::new(), Duration::from_secs(3));
+    let started = Instant::now();
+    let output = command(
+        server.address,
+        &[
+            "diagnostics",
+            "--output",
+            "json",
+            "export",
+            "--deadline-seconds",
+            "1",
+        ],
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = json(&output);
+    assert_eq!(report["collectionStatus"], "partial");
+    assert_eq!(report["sections"]["workers"]["status"], "unavailable");
+    assert_eq!(
+        report["sections"]["workers"]["errorCode"],
+        "deadline_exceeded"
+    );
+    assert!(
+        elapsed < Duration::from_millis(2_500),
+        "collection took {:?}",
+        elapsed
+    );
+
+    let fast = MockDiagnosticsServer::start(
+        (0..130)
+            .map(|index| mock_worker_status(&format!("worker-{index}"), serde_json::json!({})))
+            .collect(),
+        String::new(),
+        Duration::ZERO,
+    );
+    let output = command(
+        fast.address,
+        &[
+            "diagnostics",
+            "--output",
+            "json",
+            "export",
+            "--deadline-seconds",
+            "2",
+        ],
+    );
+    assert!(output.status.success());
+    let report = json(&output);
+    assert_eq!(
+        report["sections"]["workers"]["data"]["workers"]
+            .as_array()
+            .unwrap()
+            .len(),
+        128
+    );
+    assert_eq!(report["sections"]["workers"]["data"]["omittedWorkers"], 2);
 }
