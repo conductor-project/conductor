@@ -180,7 +180,7 @@ jobs:
           SOURCE_SHA: ${{ needs.promote.outputs.sha }}
         run: |
           set -euo pipefail
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             cat > /tmp/release-notes.md <<EOF
           Verified Conductor release candidate for $VERSION.
 
@@ -199,9 +199,9 @@ jobs:
           Source commit: $SOURCE_SHA
           Trusted Merge workflow run: $RUN_ID
           EOF
-            gh release create "$RELEASE_TAG" --draft --title "Conductor $VERSION" --notes-file /tmp/release-notes.md
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft --title "Conductor $VERSION" --notes-file /tmp/release-notes.md
           fi
-          gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft' | grep -qx true
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft' | grep -qx true
           for file in release-assets/*; do
             name=$(basename "$file")
             releases=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100")
@@ -213,7 +213,7 @@ jobs:
               expected="sha256:$(sha256sum "$file" | cut -d ' ' -f1)"
               [[ "$actual" == "$expected" ]] || { echo "Existing draft asset $name differs from the verified candidate." >&2; exit 1; }
             else
-              gh release upload "$RELEASE_TAG" "$file"
+              gh release upload "$RELEASE_TAG" "$file" --repo "$GITHUB_REPOSITORY"
             fi
           done
           find release-assets -maxdepth 1 -type f -printf '%f\n' | sort > /tmp/expected-assets
