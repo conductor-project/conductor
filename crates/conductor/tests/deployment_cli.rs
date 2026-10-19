@@ -693,7 +693,21 @@ fn rollout_timeout_preserves_deployment_identity_and_does_not_cancel_remote_desi
         .stderr(Stdio::piped())
         .spawn()
         .expect("start interruptible deployment wait");
-    thread::sleep(Duration::from_millis(300));
+    let wait_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let observed = run(address, &["inspect", "deployment-cli-service"]);
+        if observed.status.success() && json(&observed)["desiredReplicas"] == 2 {
+            break;
+        }
+        assert!(
+            Instant::now() < wait_deadline,
+            "interruptible scale command did not commit its desired replica count"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    // Allow the CLI to enter its bounded wait after the manager has accepted
+    // the mutation before delivering SIGINT.
+    thread::sleep(Duration::from_millis(100));
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(waiting.id() as i32),
         nix::sys::signal::Signal::SIGINT,
