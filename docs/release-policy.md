@@ -57,6 +57,13 @@ the trusted workflow run identifier. Architecture-specific metadata and
 checksum assets avoid filename collisions: `BUILD-INFO.json` and `SHA256SUMS`
 are for aarch64/arm64, while x86_64 uses `BUILD-INFO-x86_64.json` and
 `SHA256SUMS-x86_64`.
+Candidate verification and no-write rehearsal run with read-only repository
+contents permission. Draft creation and resumption use a separate job with
+release write permission; final publication remains isolated behind the
+protected environment. The temporary verified-asset artifact waits for
+approval for up to 90 days; if it expires, rerun `prepare` to reverify the
+exact trusted `Merge` artifacts and refresh the draft, then request publication
+again.
 Configuration of GitHub rulesets is an administrator action and must be
 verified in repository settings; workflow checks alone do not protect a tag
 from being moved or deleted.

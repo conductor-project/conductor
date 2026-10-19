@@ -3,7 +3,7 @@ type: Reference
 title: Release and support policy
 description: Supported line policy and release/security procedures, distinguished from configured GitHub protections and completed release evidence.
 status: planned
-source_revision: ae824f0a6ed7242e589b340243d46897c3b67877
+source_revision: 3acfd9a517491bb9d9909bee6c636c2645bb0a34
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../docs/release-policy.md
@@ -31,9 +31,13 @@ backport and embargo procedures, and immutable publication. The release
 workflow verifies and promotes packages from the exact successful `Merge` run
 without rebuilding; tag pushes create drafts, while publishing requires the
 configured `release-publication` environment. The workflow includes a no-write
-approval rehearsal and fails with an exact-run recovery command when transient
-artifacts are missing or expired. No version is supported until its verified
-release is published.
+approval rehearsal with read-only repository contents permission; draft writes
+are isolated in a separate job and final publication remains behind the
+protected environment. It fails with an exact-run recovery command when
+transient artifacts are missing or expired. The intermediate verified-asset
+artifact is retained for 90 days while approval is pending; its expiration
+guidance revalidates the exact trusted run and refreshes the existing draft.
+No version is supported until its verified release is published.
 
 Tag `v0.0.1` points to main commit `09f4af5e35b73fc54130c58daea4ae9fe87d7ace`.
 Its exact [`Merge` run](https://github.com/conductor-project/conductor/actions/runs/39243996603)
