@@ -165,7 +165,7 @@ jobs:
           name: verified-release-assets
           path: release-assets/*
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 90
       - name: Rehearsal completed without release writes
         if: github.event_name == 'workflow_dispatch' && inputs.action == 'rehearse'
         run: echo "Candidate verification succeeded; no release or tag was created or changed."
@@ -242,6 +242,15 @@ jobs:
         with:
           name: verified-release-assets
           path: verified-release-assets
+          if-no-files-found: ignore
+      - name: Explain expired publication candidate recovery
+        if: inputs.action == 'publish'
+        run: |
+          set -euo pipefail
+          if ! find verified-release-assets -maxdepth 1 -type f -print -quit 2>/dev/null | grep -q .; then
+            echo "The verified promotion artifact expired before approval. Dispatch Publish release with action=prepare to reverify the exact trusted Merge run and refresh the existing draft, then dispatch action=publish again." >&2
+            exit 1
+          fi
       - name: Verify release publication environment is protected
         env:
           GH_TOKEN: ${{ github.token }}
