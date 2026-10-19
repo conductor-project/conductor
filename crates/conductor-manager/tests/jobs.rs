@@ -3220,6 +3220,62 @@ fn schema_two_migration_adds_idempotency_and_indexed_run_order() {
 }
 
 #[test]
+fn failed_schema_two_migration_rolls_back_partial_changes() {
+    let directory = TempDir::new();
+    let connection = Connection::open(directory.database()).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE jobs (
+                id TEXT PRIMARY KEY NOT NULL,
+                spec_json TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                deleted_at_ms INTEGER
+             );
+             CREATE TABLE runs (
+                run_id TEXT PRIMARY KEY NOT NULL,
+                job_id TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                job_spec_json TEXT NOT NULL,
+                observation_json TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                run_order INTEGER NOT NULL
+             );
+             INSERT INTO runs VALUES ('legacy-run', 'legacy-job', 'legacy-worker', 'spec', 'observation', 1, 'succeeded', 7);
+             CREATE TABLE run_sequence (id INTEGER PRIMARY KEY CHECK (id = 1), value INTEGER NOT NULL);
+             INSERT INTO run_sequence (id, value) VALUES (1, 7);
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+    drop(connection);
+
+    assert!(JobService::open_sqlite(directory.database()).is_err());
+
+    let connection = Connection::open(directory.database()).unwrap();
+    let version: i64 = connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    let columns = connection
+        .prepare("PRAGMA table_info(runs)")
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(1))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let row: (String, i64, String) = connection
+        .query_row(
+            "SELECT run_id, run_order, state FROM runs WHERE run_id = 'legacy-run'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(version, 2);
+    assert!(!columns.iter().any(|column| column == "idempotency_key"));
+    assert!(!columns.iter().any(|column| column == "request_fingerprint"));
+    assert_eq!(row, ("legacy-run".into(), 7, "succeeded".into()));
+}
+
+#[test]
 fn schema_four_identity_layout_migrates_with_command_outbox_without_losing_tokens() {
     let directory = TempDir::new();
     let repository = SqliteJobRepository::open(directory.database()).unwrap();

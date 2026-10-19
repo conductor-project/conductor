@@ -3,7 +3,7 @@ type: Runbook
 title: Operations and recovery
 description: Use health and readiness correctly, plan graceful shutdown, and resolve uncertain work after restart.
 status: stable
-source_revision: c3d5046cfce0725634c8da0130002f4f7efbfdc6
+source_revision: aa3ed5a1e2cc15ed9a7216067d18278b4ce99e37
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../crates/conductor-api/src/lib.rs
@@ -18,8 +18,12 @@ sources:
     title: Read-only upgrade preflight
   - resource: ../crates/conductor-manager/src/lib.rs
     title: Manager schema inspection and migrations
+  - resource: ../crates/conductor-manager/tests/jobs.rs
+    title: Manager migration preservation and failure coverage
   - resource: ../crates/conductor-worker/src/lib.rs
     title: Worker schema inspection and migrations
+  - resource: ../crates/conductor-worker/tests/runs.rs
+    title: Worker migration preservation and failure coverage
   - resource: ../crates/conductor/src/backup_cli.rs
     title: Offline backup and restore commands
   - resource: ../crates/conductor/src/diagnostics_cli.rs
@@ -185,6 +189,25 @@ development builds are not a supported upgrade source.
 | Manager-worker transport | Protocol `3` | Protocol negotiation checks version overlap and required capabilities. Mixed Conductor release versions are not a supported operating mode until separately qualified. |
 | Manager database | Schema `12` | Each source migration step is transactional and the current code migrates known earlier markers. This does not prove a real previous-release upgrade. No downgrade is supported after migration. |
 | Worker database | Schema `4` | Independently versioned and migrated during worker startup. This does not prove a real previous-release upgrade. No downgrade is supported after migration. |
+
+The migration tests verify preservation for supported older schema fixtures and
+rollback of partial schema changes when manager schema `2` or worker schema `1`
+migration fails. These synthetic debug-test fixtures establish transaction
+behavior only; they are not fixtures from a published release and do not qualify
+a release-to-release upgrade.
+
+Local debug verification on source revision
+`aa3ed5a1e2cc15ed9a7216067d18278b4ce99e37` plus the migration failure tests in
+this change:
+
+- `python3 scripts/check-dependency-policy.py` — passed.
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --workspace --locked --all-targets --all-features -- -D warnings` — passed.
+- `cargo test --workspace --locked --all-targets --all-features` — 270 tests passed across 27 suites. The first sandboxed attempt could not bind loopback listeners; the same command passed when rerun with local loopback permission.
+
+This is local debug test evidence only. No release build/test, stable previous-
+release upgrade, package qualification, or failed-upgrade backup drill is
+claimed here.
 
 The release policy and the upgrade evidence are separate: the policy defines
 which stable lines are intended to receive support, while a supported upgrade
