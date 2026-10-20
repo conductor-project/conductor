@@ -2,7 +2,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 
 #[cfg(target_os = "linux")]
-use conductor_core::{OverlayPeerConfiguration, WorkerId};
+use conductor_core::{OverlayPeerConfiguration, OverlayRuntimeDiagnostic, WorkerId};
 #[cfg(target_os = "linux")]
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
@@ -23,6 +23,7 @@ enum Request {
     Reconfigure {
         configuration: OverlayPeerConfiguration,
     },
+    Status,
     Shutdown,
 }
 
@@ -38,6 +39,7 @@ struct Response<'a> {
     network_generation: Option<u64>,
     expires_at_ms: Option<i64>,
     direct_candidates: &'a [SocketAddr],
+    runtime: Option<&'a OverlayRuntimeDiagnostic>,
 }
 
 #[cfg(target_os = "linux")]
@@ -84,17 +86,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     let mut endpoint = create_endpoint(secret_key).await?;
     let mut direct_candidates = endpoint_direct_candidates(&endpoint);
+    let initial_runtime_status = conductor_overlay::OverlayRuntimeStatus::default();
     write_configuration_response(
         "ready",
         &worker_id,
         &interface,
         &configuration,
         &direct_candidates,
+        &initial_runtime_status,
     )
     .await?;
 
     let mut configuration = configuration;
-    loop {
+    'dataplane: loop {
+        let runtime_status = conductor_overlay::OverlayRuntimeStatus::default();
         let run_configuration = configuration.clone();
         let packet_loop = conductor_overlay::run_packet_dataplane(
             interface.device(),
@@ -102,13 +107,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             &run_configuration,
             &worker_id,
             now_ms(),
+            runtime_status.clone(),
         );
         tokio::pin!(packet_loop);
         tokio::select! {
             result = &mut packet_loop => {
                 let event = if result.is_ok() { "stopped" } else { "unavailable" };
                 endpoint.close().await;
-                write_configuration_response(event, &worker_id, &interface, &configuration, &direct_candidates).await?;
+                write_configuration_response(event, &worker_id, &interface, &configuration, &direct_candidates, &runtime_status).await?;
                 match read_json_line(&mut input).await? {
                     Some(Request::Reconfigure { configuration: updated }) => {
                         validate_reconfiguration(&updated, &worker_id, &configuration, &interface)?;
@@ -119,7 +125,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         configuration = updated;
                         endpoint = create_endpoint(secret_key).await?;
                         direct_candidates = endpoint_direct_candidates(&endpoint);
-                        write_configuration_response("applied", &worker_id, &interface, &configuration, &direct_candidates).await?;
+                        runtime_status.clear().await;
+                        write_configuration_response("applied", &worker_id, &interface, &configuration, &direct_candidates, &runtime_status).await?;
+                        continue 'dataplane;
+                    }
+                    Some(Request::Status) => {
+                        write_configuration_response("status", &worker_id, &interface, &configuration, &direct_candidates, &runtime_status).await?;
                     }
                     Some(Request::Shutdown) | None => break,
                     Some(Request::Start { .. }) => return Err("duplicate start request".into()),
@@ -134,7 +145,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let peers = updated.peers.iter().map(|peer| peer.worker_address).collect::<BTreeSet<_>>();
                         interface.reconcile_routes(&peers).await?;
                         configuration = updated;
-                        write_configuration_response("applied", &worker_id, &interface, &configuration, &direct_candidates).await?;
+                        runtime_status.clear().await;
+                        write_configuration_response("applied", &worker_id, &interface, &configuration, &direct_candidates, &runtime_status).await?;
+                        continue 'dataplane;
+                    }
+                    Some(Request::Status) => {
+                        write_configuration_response("status", &worker_id, &interface, &configuration, &direct_candidates, &runtime_status).await?;
                     }
                     Some(Request::Shutdown) | None => break,
                     Some(Request::Start { .. }) => return Err("duplicate start request".into()),
@@ -155,6 +171,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         network_generation: Some(configuration.network_generation),
         expires_at_ms: Some(configuration.expires_at_ms),
         direct_candidates: &direct_candidates,
+        runtime: None,
     })
     .await?;
     Ok(())
@@ -204,7 +221,17 @@ async fn write_configuration_response(
     interface: &conductor_overlay::LinuxOverlayInterface,
     configuration: &OverlayPeerConfiguration,
     direct_candidates: &[SocketAddr],
+    runtime_status: &conductor_overlay::OverlayRuntimeStatus,
 ) -> io::Result<()> {
+    let runtime = OverlayRuntimeDiagnostic {
+        interface_name: interface.interface_name().to_owned(),
+        interface_up: true,
+        local_address: interface.local_address(),
+        mtu: u16::try_from(conductor_overlay::MAX_OVERLAY_PACKET_BYTES)
+            .map_err(io::Error::other)?,
+        installed_routes: interface.installed_peer_routes().await?,
+        direct_links: runtime_status.direct_links().await,
+    };
     write_response(Response {
         event,
         worker_id: Some(worker_id),
@@ -214,6 +241,7 @@ async fn write_configuration_response(
         network_generation: Some(configuration.network_generation),
         expires_at_ms: Some(configuration.expires_at_ms),
         direct_candidates,
+        runtime: Some(&runtime),
     })
     .await
 }

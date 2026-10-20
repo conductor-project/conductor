@@ -37,6 +37,112 @@ use tokio::sync::{RwLock, mpsc, watch};
 pub const OVERLAY_ALPN: &[u8] = b"conductor/overlay/1";
 pub const MAX_OVERLAY_PEERS: usize = 128;
 
+/// Live direct-link telemetry collected by the worker's packet loop.
+#[derive(Clone, Default)]
+pub struct OverlayRuntimeStatus {
+    connections: Arc<RwLock<BTreeMap<EndpointId, TrackedConnection>>>,
+}
+
+#[derive(Clone, Default)]
+struct TrackedConnection {
+    connection: Option<Connection>,
+    selected_address: Option<std::net::SocketAddr>,
+    handshake_at_ms: Option<i64>,
+    udp_tx_bytes: u64,
+    udp_rx_bytes: u64,
+}
+
+impl OverlayRuntimeStatus {
+    pub async fn clear(&self) {
+        self.connections.write().await.clear();
+    }
+
+    async fn set_peers(&self, peers: &[OverlayPeer]) -> Result<(), OverlayTransportError> {
+        let mut connections = BTreeMap::new();
+        for peer in peers {
+            let endpoint_id = peer
+                .endpoint_id
+                .as_str()
+                .parse::<EndpointId>()
+                .map_err(|_| OverlayTransportError::UnauthorizedPeer)?;
+            connections.insert(endpoint_id, TrackedConnection::default());
+        }
+        *self.connections.write().await = connections;
+        Ok(())
+    }
+
+    async fn connected(&self, endpoint_id: EndpointId, connection: Connection) {
+        let selected_address = selected_direct_address(&connection);
+        self.connections.write().await.insert(
+            endpoint_id,
+            TrackedConnection {
+                connection: Some(connection),
+                selected_address,
+                handshake_at_ms: Some(unix_time_ms()),
+                udp_tx_bytes: 0,
+                udp_rx_bytes: 0,
+            },
+        );
+    }
+
+    async fn disconnected(&self, endpoint_id: EndpointId) {
+        if let Some(entry) = self.connections.write().await.get_mut(&endpoint_id)
+            && let Some(connection) = entry.connection.take()
+        {
+            let stats = connection.stats();
+            entry.udp_tx_bytes = stats.udp_tx.bytes;
+            entry.udp_rx_bytes = stats.udp_rx.bytes;
+            entry.selected_address =
+                selected_direct_address(&connection).or(entry.selected_address);
+        }
+    }
+
+    pub async fn direct_links(&self) -> Vec<conductor_core::OverlayDirectLinkDiagnostic> {
+        let connections = self.connections.read().await;
+        connections
+            .iter()
+            .filter_map(|(endpoint_id, entry)| {
+                let (udp_tx_bytes, udp_rx_bytes, selected_address) =
+                    if let Some(connection) = entry.connection.as_ref() {
+                        let stats = connection.stats();
+                        (
+                            stats.udp_tx.bytes,
+                            stats.udp_rx.bytes,
+                            selected_direct_address(connection).or(entry.selected_address),
+                        )
+                    } else {
+                        (
+                            entry.udp_tx_bytes,
+                            entry.udp_rx_bytes,
+                            entry.selected_address,
+                        )
+                    };
+                Some(conductor_core::OverlayDirectLinkDiagnostic {
+                    endpoint_id: conductor_core::OverlayEndpointId::new(endpoint_id.to_string())
+                        .ok()?,
+                    connected: entry
+                        .connection
+                        .as_ref()
+                        .is_some_and(|connection| connection.close_reason().is_none()),
+                    selected_address,
+                    last_handshake_at_ms: entry.handshake_at_ms,
+                    udp_tx_bytes,
+                    udp_rx_bytes,
+                })
+            })
+            .collect()
+    }
+}
+
+fn selected_direct_address(connection: &Connection) -> Option<std::net::SocketAddr> {
+    let paths = connection.paths();
+    let path = paths.iter().find(|path| path.is_selected())?;
+    match path.remote_addr() {
+        TransportAddr::Ip(address) => Some(*address),
+        _ => None,
+    }
+}
+
 /// Return a stable, bounded, Conductor-prefixed Linux interface name.
 pub fn interface_name_for_worker(worker_id: &WorkerId) -> String {
     let digest = Sha256::digest(worker_id.as_str().as_bytes());
@@ -186,12 +292,14 @@ pub async fn run_packet_dataplane(
     configuration: &OverlayPeerConfiguration,
     expected_worker: &WorkerId,
     now_ms: i64,
+    runtime_status: OverlayRuntimeStatus,
 ) -> Result<(), OverlayTransportError> {
     let router = configured_packet_router(configuration, expected_worker, now_ms)
         .map_err(OverlayTransportError::InvalidConfiguration)?;
+    runtime_status.set_peers(&configuration.peers).await?;
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<Vec<u8>>(128);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let connections = Arc::new(RwLock::new(BTreeMap::new()));
+    let connections = Arc::clone(&runtime_status.connections);
     for peer in &configuration.peers {
         let endpoint_id = peer
             .endpoint_id
@@ -203,7 +311,7 @@ pub async fn run_packet_dataplane(
         let candidates_expires_at_ms = peer.direct_candidates_expires_at_ms.unwrap_or(0);
         let router = router.clone();
         let inbound_tx = inbound_tx.clone();
-        let connections = Arc::clone(&connections);
+        let runtime_status = runtime_status.clone();
         let mut shutdown = shutdown_rx.clone();
         tokio::spawn(async move {
             let mut backoff = std::time::Duration::from_millis(250);
@@ -223,15 +331,14 @@ pub async fn run_packet_dataplane(
                 };
                 if let Ok(connection) = connected {
                     spawn_packet_reader(connection.clone(), router.clone(), inbound_tx.clone());
-                    connections
-                        .write()
-                        .await
-                        .insert(endpoint_id, connection.clone());
+                    runtime_status
+                        .connected(endpoint_id, connection.clone())
+                        .await;
                     tokio::select! {
                         _ = shutdown.changed() => break,
                         _ = connection.closed() => {},
                     }
-                    connections.write().await.remove(&endpoint_id);
+                    runtime_status.disconnected(endpoint_id).await;
                     backoff = std::time::Duration::from_millis(250);
                 } else {
                     tokio::select! {
@@ -290,7 +397,7 @@ pub async fn run_packet_dataplane(
                     .read()
                     .await
                     .get(&endpoint_id)
-                    .cloned();
+                    .and_then(|entry| entry.connection.clone());
                 let Some(connection) = connection else {
                     continue;
                 };

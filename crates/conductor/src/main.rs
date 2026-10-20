@@ -1018,12 +1018,14 @@ fn run_worker(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
                 .map_err(|_| "worker overlay helper could not apply its peer map")?;
             let candidate_refresh_at_ms =
                 candidate_refresh_at(acknowledgement.candidates_expires_at_ms);
+            let helper_runtime = helper.status().await.ok().flatten();
             report_overlay_observation(
                 &client,
                 &domain_id,
                 &worker_id,
                 &configuration,
                 conductor_core::OverlayPeerObservationStatus::Applied,
+                helper_runtime,
             )
             .await;
             Ok::<_, Box<dyn std::error::Error>>(Some(tokio::spawn(run_worker_overlay(
@@ -1127,18 +1129,26 @@ async fn run_worker_overlay(
                             &worker_id,
                             &updated,
                             conductor_core::OverlayPeerObservationStatus::Rejected,
+                            None,
                         )
                         .await;
                         return Err("worker overlay helper rejected a manager configuration update".to_owned());
                     }
                     configuration = updated;
                 }
+                let helper_runtime = helper.status().await.ok().flatten();
+                let observation_status = if helper_runtime.is_some() {
+                    conductor_core::OverlayPeerObservationStatus::Applied
+                } else {
+                    conductor_core::OverlayPeerObservationStatus::Unavailable
+                };
                 report_overlay_observation(
                     &client,
                     &domain_id,
                     &worker_id,
                     &configuration,
-                    conductor_core::OverlayPeerObservationStatus::Applied,
+                    observation_status,
+                    helper_runtime,
                 )
                 .await;
             }
@@ -1166,6 +1176,7 @@ async fn report_overlay_observation(
     worker_id: &WorkerId,
     configuration: &conductor_core::OverlayPeerConfiguration,
     status: conductor_core::OverlayPeerObservationStatus,
+    runtime: Option<conductor_core::OverlayRuntimeDiagnostic>,
 ) {
     let observation = conductor_core::OverlayPeerObservation {
         network_domain_id: domain_id.clone(),
@@ -1174,6 +1185,7 @@ async fn report_overlay_observation(
         applied_network_generation: configuration.network_generation,
         observed_at_ms: i64::try_from(timestamp_ms()).unwrap_or(i64::MAX),
         status,
+        runtime,
     };
     let _ = client
         .report_overlay_observation(domain_id, &observation)

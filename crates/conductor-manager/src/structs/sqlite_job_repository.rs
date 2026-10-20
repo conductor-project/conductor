@@ -1375,6 +1375,18 @@ impl JobRepository for SqliteJobRepository {
             conductor_core::OverlayPeerObservationStatus::Rejected => "rejected",
             conductor_core::OverlayPeerObservationStatus::Unavailable => "unavailable",
         };
+        let runtime_json = observation
+            .runtime
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| OverlayNetworkError::ObservationConflict)?;
+        if runtime_json
+            .as_ref()
+            .is_some_and(|runtime| runtime.len() > 65_536)
+        {
+            return Err(OverlayNetworkError::ObservationConflict);
+        }
         let mut connection = self
             .connection
             .lock()
@@ -1382,16 +1394,16 @@ impl JobRepository for SqliteJobRepository {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
-        let (stored_peer_generation, network_generation) = transaction
+        let (stored_peer_generation, network_generation, worker_address) = transaction
             .query_row(
-                "SELECT p.peer_generation, d.network_generation FROM overlay_peers p
+                "SELECT p.peer_generation, d.network_generation, p.worker_address FROM overlay_peers p
                  JOIN overlay_network_domains d USING (network_domain_id)
                  WHERE p.network_domain_id = ?1 AND p.worker_id = ?2 AND p.state = 'active'",
                 params![
                     observation.network_domain_id.as_str(),
                     observation.worker_id.as_str()
                 ],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
             )
             .optional()
             .map_err(|_| OverlayNetworkError::StorageUnavailable)?
@@ -1401,6 +1413,81 @@ impl JobRepository for SqliteJobRepository {
         }
         if applied_generation > network_generation {
             return Err(OverlayNetworkError::ObservationConflict);
+        }
+        if let Some(runtime) = observation.runtime.as_ref() {
+            let expected_address = u32::try_from(worker_address)
+                .ok()
+                .map(std::net::Ipv4Addr::from);
+            if !runtime.interface_name.starts_with("cnd-")
+                || runtime.interface_name.len() > 15
+                || !runtime.interface_name.is_ascii()
+                || !runtime.interface_up
+                || expected_address != Some(runtime.local_address)
+                || runtime.mtu == 0
+                || runtime.installed_routes.len() > 128
+                || runtime.direct_links.len() > 128
+                || runtime
+                    .installed_routes
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+                || runtime.installed_routes.contains(&runtime.local_address)
+            {
+                return Err(OverlayNetworkError::ObservationConflict);
+            }
+            if applied_generation == network_generation {
+                let mut authorized_routes = transaction
+                    .prepare(
+                        "SELECT worker_address FROM overlay_peers
+                         WHERE network_domain_id = ?1 AND worker_id != ?2
+                           AND state = 'active' AND expires_at_ms > ?3
+                         ORDER BY worker_address",
+                    )
+                    .map_err(|_| OverlayNetworkError::StorageUnavailable)?
+                    .query_map(
+                        params![
+                            observation.network_domain_id.as_str(),
+                            observation.worker_id.as_str(),
+                            observation.observed_at_ms
+                        ],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .map_err(|_| OverlayNetworkError::StorageUnavailable)?
+                    .map(|route| {
+                        let route = route.map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+                        u32::try_from(route)
+                            .map(std::net::Ipv4Addr::from)
+                            .map_err(|_| OverlayNetworkError::StorageUnavailable)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                authorized_routes.sort_unstable();
+                if runtime.installed_routes != authorized_routes {
+                    return Err(OverlayNetworkError::ObservationConflict);
+                }
+            }
+            let mut seen_endpoints = std::collections::BTreeSet::new();
+            for link in &runtime.direct_links {
+                if !seen_endpoints.insert(link.endpoint_id.as_str().to_owned())
+                    || !transaction
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM overlay_peers
+                             WHERE network_domain_id = ?1 AND endpoint_id = ?2 AND worker_id != ?3 AND state = 'active')",
+                            params![observation.network_domain_id.as_str(), link.endpoint_id.as_str(), observation.worker_id.as_str()],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .map_err(|_| OverlayNetworkError::StorageUnavailable)?
+                    || link.selected_address.is_some_and(|address| {
+                        !conductor_core::valid_overlay_direct_candidates(&[address])
+                    })
+                    || (link.connected
+                        && (link.selected_address.is_none()
+                            || link.last_handshake_at_ms.is_none()))
+                    || link.last_handshake_at_ms.is_some_and(|time| {
+                        time < 0 || time > observation.observed_at_ms
+                    })
+                {
+                    return Err(OverlayNetworkError::ObservationConflict);
+                }
+            }
         }
         let previous = transaction
             .query_row(
@@ -1439,14 +1526,15 @@ impl JobRepository for SqliteJobRepository {
         transaction
             .execute(
                 "INSERT INTO overlay_peer_observations
-                 (network_domain_id, worker_id, peer_generation, applied_network_generation, observed_at_ms, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 (network_domain_id, worker_id, peer_generation, applied_network_generation, observed_at_ms, status, runtime_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                  ON CONFLICT(network_domain_id, worker_id) DO UPDATE SET
                    peer_generation = excluded.peer_generation,
                    applied_network_generation = excluded.applied_network_generation,
                    observed_at_ms = excluded.observed_at_ms,
-                   status = excluded.status",
-                params![observation.network_domain_id.as_str(), observation.worker_id.as_str(), peer_generation, applied_generation, observation.observed_at_ms, status],
+                   status = excluded.status,
+                   runtime_json = excluded.runtime_json",
+                params![observation.network_domain_id.as_str(), observation.worker_id.as_str(), peer_generation, applied_generation, observation.observed_at_ms, status, runtime_json],
             )
             .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
         transaction
@@ -1544,7 +1632,7 @@ impl JobRepository for SqliteJobRepository {
             .map(|assignment| {
                 let observation = connection
                     .query_row(
-                        "SELECT peer_generation, applied_network_generation, observed_at_ms, status
+                        "SELECT peer_generation, applied_network_generation, observed_at_ms, status, runtime_json
                          FROM overlay_peer_observations
                          WHERE network_domain_id = ?1 AND worker_id = ?2",
                         params![network_domain_id.as_str(), assignment.worker_id.as_str()],
@@ -1554,12 +1642,13 @@ impl JobRepository for SqliteJobRepository {
                                 row.get::<_, i64>(1)?,
                                 row.get::<_, i64>(2)?,
                                 row.get::<_, String>(3)?,
+                                row.get::<_, Option<String>>(4)?,
                             ))
                         },
                     )
                     .optional()
                     .map_err(|_| OverlayNetworkError::StorageUnavailable)?
-                    .filter(|(peer_generation, _, _, _)| {
+                    .filter(|(peer_generation, _, _, _, _)| {
                         *peer_generation >= 0
                             && *peer_generation as u64 == assignment.peer_generation
                     });
@@ -1568,7 +1657,8 @@ impl JobRepository for SqliteJobRepository {
                     observation_network_generation,
                     observation_at_ms,
                     observation_fresh,
-                ) = if let Some((_, network_generation, observed_at_ms, status)) = observation {
+                    runtime,
+                ) = if let Some((_, network_generation, observed_at_ms, status, runtime_json)) = observation {
                     let status = match status.as_str() {
                         "applied" => conductor_core::OverlayPeerObservationStatus::Applied,
                         "rejected" => conductor_core::OverlayPeerObservationStatus::Rejected,
@@ -1581,14 +1671,19 @@ impl JobRepository for SqliteJobRepository {
                         && observed_at_ms >= 0
                         && observed_at_ms <= now_ms
                         && now_ms.saturating_sub(observed_at_ms) <= 60_000;
+                    let runtime = runtime_json
+                        .map(|runtime| serde_json::from_str(&runtime))
+                        .transpose()
+                        .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
                     (
                         Some(status),
                         u64::try_from(network_generation).ok(),
                         Some(observed_at_ms),
                         fresh,
+                        runtime,
                     )
                 } else {
-                    (None, None, None, false)
+                    (None, None, None, false, None)
                 };
                 Ok(conductor_core::OverlayPeerDiagnostic {
                     assignment,
@@ -1596,6 +1691,7 @@ impl JobRepository for SqliteJobRepository {
                     observation_network_generation,
                     observation_at_ms,
                     observation_fresh,
+                    runtime,
                     reachability: conductor_core::OverlayReachability::NotVerified,
                 })
             })

@@ -172,6 +172,35 @@ pub struct OverlayPeerObservation {
     pub applied_network_generation: u64,
     pub observed_at_ms: i64,
     pub status: OverlayPeerObservationStatus,
+    #[serde(default)]
+    pub runtime: Option<OverlayRuntimeDiagnostic>,
+}
+
+/// Bounded runtime state observed by the worker's privileged overlay helper.
+/// This reports interface and direct transport state; it is not an application
+/// reachability assertion.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OverlayRuntimeDiagnostic {
+    pub interface_name: String,
+    pub interface_up: bool,
+    pub local_address: Ipv4Addr,
+    pub mtu: u16,
+    pub installed_routes: Vec<Ipv4Addr>,
+    pub direct_links: Vec<OverlayDirectLinkDiagnostic>,
+}
+
+/// Current or most recently observed Iroh connection state for an authorized
+/// peer. Only direct socket addresses are representable here.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OverlayDirectLinkDiagnostic {
+    pub endpoint_id: OverlayEndpointId,
+    pub connected: bool,
+    pub selected_address: Option<SocketAddr>,
+    pub last_handshake_at_ms: Option<i64>,
+    pub udp_tx_bytes: u64,
+    pub udp_rx_bytes: u64,
 }
 
 /// Manager view that keeps desired assignment separate from the worker's
@@ -184,6 +213,7 @@ pub struct OverlayPeerDiagnostic {
     pub observation_network_generation: Option<u64>,
     pub observation_at_ms: Option<i64>,
     pub observation_fresh: bool,
+    pub runtime: Option<OverlayRuntimeDiagnostic>,
     pub reachability: OverlayReachability,
 }
 

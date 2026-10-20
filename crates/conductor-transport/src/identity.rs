@@ -1265,6 +1265,7 @@ mod tests {
             applied_network_generation: candidate_ack.network_generation,
             observed_at_ms: 0,
             status: conductor_core::OverlayPeerObservationStatus::Applied,
+            runtime: None,
         };
         let report = worker_client
             .post(format!(

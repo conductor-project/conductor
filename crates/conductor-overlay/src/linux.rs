@@ -108,6 +108,20 @@ impl LinuxOverlayInterface {
         self.local_address
     }
 
+    /// Return the addresses of routes currently installed by this interface.
+    pub async fn installed_peer_routes(&self) -> io::Result<Vec<Ipv4Addr>> {
+        let mut routes = self
+            .route_snapshot()
+            .await?
+            .into_iter()
+            .filter(|route| self.owns_route(route))
+            .filter_map(|route| route_destination(&route))
+            .collect::<Vec<_>>();
+        routes.sort_unstable();
+        routes.dedup();
+        Ok(routes)
+    }
+
     /// Replace the peer route set. Existing host routes are left untouched;
     /// an address occupied by a non-Conductor route is reported as a conflict.
     pub async fn reconcile_routes(&mut self, desired: &BTreeSet<Ipv4Addr>) -> io::Result<()> {

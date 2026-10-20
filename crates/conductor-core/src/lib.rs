@@ -96,10 +96,11 @@ pub use worker_id::WorkerId;
 mod overlay_network;
 pub use overlay_network::{
     MAX_OVERLAY_DIRECT_CANDIDATES, OVERLAY_PEER_CONFIGURATION_SCHEMA_VERSION,
-    OverlayDirectCandidateAcknowledgement, OverlayDirectCandidateAdvertisement, OverlayEndpointId,
-    OverlayNetworkDomainConfig, OverlayPeer, OverlayPeerAssignment, OverlayPeerConfiguration,
-    OverlayPeerDiagnostic, OverlayPeerObservation, OverlayPeerObservationStatus, OverlayPeerState,
-    OverlayReachability, valid_overlay_direct_candidates,
+    OverlayDirectCandidateAcknowledgement, OverlayDirectCandidateAdvertisement,
+    OverlayDirectLinkDiagnostic, OverlayEndpointId, OverlayNetworkDomainConfig, OverlayPeer,
+    OverlayPeerAssignment, OverlayPeerConfiguration, OverlayPeerDiagnostic, OverlayPeerObservation,
+    OverlayPeerObservationStatus, OverlayPeerState, OverlayReachability, OverlayRuntimeDiagnostic,
+    valid_overlay_direct_candidates,
 };
 #[path = "structs/network_domain_id.rs"]
 mod network_domain_id;
