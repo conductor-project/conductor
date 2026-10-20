@@ -186,27 +186,29 @@ impl LinuxOverlayHelperClient {
             .map(|peer| peer.worker_address)
             .collect::<Vec<_>>();
         expected_routes.sort_unstable();
-        let runtime_valid = response.runtime.as_ref().is_some_and(|runtime| {
-            let link_ids_valid = runtime.direct_links.len() <= crate::MAX_OVERLAY_PEERS
-                && runtime.direct_links.iter().all(|link| {
-                    configuration
-                        .peers
-                        .iter()
-                        .any(|peer| peer.endpoint_id.as_ref() == link.endpoint_id.as_str())
-                        && link.selected_address.is_none_or(|address| {
-                            conductor_core::valid_overlay_direct_candidates(&[address])
-                        })
-                        && link
-                            .last_handshake_at_ms
-                            .is_none_or(|time| (0..=current_time_ms()).contains(&time))
-                });
-            runtime.interface_name == self.interface_name
-                && runtime.interface_up
-                && runtime.local_address == configuration.worker_address
-                && runtime.mtu as usize == crate::MAX_OVERLAY_PACKET_BYTES
-                && runtime.installed_routes == expected_routes
-                && link_ids_valid
-        });
+        let runtime_valid =
+            match response.runtime.as_ref() {
+                None => expected_event == "stopped",
+                Some(runtime) => {
+                    let link_ids_valid =
+                        runtime.direct_links.len() <= crate::MAX_OVERLAY_PEERS
+                            && runtime.direct_links.iter().all(|link| {
+                                configuration.peers.iter().any(|peer| {
+                                    peer.endpoint_id.as_ref() == link.endpoint_id.as_str()
+                                }) && link.selected_address.is_none_or(|address| {
+                                    conductor_core::valid_overlay_direct_candidates(&[address])
+                                }) && link
+                                    .last_handshake_at_ms
+                                    .is_none_or(|time| (0..=current_time_ms()).contains(&time))
+                            });
+                    runtime.interface_name == self.interface_name
+                        && runtime.interface_up
+                        && runtime.local_address == configuration.worker_address
+                        && runtime.mtu as usize == crate::MAX_OVERLAY_PACKET_BYTES
+                        && runtime.installed_routes == expected_routes
+                        && link_ids_valid
+                }
+            };
         if response.event != expected_event
             || response.worker_id.as_ref() != Some(&self.worker_id)
             || response.interface_name.as_deref() != Some(self.interface_name.as_str())
