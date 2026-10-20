@@ -3,7 +3,7 @@ type: Architecture decision
 title: Overlay networking architecture
 description: Selected Rust-native direct-only host overlay contracts for encrypted worker-to-worker workload traffic.
 status: selected
-source_revision: b44c4b9886240b444c8ccc08535d6b59a9f014bc
+source_revision: 93ca0917679bc12fd575236c475dcc0c00dfe9fd
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../crates/conductor-core/src/lib.rs
