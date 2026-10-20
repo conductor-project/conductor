@@ -3,8 +3,8 @@ type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
 status: pending external testbed
-source_revision: 9397e7653e6763b58977a113761d9b98ed9acfa0
-source_reviewed_at: 2026-10-19
+source_revision: 36b84f6c94acd728a47a83516d1d575bb989c5ce
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
     title: Accepted overlay architecture and boundaries
@@ -153,7 +153,12 @@ privileges, host reboot, or direct traffic on independent hosts.
 
 A historical workspace debug suite passed 291 tests on the local macOS host for
 source commit `5e23aea68b4a99e424e96842a04ce756fa79795f`; that revision predates
-the current direct-only rework and is not evidence for this snapshot. GitHub
-Actions checks were not awaited because of the reported outage. Current local
-checks and source revisions are recorded in the qualification PR description.
-Replace this evidence record when independent-host runs are performed.
+the current direct-only rework and is not evidence for this snapshot. For source
+revision `36b84f6c94acd728a47a83516d1d575bb989c5ce`, the dependency policy,
+formatting, workspace Clippy, workspace check, and full workspace test suite
+passed locally (292 tests across 32 suites). The probe also passed a 64 KiB
+loopback smoke transfer on 2026-10-20. These checks do not qualify two-host
+overlay behavior, DNS-discovered traffic, packet-capture encryption, or the
+platform privilege boundary. GitHub Actions were not awaited because of the
+reported outage. Replace this evidence record when independent-host runs are
+performed.
