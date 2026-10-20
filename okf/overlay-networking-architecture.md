@@ -1,10 +1,10 @@
 ---
 type: Architecture decision
 title: Overlay networking architecture
-description: Proposed Rust-native host overlay contracts for encrypted worker-to-worker workload traffic.
-status: proposed
-source_revision: 1e7516055fd9572c724df85d00c3111883c58ed7
-source_reviewed_at: 2026-10-19
+description: Selected Rust-native direct-only host overlay contracts for encrypted worker-to-worker workload traffic.
+status: selected
+source_revision: 958bdc7103db9413704767462f2959423f7838b7
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../crates/conductor-core/src/lib.rs
     title: Transport-neutral worker contracts
@@ -26,12 +26,14 @@ sources:
 
 # Decision status
 
-This is the architecture proposal for MVP5 issue #152. Rust-native components
-are a requirement. The proposal selects Iroh as the encrypted peer transport,
-with a small Conductor-owned layer-3 packet adapter to connect ordinary
-workload IP traffic. No backend is implemented, no dependency is added, and no
-cross-host network behavior has been tested or qualified. Issue #154 must
-prove the packet path before support claims change.
+This is the architecture decision for MVP5 issue #152. Rust-native components
+are a requirement. The selected stack is one Iroh endpoint per worker, the
+`tun-rs` OS TUN interface, a Conductor-owned layer-3 packet adapter, and
+manager-distributed direct underlay candidates. Relays, public/default address
+discovery, and automatic NAT traversal are disabled for the initial topology.
+The implementation PRs add the worker packet path and privilege boundary, but
+cross-host behavior has not been qualified. Issue #156 must prove the direct
+packet path before support claims change.
 
 ## Goal and boundary
 
@@ -42,28 +44,29 @@ authorization. The existing manager-worker TLS connection remains the
 independent authenticated control path; it must work before overlay bootstrap
 and during overlay failure.
 
-Iroh is a Rust library for authenticated QUIC connections, direct path
-discovery/hole punching, and relay fallback. It exposes QUIC streams and
-datagrams; it is not a ready-made virtual-IP network. Conductor must connect a
-TUN interface to authorized Iroh peers, preserve IP packet boundaries, route
-packets by manager-assigned address, and report transport and interface state
-separately. This reuses Iroh for transport, peer authentication, and path
-management without implementing a crypto or NAT-traversal protocol in the
-workspace. The TUN packet adapter and host route lifecycle remain Conductor
-code and must stay small, bounded, and independently testable.
+Iroh is a Rust library for authenticated QUIC connections, direct connectivity,
+streams, and datagrams; it is not a ready-made virtual-IP network. Conductor
+uses one Iroh endpoint per worker for all local services. It connects the
+`tun-rs` TUN interface to authorized Iroh peers, preserves IP packet
+boundaries, routes packets by manager-assigned address, and reports transport
+and interface state separately. Iroh relay mode and public/default address
+discovery are explicitly disabled. Managers distribute EndpointIds and
+validated direct IP:port candidates over the authenticated control plane;
+peers must be directly reachable on the declared LAN/VPC or configured
+topology. Conductor owns packet adaptation, policy, routes, and lifecycle; it
+does not implement cryptography or NAT traversal.
 
-Pin a stable Iroh release from crates.io, not a moving Git branch. Upstream
-announced wire/API stability for Iroh 1.0 in June 2026; docs.rs lists 1.3.0
-as the latest release at this review. Verify the selected release and its
-transitive dependency graph against Conductor's pinned Rust 1.99.1 toolchain
-before adding it. A docs.rs build using a newer compiler is not evidence of
-minimum compiler compatibility.
+Pin published Iroh and `tun-rs` releases from crates.io, not moving Git
+branches. PR #187 pins Iroh 1.3.0. Verify the selected releases and their
+transitive dependency graph against Conductor's pinned Rust 1.99.1 toolchain.
+A docs.rs build using a newer compiler is not evidence of minimum compiler
+compatibility.
 
 ## Alternatives considered
 
 | Option | Capability and operational shape | Assessment for MVP5 |
 | --- | --- | --- |
-| Iroh library plus Conductor L3 adapter | Rust library for authenticated QUIC peer connections, direct path discovery/hole punching, and relay fallback. MIT/Apache-2.0. Self-hostable relay. Needs a TUN adapter, manager-owned membership/address contracts, and a privileged networking boundary. | Selected proposal. It meets the Rust-native constraint and supplies mature transport/path management. The packet adapter is the main implementation risk and must pass a two-host prototype before broad implementation. |
+| Iroh library plus Conductor L3 adapter | Rust library for authenticated QUIC peer connections, with direct addresses supplied by Conductor. MIT/Apache-2.0. Needs a TUN adapter, manager-owned membership/address contracts, and a privileged networking boundary. | Selected. It meets the Rust-native constraint and supplies QUIC transport and endpoint identity. Relays and public/default address discovery are disabled; direct UDP reachability is a deployment prerequisite. The packet adapter remains the main qualification risk. |
 | Nebula | Complete host overlay with certificates, assigned IPs, firewall rules, lighthouse discovery, hole punching, and relay support. MIT. Runs as a separate Go daemon and has its own certificate/configuration lifecycle. | Not selected: the network daemon is Go, contrary to the Rust-native requirement. It remains a useful feature benchmark for the operator surface and failure cases. |
 | ZeroTier One | Complete virtual networking daemon with peer-to-peer encrypted links, virtual Ethernet, controller-managed membership, and relaying. The main daemon is C++; the repository identifies MPL-2.0 and non-free/source-available code. | Not selected: it is not Rust-native and introduces a separate daemon/controller plus licensing review. |
 | OpenZiti | Self-hostable identity-based service overlay with controllers, routers, and endpoint SDKs/tunnelers; Apache-2.0. | Not selected: it focuses on identity-authorized service access, not manager-assigned host IP networking, and its core components are not Rust-native. |
@@ -93,9 +96,10 @@ contracts as a drop-in component.
 
 These projects are prior art rather than evidence of Conductor compatibility or
 production qualification. Review their exact source revisions, protocol and
-license before reusing code. A `tun-rs`-style device crate can supply OS TUN
-plumbing but does not supply peer mapping, manager authorization, allocation,
-or packet lifecycle behavior.
+license before reusing code. `tun-rs` supplies OS TUN device access but does
+not supply peer mapping, manager authorization, allocation, packet
+encapsulation, or route lifecycle behavior. Its selected release and enabled
+features must remain recorded in the dependency decision.
 
 ## Protocol and ownership contracts
 
@@ -120,13 +124,16 @@ that do not overlap networks outside Conductor's view.
 
 Control messages are versioned JSON contracts carried through the existing
 authenticated worker transport. A snapshot names the domain, both generations,
-the worker's assigned address, allowed peer public identities and endpoint
-addresses, relay configuration, lease timestamps, and config schema version.
-Unknown fields are rejected. No Iroh secret key or workload payload crosses
-the manager API. Reports separately identify desired generation, applied
-generation, local interface/route state, peer path (direct or relayed), and
-bounded probe results. A connection or handshake is not evidence that an
-application listener is reachable.
+the worker's assigned address, allowed peer public identities and direct
+underlay candidates, lease timestamps, and config schema version. Peer
+candidates are reachability hints, never identity or authorization. Workers
+advertise bounded direct candidates through the authenticated worker session;
+the manager validates and distributes them with the peer map. Unknown fields
+are rejected. No Iroh secret key or workload payload crosses the manager API.
+Reports separately identify desired generation, applied generation, local
+interface/route state, authenticated Iroh connection state, selected direct
+path, and bounded probe results. A connection or handshake is not evidence
+that an application listener is reachable.
 
 Workers persist the highest accepted generation per domain and peer
 incarnation. Lower generations and retired peer identities are rejected,
@@ -161,13 +168,13 @@ last configuration delivery that included the peer, plus the configured clock
 skew allowance. This bound is a policy proposal, not a measurement. MVP5 must
 measure delivery and expiry timing, including restart and an offline peer.
 
-Direct connectivity is attempted where possible. Relay fallback uses an
-operator-configured Iroh relay; production does not silently depend on the
-public shared relay, which upstream describes as rate-limited and without an
-uptime guarantee. An operator must permit the configured outbound QUIC/relay
-traffic. MVP5 does not promise connectivity where both peers and the relay
-are unreachable. Host-network-only deployments remain an explicit supported
-mode.
+The initial overlay uses only directly reachable UDP candidates on declared
+LAN/VPC or explicitly configured underlay topologies. Iroh relay mode and
+public/default address discovery are disabled; no dedicated Conductor relay
+role or worker relay server is used. A peer pair with blocked or unavailable
+direct UDP reachability fails explicitly after bounded retries. Managers do
+not carry workload packets. Host-network-only deployments remain an explicit
+supported mode.
 
 ## Platform and privilege boundary
 
@@ -192,7 +199,7 @@ boundary and safe API require implementation review in #154.
 
 | Risk | Contract and limit |
 | --- | --- |
-| Underlay observer or untrusted relay | Iroh authenticates/encrypts peer QUIC connections; relays forward encrypted data. Relay metadata and traffic volume remain visible. Verify the selected release's security properties and configuration in implementation review. |
+| Underlay observer | Iroh authenticates/encrypts peer QUIC connections. Underlay addresses and traffic volume remain observable. Verify the selected release's security properties and configuration in implementation review. |
 | Stolen worker endpoint key | Manager binds the key to the enrolled worker identity, supports replacement/revocation, and expires peer snapshots within the configured lease. Offline peers can remain effective only to the lease bound. |
 | Stale or replayed manager configuration | Authenticated existing transport, strict schema/version checks, monotonic durable generations, expiry, and retired identity tombstones reject stale state. |
 | Compromised workload on an overlay-enabled worker | Overlay membership is host-level reachability, not service authorization or workload isolation. Workloads execute with daemon-user network access; MVP5 makes no claim that same-host workloads cannot reach overlay peers. |
@@ -213,18 +220,16 @@ authenticated manager-worker path. The current platform page records Linux
 x86_64, Linux arm64, and Apple silicon CI, but no independent-host overlay
 qualification.
 
-Before adding Iroh as a dependency, inspect the `iroh-lan` packet path and
-prototype the minimum Conductor-owned path on two Linux hosts: manager-enrolled
-endpoint identities, TUN packet forwarding, Iroh QUIC datagrams or a bounded
-packet framing scheme, a self-hosted relay fallback, and a request/reply
-application probe. Measure direct and relayed MTU, reconnect, throughput, and
-packet loss. Verify compile compatibility with Rust 1.99.1, dependency
-footprint, feature flags, and third-party safety boundary. Treat the adapter
-and privileged route lifecycle as substantial implementation work, not as
-functionality supplied by Iroh. If the packet path fails the prototype, revise
-the Rust-native backend or the milestone's addressed-IP acceptance before
-implementation proceeds; Iroh peer connectivity alone does not provide the
-required host overlay.
+The implementation uses Iroh and `tun-rs` as dependencies. The two-host
+qualification must exercise manager-enrolled endpoint identities, direct-only
+TUN packet forwarding, the selected Iroh datagram/stream framing contract, and
+a request/reply application probe while relays and public discovery are
+unavailable. Measure MTU, reconnect, throughput, and packet loss; verify the
+direct UDP prerequisites and bounded failure when they are not met. Keep the
+dependency versions, enabled features, transitive footprint, and third-party
+safety boundary in the dependency decision. Treat the adapter and privileged
+route lifecycle as substantial Conductor implementation, not functionality
+supplied by Iroh.
 
 This source review did not run tests, construct an overlay, validate a
 privileged helper, or access a two-host testbed. No network behavior or
