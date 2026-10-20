@@ -34,6 +34,41 @@ is not authentication. Resolver installation is host-specific and should be
 performed by an administrator; see the [service discovery operations guide](../../../okf/service-discovery.md)
 for host setup and rollback procedures.
 
+The existing `suffix` publishes host-network addresses. To publish overlay
+addresses as a separate namespace, configure both `overlayNetworkDomainId`
+and `overlaySuffix` inside `service_dns`. The manager verifies the network
+domain at startup and publishes an endpoint only while its service catalog
+entry is eligible and its worker has an active, unexpired assignment in that
+domain. The overlay namespace uses the manager-assigned worker IPv4 address
+with the catalog's allocated service port; the host-network suffix keeps its
+existing advertised-address behavior. Separate suffixes avoid returning a mix
+of host-only and overlay-only addresses to the same name. The current overlay
+address pools are IPv4, so overlay lookups return A and SRV data; AAAA queries
+produce NODATA. A workload published through the overlay suffix must bind its
+allocated service port on the worker overlay address or a wildcard address;
+binding only to a host-only interface makes the DNS result unreachable.
+
+```json
+{
+  "service_dns": {
+    "listen": "10.90.0.1:53",
+    "suffix": "conductor.internal",
+    "overlayNetworkDomainId": "workers-east",
+    "overlaySuffix": "overlay.internal",
+    "allowedClients": ["10.90.0.0/24"]
+  }
+}
+```
+
+Use `backend.default.service.conductor.internal` for host-network discovery
+and `backend.default.service.overlay.internal` for overlay discovery. A TCP
+SRV lookup under either suffix preserves the address/port pair in its target;
+ordinary A records do not communicate dynamic service ports. Overlay DNS
+reflects current manager state and has a 2-second positive TTL. An expired or
+revoked peer is withdrawn from the overlay namespace even if its host-network
+catalog entry remains eligible. DNS publication does not prove direct-path
+reachability or application connectivity.
+
 ## DNS response and freshness semantics
 
 Successful A, AAAA, and TCP SRV records have a 2-second TTL. The manager

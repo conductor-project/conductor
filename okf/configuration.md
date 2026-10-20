@@ -44,6 +44,19 @@ state directories under `./state`. It uses local API access, two worker slots,
 and disabled cgroup and Landlock enforcement. Resolve its relative state paths
 from the repository root when using it.
 
+# Optional service DNS
+
+The `service_dns` listener can continue serving host-network records through
+its `suffix`. Overlay publication is opt-in and uses the separate
+`overlayNetworkDomainId` and `overlaySuffix` fields together. The manager
+then publishes eligible service endpoints at the assigned worker overlay IPv4
+address and allocated service port under that suffix. The overlay network
+domain must already exist when the manager starts. Host and overlay names stay
+separate so a lookup does not mix addresses from different network contexts.
+Resolver forwarding and search domains remain administrator-managed. See the
+[service discovery bundle](../crates/conductor-api/okf/service-discovery.md)
+for the strict JSON example, SRV behavior, and limitations.
+
 # Operator access
 
 Local API mode is unauthenticated and intended for a loopback-only listener.

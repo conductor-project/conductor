@@ -205,7 +205,12 @@ prove that the address is reachable from the caller. Use `watch` to long-poll
 for a catalog change. The current API does not provide watch cursors or
 versions, so the CLI retries transient connection and capacity failures within
 the requested deadline; Ctrl-C stops observation without changing deployment
-state.
+state. The optional manager Hickory listener can expose these services through
+a separate overlay DNS suffix, resolving active workers to their assigned
+overlay addresses while preserving the existing host-network suffix. Overlay
+TCP SRV records preserve each assigned service port; see the [service
+discovery reference](crates/conductor-api/okf/service-discovery.md) for
+configuration and resolver limits.
 
 ```sh
 ./target/debug/conductor service endpoints mvp3-demo-service --output json

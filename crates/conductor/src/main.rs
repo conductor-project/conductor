@@ -205,6 +205,11 @@ struct ServiceDnsListenerConfig {
     listen: SocketAddr,
     #[serde(default = "default_service_dns_suffix")]
     suffix: String,
+    /// Optional separate namespace for overlay-addressed service endpoints.
+    #[serde(default)]
+    overlay_network_domain_id: Option<String>,
+    #[serde(default)]
+    overlay_suffix: Option<String>,
     /// Empty means loopback clients only. Non-loopback exposure must be explicit.
     #[serde(default)]
     allowed_clients: Vec<String>,
@@ -1360,6 +1365,9 @@ fn log_started(
     if let Some(service_dns) = &config.service_dns {
         event["serviceDnsAddress"] = serde_json::Value::String(service_dns.listen.to_string());
         event["serviceDnsSuffix"] = serde_json::Value::String(service_dns.suffix.clone());
+        if let Some(suffix) = &service_dns.overlay_suffix {
+            event["serviceDnsOverlaySuffix"] = serde_json::Value::String(suffix.clone());
+        }
     }
     eprintln!("{}", serde_json::to_string(&event)?);
     Ok(())
@@ -1481,6 +1489,19 @@ fn service_dns_config(
     let service_dns = conductor_api::dns::ServiceDnsConfig {
         listen: configured.listen,
         suffix: configured.suffix.clone(),
+        overlay: match (
+            configured.overlay_network_domain_id.as_deref(),
+            configured.overlay_suffix.as_deref(),
+        ) {
+            (Some(domain_id), Some(suffix)) => Some(conductor_api::dns::OverlayDnsConfig {
+                network_domain_id: NetworkDomainId::new(domain_id.to_owned())?,
+                suffix: suffix.to_owned(),
+            }),
+            (None, None) => None,
+            _ => {
+                return Err("service DNS overlay_network_domain_id and overlay_suffix must be configured together".into());
+            }
+        },
         allowed_clients,
     };
     service_dns.validate().map_err(std::io::Error::other)?;
@@ -2103,6 +2124,24 @@ mod tests {
             .expect("loopback-only access defaults")
             .expect("configured DNS listener");
         assert_eq!(converted.allowed_clients.len(), 2);
+
+        let overlay: super::ServiceDnsListenerConfig = serde_json::from_str(
+            r#"{"listen":"127.0.0.1:8053","overlayNetworkDomainId":"workers-east","overlaySuffix":"overlay.internal"}"#,
+        )
+        .expect("overlay DNS fields are accepted");
+        let converted = super::service_dns_config(Some(&overlay))
+            .expect("overlay DNS config converts")
+            .expect("configured DNS listener");
+        assert_eq!(
+            converted.overlay.expect("overlay namespace").suffix,
+            "overlay.internal"
+        );
+
+        let incomplete_overlay: super::ServiceDnsListenerConfig = serde_json::from_str(
+            r#"{"listen":"127.0.0.1:8053","overlayNetworkDomainId":"workers-east"}"#,
+        )
+        .expect("partial overlay config deserializes strictly");
+        assert!(super::service_dns_config(Some(&incomplete_overlay)).is_err());
 
         let remote: super::ServiceDnsListenerConfig =
             serde_json::from_str(r#"{"listen":"192.0.2.53:53"}"#)

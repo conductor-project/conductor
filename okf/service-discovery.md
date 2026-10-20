@@ -18,7 +18,24 @@ sources:
 
 Conductor can expose service catalog records through an optional UDP and TCP DNS listener. The listener is disabled when `service_dns` is omitted. A loopback listener gets a loopback-only client range by default. A non-loopback listener must list explicit `allowedClients` CIDRs; the daemon rejects a non-loopback listener without them. The lower-level DNS listener rejects an empty client allowlist. The allowlist is an address filter, not authentication. Restrict it to workload hosts that need discovery.
 
-The default DNS suffix is `conductor.internal`. The stable FQDN is `<service>.default.service.<suffix>.`; `default` is the only supported namespace. A records contain advertised IPv4 addresses, AAAA records contain advertised IPv6 addresses, and named TCP ports are returned as SRV records. SRV is needed for dynamically assigned host ports. Each SRV target identifies its endpoint using the advertised IP and port; querying that target returns only the matching eligible address. Service-wide A/AAAA queries continue to aggregate all eligible replicas. The [API service discovery reference](../crates/conductor-api/okf/service-discovery.md) documents record semantics, cache convergence, listener behavior, and verification limits.
+The default DNS suffix is `conductor.internal`. The stable FQDN is
+`<service>.default.service.<suffix>.`; `default` is the only supported
+namespace. Overlay DNS can use `overlayNetworkDomainId` and `overlaySuffix`
+together to publish active peers under a separate name suffix. For example,
+`backend.default.service.overlay.internal` resolves to the worker's assigned
+overlay IPv4 address; SRV records preserve the allocated service port.
+Workloads must bind their service port on the worker overlay address or a
+wildcard address. Existing host-network suffix answers are unchanged. The
+manager must have the referenced overlay domain before startup, and expired or
+revoked peer assignments are withdrawn. Configure host resolver forwarding
+for each desired suffix separately; see the [API service discovery
+reference](../crates/conductor-api/okf/service-discovery.md). Host-network A
+records contain advertised IPv4 addresses, AAAA records contain advertised
+IPv6 addresses, and named TCP ports are returned as SRV records. SRV is needed
+for dynamically assigned ports. Each SRV target identifies its endpoint using
+the advertised IP and port; querying that target returns only the matching
+eligible address. Service-wide A/AAAA queries continue to aggregate eligible
+replicas.
 
 For a single-host daemon, a loopback listener can use the configured default client range:
 
@@ -61,7 +78,7 @@ sudo resolvectl domain tun0 '~service.conductor.internal' \
   default.service.conductor.internal
 ```
 
-The tilde-prefixed domain routes only `service.conductor.internal` queries to the dedicated link. The unprefixed `default.service.conductor.internal` domain expands the short name `backend` to its FQDN. For another configured suffix, substitute `service.<suffix>` and `default.service.<suffix>`. Omit the unprefixed search domain when short names are not wanted. Verify the full name with `resolvectl query backend.default.service.conductor.internal`, the short name with `resolvectl query backend`, then verify an unrelated name still uses its ordinary resolver. To roll back, restore the exact DNS server and domain lists recorded before setup using `resolvectl dns` and `resolvectl domain`. Do not use `resolvectl revert` if the interface has other per-link DNS settings that must remain. This procedure requires systemd-resolved to be the active resolver. On NetworkManager-managed systems, configure split DNS through the connection settings instead of mixing network managers.
+The tilde-prefixed domains route only the configured service zones to the dedicated link. For overlay publication, add `~service.overlay.internal` and the optional unprefixed search domain `default.service.overlay.internal` alongside the host-network suffix. Verify both full names and any desired short names, then verify an unrelated name still uses its ordinary resolver. To roll back, restore the exact DNS server and domain lists recorded before setup using `resolvectl dns` and `resolvectl domain`. Do not use `resolvectl revert` if the interface has other per-link DNS settings that must remain. This procedure requires systemd-resolved to be the active resolver. On NetworkManager-managed systems, configure split DNS through the connection settings instead of mixing network managers.
 
 ## macOS
 
