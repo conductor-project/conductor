@@ -108,10 +108,14 @@ copying an outdated schema description.
 Linux standalone workers may additionally set both
 `worker_overlay_network_domain_id` and the absolute
 `worker_overlay_helper_binary` path to join an overlay domain. The helper owns
-one worker Iroh endpoint, packet adapter, TUN interface, and overlay routes; it
-is a separate process and should be installed with only `CAP_NET_ADMIN`. These
-fields are rejected for `all` and `manager` roles. Other platforms reject
-overlay-enabled workers.
+one worker Iroh endpoint, packet adapter, TUN interface, and overlay routes. It
+currently requires `CAP_NET_ADMIN`, but assigning a file capability to the
+helper also lets any workload running as the Conductor daemon user invoke it
+with that capability. Do not use that setup with workloads that are not trusted
+to administer host networking; file permissions alone cannot isolate the
+helper from same-user workloads. A separate authenticated privilege boundary
+is still needed. These fields are rejected for `all` and `manager` roles. Other
+platforms reject overlay-enabled workers.
 
 The manager or combined `all` role can publish host-network service DNS through
 `service_dns.suffix`. Overlay publication is opt-in: configure both

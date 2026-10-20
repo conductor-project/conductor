@@ -69,11 +69,15 @@ separate state directory, identity file, and credential.
 
 An opt-in Linux worker can join a manager-owned overlay domain by setting
 `worker_overlay_network_domain_id` and the absolute path
-`worker_overlay_helper_binary`. Install the helper as a root-owned executable
-available only to the Conductor service account, and grant only that helper
-`CAP_NET_ADMIN`; the main `conductor` process and workload processes must not
-receive it. The helper runs the worker's single Iroh endpoint and packet
-adapter alongside the TUN and route lifecycle. The worker stores its Iroh secret in
+`worker_overlay_helper_binary`. The helper currently requires `CAP_NET_ADMIN`
+to configure TUN and routes, but a file capability on an executable also grants
+that capability when a workload running as the Conductor daemon user invokes
+the helper directly. File ownership and execute permissions cannot distinguish
+the daemon from its workloads because they share that user. Do not deploy the
+file-capability helper with workloads that are not trusted to administer host
+networking; a separate authenticated privilege boundary remains required. The
+helper runs the worker's single Iroh endpoint and packet adapter alongside the
+TUN and route lifecycle. The worker stores its Iroh secret in
 `worker_data_dir/overlay-identity.key` with owner-only permissions, registers
 the derived endpoint identity over worker mTLS, and refreshes its peer snapshot
 from the manager. The selected topology is direct-only: workers exchange

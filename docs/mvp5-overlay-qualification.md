@@ -65,7 +65,7 @@ or raw environment values in this document.
 | Overlay MTU and effective workload packet size | Pending |
 | Worker overlay addresses and domain ID | Pending |
 | Address pools and overlapping host routes checked | Pending |
-| Helper privilege and service-manager configuration | Pending |
+| Helper privilege and service-manager configuration | Pending; a file-capability helper can also be invoked by workloads running as the daemon user, so the current privilege boundary is not qualified for untrusted workloads |
 | Evidence directory and checksums | Pending |
 
 Use at least two independently booted Linux worker hosts on an underlay that
