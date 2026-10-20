@@ -2,8 +2,8 @@
 type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
-status: partial direct TUN/TCP test passed; TCP/UDP rerun and deployment qualification pending
-source_revision: 1bfbca0fb09ff493a20bb011d204279d6c7b579a
+status: partial TCP/UDP and manager-backed DNS coverage; deployment qualification pending
+source_revision: 5d0a934d0448e144930784180debbb8e22b917e6
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
@@ -174,7 +174,8 @@ answer's address/port pair rather than a hard-coded endpoint. The test queries
 the manager listener directly over DNS; it does not install or exercise the
 operating system's host resolver or exercise a production manager daemon. The
 host-resolver setup and rollback procedure above still needs deployment-host
-qualification.
+qualification. The combined cross-host DNS-to-application test is present but
+has not yet been executed on Linux at this source revision.
 
 # Basic traffic procedure
 
