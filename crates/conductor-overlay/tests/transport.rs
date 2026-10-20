@@ -62,12 +62,28 @@ async fn two_local_iroh_endpoints_exchange_authenticated_overlay_datagrams() {
         .expect("Iroh peer acceptance stays within ten seconds")
         .expect("accept only the manager-authorized endpoint A");
 
-    assert!(client_connection.paths().iter().any(|path| {
-        path.is_selected()
-            && matches!(path.remote_addr(), iroh::TransportAddr::Ip(address) if candidates_b.contains(address))
-    }));
+    let selected_candidate = client_connection
+        .paths()
+        .iter()
+        .find(|path| path.is_selected())
+        .and_then(|path| match path.remote_addr() {
+            iroh::TransportAddr::Ip(address) => Some(*address),
+            _ => None,
+        })
+        .expect("select an IP underlay path");
+    assert!(candidates_b.contains(&selected_candidate));
+    let capture_marker = format!(
+        "conductor-iroh-capture-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("test clock after Unix epoch")
+            .as_nanos()
+    );
+    println!("capture_selected_candidate={selected_candidate}");
+    println!("capture_marker={capture_marker}");
 
-    let forward_packet = ipv4_packet(overlay_a, overlay_b, b"forward-payload");
+    let forward_packet = ipv4_packet(overlay_a, overlay_b, capture_marker.as_bytes());
     send_packet(&client_connection, &forward_packet).expect("send a bounded IPv4 datagram");
     let received = tokio::time::timeout(
         Duration::from_secs(5),
@@ -78,7 +94,8 @@ async fn two_local_iroh_endpoints_exchange_authenticated_overlay_datagrams() {
     .expect("authenticate source address against endpoint A");
     assert_eq!(received.bytes, forward_packet);
 
-    let reverse_packet = ipv4_packet(overlay_b, overlay_a, b"reverse-payload");
+    let reverse_marker = format!("{capture_marker}-reverse");
+    let reverse_packet = ipv4_packet(overlay_b, overlay_a, reverse_marker.as_bytes());
     send_packet(&server_connection, &reverse_packet).expect("send the reverse IPv4 datagram");
     let received = tokio::time::timeout(
         Duration::from_secs(5),
