@@ -4,6 +4,7 @@ mod deployment_cli;
 mod diagnostics_cli;
 mod job_cli;
 mod operator_cli;
+mod overlay_probe_cli;
 mod run_cli;
 mod service_cli;
 mod state_lock;
@@ -73,6 +74,8 @@ enum Commands {
     Worker(worker_cli::WorkerArgs),
     /// Look up and watch manager-published service endpoints.
     Service(service_cli::ServiceArgs),
+    /// Send a bounded HTTP reachability probe through the local worker overlay.
+    Overlay(overlay_probe_cli::OverlayArgs),
     /// Check manager health, readiness, and metrics.
     Diagnostics(diagnostics_cli::DiagnosticsArgs),
     /// Inspect local version and database upgrade compatibility.
@@ -390,6 +393,7 @@ fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
         Commands::Deployment(args) => return Ok(deployment_cli::run(args)),
         Commands::Worker(args) => return Ok(worker_cli::run(args)),
         Commands::Service(args) => return Ok(service_cli::run(args)),
+        Commands::Overlay(args) => return Ok(overlay_probe_cli::run(args)),
         Commands::Diagnostics(args) => return Ok(diagnostics_cli::run(args)),
         Commands::Upgrade(args) => return Ok(upgrade_cli::run(args)),
         Commands::Backup(args) => return Ok(backup_cli::run(args)),
