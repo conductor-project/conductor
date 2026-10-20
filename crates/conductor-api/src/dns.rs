@@ -1099,6 +1099,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dns_listener_refuses_clients_outside_configured_ranges_over_udp_and_tcp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let state = IsolatedDnsState::new();
+        let manager = Arc::new(
+            JobService::open_sqlite(state.0.join("manager.sqlite3"))
+                .expect("open isolated manager database"),
+        );
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve DNS port");
+        let listen = probe.local_addr().expect("read reserved port");
+        drop(probe);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let _stop_on_drop = StopDnsOnDrop(Arc::clone(&shutdown));
+        let server = tokio::spawn(serve_service_dns(
+            ServiceDnsConfig {
+                listen,
+                suffix: "conductor.internal".to_owned(),
+                overlay: None,
+                allowed_clients: vec!["192.0.2.0/24".parse().expect("non-local test CIDR")],
+            },
+            manager,
+            Vec::new(),
+            Arc::clone(&shutdown),
+        ));
+
+        let query = dns_query("missing.default.service.conductor.internal.");
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind disallowed DNS client");
+        let response = dns_exchange(&socket, listen, query.clone()).await;
+        assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+
+        let mut stream = timeout(
+            Duration::from_secs(2),
+            tokio::net::TcpStream::connect(listen),
+        )
+        .await
+        .expect("connect to DNS-over-TCP listener")
+        .expect("TCP connection succeeds");
+        let length = u16::try_from(query.len()).expect("DNS query fits TCP frame");
+        stream
+            .write_all(&length.to_be_bytes())
+            .await
+            .expect("write DNS-over-TCP frame length");
+        stream
+            .write_all(&query)
+            .await
+            .expect("write DNS-over-TCP query");
+        let response_length = timeout(Duration::from_secs(2), stream.read_u16())
+            .await
+            .expect("DNS-over-TCP response length arrives")
+            .expect("read DNS-over-TCP response length");
+        let mut response_bytes = vec![0; usize::from(response_length)];
+        timeout(
+            Duration::from_secs(2),
+            stream.read_exact(&mut response_bytes),
+        )
+        .await
+        .expect("DNS-over-TCP response arrives")
+        .expect("read DNS-over-TCP response");
+        let response = Message::from_vec(&response_bytes).expect("decode TCP DNS response");
+        assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+
+        shutdown.store(true, Ordering::Release);
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("DNS server stops after shutdown")
+            .expect("DNS task joins")
+            .expect("DNS server exits cleanly");
+    }
+
+    #[tokio::test]
     async fn overlay_dns_suffix_uses_its_configured_network_domain() {
         let state = IsolatedDnsState::new();
         let manager = Arc::new(
