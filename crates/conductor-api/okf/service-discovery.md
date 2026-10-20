@@ -36,10 +36,12 @@ for host setup and rollback procedures.
 
 The existing `suffix` publishes host-network addresses. To publish overlay
 addresses as a separate namespace, configure both `overlayNetworkDomainId`
-and `overlaySuffix` inside `service_dns`. The manager verifies the network
-domain at startup and publishes an endpoint only while its service catalog
-entry is eligible and its worker has an active, unexpired assignment in that
-domain. The overlay namespace uses the manager-assigned worker IPv4 address
+and `overlaySuffix` inside `service_dns`. The DNS listener validates the domain
+ID and suffix at startup; the network domain may be created later through the
+operator API. Overlay lookups fail with `SERVFAIL` until the domain exists,
+then publish an endpoint only while its service catalog entry is eligible and
+its worker has an active, unexpired assignment in that domain. The overlay
+namespace uses the manager-assigned worker IPv4 address
 with the catalog's allocated service port; the host-network suffix keeps its
 existing advertised-address behavior. Separate suffixes avoid returning a mix
 of host-only and overlay-only addresses to the same name. The current overlay

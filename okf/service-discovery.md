@@ -26,8 +26,9 @@ together to publish active peers under a separate name suffix. For example,
 overlay IPv4 address; SRV records preserve the allocated service port.
 Workloads must bind their service port on the worker overlay address or a
 wildcard address. Existing host-network suffix answers are unchanged. The
-manager must have the referenced overlay domain before startup, and expired or
-revoked peer assignments are withdrawn. Configure host resolver forwarding
+referenced overlay domain can be created after manager startup; overlay
+lookups return `SERVFAIL` until it exists. Expired or revoked peer assignments
+are withdrawn. Configure host resolver forwarding
 for each desired suffix separately; see the [API service discovery
 reference](../crates/conductor-api/okf/service-discovery.md). Host-network A
 records contain advertised IPv4 addresses, AAAA records contain advertised

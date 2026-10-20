@@ -51,9 +51,10 @@ its `suffix`. Overlay publication is opt-in and uses the separate
 `overlayNetworkDomainId` and `overlaySuffix` fields together. The manager
 then publishes eligible service endpoints at the assigned worker overlay IPv4
 address and allocated service port under that suffix. The overlay network
-domain must already exist when the manager starts. Host and overlay names stay
-separate so a lookup does not mix addresses from different network contexts.
-Resolver forwarding and search domains remain administrator-managed. See the
+domain can be created after manager startup; overlay lookups fail with
+`SERVFAIL` until it exists. Host and overlay names stay separate so a lookup
+does not mix addresses from different network contexts. Resolver forwarding
+and search domains remain administrator-managed. See the
 [service discovery bundle](../crates/conductor-api/okf/service-discovery.md)
 for the strict JSON example, SRV behavior, and limitations.
 

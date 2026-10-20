@@ -102,17 +102,6 @@ pub async fn serve_service_dns(
     shutdown: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     config.validate().map_err(std::io::Error::other)?;
-    if let Some(overlay) = &config.overlay {
-        match manager.get_overlay_network_domain(&overlay.network_domain_id) {
-            Ok(Some(_)) => {}
-            Ok(None) | Err(_) => {
-                return Err(std::io::Error::other(
-                    "service DNS overlay network domain is unavailable",
-                )
-                .into());
-            }
-        }
-    }
     let udp_socket = UdpSocket::bind(config.listen).await?;
     let tcp_listener = TcpListener::bind(udp_socket.local_addr()?).await?;
     let handler = ServiceDnsHandler {
@@ -1111,16 +1100,6 @@ mod tests {
                 .expect("open isolated manager database"),
         );
         let domain_id = NetworkDomainId::new("workers-east".to_owned()).expect("domain ID");
-        manager
-            .create_overlay_network_domain(
-                &conductor_core::OverlayNetworkDomainConfig {
-                    network_domain_id: domain_id.clone(),
-                    worker_address_pool: "10.91.0.0/24".to_owned(),
-                    service_address_pool: "10.91.1.0/24".to_owned(),
-                },
-                1_000,
-            )
-            .expect("create overlay domain used by DNS config");
         let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve DNS port");
         let listen = probe.local_addr().expect("read reserved port");
         drop(probe);
@@ -1131,15 +1110,25 @@ mod tests {
                 listen,
                 suffix: "conductor.internal".to_owned(),
                 overlay: Some(OverlayDnsConfig {
-                    network_domain_id: domain_id,
+                    network_domain_id: domain_id.clone(),
                     suffix: "overlay.internal".to_owned(),
                 }),
                 allowed_clients: vec!["127.0.0.0/8".parse().expect("loopback CIDR")],
             },
-            manager,
+            Arc::clone(&manager),
             Vec::new(),
             Arc::clone(&shutdown),
         ));
+        manager
+            .create_overlay_network_domain(
+                &conductor_core::OverlayNetworkDomainConfig {
+                    network_domain_id: domain_id.clone(),
+                    worker_address_pool: "10.91.0.0/24".to_owned(),
+                    service_address_pool: "10.91.1.0/24".to_owned(),
+                },
+                1_000,
+            )
+            .expect("create overlay domain after DNS listener starts");
         let socket = UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("bind DNS client");

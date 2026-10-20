@@ -115,10 +115,11 @@ The manager or combined `all` role can publish host-network service DNS through
 `service_dns.suffix`. Overlay publication is opt-in: configure both
 `service_dns.overlayNetworkDomainId` and `service_dns.overlaySuffix` to publish
 eligible service ports at their workers' assigned overlay IPv4 addresses under
-a separate DNS suffix. The overlay domain must exist when the manager starts;
-expired or revoked peer leases are withdrawn. Services must bind their port on
-the overlay address or a wildcard address. Resolver forwarding remains an
-administrator task; see the [service discovery bundle](../../../okf/service-discovery.md).
+a separate DNS suffix. The network domain can be created after manager startup;
+overlay queries fail with `SERVFAIL` until it exists. Expired or revoked peer
+leases are withdrawn. Services must bind their port on the overlay address or
+a wildcard address. Resolver forwarding remains an administrator task; see the
+[service discovery bundle](../../../okf/service-discovery.md).
 
 # Path resolution
 
