@@ -133,8 +133,13 @@ active enrolled overlay peer through manager APIs. It verifies that the SRV
 answer preserves the assigned port, its target A answer uses the manager's
 overlay address, host-network A publication remains unchanged, overlay AAAA is
 NODATA, and revoking the peer withdraws its SRV answer. This exercises
-manager-backed DNS publication and withdrawal. It does not yet exercise an
-installed host resolver or an application connection through the overlay.
+manager-backed DNS publication and withdrawal. The ignored Linux cross-host
+transport test now also queries a live manager-backed DNS listener, follows
+the SRV target to its A address, and uses the returned address/port for a TCP
+application exchange through the TUN/Iroh path. It sends DNS queries directly
+to Hickory; it does not install or exercise an operating-system host resolver,
+and the manager state is isolated test state rather than a production manager
+daemon.
 
 At source revision `1bfbca0fb09ff493a20bb011d204279d6c7b579a`, both live DNS
 listener tests passed. Dependency policy, formatting, workspace Clippy, and

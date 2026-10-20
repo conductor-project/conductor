@@ -640,8 +640,11 @@ name = "conductor-overlay"
 version = "0.0.1"
 dependencies = [
  "bytes",
+ "conductor-api",
  "conductor-core",
+ "conductor-manager",
  "futures-util",
+ "hickory-server",
  "iroh",
  "iroh-base",
  "rtnetlink",
