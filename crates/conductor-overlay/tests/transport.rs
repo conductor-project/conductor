@@ -7,6 +7,17 @@ use iroh_base::SecretKey;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use conductor_core::{NetworkDomainId, OverlayPeerConfiguration};
+#[cfg(target_os = "linux")]
+use conductor_overlay::{LinuxOverlayInterface, OverlayRuntimeStatus, run_packet_dataplane};
+#[cfg(target_os = "linux")]
+use iroh::{Endpoint, RelayMode, endpoint::presets::Minimal};
+#[cfg(target_os = "linux")]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(target_os = "linux")]
+use tokio::net::{TcpListener, TcpStream};
+
 #[tokio::test]
 #[ignore = "requires directly reachable non-loopback local UDP candidates"]
 async fn two_local_iroh_endpoints_exchange_authenticated_overlay_datagrams() {
@@ -125,6 +136,193 @@ async fn two_local_iroh_endpoints_exchange_authenticated_overlay_datagrams() {
     server_connection.close(0_u32.into(), b"test complete");
     endpoint_a.close().await;
     endpoint_b.close().await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires two Linux hosts with direct UDP candidates and TUN privileges"]
+async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
+    let role = std::env::var("CONDUCTOR_OVERLAY_TEST_ROLE").expect("test role is configured");
+    assert!(role == "a" || role == "b", "test role must be a or b");
+    let local_worker = WorkerId::new(if role == "a" {
+        "cross-host-a"
+    } else {
+        "cross-host-b"
+    })
+    .expect("valid local worker ID");
+    let remote_worker = WorkerId::new(if role == "a" {
+        "cross-host-b"
+    } else {
+        "cross-host-a"
+    })
+    .expect("valid remote worker ID");
+    let local_address = if role == "a" {
+        Ipv4Addr::new(198, 18, 14, 1)
+    } else {
+        Ipv4Addr::new(198, 18, 14, 2)
+    };
+    let remote_address = if role == "a" {
+        Ipv4Addr::new(198, 18, 14, 2)
+    } else {
+        Ipv4Addr::new(198, 18, 14, 1)
+    };
+    let local_secret = SecretKey::from_bytes(if role == "a" { &[61; 32] } else { &[62; 32] });
+    let remote_secret = SecretKey::from_bytes(if role == "a" { &[62; 32] } else { &[61; 32] });
+    let local_endpoint = endpoint_on_ports(
+        local_secret,
+        std::env::var("CONDUCTOR_OVERLAY_TEST_BIND_PORT")
+            .expect("test bind port is configured")
+            .parse::<u16>()
+            .expect("test bind port is valid"),
+    )
+    .await;
+    let candidate = std::env::var("CONDUCTOR_OVERLAY_TEST_PEER_CANDIDATE")
+        .expect("peer candidate is configured")
+        .parse::<SocketAddr>()
+        .expect("peer candidate is a socket address");
+    let peer = OverlayPeer {
+        worker_id: remote_worker,
+        endpoint_id: OverlayEndpointId::new(remote_secret.public().to_string())
+            .expect("valid remote endpoint ID"),
+        worker_address: remote_address,
+        peer_generation: 1,
+        direct_candidates: vec![candidate],
+        direct_candidates_expires_at_ms: Some(unix_time_ms().saturating_add(300_000)),
+    };
+    let configuration = OverlayPeerConfiguration {
+        schema_version: conductor_core::OVERLAY_PEER_CONFIGURATION_SCHEMA_VERSION,
+        network_domain_id: NetworkDomainId::new("cross-host-test")
+            .expect("valid network domain ID"),
+        worker_id: local_worker.clone(),
+        worker_address: local_address,
+        peer_generation: 1,
+        network_generation: 1,
+        expires_at_ms: unix_time_ms().saturating_add(300_000),
+        peers: vec![peer],
+    };
+    let interface_name = conductor_overlay::interface_name_for_worker(&local_worker);
+    let mut interface =
+        LinuxOverlayInterface::start(&interface_name, local_address, [remote_address])
+            .await
+            .expect("create owned TUN and peer route");
+    let runtime_status = OverlayRuntimeStatus::default();
+    let run_configuration = configuration.clone();
+    let run_worker = local_worker.clone();
+    let run_endpoint = local_endpoint.clone();
+    let run_device = interface.device();
+    let run_status = runtime_status.clone();
+    let dataplane = tokio::spawn(async move {
+        run_packet_dataplane(
+            run_device,
+            run_endpoint,
+            &run_configuration,
+            &run_worker,
+            unix_time_ms(),
+            run_status,
+        )
+        .await
+    });
+
+    let result = exchange_overlay_tcp(
+        role.as_str(),
+        local_address,
+        remote_address,
+        &runtime_status,
+    )
+    .await;
+
+    dataplane.abort();
+    let _ = dataplane.await;
+    local_endpoint.close().await;
+    let cleanup = interface.shutdown().await;
+    cleanup.expect("remove only the test-owned interface and route");
+    result.expect("exchange and verify the application payload over the overlay");
+}
+
+#[cfg(target_os = "linux")]
+async fn endpoint_on_ports(secret_key: SecretKey, port: u16) -> Endpoint {
+    Endpoint::builder(Minimal)
+        .clear_ip_transports()
+        .bind_addr(SocketAddr::from(([0, 0, 0, 0], port)))
+        .expect("valid IPv4 bind address")
+        .bind_addr(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port)))
+        .expect("valid IPv6 bind address")
+        .secret_key(secret_key)
+        .relay_mode(RelayMode::Disabled)
+        .alpns(vec![conductor_overlay::OVERLAY_ALPN.to_vec()])
+        .bind()
+        .await
+        .expect("bind relay-free direct endpoint")
+}
+
+#[cfg(target_os = "linux")]
+async fn exchange_overlay_tcp(
+    role: &str,
+    local_address: Ipv4Addr,
+    remote_address: Ipv4Addr,
+    runtime_status: &OverlayRuntimeStatus,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let selected_address = loop {
+        if let Some(address) = runtime_status
+            .direct_links()
+            .await
+            .into_iter()
+            .find(|link| link.connected)
+            .and_then(|link| link.selected_address)
+        {
+            break address;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("no authenticated direct Iroh path within 30 seconds".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    println!("role={role} selected_direct_candidate={selected_address}");
+
+    if role == "b" {
+        let listener = TcpListener::bind(SocketAddr::from((local_address, 18080))).await?;
+        let (mut stream, _) =
+            tokio::time::timeout(Duration::from_secs(30), listener.accept()).await??;
+        let mut request = vec![0; 65_536];
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut request)).await??;
+        if !request.starts_with(b"conductor-cross-host-") {
+            return Err("application payload marker was not received".into());
+        }
+        stream.write_all(&request).await?;
+        stream.shutdown().await?;
+    } else {
+        let marker = format!(
+            "conductor-cross-host-{}-{}",
+            std::process::id(),
+            unix_time_ms()
+        );
+        println!("capture_marker={marker}");
+        let mut payload = vec![0x5a; 65_536];
+        payload[..marker.len()].copy_from_slice(marker.as_bytes());
+        let mut stream = tokio::time::timeout(
+            Duration::from_secs(30),
+            TcpStream::connect(SocketAddr::from((remote_address, 18080))),
+        )
+        .await??;
+        stream.write_all(&payload).await?;
+        stream.shutdown().await?;
+        let mut response = vec![0; payload.len()];
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut response)).await??;
+        if response != payload {
+            return Err("application response payload differs from the request".into());
+        }
+        println!("application_bytes={} payload_match=true", response.len());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn unix_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock is after Unix epoch")
+        .as_millis() as i64
 }
 
 fn direct_ipv4_candidates(endpoint: &iroh::Endpoint) -> Vec<SocketAddr> {
