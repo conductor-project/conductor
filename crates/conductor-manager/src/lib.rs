@@ -2916,6 +2916,143 @@ mod overlay_network_tests {
     }
 
     #[test]
+    fn endpoint_rotation_preserves_address_fences_generation_and_retires_old_key() {
+        let database = TestDatabase::new();
+        let repository = database.open();
+        let worker = enroll(&repository, "worker-a", 1);
+        let other_worker = enroll(&repository, "worker-b", 2);
+        let domain = domain();
+        repository
+            .create_overlay_network_domain(&domain, 1)
+            .expect("create domain");
+        repository
+            .register_overlay_peer(
+                &domain.network_domain_id,
+                &other_worker,
+                &endpoint(2),
+                60_000,
+                2,
+            )
+            .expect("assign another active peer");
+        let old_assignment = repository
+            .register_overlay_peer(&domain.network_domain_id, &worker, &endpoint(1), 60_000, 2)
+            .expect("assign original endpoint");
+        let candidate: std::net::SocketAddr = "192.168.50.12:42500"
+            .parse()
+            .expect("valid direct candidate");
+        repository
+            .advertise_overlay_candidates(
+                &domain.network_domain_id,
+                &worker,
+                old_assignment.peer_generation,
+                &[candidate],
+                3,
+            )
+            .expect("advertise original endpoint candidate");
+
+        let rotated = repository
+            .register_overlay_peer(&domain.network_domain_id, &worker, &endpoint(3), 70_000, 4)
+            .expect("rotate endpoint for authenticated worker");
+        assert_eq!(rotated.worker_address, old_assignment.worker_address);
+        assert_eq!(rotated.peer_generation, old_assignment.peer_generation + 1);
+        assert!(rotated.network_generation > old_assignment.network_generation);
+        let configuration = repository
+            .overlay_peer_configuration(&domain.network_domain_id, &other_worker, 5)
+            .expect("read configuration for another peer")
+            .expect("other peer remains active");
+        let rotated_peer = configuration
+            .peers
+            .iter()
+            .find(|peer| peer.worker_id == worker)
+            .expect("rotated peer remains assigned");
+        assert_eq!(rotated_peer.endpoint_id, endpoint(3));
+        assert!(rotated_peer.direct_candidates.is_empty());
+        assert_eq!(rotated_peer.direct_candidates_expires_at_ms, None);
+        assert_eq!(
+            repository.register_overlay_peer(
+                &domain.network_domain_id,
+                &worker,
+                &endpoint(1),
+                70_000,
+                6
+            ),
+            Err(OverlayNetworkError::EndpointIdentityReplay)
+        );
+        assert_eq!(
+            repository.register_overlay_peer(
+                &domain.network_domain_id,
+                &other_worker,
+                &endpoint(3),
+                70_000,
+                7
+            ),
+            Err(OverlayNetworkError::EndpointIdentityConflict)
+        );
+    }
+
+    #[test]
+    fn expired_offline_authorization_stays_expired_across_repository_restart() {
+        let database = TestDatabase::new();
+        let repository = database.open();
+        let worker = enroll(&repository, "worker-a", 1);
+        let domain = domain();
+        repository
+            .create_overlay_network_domain(&domain, 1)
+            .expect("create domain");
+        let assignment = repository
+            .register_overlay_peer(&domain.network_domain_id, &worker, &endpoint(1), 1_000, 2)
+            .expect("assign bounded peer authorization");
+        drop(repository);
+
+        let repository = database.open();
+        assert!(
+            repository
+                .overlay_peer_configuration(&domain.network_domain_id, &worker, 1_000)
+                .expect("read expired peer configuration")
+                .is_none()
+        );
+        let peers = repository
+            .list_overlay_peers(&domain.network_domain_id, 10, 1_000)
+            .expect("read expired peer state");
+        assert_eq!(peers[0].state, OverlayPeerState::Quarantined);
+        assert_eq!(peers[0].quarantine_until_ms, Some(31_000));
+        assert_eq!(
+            repository.register_overlay_peer(
+                &domain.network_domain_id,
+                &worker,
+                &endpoint(1),
+                60_000,
+                1_001
+            ),
+            Err(OverlayNetworkError::PeerQuarantined)
+        );
+        drop(repository);
+
+        let repository = database.open();
+        let replacement = repository
+            .register_overlay_peer(
+                &domain.network_domain_id,
+                &worker,
+                &endpoint(2),
+                60_000,
+                31_001,
+            )
+            .expect("new endpoint can rejoin after durable quarantine");
+        assert_eq!(replacement.worker_address, assignment.worker_address);
+        assert!(replacement.peer_generation > assignment.peer_generation);
+        assert_eq!(
+            repository.register_overlay_peer(
+                &domain.network_domain_id,
+                &worker,
+                &endpoint(1),
+                60_000,
+                31_002
+            ),
+            Err(OverlayNetworkError::EndpointIdentityReplay)
+        );
+    }
+
+    #[test]
     fn direct_candidates_are_generation_fenced_and_distributed_in_peer_maps() {
         let database = TestDatabase::new();
         let repository = database.open();
