@@ -3,7 +3,7 @@ type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
 status: partial direct TUN/TCP test passed; TCP/UDP rerun and deployment qualification pending
-source_revision: 270b2e7f6e2aa3b9debdb34310f0ec7f506a5d2f
+source_revision: b44c4b9886240b444c8ccc08535d6b59a9f014bc
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
