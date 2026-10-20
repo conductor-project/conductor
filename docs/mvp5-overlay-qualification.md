@@ -3,7 +3,7 @@ type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
 status: pending external testbed
-source_revision: 74a577bec06a7ad817fadff5833dae41c56acf93
+source_revision: ebaf367e206a620c9f01194403ca15d276047b2e
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
@@ -315,6 +315,26 @@ The local transport simulation uses actual UDP between two Iroh endpoints on
 one host. It is not separate-host workload traffic, packet-capture evidence of
 encryption, or qualification of host-resolver DNS, independent-host relay
 absence, restart recovery, or the complete failure matrix.
+
+On 2026-10-20, the exact source revision at the open #190 head,
+`ebaf367e206a620c9f01194403ca15d276047b2e`, was archived with SHA-256
+`106d291ae07ea4f870b92da822c1d6a268fd9e18644a269b9ca438176c59ee32` and
+compiled on Fortress using Rust 1.99.1. The focused command
+`CARGO_TARGET_DIR=/home/batman/conductor-mvp5-src/target
+/home/batman/.cargo/bin/cargo test --locked -p conductor-overlay --test
+linux_overlay --test transport --no-run` completed successfully. The ignored
+Linux lifecycle target passed both tests under `sudo -n unshare --net`; the
+ignored transport simulation passed one test. Test/helper binary SHA-256
+values were `69e0ccb94f7a24ad44008579ebfa89acc4708273172c3dff00d172d1771149cf`,
+`79714debdca87e94a517772e2096158c9a5d4cb4598d576968260b46ac370064`, and
+`d53ba4172f5b681e5c7abfffa6670b8ca9fc6545d1d007d4d6556622a50382f5` for the
+Linux lifecycle test, transport simulation, and helper. The transport test
+selected the advertised direct candidate `192.168.0.238`, exchanged authorized
+IPv4 packets between two local Iroh endpoints, and rejected a spoofed source.
+This remains single-host simulation evidence: it does not establish separate-
+host traffic, underlay packet-capture encryption, or host-resolver DNS
+qualification. The current host has not yet been paired with a second
+independent Linux worker.
 
 A historical workspace debug suite passed 291 tests on the local macOS host for
 source commit `5e23aea68b4a99e424e96842a04ce756fa79795f`; that revision predates
