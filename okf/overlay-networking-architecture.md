@@ -18,6 +18,8 @@ sources:
     title: Worker packet adapter and route lifecycle implementation reference
   - resource: https://github.com/n0-computer/iroh
     title: Iroh networking library
+  - resource: https://github.com/tun-rs/tun-rs
+    title: tun-rs TUN device library
   - resource: https://docs.rs/iroh/latest/iroh/
     title: Iroh API and transport model
   - resource: https://github.com/slackhq/nebula
