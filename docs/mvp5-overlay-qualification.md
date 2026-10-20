@@ -3,7 +3,7 @@ type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
 status: pending external testbed
-source_revision: bbd5f027864045d8abc30a9fd0cf0504c0829015
+source_revision: d236e7a4e184fe9b965e95eccd4170f6a3b82d7b
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
@@ -57,8 +57,12 @@ permits direct UDP between their advertised candidates. Record the candidate
 addresses, firewall rules, and observed direct-path result. This implementation
 provides no relay fallback or public/default address lookup; a blocked direct
 path is expected to fail within the documented bound. Current operator
-diagnostics distinguish desired membership and helper-applied generation, but
-do not report Iroh connection state, selected path, or counters.
+diagnostics distinguish desired membership, helper-reported TUN/address/MTU
+and installed routes, active direct Iroh links, selected direct IP path, last
+handshake time, and transport byte counters. Reports are generation- and
+freshness-tagged; counters measure QUIC UDP traffic including protocol overhead,
+not application payload. The manager still reports `reachability: not_verified`
+until a bounded application probe succeeds.
 
 # DNS-discovered application traffic
 
@@ -220,16 +224,19 @@ the probe's hash and output handling only. These are single-host results; they
 did not exercise two-host Iroh traffic, underlay encryption, deployment
 privileges, host reboot, or direct traffic on independent hosts.
 
+On 2026-10-20, the current source passed a Rust 1.99.1 Linux arm64 workspace
+`cargo check --workspace --locked --all-targets --all-features`. This compiles
+the current Linux helper, TUN, route, and worker startup code; it does not run
+that helper or qualify host networking.
+
 A historical workspace debug suite passed 291 tests on the local macOS host for
 source commit `5e23aea68b4a99e424e96842a04ce756fa79795f`; that revision predates
-the current direct-only rework and is not evidence for this snapshot. For source
-revision `929d001fa66a983ac4ef5b07d0bdd142e6bab7be`, the dependency policy,
-formatting, workspace Clippy, workspace check, and full workspace test suite
-passed locally. After the DNS startup-order fix in `bbd5f027864045d8abc30a9fd0cf0504c0829015`,
-the focused API DNS suite passed, covering the overlay suffix, active peer
-lease filtering, SRV address/port pairing, and domain bootstrap after listener
-startup. The managed-port probe passed a 64 KiB loopback smoke transfer on
-2026-10-20. These checks do not qualify
+the current direct-only rework and is not evidence for this snapshot. For the
+current integrated source, the dependency policy, formatting, workspace
+Clippy, workspace check, and full workspace test suite passed on the local
+macOS host; the focused core contract test and Linux arm64 all-target check
+also passed after the final Linux worker ownership fix. The managed-port probe
+passed a 64 KiB loopback smoke transfer on 2026-10-20. These checks do not qualify
 two-host overlay behavior, DNS-discovered traffic through an installed host
 resolver, packet-capture encryption, or the platform privilege boundary.
 GitHub Actions were not awaited because of the reported outage. Replace this
