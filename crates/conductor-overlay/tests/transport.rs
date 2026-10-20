@@ -128,10 +128,18 @@ async fn two_local_iroh_endpoints_exchange_authenticated_overlay_datagrams() {
 }
 
 fn direct_ipv4_candidates(endpoint: &iroh::Endpoint) -> Vec<SocketAddr> {
+    // Do not let this single-host simulation silently use a Tailscale/CGNAT
+    // candidate when an ordinary LAN candidate is available.
     let mut candidates = endpoint
         .addr()
         .ip_addrs()
-        .filter(|address| matches!(address.ip(), IpAddr::V4(_)))
+        .filter(|address| match address.ip() {
+            IpAddr::V4(ip) => {
+                let octets = ip.octets();
+                !(octets[0] == 100 && (64..=127).contains(&octets[1]))
+            }
+            IpAddr::V6(_) => false,
+        })
         .copied()
         .collect::<Vec<_>>();
     candidates.sort_unstable();
