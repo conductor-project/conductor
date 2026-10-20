@@ -3,8 +3,8 @@ type: Reference
 title: HTTP routes and contracts
 description: Routes expose jobs, runs, service revisions/deployments, workers, drains, metrics, and readiness; the feature-gated typed client calls these contracts with bounded JSON responses.
 status: stable
-source_revision: de95885
-source_reviewed_at: 2026-10-19
+source_revision: a622643
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/server.rs
     title: Route registration and handlers

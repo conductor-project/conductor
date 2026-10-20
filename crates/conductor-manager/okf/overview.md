@@ -3,8 +3,8 @@ type: Component
 title: conductor-manager overview
 description: Manager operations own desired state, durable scheduling decisions, worker-facing commands, and reconciliation.
 status: stable
-source_revision: de95885
-source_reviewed_at: 2026-10-19
+source_revision: a622643
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/lib.rs
     title: Manager contracts and service facade
