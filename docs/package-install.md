@@ -52,6 +52,17 @@ service runs as the unprivileged `conductor` account with umask `0077`; keep
 private keys and enrollment credentials readable only by the service account
 and administrators. The default persistent path is `/var/lib/conductor`.
 
+## Linux overlay helper status
+
+The Linux packages currently install only the `conductor` executable; they do
+not package `conductor-overlay-helper` or configure `CAP_NET_ADMIN`. Do not add
+a file capability to a manually installed helper for a worker that runs
+untrusted workloads. Workloads run as the same `conductor` account and could
+invoke that executable directly with its file capability, gaining authority
+to change host networking. File ownership and mode bits cannot separate those
+workloads from the daemon. A separate authenticated privilege boundary is
+required before package installation can safely enable overlay networking.
+
 The package does not automatically enable or start the service. After
 validating the configuration and arranging any external identity files, start
 it explicitly:
