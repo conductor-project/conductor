@@ -3,7 +3,7 @@ type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
 status: pending external testbed
-source_revision: c3584f77b0f39252822acc03743b10397077ab1e
+source_revision: edab1ed358e9e04d5efec5e0ea9b0cdac035f3a6
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
