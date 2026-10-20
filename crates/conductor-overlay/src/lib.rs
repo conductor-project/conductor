@@ -443,8 +443,14 @@ pub async fn run_packet_dataplane(
             }
             received = device.recv(&mut packet) => {
                 let size = received.map_err(OverlayTransportError::TunnelIo)?;
-                let (endpoint_id, _) = route_outbound_packet(&router, &packet[..size])
-                    .map_err(OverlayTransportError::InvalidPacket)?;
+                // The host may emit unrelated traffic such as LLMNR multicast
+                // on a TUN interface. Reject packets that are malformed or do
+                // not map to an authorized peer without terminating the whole
+                // dataplane; the validation API still exposes the exact error
+                // to callers that need diagnostics.
+                let Ok((endpoint_id, _)) = route_outbound_packet(&router, &packet[..size]) else {
+                    continue;
+                };
                 let connection = connections
                     .read()
                     .await

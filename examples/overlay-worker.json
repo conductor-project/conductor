@@ -1,0 +1,12 @@
+{
+  "role": "worker",
+  "worker_data_dir": "/var/lib/conductor/worker-east",
+  "worker_id": "worker-east",
+  "worker_concurrency": 4,
+  "manager_endpoint": "https://manager.example.net:9443/",
+  "manager_ca_file": "/etc/conductor/manager-ca.pem",
+  "worker_enrollment_credential_file": "/etc/conductor/enrollment-token",
+  "worker_identity_file": "/var/lib/conductor/worker-east/identity.pem",
+  "worker_overlay_network_domain_id": "workers-east",
+  "worker_overlay_helper_binary": "/usr/libexec/conductor-overlay-helper"
+}
