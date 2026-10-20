@@ -48,6 +48,10 @@ or raw environment values in this document.
 | Worker A OS, kernel, architecture | Pending |
 | Worker B OS, kernel, architecture | Pending |
 | Underlay topology and firewall rules | Pending |
+| CPU model, governor, and load during run | Pending |
+| Manager, worker, and helper CPU/RSS measurement method | Pending |
+| Application transfer size, iterations, latency percentiles, throughput | Pending |
+| Overlay MTU and effective workload packet size | Pending |
 | Worker overlay addresses and domain ID | Pending |
 | Address pools and overlapping host routes checked | Pending |
 | Helper privilege and service-manager configuration | Pending |
@@ -131,7 +135,7 @@ conductor overlay --config /etc/conductor/worker-b.json probe \
 python3 scripts/qualify-overlay-traffic.py request \
   --host SRV_TARGET --port SRV_PORT \
   --nonce READY_NONCE --sha256 READY_SHA256 --bytes 65536 \
-  --timeout-seconds 30
+  --timeout-seconds 30 --iterations 10
 ```
 
 Save the SRV answer, target A answer, `probe_complete` record, and server's
@@ -165,7 +169,7 @@ payload-verifying request as separate evidence.
    ```sh
    python3 scripts/qualify-overlay-traffic.py serve \
      --bind WORKER_A_OVERLAY_IP --port 18080 --bytes 65536 \
-     --timeout-seconds 120
+     --timeout-seconds 120 --max-requests 10
    ```
 
    Save the single `ready` JSON line; it contains a random request nonce, the
@@ -179,16 +183,19 @@ payload-verifying request as separate evidence.
    python3 scripts/qualify-overlay-traffic.py request \
      --host WORKER_A_OVERLAY_IP --port 18080 \
      --nonce READY_NONCE --sha256 READY_SHA256 --bytes 65536 \
-     --timeout-seconds 30
+     --timeout-seconds 30 --iterations 10
    ```
 
-   Save the `probe_complete` JSON record on worker B. It reports the result,
-   connected peer, status, byte count, hash, and elapsed time. Repeat with
-   worker roles reversed and a new nonce/payload.
+   Save the `probe_complete` JSON record on worker B. It reports a verified
+   payload hash, byte count, per-transfer latency and throughput, and min,
+   median, p95, and max summaries. Each iteration resolves the service name
+   and opens a fresh TCP connection; the system resolver may answer from cache.
+   These are application end-to-end measurements rather than isolated link
+   capacity. Repeat with worker roles reversed and a new nonce/payload.
 
-   Repeat with worker roles reversed. A successful peer handshake alone does
-   not satisfy this step. Record HTTP status, byte count, hashes, elapsed time,
-   and the source/destination addresses observed by the application.
+   A successful peer handshake alone does not satisfy this step. Record HTTP
+   status, byte count, hashes, elapsed time, and the source/destination
+   addresses observed by the application.
 5. Capture the underlay interface on each worker during a repeated transfer.
    Record the packet-capture command, interface, filters, and checksum. Search
    the capture bytes for the random `captureMarker` from the server's `ready`
@@ -200,6 +207,15 @@ payload-verifying request as separate evidence.
    helper termination, and after daemon restart. Verify only the Conductor
    interface and tagged routes were changed and that unrelated routes remain
    byte-for-byte equivalent in the saved normalized output.
+7. Record the CPU model, governor, background load, transfer size, iteration
+   count, MTU, and effective packet size for each run. Measure the probe
+   processes with `/usr/bin/time -v` and record user/system CPU time and maximum
+   resident set size. Measure the manager, worker, and helper separately with
+   a documented process or service-cgroup sampler; include its version and
+   sampling interval. Keep resource samples synchronized with the traffic
+   interval. The Python probe's throughput includes DNS lookup and connection
+   setup when given a service name, so retain these figures as end-to-end
+   workload measurements and do not label them as Iroh link capacity.
 
 # Failure and recovery matrix
 
