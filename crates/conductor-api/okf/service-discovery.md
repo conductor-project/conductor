@@ -3,7 +3,7 @@ type: Reference
 title: Service catalog and DNS discovery
 description: The API exposes observed service endpoints over HTTP and can serve DNS records from the manager catalog.
 status: stable
-source_revision: a1baa9ebca3923663b91181fde02a3465ad151f6
+source_revision: 1bfbca0fb09ff493a20bb011d204279d6c7b579a
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/server.rs
