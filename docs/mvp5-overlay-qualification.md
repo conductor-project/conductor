@@ -253,6 +253,13 @@ the probe's hash and output handling only. These are single-host results; they
 did not exercise two-host Iroh traffic, underlay encryption, deployment
 privileges, host reboot, or direct traffic on independent hosts.
 
+On 2026-10-20, qualification-tool source commit
+`2146dda3fb990386aaf7b1b74cc186f7d9ffafed` passed Python compilation and a
+four-iteration, 64 KiB-per-transfer loopback smoke check. The output contained
+the expected 262,144 verified bytes and latency/throughput summaries. This
+validates the bounded probe and its reporting only; loopback measurements are
+not overlay performance evidence.
+
 On 2026-10-20, source commit `9752cfc376a66f31808b2ddf900ed41d12c1dfe2`
 passed a Rust 1.99.1 Linux arm64 workspace `cargo check --offline --workspace
 --locked --all-targets --all-features`. This compiles the Linux helper, TUN,
