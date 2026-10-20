@@ -1565,8 +1565,13 @@ impl JobRepository for SqliteJobRepository {
             .query_row(
                 "SELECT p.peer_generation, d.network_generation FROM overlay_peers p
              JOIN overlay_network_domains d USING (network_domain_id)
-             WHERE p.network_domain_id = ?1 AND p.worker_id = ?2 AND p.state = 'active'",
-                params![report.network_domain_id.as_str(), report.worker_id.as_str()],
+                 WHERE p.network_domain_id = ?1 AND p.worker_id = ?2
+                   AND p.state = 'active' AND p.expires_at_ms > ?3",
+                params![
+                    report.network_domain_id.as_str(),
+                    report.worker_id.as_str(),
+                    observed_at_ms
+                ],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()
@@ -1580,10 +1585,12 @@ impl JobRepository for SqliteJobRepository {
         let target_worker_id: String = transaction
             .query_row(
                 "SELECT worker_id FROM overlay_peers
-             WHERE network_domain_id = ?1 AND worker_address = ?2 AND state = 'active'",
+             WHERE network_domain_id = ?1 AND worker_address = ?2
+               AND state = 'active' AND expires_at_ms > ?3",
                 params![
                     report.network_domain_id.as_str(),
-                    i64::from(u32::from(report.target_address))
+                    i64::from(u32::from(report.target_address)),
+                    observed_at_ms
                 ],
                 |row| row.get(0),
             )
@@ -1803,7 +1810,9 @@ impl JobRepository for SqliteJobRepository {
                         };
                         let current_address = current_address.and_then(|value| u32::try_from(value).ok())
                             .map(std::net::Ipv4Addr::from);
-                        let fresh = peer_generation >= 0
+                        let fresh = assignment.state == conductor_core::OverlayPeerState::Active
+                            && assignment.expires_at_ms > now_ms
+                            && peer_generation >= 0
                             && peer_generation as u64 == assignment.peer_generation
                             && network_generation >= 0
                             && network_generation as u64 == assignment.network_generation
