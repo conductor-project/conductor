@@ -1928,8 +1928,6 @@ fn operator_cli_authenticates_inspects_paginates_and_reads_bounded_logs() {
             "overlay",
             "create",
             "operator-overlay",
-            "--relay-url",
-            "https://relay.example.test",
             "--worker-address-pool",
             "10.95.0.0/24",
             "--service-address-pool",
@@ -1943,7 +1941,7 @@ fn operator_cli_authenticates_inspects_paginates_and_reads_bounded_logs() {
     );
     let domain: serde_json::Value = serde_json::from_slice(&domain.stdout).unwrap();
     assert_eq!(domain["networkDomainId"], "operator-overlay");
-    assert_eq!(domain["relayUrl"], "https://relay.example.test");
+    assert_eq!(domain["workerAddressPool"], "10.95.0.0/24");
 
     let inspected = operator_command(
         address,
