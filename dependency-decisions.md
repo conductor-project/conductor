@@ -40,6 +40,10 @@ This record covers direct third-party dependencies. Revisit it whenever a depend
 | `futures-util` | Streams rtnetlink replies with bounded iteration rather than hand-writing polling logic. | `futures-util` 0.3.34, MIT/Apache-2.0. Pinned exactly; defaults disabled and only `std` is enabled. | Existing transitive dependency used directly by the Linux overlay lifecycle module; workspace uses its safe stream API. |
 | `tar` | Reads and writes the versioned offline backup archive; using an established tar implementation avoids a custom parser and path extraction format. | `tar` 0.4.46, MIT/Apache-2.0 with included BSD-like portions; defaults disabled. The locked version includes fixes for the 2026 path/permission and PAX parsing advisories. | Adds archive parsing and writing code and its transitive dependencies. Restore rejects links and non-regular entries, validates paths and checksums, bounds entry count and total bytes, and extracts into a new private directory. Dependency internals are outside the workspace unsafe-code lint. |
 
-All dependencies are centralized in `[workspace.dependencies]`. Review the resolved transitive graph in `Cargo.lock` as part of changes.
+Dependencies are centralized in `[workspace.dependencies]`. The Iroh and
+Iroh Base entries are implemented in the #153 branch. The bytes, tun-rs,
+rtnetlink, and futures-util entries record the selected #154 packet-adapter
+dependencies; review their resolved transitive graph in `Cargo.lock` when that
+implementation is integrated.
 
 The cgroup v2 adapter intentionally uses `std::fs` against the documented cgroupfs control files rather than a cgroup-management dependency. It supports only the selected CPU, memory, swap, PID, process-placement, kill, and populated-state interfaces; it does not configure systemd or ancestor controllers. This keeps the API surface narrow and avoids adding a library whose broader host-integration behaviors are out of scope. All workspace code uses safe Rust; `cgroup.procs` placement is performed by a fresh internal launcher before it calls the safe Unix `CommandExt::exec` method.
