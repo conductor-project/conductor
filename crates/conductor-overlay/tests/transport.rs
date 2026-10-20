@@ -219,6 +219,21 @@ async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
     let interface = LinuxOverlayInterface::start(&interface_name, local_address, [remote_address])
         .await
         .expect("create owned TUN and peer route");
+    // Bind the application listener before either peer can observe the direct
+    // Iroh path. A ready overlay path does not imply the remote TCP app is
+    // listening yet.
+    let application_listener = if role == "b" {
+        Some(
+            TcpListener::bind(SocketAddr::from((local_address, 18080)))
+                .await
+                .expect("bind test application before peer readiness"),
+        )
+    } else {
+        None
+    };
+    if role == "b" {
+        println!("role=b application_listener=ready");
+    }
     let runtime_status = OverlayRuntimeStatus::default();
     let run_configuration = configuration.clone();
     let run_worker = local_worker.clone();
@@ -240,9 +255,9 @@ async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
     let (result, dataplane_finished) = tokio::select! {
         result = exchange_overlay_tcp(
             role.as_str(),
-            local_address,
             remote_address,
             &runtime_status,
+            application_listener,
         ) => (result, false),
         dataplane_result = &mut dataplane => (
             Err(format!(
@@ -260,6 +275,91 @@ async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
     let cleanup = interface.shutdown().await;
     cleanup.expect("remove only the test-owned interface and route");
     result.expect("exchange and verify the application payload over the overlay");
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires Linux root and TUN privileges"]
+async fn unavailable_direct_candidate_reports_failure_within_bound() {
+    let local_worker = WorkerId::new("blocked-direct-local").expect("valid local worker ID");
+    let remote_worker = WorkerId::new("blocked-direct-remote").expect("valid remote worker ID");
+    let local_address = Ipv4Addr::new(198, 18, 15, 1);
+    let remote_address = Ipv4Addr::new(198, 18, 15, 2);
+    let remote_secret = SecretKey::from_bytes(&[64; 32]);
+    let endpoint = endpoint_on_ports(SecretKey::from_bytes(&[63; 32]), 0, 0).await;
+    let configuration = OverlayPeerConfiguration {
+        schema_version: conductor_core::OVERLAY_PEER_CONFIGURATION_SCHEMA_VERSION,
+        network_domain_id: NetworkDomainId::new("blocked-direct-test")
+            .expect("valid network domain ID"),
+        worker_id: local_worker.clone(),
+        worker_address: local_address,
+        peer_generation: 1,
+        network_generation: 1,
+        expires_at_ms: unix_time_ms().saturating_add(60_000),
+        peers: vec![OverlayPeer {
+            worker_id: remote_worker,
+            endpoint_id: OverlayEndpointId::new(remote_secret.public().to_string())
+                .expect("valid remote endpoint ID"),
+            worker_address: remote_address,
+            peer_generation: 1,
+            direct_candidates: vec!["192.0.2.1:65000".parse().expect("valid candidate")],
+            direct_candidates_expires_at_ms: Some(unix_time_ms().saturating_add(60_000)),
+        }],
+    };
+    let interface = LinuxOverlayInterface::start(
+        &conductor_overlay::interface_name_for_worker(&local_worker),
+        local_address,
+        [remote_address],
+    )
+    .await
+    .expect("create owned TUN and peer route");
+    let runtime_status = OverlayRuntimeStatus::default();
+    let run_configuration = configuration.clone();
+    let run_worker = local_worker.clone();
+    let run_endpoint = endpoint.clone();
+    let run_device = interface.device();
+    let run_status = runtime_status.clone();
+    let task = tokio::spawn(async move {
+        run_packet_dataplane(
+            run_device,
+            run_endpoint,
+            &run_configuration,
+            &run_worker,
+            unix_time_ms(),
+            run_status,
+        )
+        .await
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(12);
+    let outcome = loop {
+        let links = runtime_status.direct_links().await;
+        if let Some(outcome) = links
+            .iter()
+            .find(|link| link.last_attempt_outcome.is_some())
+            .and_then(|link| link.last_attempt_outcome)
+        {
+            assert!(!links.iter().any(|link| link.connected));
+            break outcome;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "direct candidate failure was not reported within 12 seconds: {links:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_ne!(
+        outcome,
+        conductor_core::OverlayConnectionAttemptOutcome::Connected
+    );
+
+    task.abort();
+    let _ = task.await;
+    endpoint.close().await;
+    interface
+        .shutdown()
+        .await
+        .expect("remove only the test-owned interface and route");
 }
 
 #[cfg(target_os = "linux")]
@@ -286,9 +386,9 @@ async fn endpoint_on_ports(secret_key: SecretKey, ipv4_port: u16, ipv6_port: u16
 #[cfg(target_os = "linux")]
 async fn exchange_overlay_tcp(
     role: &str,
-    local_address: Ipv4Addr,
     remote_address: Ipv4Addr,
     runtime_status: &OverlayRuntimeStatus,
+    application_listener: Option<TcpListener>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let selected_address = loop {
@@ -313,16 +413,22 @@ async fn exchange_overlay_tcp(
     println!("role={role} selected_direct_candidate={selected_address}");
 
     if role == "b" {
-        let listener = TcpListener::bind(SocketAddr::from((local_address, 18080))).await?;
+        let listener = application_listener.expect("role B bound its listener before readiness");
         let (mut stream, _) =
             tokio::time::timeout(Duration::from_secs(30), listener.accept()).await??;
+        println!("role=b application=accepted");
         let mut request = vec![0; 65_536];
         tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut request)).await??;
+        println!(
+            "role=b application=request_received bytes={}",
+            request.len()
+        );
         if !request.starts_with(b"conductor-cross-host-") {
             return Err("application payload marker was not received".into());
         }
         stream.write_all(&request).await?;
         stream.flush().await?;
+        println!("role=b application=response_sent");
         let mut acknowledgment = [0; 3];
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -332,8 +438,6 @@ async fn exchange_overlay_tcp(
         if &acknowledgment != b"ACK" {
             return Err("application response acknowledgment did not match".into());
         }
-        stream.write_all(b"ACK2").await?;
-        stream.flush().await?;
         let mut trailing = [0; 1];
         let bytes_read =
             tokio::time::timeout(Duration::from_secs(10), stream.read(&mut trailing)).await??;
@@ -342,6 +446,7 @@ async fn exchange_overlay_tcp(
                 "application sent unexpected bytes after the response acknowledgment".into(),
             );
         }
+        // Role B returns only after it has observed the client's orderly FIN.
     } else {
         let marker = format!(
             "conductor-cross-host-{}-{}",
@@ -356,28 +461,35 @@ async fn exchange_overlay_tcp(
             TcpStream::connect(SocketAddr::from((remote_address, 18080))),
         )
         .await??;
+        println!("role=a application=connected");
         stream.write_all(&payload).await?;
         stream.flush().await?;
+        println!("role=a application=request_sent bytes={}", payload.len());
         let mut response = vec![0; payload.len()];
         tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut response)).await??;
+        println!(
+            "role=a application=response_received bytes={}",
+            response.len()
+        );
         if response != payload {
             return Err("application response payload differs from the request".into());
         }
         stream.write_all(b"ACK").await?;
         stream.flush().await?;
-        let mut acknowledgment = [0; 4];
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            stream.read_exact(&mut acknowledgment),
-        )
-        .await??;
-        if &acknowledgment != b"ACK2" {
-            return Err("application completion acknowledgment did not match".into());
-        }
         stream.shutdown().await?;
-        // Keep the overlay alive long enough for the server to observe the
-        // client's FIN before the test tears down the TUN and endpoint.
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        let close_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let links = runtime_status.direct_links().await;
+            if !links.iter().any(|link| link.connected) {
+                break;
+            }
+            if tokio::time::Instant::now() >= close_deadline {
+                return Err(format!(
+                    "remote test role did not close its direct Iroh path after receiving the client FIN: {links:?}"
+                ).into());
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         println!("application_bytes={} payload_match=true", response.len());
     }
     Ok(())
