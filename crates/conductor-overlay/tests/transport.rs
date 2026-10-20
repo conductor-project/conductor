@@ -225,7 +225,7 @@ async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
     let run_endpoint = local_endpoint.clone();
     let run_device = interface.device();
     let run_status = runtime_status.clone();
-    let dataplane = tokio::spawn(async move {
+    let mut dataplane = tokio::spawn(async move {
         run_packet_dataplane(
             run_device,
             run_endpoint,
@@ -237,13 +237,17 @@ async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
         .await
     });
 
-    let result = exchange_overlay_tcp(
-        role.as_str(),
-        local_address,
-        remote_address,
-        &runtime_status,
-    )
-    .await;
+    let result = tokio::select! {
+        result = exchange_overlay_tcp(
+            role.as_str(),
+            local_address,
+            remote_address,
+            &runtime_status,
+        ) => result,
+        dataplane_result = &mut dataplane => Err(format!(
+            "overlay dataplane exited before application exchange: {dataplane_result:?}"
+        ).into()),
+    };
 
     dataplane.abort();
     let _ = dataplane.await;
