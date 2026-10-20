@@ -2,8 +2,8 @@
 type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
-status: pending external testbed
-source_revision: ebaf367e206a620c9f01194403ca15d276047b2e
+status: partial direct TUN/TCP test passed; deployment qualification pending
+source_revision: dcbfa67fd959c9113bfcfa2a9782b687424e2bb5
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
@@ -20,17 +20,19 @@ sources:
 
 # Qualification status
 
-No independent-host traffic result is recorded yet. One separate Linux host is
-available; a second independently booted Linux worker host is still needed.
-Do not treat local tests as cross-host evidence or mark acceptance rows as
-passed until the run is performed on both hosts.
+Partial direct application-traffic evidence is recorded below: the Linux TUN
+and Iroh adapter exchanged TCP data between two independently booted Debian
+systems. The second system was a QEMU VM hosted on the development Mac, so the
+run does not prove resilience across two independent physical hosts. The
+deployment-level qualification remains pending; keep acceptance rows open.
 
 On 2026-10-20, authenticated SSH access to the available Debian 13 x86_64
 Linux host was confirmed. The host reports kernel
-`6.12.113+deb13-amd64`; `/dev/net/tun` and `tcpdump` are present. This confirms
-that one host is reachable for preparation only. It does not establish that
-Conductor or its overlay helper was built or run there, and it is not
-cross-host traffic or encryption evidence.
+`6.12.113+deb13-amd64`; `/dev/net/tun` and `tcpdump` are present. This host was
+used as worker A in the partial direct-traffic run below. Worker B was a Debian
+13 ARM64 QEMU VM on the development Mac. The two systems had separate kernels
+and exchanged traffic over direct UDP, but shared one physical Mac/underlay
+environment and did not use a manager process.
 
 The code under review supports a Linux TUN with a 1,000-byte IPv4 packet
 limit and a direct-only Iroh topology. Iroh relay use, public/default address
@@ -250,6 +252,56 @@ freshness, lease expiry, and state. A failed or stale application probe must
 not be treated as verified reachability.
 
 # Existing local evidence
+
+## Partial direct-host application test
+
+On 2026-10-20, exact source revision
+`dcbfa67fd959c9113bfcfa2a9782b687424e2bb5` passed the ignored
+`independent_linux_hosts_exchange_tcp_over_iroh_tun` test on both systems.
+Worker A was Fortress: Debian 13.7, x86_64, kernel
+`6.12.113+deb13-amd64`, Rust 1.99.1, AMD Ryzen 3 3200G. Worker B was an
+independently booted Debian 13 ARM64 QEMU VM: kernel
+`6.12.111+deb13-cloud-arm64`, Rust 1.99.1. The VM was hosted on the development
+Mac and used QEMU user-mode networking with a static UDP port forward. This is
+two separate Linux kernels, but one physical host plus one VM; it is not a
+two-machine failure-domain qualification.
+
+Each process created a Linux TUN with a /32 overlay address, installed the
+test-owned peer route, and ran a relay-disabled Iroh endpoint using the test's
+explicit direct candidate. A native TCP socket transferred 65,536 bytes from A
+to B, returned the same payload, and completed application acknowledgments in
+both directions. Both test processes passed; their reported durations were
+6.27 seconds on A and 6.71 seconds on B. Iroh selected a direct IP path. The
+manager was not running: the test injected a short-lived peer configuration
+directly, so this does not qualify manager-distributed bootstrap or cached
+operation during manager loss.
+
+The TUN test initially exposed host-generated LLMNR multicast reaching the
+interface. The dataplane previously terminated on that unroutable packet; it
+now drops malformed or unmapped TUN packets while preserving packet-validation
+errors for callers. The final bidirectional exchange passed with that fix.
+
+Fortress captured the underlay on `enp3s0` using a UDP filter for test ports
+40000 and 40101–40103. The capture contains 419 packets in both directions;
+the randomized application marker was absent from the capture bytes. Iroh
+relay mode was disabled and the test supplied the direct peer candidate. The
+capture SHA-256 is
+`b291dd5dce80d8a929c204075406c0cb6682b101d443cad2caae4ed8ac3ea022`.
+The protected capture is retained outside the repository because it includes
+underlay metadata. Test binary SHA-256 values are
+`3b26c9789d15a27b81ac213021797ee0affaf955f14e0fa436c00f2b353e43a8` on
+Fortress and
+`2abfd533d15a5a04d47a520d48cf504ffe65e38226f0f7ca5b93d45ee4245982` on the
+VM. Both were compiled from the same test source and toolchain.
+
+This partial run did not use a Conductor manager, Hickory DNS, the host
+resolver, or a deployed service process. It did not measure throughput,
+latency percentiles, CPU/RSS, daemon/host restart, revocation, lease expiry,
+manager outage, route preservation across reboot, queue pressure, MTU failure,
+or blocked direct UDP. The VM's same-Mac placement and QEMU port forwarding
+also limit what the underlay capture proves. Keep the corresponding #156
+acceptance criteria open until those scenarios are run on the declared
+deployment topology.
 
 On 2026-10-19, the Linux overlay integration target was compiled and run in a
 Rust 1.99.1 Docker container on an Apple silicon host (`aarch64`). Both ignored
