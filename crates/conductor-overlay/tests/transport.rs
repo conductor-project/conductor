@@ -577,6 +577,7 @@ async fn start_cross_host_dns(
     for (worker_id, seed) in [(&peer_a, 71_u8), (service_worker_id, 72_u8)] {
         let credential_hash = [seed; 32];
         let certificate_fingerprint = [seed.wrapping_add(1); 32];
+        let certificate_serial = format!("cross-host-test-certificate-{seed}");
         identities
             .create_enrollment_credential(
                 &credential_hash,
@@ -588,7 +589,7 @@ async fn start_cross_host_dns(
             .enroll_worker_identity(
                 &credential_hash,
                 &certificate_fingerprint,
-                "cross-host-test-certificate",
+                &certificate_serial,
                 now_ms,
                 now_ms.saturating_add(60_000),
                 now_ms,
