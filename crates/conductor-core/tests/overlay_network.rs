@@ -1,7 +1,8 @@
 use conductor_core::{
-    MAX_OVERLAY_DIRECT_CANDIDATES, NetworkDomainId, OverlayEndpointId, OverlayNetworkDomainConfig,
-    OverlayPeer, OverlayPeerObservation, OverlayPeerObservationStatus, OverlayPeerState,
-    OverlayRuntimeDiagnostic, WorkerId, valid_overlay_direct_candidates,
+    MAX_OVERLAY_DIRECT_CANDIDATES, NetworkDomainId, OverlayConnectionAttemptOutcome,
+    OverlayEndpointId, OverlayNetworkDomainConfig, OverlayPeer, OverlayPeerObservation,
+    OverlayPeerObservationStatus, OverlayPeerState, OverlayRuntimeDiagnostic, WorkerId,
+    valid_overlay_direct_candidates,
 };
 
 #[test]
@@ -59,6 +60,10 @@ fn overlay_contracts_use_bounded_strict_json_shapes() {
     assert_eq!(observation_json["observedAtMs"], 10);
     assert_eq!(observation_json["runtime"]["interfaceUp"], true);
     assert_eq!(observation_json["runtime"]["mtu"], 1280);
+    assert_eq!(
+        serde_json::to_value(OverlayConnectionAttemptOutcome::AuthenticationFailed).unwrap(),
+        "authentication_failed"
+    );
 }
 
 #[test]

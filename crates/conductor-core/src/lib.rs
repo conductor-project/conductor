@@ -98,11 +98,12 @@ pub use overlay_network::{
     MAX_OVERLAY_APPLICATION_PROBE_RESPONSE_BYTES, MAX_OVERLAY_APPLICATION_PROBE_TIMEOUT_MS,
     MAX_OVERLAY_DIRECT_CANDIDATES, OVERLAY_PEER_CONFIGURATION_SCHEMA_VERSION,
     OverlayApplicationProbeDiagnostic, OverlayApplicationProbeOutcome,
-    OverlayApplicationProbeReport, OverlayDirectCandidateAcknowledgement,
-    OverlayDirectCandidateAdvertisement, OverlayDirectLinkDiagnostic, OverlayEndpointId,
-    OverlayNetworkDomainConfig, OverlayPeer, OverlayPeerAssignment, OverlayPeerConfiguration,
-    OverlayPeerDiagnostic, OverlayPeerObservation, OverlayPeerObservationStatus, OverlayPeerState,
-    OverlayReachability, OverlayRuntimeDiagnostic, valid_overlay_direct_candidates,
+    OverlayApplicationProbeReport, OverlayConnectionAttemptOutcome,
+    OverlayDirectCandidateAcknowledgement, OverlayDirectCandidateAdvertisement,
+    OverlayDirectLinkDiagnostic, OverlayEndpointId, OverlayNetworkDomainConfig, OverlayPeer,
+    OverlayPeerAssignment, OverlayPeerConfiguration, OverlayPeerDiagnostic, OverlayPeerObservation,
+    OverlayPeerObservationStatus, OverlayPeerState, OverlayReachability, OverlayRuntimeDiagnostic,
+    valid_overlay_direct_candidates,
 };
 #[path = "structs/network_domain_id.rs"]
 mod network_domain_id;

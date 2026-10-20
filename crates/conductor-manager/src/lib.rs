@@ -3161,6 +3161,15 @@ mod overlay_network_tests {
             config.peers[0].direct_candidates_expires_at_ms,
             Some(60_000)
         );
+        let peers = repository
+            .list_overlay_peers(&domain.network_domain_id, 10, 4)
+            .expect("read peer diagnostics");
+        let advertised = peers
+            .iter()
+            .find(|peer| peer.worker_id == second)
+            .expect("advertised peer remains visible");
+        assert_eq!(advertised.direct_candidates, candidates);
+        assert_eq!(advertised.direct_candidates_expires_at_ms, Some(60_000));
 
         assert_eq!(
             repository.advertise_overlay_candidates(

@@ -380,6 +380,8 @@ struct OverlayPeerAssignmentRow {
     expires_at_ms: i64,
     state: String,
     quarantine_until_ms: Option<i64>,
+    direct_candidates_json: String,
+    direct_candidates_expires_at_ms: Option<i64>,
 }
 
 fn overlay_peer_assignment(
@@ -387,6 +389,12 @@ fn overlay_peer_assignment(
 ) -> Result<conductor_core::OverlayPeerAssignment, OverlayNetworkError> {
     use conductor_core::{NetworkDomainId, OverlayEndpointId, OverlayPeerState, WorkerId};
 
+    let direct_candidates =
+        serde_json::from_str::<Vec<std::net::SocketAddr>>(&row.direct_candidates_json)
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+    if !conductor_core::valid_overlay_direct_candidates(&direct_candidates) {
+        return Err(OverlayNetworkError::StorageUnavailable);
+    }
     Ok(conductor_core::OverlayPeerAssignment {
         network_domain_id: NetworkDomainId::new(row.network_domain_id)
             .map_err(|_| OverlayNetworkError::StorageUnavailable)?,
@@ -406,6 +414,8 @@ fn overlay_peer_assignment(
             _ => return Err(OverlayNetworkError::StorageUnavailable),
         },
         quarantine_until_ms: row.quarantine_until_ms,
+        direct_candidates,
+        direct_candidates_expires_at_ms: row.direct_candidates_expires_at_ms,
     })
 }
 
@@ -1020,6 +1030,8 @@ impl JobRepository for SqliteJobRepository {
             expires_at_ms,
             state: "active".to_owned(),
             quarantine_until_ms: None,
+            direct_candidates_json: "[]".to_owned(),
+            direct_candidates_expires_at_ms: None,
         })?;
         transaction
             .commit()
@@ -1484,6 +1496,13 @@ impl JobRepository for SqliteJobRepository {
                     || link.last_handshake_at_ms.is_some_and(|time| {
                         time < 0 || time > observation.observed_at_ms
                     })
+                    || link.last_attempt_at_ms.is_some_and(|time| {
+                        time < 0 || time > observation.observed_at_ms
+                    })
+                    || link.last_attempt_at_ms.is_some() != link.last_attempt_outcome.is_some()
+                    || (link.last_attempt_outcome
+                        == Some(conductor_core::OverlayConnectionAttemptOutcome::Connected)
+                        && link.last_handshake_at_ms.is_none())
                 {
                     return Err(OverlayNetworkError::ObservationConflict);
                 }
@@ -1661,7 +1680,8 @@ impl JobRepository for SqliteJobRepository {
         let mut statement = transaction
             .prepare(
                 "SELECT network_domain_id, worker_id, endpoint_id, worker_address, peer_generation,
-                        expires_at_ms, state, quarantine_until_ms
+                        expires_at_ms, state, quarantine_until_ms, direct_candidates_json,
+                        direct_candidates_expires_at_ms
                  FROM overlay_peers WHERE network_domain_id = ?1
                    AND (state = 'active' OR quarantine_until_ms > ?3)
                  ORDER BY worker_address LIMIT ?2",
@@ -1680,25 +1700,41 @@ impl JobRepository for SqliteJobRepository {
                         row.get::<_, i64>(5)?,
                         row.get::<_, String>(6)?,
                         row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<i64>>(9)?,
                     ))
                 },
             )
             .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
-        let peers = rows.map(|row| {
-            let (domain, worker, endpoint, address, peer_generation, expiry, state, quarantine) =
-                row.map_err(|_| OverlayNetworkError::StorageUnavailable)?;
-            overlay_peer_assignment(OverlayPeerAssignmentRow {
-                network_domain_id: domain,
-                worker_id: worker,
-                endpoint_id: endpoint,
-                worker_address: address,
-                peer_generation,
-                network_generation: generation,
-                expires_at_ms: expiry,
-                state,
-                quarantine_until_ms: quarantine,
+        let peers = rows
+            .map(|row| {
+                let (
+                    domain,
+                    worker,
+                    endpoint,
+                    address,
+                    peer_generation,
+                    expiry,
+                    state,
+                    quarantine,
+                    direct_candidates_json,
+                    direct_candidates_expires_at_ms,
+                ) = row.map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+                overlay_peer_assignment(OverlayPeerAssignmentRow {
+                    network_domain_id: domain,
+                    worker_id: worker,
+                    endpoint_id: endpoint,
+                    worker_address: address,
+                    peer_generation,
+                    network_generation: generation,
+                    expires_at_ms: expiry,
+                    state,
+                    quarantine_until_ms: quarantine,
+                    direct_candidates_json,
+                    direct_candidates_expires_at_ms,
+                })
             })
-        }).collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
         transaction
             .commit()

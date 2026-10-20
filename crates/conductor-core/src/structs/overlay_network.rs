@@ -123,6 +123,13 @@ pub struct OverlayPeerAssignment {
     pub expires_at_ms: i64,
     pub state: OverlayPeerState,
     pub quarantine_until_ms: Option<i64>,
+    /// Current manager-accepted underlay candidates. These are reachability
+    /// hints, not authenticated identity or source-address authorization.
+    #[serde(default)]
+    pub direct_candidates: Vec<SocketAddr>,
+    /// Candidate freshness is separate from the peer authorization lease.
+    #[serde(default)]
+    pub direct_candidates_expires_at_ms: Option<i64>,
 }
 
 /// Authenticated worker advertisement of direct UDP underlay addresses.
@@ -288,6 +295,26 @@ pub struct OverlayDirectLinkDiagnostic {
     pub last_handshake_at_ms: Option<i64>,
     pub udp_tx_bytes: u64,
     pub udp_rx_bytes: u64,
+    /// Most recent bounded connect result; a successful handshake authenticates
+    /// the peer endpoint but does not prove application reachability.
+    #[serde(default)]
+    pub last_attempt_at_ms: Option<i64>,
+    #[serde(default)]
+    pub last_attempt_outcome: Option<OverlayConnectionAttemptOutcome>,
+}
+
+/// Coarse, bounded result for the most recent direct connection attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayConnectionAttemptOutcome {
+    Connected,
+    NoCandidates,
+    CandidatesExpired,
+    TimedOut,
+    UnderlayUnavailable,
+    AuthenticationFailed,
+    IdentityMismatch,
+    OtherFailure,
 }
 
 /// Manager view that keeps desired assignment separate from the worker's

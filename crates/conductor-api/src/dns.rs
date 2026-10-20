@@ -985,6 +985,8 @@ mod tests {
                 expires_at_ms: 20_000,
                 state: OverlayPeerState::Active,
                 quarantine_until_ms: None,
+                direct_candidates: Vec::new(),
+                direct_candidates_expires_at_ms: None,
             },
             conductor_core::OverlayPeerAssignment {
                 network_domain_id: domain.clone(),
@@ -997,6 +999,8 @@ mod tests {
                 expires_at_ms: 10_000,
                 state: OverlayPeerState::Active,
                 quarantine_until_ms: None,
+                direct_candidates: Vec::new(),
+                direct_candidates_expires_at_ms: None,
             },
             conductor_core::OverlayPeerAssignment {
                 network_domain_id: domain,
@@ -1009,6 +1013,8 @@ mod tests {
                 expires_at_ms: 20_000,
                 state: OverlayPeerState::Quarantined,
                 quarantine_until_ms: Some(20_000),
+                direct_candidates: Vec::new(),
+                direct_candidates_expires_at_ms: None,
             },
         ];
         let addresses = active_overlay_addresses(peers, 10_000);

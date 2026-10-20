@@ -23,7 +23,8 @@ pub use linux_helper::LinuxOverlayHelperClient;
 
 use bytes::Bytes;
 use conductor_core::{
-    OVERLAY_PEER_CONFIGURATION_SCHEMA_VERSION, OverlayPeer, OverlayPeerConfiguration, WorkerId,
+    OVERLAY_PEER_CONFIGURATION_SCHEMA_VERSION, OverlayConnectionAttemptOutcome, OverlayPeer,
+    OverlayPeerConfiguration, WorkerId,
 };
 use iroh::{Endpoint, EndpointAddr, RelayMode, TransportAddr, endpoint::Connection};
 use iroh_base::{EndpointId, SecretKey};
@@ -50,6 +51,8 @@ struct TrackedConnection {
     handshake_at_ms: Option<i64>,
     udp_tx_bytes: u64,
     udp_rx_bytes: u64,
+    last_attempt_at_ms: Option<i64>,
+    last_attempt_outcome: Option<OverlayConnectionAttemptOutcome>,
 }
 
 impl OverlayRuntimeStatus {
@@ -73,16 +76,38 @@ impl OverlayRuntimeStatus {
 
     async fn connected(&self, endpoint_id: EndpointId, connection: Connection) {
         let selected_address = selected_direct_address(&connection);
+        let now_ms = unix_time_ms();
         self.connections.write().await.insert(
             endpoint_id,
             TrackedConnection {
                 connection: Some(connection),
                 selected_address,
-                handshake_at_ms: Some(unix_time_ms()),
+                handshake_at_ms: Some(now_ms),
                 udp_tx_bytes: 0,
                 udp_rx_bytes: 0,
+                last_attempt_at_ms: Some(now_ms),
+                last_attempt_outcome: Some(OverlayConnectionAttemptOutcome::Connected),
             },
         );
+    }
+
+    async fn connection_failed(
+        &self,
+        endpoint_id: EndpointId,
+        outcome: OverlayConnectionAttemptOutcome,
+    ) {
+        let mut connections = self.connections.write().await;
+        let entry = connections.entry(endpoint_id).or_insert(TrackedConnection {
+            connection: None,
+            selected_address: None,
+            handshake_at_ms: None,
+            udp_tx_bytes: 0,
+            udp_rx_bytes: 0,
+            last_attempt_at_ms: None,
+            last_attempt_outcome: None,
+        });
+        entry.last_attempt_at_ms = Some(unix_time_ms());
+        entry.last_attempt_outcome = Some(outcome);
     }
 
     async fn disconnected(&self, endpoint_id: EndpointId) {
@@ -128,6 +153,8 @@ impl OverlayRuntimeStatus {
                     last_handshake_at_ms: entry.handshake_at_ms,
                     udp_tx_bytes,
                     udp_rx_bytes,
+                    last_attempt_at_ms: entry.last_attempt_at_ms,
+                    last_attempt_outcome: entry.last_attempt_outcome,
                 })
             })
             .collect()
@@ -140,6 +167,22 @@ fn selected_direct_address(connection: &Connection) -> Option<std::net::SocketAd
     match path.remote_addr() {
         TransportAddr::Ip(address) => Some(*address),
         _ => None,
+    }
+}
+
+fn connection_attempt_outcome(error: &OverlayTransportError) -> OverlayConnectionAttemptOutcome {
+    use OverlayConnectionAttemptOutcome as Outcome;
+    match error {
+        OverlayTransportError::NoDirectCandidates => Outcome::NoCandidates,
+        OverlayTransportError::CandidateLeaseExpired => Outcome::CandidatesExpired,
+        OverlayTransportError::PeerUnavailable => Outcome::TimedOut,
+        OverlayTransportError::UnauthorizedPeer => Outcome::IdentityMismatch,
+        OverlayTransportError::Iroh(iroh::endpoint::ConnectError::Connecting {
+            source: iroh::endpoint::ConnectingError::HandshakeFailure { .. },
+            ..
+        }) => Outcome::AuthenticationFailed,
+        OverlayTransportError::Iroh(_) => Outcome::UnderlayUnavailable,
+        _ => Outcome::OtherFailure,
     }
 }
 
@@ -161,6 +204,7 @@ pub enum OverlayTransportError {
     EndpointClosed,
     PeerUnavailable,
     NoDirectCandidates,
+    CandidateLeaseExpired,
     DatagramUnsupported,
     PacketTooLarge,
     Bind(iroh::endpoint::BindError),
@@ -319,8 +363,10 @@ pub async fn run_packet_dataplane(
                 let connected = tokio::select! {
                     _ = shutdown.changed() => break,
                     connected = async {
-                        if unix_time_ms() >= candidates_expires_at_ms {
+                        if candidates.is_empty() {
                             Err(OverlayTransportError::NoDirectCandidates)
+                        } else if unix_time_ms() >= candidates_expires_at_ms {
+                            Err(OverlayTransportError::CandidateLeaseExpired)
                         } else {
                             tokio::time::timeout(
                                 std::time::Duration::from_secs(10),
@@ -341,6 +387,12 @@ pub async fn run_packet_dataplane(
                     runtime_status.disconnected(endpoint_id).await;
                     backoff = std::time::Duration::from_millis(250);
                 } else {
+                    let outcome = connected
+                        .as_ref()
+                        .err()
+                        .map(connection_attempt_outcome)
+                        .unwrap_or(OverlayConnectionAttemptOutcome::OtherFailure);
+                    runtime_status.connection_failed(endpoint_id, outcome).await;
                     tokio::select! {
                         _ = shutdown.changed() => break,
                         _ = tokio::time::sleep(backoff) => {},
@@ -485,4 +537,29 @@ pub fn configured_packet_router(
     }
     OverlayPacketRouter::new(configuration.worker_address, &configuration.peers)
         .map_err(OverlayConfigurationError::InvalidPeers)
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn connection_attempt_failures_have_bounded_diagnostic_categories() {
+        assert_eq!(
+            connection_attempt_outcome(&OverlayTransportError::NoDirectCandidates),
+            OverlayConnectionAttemptOutcome::NoCandidates
+        );
+        assert_eq!(
+            connection_attempt_outcome(&OverlayTransportError::CandidateLeaseExpired),
+            OverlayConnectionAttemptOutcome::CandidatesExpired
+        );
+        assert_eq!(
+            connection_attempt_outcome(&OverlayTransportError::PeerUnavailable),
+            OverlayConnectionAttemptOutcome::TimedOut
+        );
+        assert_eq!(
+            connection_attempt_outcome(&OverlayTransportError::UnauthorizedPeer),
+            OverlayConnectionAttemptOutcome::IdentityMismatch
+        );
+    }
 }
