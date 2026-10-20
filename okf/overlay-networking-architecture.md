@@ -185,6 +185,11 @@ maximum lease, the stated revocation bound is at most five minutes from the
 last configuration delivery that included the peer, plus the configured clock
 skew allowance. This bound is a policy proposal, not a measurement. MVP5 must
 measure delivery and expiry timing, including restart and an offline peer.
+When the helper applies a newer peer map, it closes the prior Iroh endpoint
+before reconciling routes, then starts a new endpoint using the same worker key.
+This terminates detached packet readers and active connections authorized by
+the previous snapshot; the endpoint identity remains stable while peer
+authorization changes.
 
 The initial overlay uses only directly reachable UDP candidates on declared
 LAN/VPC or explicitly configured underlay topologies. Iroh relay mode and

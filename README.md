@@ -270,7 +270,10 @@ The worker overlay crate validates IPv4 packets, routes them by the manager's
 peer map, and carries them in authenticated Iroh datagrams with relays and
 address lookup disabled. On Linux, a separate helper owns the tun-rs device
 and Conductor-managed routes; ordinary worker mode starts one endpoint for its
-local services. A direct-only TCP/UDP application test passed between Fortress
+local services. Applying a newer peer-map generation closes the previous
+endpoint and its packet readers before reconnecting with the same worker
+identity, so revoked peers cannot retain a live dataplane connection. A
+direct-only TCP/UDP application test passed between Fortress
 (Debian 13 x86_64) and a Debian 13 ARM64 QEMU VM, and a bounded underlay capture
 did not contain either application marker. The VM shares the development Mac's
 physical host; manager bootstrap, host-resolver DNS, and independent physical
