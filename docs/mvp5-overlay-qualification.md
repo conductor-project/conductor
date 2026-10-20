@@ -3,7 +3,7 @@ type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
 status: pending external testbed
-source_revision: 7b63a6d443b793936df06e47c163ef64a984f292
+source_revision: 9b8514318388edccd8f91af5359fc5d4839cd6eb
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
@@ -273,6 +273,35 @@ passed a Rust 1.99.1 Linux arm64 workspace `cargo check --offline --workspace
 route, and worker startup code at that revision; it does not run the helper or
 qualify host networking. The later manager-persisted probe report change has
 not yet been rechecked in the Linux container.
+
+On 2026-10-20, exact source commit
+`9b8514318388edccd8f91af5359fc5d4839cd6eb` was archived
+(`1f84e47b646a09bbc72666637da9483c763600b8ca32e4d633af2be77ce0b672`) and
+tested on the available Fortress host: Debian 13 x86_64, kernel
+`6.12.113+deb13-amd64`, Rust 1.99.1. The command
+`CARGO_TARGET_DIR=/home/batman/conductor-mvp5-src/target cargo test --locked -p
+conductor-overlay --test linux_overlay --no-run` built the Linux integration
+target. Then
+`sudo -n unshare --net -- env RUST_TEST_THREADS=1 timeout 90s
+target/debug/deps/linux_overlay-31f5885afd604320 --include-ignored
+--test-threads=1` passed both ignored tests: helper TUN/dataplane ownership and
+managed interface/route reconciliation across restart (2 passed, 0 failed,
+0.15 seconds). The test binary SHA-256 is
+`6a1e52def742b570ba86921cf46ee9c1844683010b795c56dc0a4628ab41338f`; the
+helper SHA-256 is
+`170afe02433c12a2c5b1e5d5e2c4be6e4ee093c81a266c166a468d01ba4d20bc`. The
+normalized host address and route snapshot matched before and after the run
+(SHA-256
+`69afe1026d788d8ee35df5e85f7355b1f9d5db1d3dcf32a54f2e76c32fb8ccc6`).
+
+The first run exposed that the diagnostics client rejected the helper's valid
+terminal `stopped` response, which omits runtime telemetry. PR #189 now accepts
+that terminal shape while continuing to require validated runtime telemetry
+for ready, applied, and status responses; the rerun above passed with the fix.
+This host-local network-namespace check exercises TUN and route lifecycle, but
+does not generate cross-host workload traffic or qualify direct UDP, underlay
+encryption, host-resolver DNS, relay absence, restart recovery, or the complete
+failure matrix. It is single-host evidence only.
 
 A historical workspace debug suite passed 291 tests on the local macOS host for
 source commit `5e23aea68b4a99e424e96842a04ce756fa79795f`; that revision predates
