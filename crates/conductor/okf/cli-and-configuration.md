@@ -1,15 +1,17 @@
 ---
 type: Reference
 title: conductor CLI and configuration
-description: Clap commands select daemon operation, named operator contexts, and strict JSON configuration selects role-specific listeners, state, and identity paths.
+description: Clap commands select daemon operation, named operator contexts, strict JSON selects role-specific listeners, and workers can run bounded local overlay probes.
 status: stable
-source_revision: bbd5f027864045d8abc30a9fd0cf0504c0829015
+source_revision: 28dd056a30bf9ce7ab11165548ae17b66c473713
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/main.rs
     title: CLI and serde configuration
   - resource: ../src/operator_cli.rs
     title: Operator subcommands and flags
+  - resource: ../src/overlay_probe_cli.rs
+    title: Bounded local worker overlay application probe
   - resource: ../src/contexts.rs
     title: Named connection contexts
   - resource: ../src/upgrade_cli.rs
@@ -120,6 +122,13 @@ overlay queries fail with `SERVFAIL` until it exists. Expired or revoked peer
 leases are withdrawn. Services must bind their port on the overlay address or
 a wildcard address. Resolver forwarding remains an administrator task; see the
 [service discovery bundle](../../../okf/service-discovery.md).
+
+Run `conductor overlay probe --target-ip <private-ip> --port <port> --path
+<safe-health-path>` on an overlay-enabled worker to send a bounded HTTP GET
+through its local route. The total deadline is at most five seconds and the
+response body is limited to 65,536 bytes. The probe does not use operator API
+credentials, does not follow redirects or proxies, and does not update manager
+reachability state.
 
 # Path resolution
 

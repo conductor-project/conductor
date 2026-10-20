@@ -256,7 +256,12 @@ Operators can create and inspect network domains with
 distinguish desired membership, helper-reported TUN/routes, and active direct
 Iroh paths with their handshake time and transport counters. Those observations
 are bounded and generation/freshness tagged; they do not prove application
-reachability. See the [operator command guide](crates/conductor/okf/operator-commands.md).
+reachability. From an overlay-enabled worker, run `conductor overlay probe`
+with an assigned private overlay IP, service port, and explicit safe HTTP GET
+path to verify that an application response returns through that worker's
+local route. The probe is capped at five seconds and 64 KiB; it does not run
+through the manager or change service state. See the [operator command
+guide](crates/conductor/okf/operator-commands.md).
 
 The worker overlay crate validates IPv4 packets, routes them by the manager's
 peer map, and carries them in authenticated Iroh datagrams with relays and

@@ -3,7 +3,7 @@ type: Runbook
 title: Operate Conductor with the CLI
 description: Select named manager connection contexts, submit and manage jobs and revisions, observe and control runs, follow bounded logs, inspect workers and services, mutate desired state safely, drain workers, and page history.
 status: stable
-source_revision: d236e7a4e184fe9b965e95eccd4170f6a3b82d7b
+source_revision: 28dd056a30bf9ce7ab11165548ae17b66c473713
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/operator_cli.rs
@@ -202,8 +202,16 @@ configuration apply from reported TUN address/MTU, installed routes, active
 direct Iroh links, handshake times, and transport UDP byte counters. Those
 counters include protocol overhead, not application payload. Worker reports
 do not prove application reachability; `reachability` remains `not_verified`
-until bounded application probes are implemented. Revoke output also marks
-reachability `not_verified` deliberately.
+until an operator runs an explicit probe. On an overlay-enabled worker,
+`conductor overlay probe` performs a bounded HTTP GET over the local worker's
+overlay route to an assigned private IPv4 address and workload port. Supply a
+safe health path explicitly. The probe disables proxies and redirects, limits
+the total request to five seconds and the response body to 65,536 bytes. It
+reports probe success only after receiving a 2xx response; any complete HTTP
+response is separately marked `application_response_received`, including
+non-2xx status codes. It tests application traffic from that worker; it is not
+a manager-side or cross-host qualification and does not measure throughput.
+Revoke output continues to mark reachability `not_verified`.
 
 ```sh
 conductor operator --context production overlay create workers-east \
@@ -212,6 +220,7 @@ conductor operator --context production overlay create workers-east \
 conductor operator --context production overlay inspect workers-east
 conductor operator --context production --output json overlay peers workers-east
 conductor operator --context production overlay revoke workers-east worker-17
+conductor overlay probe --target-ip 10.90.0.17 --port 8080 --path /health
 ```
 
 # Retrieve logs

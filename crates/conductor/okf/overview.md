@@ -1,15 +1,17 @@
 ---
 type: Component
 title: conductor crate overview
-description: The executable exposes daemon, job, run, deployment, worker, service discovery, diagnostics, operator context, and bootstrap commands.
+description: The executable exposes daemon, job, run, deployment, worker, overlay probe, service discovery, diagnostics, operator context, and bootstrap commands.
 status: stable
-source_revision: b5f8e8614fbdc2134fb3f4405a42e03caa3097b3
-source_reviewed_at: 2026-10-19
+source_revision: 28dd056a30bf9ce7ab11165548ae17b66c473713
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/main.rs
     title: CLI, configuration, and composition
   - resource: ../src/operator_cli.rs
     title: Authenticated operator client
+  - resource: ../src/overlay_probe_cli.rs
+    title: Bounded local worker overlay application probe
   - resource: ../src/contexts.rs
     title: Named operator contexts
   - resource: ../src/job_cli.rs
@@ -50,7 +52,7 @@ their owning crates.
 ## Commands
 
 The public commands are `agent`, `context`, `operator`, `job`, `run`,
-`deployment`, `worker`, `service`, `diagnostics`, `enroll-worker`,
+`deployment`, `worker`, `overlay`, `service`, `diagnostics`, `enroll-worker`,
 `revoke-worker`, and `create-operator-token`.
 The hidden `__internal-launch` command is used by
 the process backend to enter configured enforcement before executing a job.
