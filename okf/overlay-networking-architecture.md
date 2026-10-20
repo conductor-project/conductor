@@ -3,7 +3,7 @@ type: Architecture decision
 title: Overlay networking architecture
 description: Selected Rust-native direct-only host overlay contracts for encrypted worker-to-worker workload traffic.
 status: selected
-source_revision: 0fd23ee30a2486c317aff72e2cda1f98b559e6b4
+source_revision: e9eae8522e123dea79371715fa5d820673e335a6
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../crates/conductor-core/src/lib.rs
@@ -235,16 +235,27 @@ Source review at `source_revision` confirms that `conductor-core` owns
 transport-neutral contracts, `conductor-manager` owns desired state, the
 worker owns local supervision, and `conductor-transport` already provides an
 authenticated manager-worker path. The current platform page records Linux
-x86_64, Linux arm64, and Apple silicon CI, but no independent-host overlay
-qualification.
+x86_64, Linux arm64, and Apple silicon CI. It does not expand general platform
+support.
 
 PR #187 adds the pinned Iroh release and manager identity/address contracts;
 PR #188 adds direct candidate advertisements, `tun-rs`, the Conductor packet
 adapter, and the Linux helper route lifecycle. Local unit and workspace tests
 cover packet validation, peer authorization, candidate fencing, and manager
-migrations. They do not demonstrate independent-host traffic or exercise the
-privileged Linux helper. Issue #156 must still qualify manager-enrolled
-identities, direct-only packet forwarding, an application request/reply, MTU,
-reconnect, throughput, and packet loss on separate hosts with relays and public
-discovery unavailable. Keep versions, enabled features, transitive footprint,
-and third-party safety boundaries in the dependency decision.
+migrations. On 2026-10-20, the ignored direct-only Linux transport test passed
+TCP and UDP application traffic between Fortress (Debian 13 x86_64) and a
+Debian 13 ARM64 QEMU VM. A bounded capture of the test UDP ports contained
+neither application marker. The helper startup/reconfigure/shutdown/restart,
+owned-route reconciliation, route-conflict preservation, and bounded direct
+candidate failure tests also passed in disposable network namespaces on
+Fortress. The VM shares the development Mac's physical host, and the test
+injected short-lived peer configuration rather than starting a manager.
+
+These results do not qualify independent physical failure domains, manager
+bootstrap/outage, actual host-resolver DNS discovery, worker daemon/host
+restart, revocation, expiry, MTU, queue pressure, performance, or blocked direct
+UDP between hosts. Issue #156 remains open for those cases and the operator
+walkthrough. Keep versions, enabled features, transitive footprint, and
+third-party safety boundaries in the dependency decision. Detailed commands,
+binary hashes, capture hash, and limits are in
+`docs/mvp5-overlay-qualification.md`.

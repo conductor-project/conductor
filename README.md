@@ -270,9 +270,14 @@ The worker overlay crate validates IPv4 packets, routes them by the manager's
 peer map, and carries them in authenticated Iroh datagrams with relays and
 address lookup disabled. On Linux, a separate helper owns the tun-rs device
 and Conductor-managed routes; ordinary worker mode starts one endpoint for its
-local services. This implementation has local tests, but no independent-host
-traffic qualification yet. See the [overlay architecture](okf/overlay-networking-architecture.md)
-and [manager/API contracts](crates/conductor-manager/okf/desired-state-and-persistence.md).
+local services. A direct-only TCP/UDP application test passed between Fortress
+(Debian 13 x86_64) and a Debian 13 ARM64 QEMU VM, and a bounded underlay capture
+did not contain either application marker. The VM shares the development Mac's
+physical host; manager bootstrap, host-resolver DNS, and independent physical
+failure-domain qualification remain open. See the [qualification
+record](docs/mvp5-overlay-qualification.md), [overlay
+architecture](okf/overlay-networking-architecture.md), and [manager/API
+contracts](crates/conductor-manager/okf/desired-state-and-persistence.md).
 
 ## Command output and recovery
 
