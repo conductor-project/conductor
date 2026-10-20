@@ -3,7 +3,7 @@ type: Reference
 title: Manager desired state and persistence
 description: SQLite stores immutable job/revision records, mutable deployment state, run reservations, worker records, commands, allocations, audit, and overlay membership.
 status: stable
-source_revision: d236e7a4e184fe9b965e95eccd4170f6a3b82d7b
+source_revision: 28dd056a30bf9ce7ab11165548ae17b66c473713
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/lib.rs
@@ -81,8 +81,9 @@ UDP byte counters (including protocol overhead, not application payload).
 Runtime payloads are capped at 64 KiB, validated against the
 authenticated worker assignment, and stored with the report. They are
 worker-reported state, not a route probe or proof of peer/application
-reachability; those claims remain `not_verified` until an explicit bounded
-probe succeeds.
+reachability. `reachability` remains `not_verified` in manager diagnostics.
+The local `conductor overlay probe` reports a bounded HTTP result to its caller
+but does not persist that result in manager state.
 
 ## Run-history retention
 
