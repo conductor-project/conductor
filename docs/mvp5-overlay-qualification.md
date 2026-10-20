@@ -61,8 +61,9 @@ diagnostics distinguish desired membership, helper-reported TUN/address/MTU
 and installed routes, active direct Iroh links, selected direct IP path, last
 handshake time, and transport byte counters. Reports are generation- and
 freshness-tagged; counters measure QUIC UDP traffic including protocol overhead,
-not application payload. The manager still reports `reachability: not_verified`
-until a bounded application probe succeeds.
+not application payload. The manager's `reachability` field remains
+`not_verified`; the local `conductor overlay probe` reports its result only to
+the operator and does not persist it in manager state.
 
 # DNS-discovered application traffic
 
@@ -216,7 +217,7 @@ worker status, Iroh handshake, ping, or timeout alone.
 For each failure, save the manager peer listing before and after, including
 desired peer generation, observation generation, observation timestamp,
 freshness, lease expiry, and state. Keep `reachability: not_verified` in the
-record unless an application-level probe succeeded.
+manager output; save any separate application probe output alongside it.
 
 # Existing local evidence
 
