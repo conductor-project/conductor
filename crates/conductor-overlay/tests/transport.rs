@@ -182,6 +182,10 @@ async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
             .expect("test bind port is valid"),
     )
     .await;
+    let candidate = std::env::var("CONDUCTOR_OVERLAY_TEST_PEER_CANDIDATE")
+        .expect("peer candidate is configured")
+        .parse::<SocketAddr>()
+        .expect("peer candidate is a socket address");
     println!(
         "role={role} endpoint_id={} bound_candidates={:?} peer_candidate={candidate}",
         local_endpoint.id(),
@@ -191,10 +195,6 @@ async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
             .copied()
             .collect::<Vec<_>>()
     );
-    let candidate = std::env::var("CONDUCTOR_OVERLAY_TEST_PEER_CANDIDATE")
-        .expect("peer candidate is configured")
-        .parse::<SocketAddr>()
-        .expect("peer candidate is a socket address");
     let peer = OverlayPeer {
         worker_id: remote_worker,
         endpoint_id: OverlayEndpointId::new(remote_secret.public().to_string())
