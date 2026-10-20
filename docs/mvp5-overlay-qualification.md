@@ -25,6 +25,13 @@ available; a second independently booted Linux worker host is still needed.
 Do not treat local tests as cross-host evidence or mark acceptance rows as
 passed until the run is performed on both hosts.
 
+On 2026-10-20, authenticated SSH access to the available Debian 13 x86_64
+Linux host was confirmed. The host reports kernel
+`6.12.113+deb13-amd64`; `/dev/net/tun` and `tcpdump` are present. This confirms
+that one host is reachable for preparation only. It does not establish that
+Conductor or its overlay helper was built or run there, and it is not
+cross-host traffic or encryption evidence.
+
 The code under review supports a Linux TUN with a 1,000-byte IPv4 packet
 limit and a direct-only Iroh topology. Iroh relay use, public/default address
 discovery, and NAT traversal are disabled. Managers distribute authenticated
