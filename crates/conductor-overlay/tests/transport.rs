@@ -469,13 +469,18 @@ async fn exchange_overlay_tcp_and_udp(
         }
         stream.write_all(b"DONE").await?;
         stream.flush().await?;
-        stream.shutdown().await?;
-        let mut trailing = [0; 1];
-        let bytes_read =
-            tokio::time::timeout(Duration::from_secs(10), stream.read(&mut trailing)).await??;
-        if bytes_read != 0 {
-            return Err("client sent unexpected bytes after completion".into());
+        let mut completion_acknowledgment = [0; 5];
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read_exact(&mut completion_acknowledgment),
+        )
+        .await??;
+        if &completion_acknowledgment != b"FINAL" {
+            return Err("client completion acknowledgment did not match".into());
         }
+        println!("role=b application=completion_acknowledged");
+        stream.shutdown().await?;
+        tokio::time::sleep(Duration::from_millis(250)).await;
     } else {
         let marker = format!(
             "conductor-cross-host-{}-{}",
@@ -525,6 +530,8 @@ async fn exchange_overlay_tcp_and_udp(
         if &completion != b"DONE" {
             return Err("server completion message did not match".into());
         }
+        stream.write_all(b"FINAL").await?;
+        stream.flush().await?;
         stream.shutdown().await?;
         let mut trailing = [0; 1];
         let bytes_read =
@@ -532,7 +539,7 @@ async fn exchange_overlay_tcp_and_udp(
         if bytes_read != 0 {
             return Err("server sent unexpected bytes after completion".into());
         }
-        println!("application_bytes={} payload_match=true", response.len());
+        println!("application_bytes={} payload_match=true", payload.len());
     }
     Ok(())
 }
