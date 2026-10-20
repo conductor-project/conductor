@@ -316,9 +316,33 @@ manager was not running; the test injected short-lived peer configuration.
 There was no underlay packet capture in this rerun, so encryption at the
 underlay boundary is not newly demonstrated by this result. Manager bootstrap
 and outage, host-resolver DNS/Hickory application discovery, independent
-physical failure domains, performance limits, restart, revocation, expiry,
-MTU, queue pressure, route preservation, and blocked direct UDP remain
+physical failure domains, performance limits, worker daemon/host restart,
+revocation, expiry, MTU, queue pressure, host-route preservation during
+successful setup/cleanup, and blocked direct UDP between hosts remain
 unqualified. Keep those #156 acceptance criteria open.
+
+On the same source revision, three Linux lifecycle tests passed on Fortress in
+disposable network namespaces: `managed_interface_routes_reconcile_and_restart_cleanly`
+(0.04 seconds), `helper_process_owns_tun_and_runs_overlay_dataplane` (0.16
+seconds), and `overlapping_host_route_is_preserved_when_overlay_start_is_rejected`
+(0.04 seconds). They cover route reconciliation/restart, helper startup and
+reconfiguration/shutdown/restart, and preservation of a conflicting unrelated
+host route. The `linux_overlay` test binary SHA-256 was
+`84cc938cd9bf045cd734fec87ecf986e773acd2096f73b3c38ecebc04edb5647` on
+Fortress. The ignored `unavailable_direct_candidate_reports_failure_within_bound`
+test also passed there in 13.02 seconds, reporting failure within its 12-second
+connection bound. Its test binary SHA-256 was
+`7e8d0f315daf5dc003f4e3f5209a4cba672497b678b5f6ece07fc1156bf6d3d3`.
+
+The privileged tests ran with `sudo -n unshare --net -- env RUST_TEST_THREADS=1
+timeout 35s <test-binary> --include-ignored --exact <test-name> --nocapture
+--test-threads=1`; each invocation received a fresh network namespace. The
+cross-host test used the role-specific `CONDUCTOR_OVERLAY_TEST_ROLE`, bind-port,
+and direct-candidate variables documented in `tests/transport.rs`; it ran each
+role binary with `--include-ignored --exact
+independent_linux_hosts_exchange_tcp_and_udp_over_iroh_tun --nocapture
+--test-threads=1` and a 70-second process bound. These are implementation-level
+tests, not full manager, daemon crash-recovery, or physical-host qualification.
 
 ## Partial direct-host application test
 
