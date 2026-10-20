@@ -30,7 +30,6 @@ async fn helper_process_owns_tun_and_runs_overlay_dataplane() {
         schema_version: OVERLAY_PEER_CONFIGURATION_SCHEMA_VERSION,
         network_domain_id: NetworkDomainId::new("overlay-test").expect("valid domain ID"),
         worker_id: worker_id.clone(),
-        relay_url: "https://127.0.0.1:4444".to_owned(),
         worker_address: local,
         peer_generation: 1,
         network_generation: 1,

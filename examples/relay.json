@@ -1,4 +1,0 @@
-{
-  "role": "relay",
-  "relay_http_listen": "127.0.0.1:3340"
-}

@@ -3076,7 +3076,7 @@ mod access_tests {
     async fn overlay_domain_and_peer_status_routes_are_authenticated_and_audited() {
         let database = TestDatabase::new();
         let router = router(&database);
-        let body = r#"{"networkDomainId":"overlay-a","relayUrl":"https://relay.example.test","workerAddressPool":"10.88.0.0/24","serviceAddressPool":"10.88.1.0/24"}"#;
+        let body = r#"{"networkDomainId":"overlay-a","workerAddressPool":"10.88.0.0/24","serviceAddressPool":"10.88.1.0/24"}"#;
         let created = router
             .clone()
             .oneshot(authorized_request(

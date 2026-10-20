@@ -92,7 +92,6 @@ impl<'de> Deserialize<'de> for OverlayEndpointId {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OverlayNetworkDomainConfig {
     pub network_domain_id: NetworkDomainId,
-    pub relay_url: String,
     pub worker_address_pool: String,
     pub service_address_pool: String,
 }
@@ -156,7 +155,6 @@ pub struct OverlayPeerConfiguration {
     pub schema_version: u32,
     pub network_domain_id: NetworkDomainId,
     pub worker_id: WorkerId,
-    pub relay_url: String,
     pub worker_address: Ipv4Addr,
     pub peer_generation: u64,
     pub network_generation: u64,

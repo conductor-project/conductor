@@ -31,8 +31,8 @@ distinguishes a worker restart and fences stale sessions.
 Overlay contracts add a stable network-domain ID and a canonical lowercase
 hexadecimal Iroh endpoint public ID. Peer assignments use IPv4 addresses and
 monotonic peer/network generations. Configuration snapshots carry a schema
-version and operator-configured relay URL. They contain public peer identities
-only; secret endpoint keys remain worker-local. These shared types describe
+version, bounded direct UDP candidates, and candidate expiry. They contain
+public peer identities only; secret endpoint keys remain worker-local. These shared types describe
 control-plane state and do not implement packet transport.
 
 # Job contracts

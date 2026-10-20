@@ -1,5 +1,5 @@
 use std::io;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::process::Stdio;
 
 use conductor_core::{OverlayPeerConfiguration, WorkerId};
@@ -19,6 +19,7 @@ struct HelperResponse {
     peer_generation: Option<u64>,
     network_generation: Option<u64>,
     expires_at_ms: Option<i64>,
+    direct_candidates: Vec<SocketAddr>,
 }
 
 #[derive(Serialize)]
@@ -45,6 +46,7 @@ pub struct LinuxOverlayHelperClient {
     interface_name: String,
     worker_id: WorkerId,
     configuration: OverlayPeerConfiguration,
+    direct_candidates: Vec<SocketAddr>,
 }
 
 impl LinuxOverlayHelperClient {
@@ -88,6 +90,7 @@ impl LinuxOverlayHelperClient {
             interface_name,
             worker_id: worker_id.clone(),
             configuration: configuration.clone(),
+            direct_candidates: Vec::new(),
         };
         client
             .write_request(HelperRequest::Start {
@@ -98,6 +101,7 @@ impl LinuxOverlayHelperClient {
             .await?;
         let response = client.read_response().await?;
         client.validate_response(&response, "ready", configuration)?;
+        client.direct_candidates = response.direct_candidates;
         Ok(client)
     }
 
@@ -107,6 +111,10 @@ impl LinuxOverlayHelperClient {
 
     pub fn local_address(&self) -> Ipv4Addr {
         self.configuration.worker_address
+    }
+
+    pub fn direct_candidates(&self) -> &[SocketAddr] {
+        &self.direct_candidates
     }
 
     pub async fn reconfigure(
@@ -129,6 +137,7 @@ impl LinuxOverlayHelperClient {
             .await?;
         let response = self.read_response().await?;
         self.validate_response(&response, "applied", configuration)?;
+        self.direct_candidates = response.direct_candidates;
         self.configuration = configuration.clone();
         Ok(())
     }
@@ -169,6 +178,7 @@ impl LinuxOverlayHelperClient {
             || response.peer_generation != Some(configuration.peer_generation)
             || response.network_generation != Some(configuration.network_generation)
             || response.expires_at_ms != Some(configuration.expires_at_ms)
+            || !conductor_core::valid_overlay_direct_candidates(&response.direct_candidates)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

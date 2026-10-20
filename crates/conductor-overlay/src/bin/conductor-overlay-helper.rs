@@ -1,5 +1,5 @@
 #[cfg(target_os = "linux")]
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 #[cfg(target_os = "linux")]
 use conductor_core::{OverlayPeerConfiguration, WorkerId};
@@ -37,6 +37,7 @@ struct Response<'a> {
     peer_generation: Option<u64>,
     network_generation: Option<u64>,
     expires_at_ms: Option<i64>,
+    direct_candidates: &'a [SocketAddr],
 }
 
 #[cfg(target_os = "linux")]
@@ -81,8 +82,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         configuration.peers.iter().map(|peer| peer.worker_address),
     )
     .await?;
-    let mut endpoint = create_endpoint(secret_key, &configuration).await?;
-    write_configuration_response("ready", &worker_id, &interface, &configuration).await?;
+    let mut endpoint = create_endpoint(secret_key).await?;
+    let mut direct_candidates = endpoint_direct_candidates(&endpoint);
+    write_configuration_response(
+        "ready",
+        &worker_id,
+        &interface,
+        &configuration,
+        &direct_candidates,
+    )
+    .await?;
 
     let mut configuration = configuration;
     loop {
@@ -99,7 +108,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             result = &mut packet_loop => {
                 let event = if result.is_ok() { "stopped" } else { "unavailable" };
                 endpoint.close().await;
-                write_configuration_response(event, &worker_id, &interface, &configuration).await?;
+                write_configuration_response(event, &worker_id, &interface, &configuration, &direct_candidates).await?;
                 match read_json_line(&mut input).await? {
                     Some(Request::Reconfigure { configuration: updated }) => {
                         validate_reconfiguration(&updated, &worker_id, &configuration, &interface)?;
@@ -108,8 +117,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         let peers = updated.peers.iter().map(|peer| peer.worker_address).collect::<BTreeSet<_>>();
                         interface.reconcile_routes(&peers).await?;
                         configuration = updated;
-                        endpoint = create_endpoint(secret_key, &configuration).await?;
-                        write_configuration_response("applied", &worker_id, &interface, &configuration).await?;
+                        endpoint = create_endpoint(secret_key).await?;
+                        direct_candidates = endpoint_direct_candidates(&endpoint);
+                        write_configuration_response("applied", &worker_id, &interface, &configuration, &direct_candidates).await?;
                     }
                     Some(Request::Shutdown) | None => break,
                     Some(Request::Start { .. }) => return Err("duplicate start request".into()),
@@ -123,10 +133,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .map_err(|_| "manager overlay configuration is invalid")?;
                         let peers = updated.peers.iter().map(|peer| peer.worker_address).collect::<BTreeSet<_>>();
                         interface.reconcile_routes(&peers).await?;
-                        endpoint.close().await;
                         configuration = updated;
-                        endpoint = create_endpoint(secret_key, &configuration).await?;
-                        write_configuration_response("applied", &worker_id, &interface, &configuration).await?;
+                        write_configuration_response("applied", &worker_id, &interface, &configuration, &direct_candidates).await?;
                     }
                     Some(Request::Shutdown) | None => break,
                     Some(Request::Start { .. }) => return Err("duplicate start request".into()),
@@ -146,6 +154,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         peer_generation: Some(configuration.peer_generation),
         network_generation: Some(configuration.network_generation),
         expires_at_ms: Some(configuration.expires_at_ms),
+        direct_candidates: &direct_candidates,
     })
     .await?;
     Ok(())
@@ -170,15 +179,22 @@ fn validate_reconfiguration(
 #[cfg(target_os = "linux")]
 async fn create_endpoint(
     secret_key: [u8; 32],
-    configuration: &OverlayPeerConfiguration,
 ) -> Result<iroh::Endpoint, Box<dyn std::error::Error>> {
-    let relay_url = configuration
-        .relay_url
-        .parse::<iroh_base::RelayUrl>()
-        .map_err(|_| "manager overlay relay URL is invalid")?;
-    conductor_overlay::create_endpoint(iroh_base::SecretKey::from_bytes(&secret_key), relay_url)
+    conductor_overlay::create_endpoint(iroh_base::SecretKey::from_bytes(&secret_key))
         .await
         .map_err(|_| "could not start the overlay endpoint".into())
+}
+
+#[cfg(target_os = "linux")]
+fn endpoint_direct_candidates(endpoint: &iroh::Endpoint) -> Vec<SocketAddr> {
+    let mut candidates = endpoint.addr().ip_addrs().copied().collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates.dedup();
+    candidates.retain(|candidate| {
+        conductor_core::valid_overlay_direct_candidates(std::slice::from_ref(candidate))
+    });
+    candidates.truncate(conductor_core::MAX_OVERLAY_DIRECT_CANDIDATES);
+    candidates
 }
 
 #[cfg(target_os = "linux")]
@@ -187,6 +203,7 @@ async fn write_configuration_response(
     worker_id: &WorkerId,
     interface: &conductor_overlay::LinuxOverlayInterface,
     configuration: &OverlayPeerConfiguration,
+    direct_candidates: &[SocketAddr],
 ) -> io::Result<()> {
     write_response(Response {
         event,
@@ -196,6 +213,7 @@ async fn write_configuration_response(
         peer_generation: Some(configuration.peer_generation),
         network_generation: Some(configuration.network_generation),
         expires_at_ms: Some(configuration.expires_at_ms),
+        direct_candidates,
     })
     .await
 }

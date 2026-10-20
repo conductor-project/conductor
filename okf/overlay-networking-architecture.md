@@ -230,15 +230,12 @@ x86_64, Linux arm64, and Apple silicon CI, but no independent-host overlay
 qualification.
 
 PR #187 adds the pinned Iroh release and manager identity/address contracts;
-PR #188 adds `tun-rs`, the Conductor packet adapter, and privileged route
-lifecycle. The two-host qualification must exercise manager-enrolled endpoint
-identities, direct-only TUN packet forwarding, the selected Iroh
-datagram/stream framing contract, and a request/reply application probe while
-relays and public discovery are unavailable. Measure MTU, reconnect,
-throughput, and packet loss; verify the direct UDP prerequisites and bounded
-failure when they are not met. Keep versions, enabled features, transitive
-footprint, and third-party safety boundaries in the dependency decision.
-
-This source review did not run tests, construct an overlay, validate a
-privileged helper, or access a two-host testbed. No network behavior or
-platform qualification is claimed.
+PR #188 adds direct candidate advertisements, `tun-rs`, the Conductor packet
+adapter, and the Linux helper route lifecycle. Local unit and workspace tests
+cover packet validation, peer authorization, candidate fencing, and manager
+migrations. They do not demonstrate independent-host traffic or exercise the
+privileged Linux helper. Issue #156 must still qualify manager-enrolled
+identities, direct-only packet forwarding, an application request/reply, MTU,
+reconnect, throughput, and packet loss on separate hosts with relays and public
+discovery unavailable. Keep versions, enabled features, transitive footprint,
+and third-party safety boundaries in the dependency decision.

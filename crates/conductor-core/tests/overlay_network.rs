@@ -15,31 +15,15 @@ fn endpoint_ids_accept_only_canonical_lowercase_hex() {
 fn overlay_contracts_use_bounded_strict_json_shapes() {
     let domain = OverlayNetworkDomainConfig {
         network_domain_id: NetworkDomainId::new("production").unwrap(),
-        relay_url: "https://relay.example.test".to_owned(),
         worker_address_pool: "10.88.0.0/24".to_owned(),
         service_address_pool: "10.88.1.0/24".to_owned(),
     };
     let json = serde_json::to_string(&domain).unwrap();
     assert!(serde_json::from_str::<OverlayNetworkDomainConfig>(&json).is_ok());
     assert!(serde_json::from_str::<OverlayNetworkDomainConfig>(
-        r#"{"networkDomainId":"production","relayUrl":"https://relay.example.test","workerAddressPool":"10.88.0.0/24","serviceAddressPool":"10.88.1.0/24","privateKey":"secret"}"#
+        r#"{"networkDomainId":"production","workerAddressPool":"10.88.0.0/24","serviceAddressPool":"10.88.1.0/24","privateKey":"secret"}"#
     )
     .is_err());
-
-    let configuration = conductor_core::OverlayPeerConfiguration {
-        schema_version: conductor_core::OVERLAY_PEER_CONFIGURATION_SCHEMA_VERSION,
-        network_domain_id: domain.network_domain_id.clone(),
-        worker_id: WorkerId::new("worker-a").unwrap(),
-        relay_url: domain.relay_url.clone(),
-        worker_address: "10.88.0.1".parse().unwrap(),
-        peer_generation: 2,
-        network_generation: 3,
-        expires_at_ms: 10_000,
-        peers: Vec::new(),
-    };
-    let configuration_json = serde_json::to_value(&configuration).unwrap();
-    assert_eq!(configuration_json["schemaVersion"], 1);
-    assert_eq!(configuration_json["relayUrl"], "https://relay.example.test");
 
     let peer = OverlayPeer {
         worker_id: WorkerId::new("worker-a").unwrap(),

@@ -72,15 +72,16 @@ An opt-in Linux worker can join a manager-owned overlay domain by setting
 `worker_overlay_helper_binary`. Install the helper as a root-owned executable
 available only to the Conductor service account, and grant only that helper
 `CAP_NET_ADMIN`; the main `conductor` process and workload processes must not
-receive it. The worker stores its Iroh secret in
+receive it. The helper runs the worker's single Iroh endpoint and packet
+adapter alongside the TUN and route lifecycle. The worker stores its Iroh secret in
 `worker_data_dir/overlay-identity.key` with owner-only permissions, registers
 the derived endpoint identity over worker mTLS, and refreshes its peer snapshot
-from the manager. This currently requires Linux and an operator-provided Iroh
-relay URL in the manager's overlay-domain configuration. Start dedicated relay
-nodes with `role: relay`; that role hosts Iroh's relay server in the Conductor
-process. The relay listener is plain HTTP and should sit behind a trusted TLS
-reverse proxy that supports WebSocket upgrades. Do not use it as an internet
-HTTP endpoint without that proxy.
+from the manager. The selected topology is direct-only: workers exchange
+authenticated EndpointIds and direct UDP candidates through the manager, and
+Iroh relays, public/default address discovery, and automatic NAT traversal are
+disabled. Peers must be directly reachable on the configured LAN/VPC or
+underlay topology. This currently requires Linux; blocked direct paths fail
+without relay fallback.
 
 Revoke a worker from the manager host:
 

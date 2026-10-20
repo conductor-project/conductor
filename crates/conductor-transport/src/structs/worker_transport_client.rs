@@ -121,6 +121,25 @@ impl WorkerTransportClient {
         .await
     }
 
+    pub async fn advertise_overlay_candidates(
+        &self,
+        domain_id: &conductor_core::NetworkDomainId,
+        peer_generation: u64,
+        candidates: &[std::net::SocketAddr],
+    ) -> Result<conductor_core::OverlayDirectCandidateAcknowledgement, TransportError> {
+        self.post_json(
+            &format!(
+                "v1/worker/network-domains/{}/candidates",
+                domain_id.as_str()
+            ),
+            &conductor_core::OverlayDirectCandidateAdvertisement {
+                peer_generation,
+                candidates: candidates.to_vec(),
+            },
+        )
+        .await
+    }
+
     pub async fn report_overlay_observation(
         &self,
         domain_id: &conductor_core::NetworkDomainId,

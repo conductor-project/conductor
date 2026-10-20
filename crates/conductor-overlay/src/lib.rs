@@ -25,8 +25,8 @@ use bytes::Bytes;
 use conductor_core::{
     OVERLAY_PEER_CONFIGURATION_SCHEMA_VERSION, OverlayPeer, OverlayPeerConfiguration, WorkerId,
 };
-use iroh::{Endpoint, EndpointAddr, RelayMode, endpoint::Connection};
-use iroh_base::{EndpointId, RelayUrl, SecretKey};
+use iroh::{Endpoint, EndpointAddr, RelayMode, TransportAddr, endpoint::Connection};
+use iroh_base::{EndpointId, SecretKey};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -54,6 +54,7 @@ pub enum OverlayTransportError {
     UnauthorizedPeer,
     EndpointClosed,
     PeerUnavailable,
+    NoDirectCandidates,
     DatagramUnsupported,
     PacketTooLarge,
     Bind(iroh::endpoint::BindError),
@@ -72,34 +73,37 @@ pub enum OverlayConfigurationError {
     UnsupportedSchema,
     WrongWorker,
     InvalidLease,
-    InvalidRelayUrl,
+    InvalidCandidates,
     TooManyPeers,
     InvalidPeers(OverlayPacketError),
 }
 
-/// Create a worker endpoint with a locally held key and the operator's relay.
-/// This deliberately avoids Iroh's public default relay map.
-pub async fn create_endpoint(
-    secret_key: SecretKey,
-    relay_url: RelayUrl,
-) -> Result<Endpoint, OverlayTransportError> {
-    Endpoint::builder(iroh::endpoint::presets::N0)
+/// Create one worker endpoint with no relay or address lookup services.
+pub async fn create_endpoint(secret_key: SecretKey) -> Result<Endpoint, OverlayTransportError> {
+    Endpoint::builder(iroh::endpoint::presets::Minimal)
         .secret_key(secret_key)
-        .relay_mode(RelayMode::custom([relay_url]))
+        .relay_mode(RelayMode::Disabled)
         .alpns(vec![OVERLAY_ALPN.to_vec()])
         .bind()
         .await
         .map_err(OverlayTransportError::Bind)
 }
 
-/// Establish an authenticated Iroh connection to a peer using the operator's
-/// configured relay. The peer key is checked again after the QUIC handshake.
+/// Establish an authenticated Iroh connection using only manager-distributed
+/// direct underlay candidates. The peer key is checked after the QUIC handshake.
 pub async fn connect_peer(
     endpoint: &Endpoint,
     endpoint_id: EndpointId,
-    relay_url: RelayUrl,
+    candidates: &[std::net::SocketAddr],
 ) -> Result<Connection, OverlayTransportError> {
-    let address = EndpointAddr::new(endpoint_id).with_relay_url(relay_url);
+    if candidates.is_empty() {
+        return Err(OverlayTransportError::NoDirectCandidates);
+    }
+    if !conductor_core::valid_overlay_direct_candidates(candidates) {
+        return Err(OverlayTransportError::UnauthorizedPeer);
+    }
+    let address = EndpointAddr::new(endpoint_id)
+        .with_addrs(candidates.iter().copied().map(TransportAddr::Ip));
     let connection = endpoint
         .connect(address, OVERLAY_ALPN)
         .await
@@ -185,10 +189,6 @@ pub async fn run_packet_dataplane(
 ) -> Result<(), OverlayTransportError> {
     let router = configured_packet_router(configuration, expected_worker, now_ms)
         .map_err(OverlayTransportError::InvalidConfiguration)?;
-    let relay_url = configuration
-        .relay_url
-        .parse::<RelayUrl>()
-        .map_err(|_| OverlayTransportError::UnauthorizedPeer)?;
     let (inbound_tx, mut inbound_rx) = mpsc::channel::<Vec<u8>>(128);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let connections = Arc::new(RwLock::new(BTreeMap::new()));
@@ -199,7 +199,8 @@ pub async fn run_packet_dataplane(
             .parse::<EndpointId>()
             .map_err(|_| OverlayTransportError::UnauthorizedPeer)?;
         let endpoint = endpoint.clone();
-        let relay_url = relay_url.clone();
+        let candidates = peer.direct_candidates.clone();
+        let candidates_expires_at_ms = peer.direct_candidates_expires_at_ms.unwrap_or(0);
         let router = router.clone();
         let inbound_tx = inbound_tx.clone();
         let connections = Arc::clone(&connections);
@@ -209,12 +210,18 @@ pub async fn run_packet_dataplane(
             loop {
                 let connected = tokio::select! {
                     _ = shutdown.changed() => break,
-                    connected = tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        connect_peer(&endpoint, endpoint_id, relay_url.clone()),
-                    ) => connected,
+                    connected = async {
+                        if unix_time_ms() >= candidates_expires_at_ms {
+                            Err(OverlayTransportError::NoDirectCandidates)
+                        } else {
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(10),
+                                connect_peer(&endpoint, endpoint_id, &candidates),
+                            ).await.map_err(|_| OverlayTransportError::PeerUnavailable)?
+                        }
+                    } => connected,
                 };
-                if let Ok(Ok(connection)) = connected {
+                if let Ok(connection) = connected {
                     spawn_packet_reader(connection.clone(), router.clone(), inbound_tx.clone());
                     connections
                         .write()
@@ -307,6 +314,14 @@ pub async fn run_packet_dataplane(
     }
 }
 
+fn unix_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(i64::MAX)
+}
+
 fn spawn_packet_reader(
     connection: Connection,
     router: OverlayPacketRouter,
@@ -348,22 +363,18 @@ pub fn configured_packet_router(
     {
         return Err(OverlayConfigurationError::InvalidLease);
     }
-    let relay_url = configuration
-        .relay_url
-        .parse::<RelayUrl>()
-        .map_err(|_| OverlayConfigurationError::InvalidRelayUrl)?;
-    if relay_url.scheme() != "https"
-        || relay_url.host_str().is_none()
-        || !relay_url.username().is_empty()
-        || relay_url.password().is_some()
-        || (relay_url.path() != "/" && !relay_url.path().is_empty())
-        || relay_url.query().is_some()
-        || relay_url.fragment().is_some()
-    {
-        return Err(OverlayConfigurationError::InvalidRelayUrl);
-    }
     if configuration.peers.len() > MAX_OVERLAY_PEERS {
         return Err(OverlayConfigurationError::TooManyPeers);
+    }
+    for peer in &configuration.peers {
+        if !conductor_core::valid_overlay_direct_candidates(&peer.direct_candidates)
+            || (!peer.direct_candidates.is_empty()
+                && !peer
+                    .direct_candidates_expires_at_ms
+                    .is_some_and(|expiry| expiry > now_ms))
+        {
+            return Err(OverlayConfigurationError::InvalidCandidates);
+        }
     }
     OverlayPacketRouter::new(configuration.worker_address, &configuration.peers)
         .map_err(OverlayConfigurationError::InvalidPeers)
