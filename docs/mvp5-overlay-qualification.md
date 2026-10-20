@@ -3,13 +3,15 @@ type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
 status: partial direct TUN/TCP test passed; deployment qualification pending
-source_revision: dcbfa67fd959c9113bfcfa2a9782b687424e2bb5
+source_revision: e1003ad016084731ac334b5063959a91bebded7b
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
     title: Accepted overlay architecture and boundaries
   - resource: ../crates/conductor-overlay/tests/linux_overlay.rs
     title: Local Linux interface lifecycle tests
+  - resource: ../crates/conductor-overlay/tests/transport.rs
+    title: Direct-only transport and cross-host qualification tests
   - resource: ../examples/overlay-worker.json
     title: Standalone Linux worker overlay configuration
   - resource: ../scripts/qualify-overlay-traffic.py
@@ -252,6 +254,35 @@ freshness, lease expiry, and state. A failed or stale application probe must
 not be treated as verified reachability.
 
 # Existing local evidence
+
+## Repeat direct-host run and blocked-candidate probe
+
+On 2026-10-20, the exact source revision
+`e1003ad016084731ac334b5063959a91bebded7b` passed the ignored
+`independent_linux_hosts_exchange_tcp_over_iroh_tun` test on Fortress and the
+separately booted Debian 13 ARM64 QEMU VM. Each role compiled the test target
+with Rust 1.99.1. Both roles exchanged and compared a 65,536-byte TCP payload
+and its echo through owned TUN interfaces and relay-disabled Iroh endpoints.
+Worker B bound its test listener before waiting for the peer path; Worker A
+waited for the peer test endpoint to close after it sent the application ACK.
+The role-specific test processes passed in 5.77 seconds (A) and 3.97 seconds
+(B). Test binary SHA-256 values were
+`fc6246e80317220c0470edccb752d37bf6291a8009e56ec53a6fc217b9efb9e1` on
+Fortress and
+`1d64253bc530b2c27e544762754534b57afbde1d54e0a8cbf62b44d83597ef44` on the
+VM. The run still used a manually injected, short-lived peer configuration;
+the VM shared the development Mac as its physical host. It does not qualify
+manager bootstrap, Hickory/host-resolver discovery, two independent physical
+failure domains, restart, revocation, MTU, queue pressure, or performance.
+
+The same source revision passed the ignored
+`unavailable_direct_candidate_reports_failure_within_bound` test on Fortress.
+With relay mode disabled and the explicit documentation-only candidate
+`192.0.2.1:65000`, the test reported a non-connected attempt outcome inside its
+12-second bound; the full test completed in 13.04 seconds. Its binary was the
+Fortress transport test binary above. This exercises one local unreachable
+candidate; it is not a two-host firewall-blockage run and does not replace the
+remaining #156 failure matrix.
 
 ## Partial direct-host application test
 
