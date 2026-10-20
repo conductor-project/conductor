@@ -66,6 +66,106 @@ async fn helper_process_owns_tun_and_runs_overlay_dataplane() {
         .expect("clean up after helper restart");
 }
 
+#[tokio::test]
+#[ignore = "requires a Linux network namespace, CAP_NET_ADMIN, and /dev/net/tun"]
+async fn overlapping_host_route_is_preserved_when_overlay_start_is_rejected() {
+    use futures_util::StreamExt;
+    use rtnetlink::RouteMessageBuilder;
+    use rtnetlink::packet_route::route::RouteProtocol;
+
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        let (connection, handle, _messages) =
+            rtnetlink::new_connection().expect("create isolated route controller");
+        tokio::spawn(connection);
+        let loopback = handle
+            .link()
+            .get()
+            .match_name("lo")
+            .execute()
+            .next()
+            .await
+            .expect("loopback interface exists")
+            .expect("read loopback interface");
+        handle
+            .link()
+            .change(
+                rtnetlink::LinkMessageBuilder::<rtnetlink::LinkUnspec>::new()
+                    .index(loopback.header.index)
+                    .up()
+                    .build(),
+            )
+            .execute()
+            .await
+            .expect("enable loopback in the isolated namespace");
+        let network = Ipv4Addr::new(198, 18, 10, 0);
+        let peer = Ipv4Addr::new(198, 18, 10, 2);
+        let mut host_route = RouteMessageBuilder::<Ipv4Addr>::new()
+            .destination_prefix(network, 24)
+            .output_interface(loopback.header.index)
+            .build();
+        host_route.header.protocol = RouteProtocol::Static;
+        handle
+            .route()
+            .add(host_route.clone())
+            .execute()
+            .await
+            .expect("install unrelated overlapping host route fixture");
+
+        let interface_name = format!("cnd-{:x}", std::process::id());
+        let error = match LinuxOverlayInterface::start(
+            &interface_name,
+            Ipv4Addr::new(198, 18, 10, 1),
+            [peer],
+        )
+        .await
+        {
+            Ok(interface) => {
+                interface
+                    .shutdown()
+                    .await
+                    .expect("clean unexpected overlay interface");
+                panic!("overlapping non-Conductor host route must reject overlay setup");
+            }
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+
+        let mut routes = handle
+            .route()
+            .get(RouteMessageBuilder::<Ipv4Addr>::new().build())
+            .execute();
+        let mut route_remains = false;
+        while let Some(route) = routes.next().await {
+            let route = route.expect("read isolated route table");
+            if route.header.protocol == RouteProtocol::Static
+                && route.header.destination_prefix_length == 24
+                && route.attributes.iter().any(|attribute| {
+                    matches!(
+                        attribute,
+                        rtnetlink::packet_route::route::RouteAttribute::Destination(
+                            rtnetlink::packet_route::route::RouteAddress::Inet(address)
+                        ) if *address == network
+                    )
+                })
+            {
+                route_remains = true;
+            }
+        }
+        assert!(
+            route_remains,
+            "rejected setup must preserve the existing host route"
+        );
+        handle
+            .route()
+            .del(host_route)
+            .execute()
+            .await
+            .expect("remove only the test-owned host route fixture");
+    })
+    .await
+    .expect("overlap rejection and cleanup must complete within 15 seconds");
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

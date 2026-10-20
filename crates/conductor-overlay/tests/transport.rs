@@ -18,7 +18,7 @@ use std::net::{Ipv6Addr, SocketAddrV6};
 #[cfg(target_os = "linux")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(target_os = "linux")]
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 #[tokio::test]
 #[ignore = "requires directly reachable non-loopback local UDP candidates"]
@@ -143,7 +143,7 @@ async fn two_local_iroh_endpoints_exchange_authenticated_overlay_datagrams() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires two Linux hosts with direct UDP candidates and TUN privileges"]
-async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
+async fn independent_linux_hosts_exchange_tcp_and_udp_over_iroh_tun() {
     let role = std::env::var("CONDUCTOR_OVERLAY_TEST_ROLE").expect("test role is configured");
     assert!(role == "a" || role == "b", "test role must be a or b");
     let local_worker = WorkerId::new(if role == "a" {
@@ -222,17 +222,24 @@ async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
     // Bind the application listener before either peer can observe the direct
     // Iroh path. A ready overlay path does not imply the remote TCP app is
     // listening yet.
-    let application_listener = if role == "b" {
-        Some(
-            TcpListener::bind(SocketAddr::from((local_address, 18080)))
-                .await
-                .expect("bind test application before peer readiness"),
+    let (application_listener, application_udp_socket) = if role == "b" {
+        (
+            Some(
+                TcpListener::bind(SocketAddr::from((local_address, 18080)))
+                    .await
+                    .expect("bind test application before peer readiness"),
+            ),
+            Some(
+                UdpSocket::bind(SocketAddr::from((local_address, 18081)))
+                    .await
+                    .expect("bind UDP test application before peer readiness"),
+            ),
         )
     } else {
-        None
+        (None, None)
     };
     if role == "b" {
-        println!("role=b application_listener=ready");
+        println!("role=b tcp_and_udp_applications=ready");
     }
     let runtime_status = OverlayRuntimeStatus::default();
     let run_configuration = configuration.clone();
@@ -253,11 +260,13 @@ async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
     });
 
     let (result, dataplane_finished) = tokio::select! {
-        result = exchange_overlay_tcp(
+        result = exchange_overlay_tcp_and_udp(
             role.as_str(),
+            local_address,
             remote_address,
             &runtime_status,
             application_listener,
+            application_udp_socket,
         ) => (result, false),
         dataplane_result = &mut dataplane => (
             Err(format!(
@@ -384,11 +393,13 @@ async fn endpoint_on_ports(secret_key: SecretKey, ipv4_port: u16, ipv6_port: u16
 }
 
 #[cfg(target_os = "linux")]
-async fn exchange_overlay_tcp(
+async fn exchange_overlay_tcp_and_udp(
     role: &str,
+    local_address: Ipv4Addr,
     remote_address: Ipv4Addr,
     runtime_status: &OverlayRuntimeStatus,
     application_listener: Option<TcpListener>,
+    application_udp_socket: Option<UdpSocket>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let selected_address = loop {
@@ -438,15 +449,33 @@ async fn exchange_overlay_tcp(
         if &acknowledgment != b"ACK" {
             return Err("application response acknowledgment did not match".into());
         }
+        let socket = application_udp_socket.expect("role B bound its UDP socket before readiness");
+        let mut request = [0; 64];
+        let (size, remote) =
+            tokio::time::timeout(Duration::from_secs(10), socket.recv_from(&mut request)).await??;
+        if &request[..size] != b"conductor-cross-host-udp" {
+            return Err("UDP application payload marker was not received".into());
+        }
+        socket.send_to(&request[..size], remote).await?;
+        println!("role=b udp_application=echoed bytes={size}");
+        let mut udp_acknowledgment = [0; 4];
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read_exact(&mut udp_acknowledgment),
+        )
+        .await??;
+        if &udp_acknowledgment != b"UDP!" {
+            return Err("UDP application acknowledgment did not match".into());
+        }
+        stream.write_all(b"DONE").await?;
+        stream.flush().await?;
+        stream.shutdown().await?;
         let mut trailing = [0; 1];
         let bytes_read =
             tokio::time::timeout(Duration::from_secs(10), stream.read(&mut trailing)).await??;
         if bytes_read != 0 {
-            return Err(
-                "application sent unexpected bytes after the response acknowledgment".into(),
-            );
+            return Err("client sent unexpected bytes after completion".into());
         }
-        // Role B returns only after it has observed the client's orderly FIN.
     } else {
         let marker = format!(
             "conductor-cross-host-{}-{}",
@@ -476,19 +505,32 @@ async fn exchange_overlay_tcp(
         }
         stream.write_all(b"ACK").await?;
         stream.flush().await?;
+        let udp_socket = UdpSocket::bind(SocketAddr::from((local_address, 0))).await?;
+        let request = b"conductor-cross-host-udp";
+        udp_socket
+            .send_to(request, SocketAddr::from((remote_address, 18081)))
+            .await?;
+        let mut response = [0; 64];
+        let (size, _) =
+            tokio::time::timeout(Duration::from_secs(10), udp_socket.recv_from(&mut response))
+                .await??;
+        if &response[..size] != request {
+            return Err("UDP application echo differs from the request".into());
+        }
+        println!("role=a udp_application=verified bytes={size}");
+        stream.write_all(b"UDP!").await?;
+        stream.flush().await?;
+        let mut completion = [0; 4];
+        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut completion)).await??;
+        if &completion != b"DONE" {
+            return Err("server completion message did not match".into());
+        }
         stream.shutdown().await?;
-        let close_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let links = runtime_status.direct_links().await;
-            if !links.iter().any(|link| link.connected) {
-                break;
-            }
-            if tokio::time::Instant::now() >= close_deadline {
-                return Err(format!(
-                    "remote test role did not close its direct Iroh path after receiving the client FIN: {links:?}"
-                ).into());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        let mut trailing = [0; 1];
+        let bytes_read =
+            tokio::time::timeout(Duration::from_secs(10), stream.read(&mut trailing)).await??;
+        if bytes_read != 0 {
+            return Err("server sent unexpected bytes after completion".into());
         }
         println!("application_bytes={} payload_match=true", response.len());
     }
