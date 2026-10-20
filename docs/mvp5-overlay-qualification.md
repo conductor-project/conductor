@@ -181,8 +181,10 @@ returned IP and port over the TUN/Iroh path and verifies the echoed application
 payload. The application connection uses the SRV answer's address/port pair
 rather than a hard-coded endpoint. This harness uses an isolated manager
 fixture rather than a production manager daemon. The combined cross-host
-DNS-to-application test is present but has not yet been executed on Linux at
-this source revision.
+DNS-to-application test was executed on Linux at the recorded source revision,
+but the current QEMU NAT attempt failed before path establishment. See the PR
+#200 rerun below. Successful host-resolver DNS-to-application traffic remains
+unqualified.
 
 # Basic traffic procedure
 
