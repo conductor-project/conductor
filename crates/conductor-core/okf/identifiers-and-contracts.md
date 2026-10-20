@@ -3,7 +3,7 @@ type: Reference
 title: Core identifiers and validated contracts
 description: Newtypes and constructors enforce stable IDs and validated job inputs before manager persistence or worker execution.
 status: stable
-source_revision: 36b84f6c94acd728a47a83516d1d575bb989c5ce
+source_revision: d236e7a4e184fe9b965e95eccd4170f6a3b82d7b
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/lib.rs
@@ -35,9 +35,11 @@ version, bounded direct UDP candidates, and candidate expiry. They contain
 public peer identities only; secret endpoint keys remain worker-local. These shared types describe
 control-plane state and do not implement packet transport.
 Peer diagnostics keep the latest worker apply report separate from desired
-assignment and carry its network generation and freshness. `not_verified` is
-the only reachability state until a bounded application probe exists; an
-applied helper report does not imply a live peer path.
+assignment and carry its network generation and freshness. Runtime observations
+can report helper-owned TUN state, installed routes, active direct Iroh paths,
+handshake times, and transport byte counters. `not_verified` remains the only
+reachability state until a bounded application probe succeeds; interface state,
+routes, and a peer handshake do not imply workload connectivity.
 
 # Job contracts
 

@@ -3,7 +3,7 @@ type: Reference
 title: Manager desired state and persistence
 description: SQLite stores immutable job/revision records, mutable deployment state, run reservations, worker records, commands, allocations, audit, and overlay membership.
 status: stable
-source_revision: 36b84f6c94acd728a47a83516d1d575bb989c5ce
+source_revision: d236e7a4e184fe9b965e95eccd4170f6a3b82d7b
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/lib.rs
@@ -74,9 +74,15 @@ tombstones therefore remain reserved. The peer-list diagnostic joins that
 desired state with the latest worker report and marks it fresh only when its
 timestamp is nonnegative, no later than manager time, and at most 60 seconds
 old, and its network generation matches desired state. The diagnostic includes
-the report generation so older applies remain visible as stale. Reports describe the helper's last successful configuration apply; they
-are not a live route check or proof of peer/application reachability. Those
-claims remain `not_verified` until an explicit bounded probe succeeds.
+the report generation so older applies remain visible as stale. A bounded
+runtime payload also records the helper's interface address/MTU, installed
+Conductor routes, active direct Iroh links, handshake timestamps, and transport
+UDP byte counters (including protocol overhead, not application payload).
+Runtime payloads are capped at 64 KiB, validated against the
+authenticated worker assignment, and stored with the report. They are
+worker-reported state, not a route probe or proof of peer/application
+reachability; those claims remain `not_verified` until an explicit bounded
+probe succeeds.
 
 ## Run-history retention
 

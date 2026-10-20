@@ -3,7 +3,7 @@ type: Architecture decision
 title: Overlay networking architecture
 description: Selected Rust-native direct-only host overlay contracts for encrypted worker-to-worker workload traffic.
 status: selected
-source_revision: e10f326
+source_revision: d236e7a4e184fe9b965e95eccd4170f6a3b82d7b
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../crates/conductor-core/src/lib.rs
@@ -50,7 +50,11 @@ streams, and datagrams; it is not a ready-made virtual-IP network. Conductor
 uses one Iroh endpoint per worker for all local services. It connects the
 `tun-rs` TUN interface to authorized Iroh peers, preserves IP packet
 boundaries, routes packets by manager-assigned address, and reports transport
-and interface state separately. Iroh relay mode and public/default address
+and interface state separately. The helper reports its interface address/MTU,
+installed owned routes, selected direct IP paths, handshake timestamps, and
+QUIC UDP byte counters; these counters include transport overhead and are not
+application payload measurements. Such a worker observation does not assert
+application reachability. Iroh relay mode and public/default address
 discovery are explicitly disabled. Managers distribute EndpointIds and
 validated direct IP:port candidates over the authenticated control plane;
 peers must be directly reachable on the declared LAN/VPC or configured

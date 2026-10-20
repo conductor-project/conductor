@@ -3,7 +3,7 @@ type: Reference
 title: HTTP routes and contracts
 description: Routes expose jobs, runs, service revisions/deployments, workers, drains, metrics, and readiness; the feature-gated typed client calls these contracts with bounded JSON responses.
 status: stable
-source_revision: 36b84f6c94acd728a47a83516d1d575bb989c5ce
+source_revision: d236e7a4e184fe9b965e95eccd4170f6a3b82d7b
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/server.rs
@@ -71,12 +71,15 @@ Overlay domain creation requires disjoint private IPv4 worker and service
 pools. Domain creation and peer revocation are audited operator mutations.
 Peer status contains public endpoint IDs, assigned addresses, generations,
 expiry, quarantine state, and the latest worker application report with its
-generation and a freshness bit; it contains no Iroh private key. `reachability` is
-always `not_verified`: an applied report does not prove a live peer path or
-application traffic. Worker identity enrollment, configuration delivery, and
+generation and a freshness bit; it contains no Iroh private key. A fresh runtime
+observation separately reports helper-owned interface state, installed routes,
+active direct Iroh paths, last handshake time, and QUIC/UDP byte counters. These
+byte counters include encrypted transport overhead and do not represent
+application payload bytes. These are worker-reported transport facts, not proof of application traffic;
+`reachability` remains `not_verified`. Worker identity enrollment, configuration delivery, and
 observations use the separate mTLS worker transport endpoints described in the
-transport bundle. These routes manage membership and observed configuration;
-they do not configure a tunnel or host route.
+transport bundle. The helper configures the TUN and owned routes; operator API
+routes expose their reported state but do not configure them directly.
 
 # Important run semantics
 

@@ -3,7 +3,7 @@ type: Runbook
 title: Operate Conductor with the CLI
 description: Select named manager connection contexts, submit and manage jobs and revisions, observe and control runs, follow bounded logs, inspect workers and services, mutate desired state safely, drain workers, and page history.
 status: stable
-source_revision: 36b84f6c94acd728a47a83516d1d575bb989c5ce
+source_revision: d236e7a4e184fe9b965e95eccd4170f6a3b82d7b
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/operator_cli.rs
@@ -197,11 +197,13 @@ Overlay commands create and inspect manager-owned network domains, list desired
 peer assignments with lease state and the latest worker apply report, and revoke
 a worker peer. Use the operator API; do not edit manager SQLite state directly.
 A report is fresh only when it matches the desired generation and its timestamp
-is within the last 60 seconds. It describes the helper's last successful
-configuration apply. It does not prove a live direct Iroh path or application
-reachability; `reachability` remains `not_verified` until bounded path and
-application probes are implemented. Revoke output also marks reachability
-`not_verified` deliberately.
+is within the last 60 seconds. It separates the helper's last successful
+configuration apply from reported TUN address/MTU, installed routes, active
+direct Iroh links, handshake times, and transport UDP byte counters. Those
+counters include protocol overhead, not application payload. Worker reports
+do not prove application reachability; `reachability` remains `not_verified`
+until bounded application probes are implemented. Revoke output also marks
+reachability `not_verified` deliberately.
 
 ```sh
 conductor operator --context production overlay create workers-east \

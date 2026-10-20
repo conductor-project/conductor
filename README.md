@@ -253,9 +253,10 @@ UDP and disables relays, public/default address discovery, and NAT traversal.
 
 Operators can create and inspect network domains with
 `conductor operator overlay create|inspect|peers|revoke`; peer diagnostics
-distinguish desired membership from the worker's last helper-apply report and
-never infer live reachability from that report. See the [operator command
-guide](crates/conductor/okf/operator-commands.md).
+distinguish desired membership, helper-reported TUN/routes, and active direct
+Iroh paths with their handshake time and transport counters. Those observations
+are bounded and generation/freshness tagged; they do not prove application
+reachability. See the [operator command guide](crates/conductor/okf/operator-commands.md).
 
 The worker overlay crate validates IPv4 packets, routes them by the manager's
 peer map, and carries them in authenticated Iroh datagrams with relays and
