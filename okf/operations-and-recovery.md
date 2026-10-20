@@ -3,7 +3,7 @@ type: Runbook
 title: Operations and recovery
 description: Use health and readiness correctly, plan graceful shutdown, and resolve uncertain work after restart.
 status: stable
-source_revision: 4f95c85
+source_revision: 379e733
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../crates/conductor-api/src/lib.rs
@@ -176,11 +176,12 @@ recovery decision have been verified.
 The current source reports Conductor `0.0.1`, HTTP API `v1`, manager-worker
 protocol `3`, manager database schema `12`, and worker database schema `4`.
 Manager and worker databases have independent schema sequences. The release
-policy intends `0.0.x` as the first stable line, then support for the latest
-and immediately preceding minor lines for 12 months from each line's first
-stable release. No release tag has been published, so there is not yet a
-previous supported release to use as a real upgrade baseline. Untagged
-development builds are not a supported upgrade source.
+policy supports the latest and immediately preceding minor lines for at least
+12 months from each line's first stable release. The first supported release,
+[`v0.0.1`](https://github.com/conductor-project/conductor/releases/tag/v0.0.1),
+was published on 2026-10-19. It is the first stable upgrade baseline; no
+successor release upgrade has been qualified yet. Untagged development builds
+are not a supported upgrade source.
 
 | Compatibility boundary | Current source value | Policy |
 | --- | --- | --- |
@@ -232,10 +233,19 @@ remote worker is claimed here.
 
 The release policy and the upgrade evidence are separate: the policy defines
 which stable lines are intended to receive support, while a supported upgrade
-path still requires a published source release and exercised fixtures from
-that release. Once `0.0.1` is published as the first stable release, it becomes
-the baseline for later `0.0.x` patch upgrades. A later minor release must
-exercise the preceding supported line before claiming upgrade compatibility.
+path still requires exercised fixtures from a published source release.
+Published `v0.0.1` is now the baseline for later `0.0.x` patch upgrades. A
+local debug `0.0.2` candidate built from source revision
+`379e733869ac68ceb0523590ee6158e3bd6ea067` was upgraded from the published
+`v0.0.1` packages on Debian 13 x86_64 and Rocky Linux 10.2 x86_64. Jobs, a
+succeeded run observation, deployment state, worker ID, and schemas 12/4 were
+preserved. The first deployment resume response was transiently pending with a
+restart-budget diagnostic, while a later inspection observed the replacement
+run active and the deployment ready. This is local debug candidate evidence,
+not a published `v0.0.2` or production release qualification; full package
+details and hashes are in [package upgrade evidence](../docs/package-install.md#published-v001-to-v002-candidate-upgrade-qualification-2026-10-19).
+A later minor release must exercise the preceding supported line before
+claiming upgrade compatibility.
 
 Run `conductor upgrade preflight` with the manager and worker data directories
 using the candidate binary, after draining work and stopping the daemons. It
