@@ -2,8 +2,8 @@
 type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
-status: partial direct TUN/TCP test passed; deployment qualification pending
-source_revision: e1003ad016084731ac334b5063959a91bebded7b
+status: partial direct TUN/TCP test passed; TCP/UDP rerun and deployment qualification pending
+source_revision: 93ca0917679bc12fd575236c475dcc0c00dfe9fd
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
@@ -65,7 +65,7 @@ or raw environment values in this document.
 | Overlay MTU and effective workload packet size | Pending |
 | Worker overlay addresses and domain ID | Pending |
 | Address pools and overlapping host routes checked | Pending |
-| Helper privilege and service-manager configuration | Pending |
+| Helper privilege and service-manager configuration | Pending; a file-capability helper can also be invoked by workloads running as the daemon user, so the current privilege boundary is not qualified for untrusted workloads |
 | Evidence directory and checksums | Pending |
 
 Use at least two independently booted Linux worker hosts on an underlay that
@@ -284,6 +284,73 @@ Fortress transport test binary above. This exercises one local unreachable
 candidate; it is not a two-host firewall-blockage run and does not replace the
 remaining #156 failure matrix.
 
+The worker-routing slice adds an isolated Linux route-overlap test. On
+Fortress, overlay setup was rejected with `AddrInUse` when its peer route
+overlapped an unrelated static host route, and the pre-existing route remained
+installed.
+
+## TCP and UDP cross-host rerun
+
+On 2026-10-20, exact source revision
+`e9eae8522e123dea79371715fa5d820673e335a6` passed the ignored
+`independent_linux_hosts_exchange_tcp_and_udp_over_iroh_tun` test on Fortress
+and the separately booted Debian 13 ARM64 QEMU VM. Both role binaries were
+compiled from that source with Rust 1.99.1. Relay mode was disabled, each
+process ran with the privileges required to create its owned TUN and route,
+and each used the explicit direct UDP candidate supplied for the other role.
+The test exchanged and compared a 65,536-byte TCP payload and echo, echoed a
+24-byte UDP application payload, exchanged completion acknowledgments, and
+completed a bounded TCP half-close. Both role processes passed: A in 1.32
+seconds and B in 17.21 seconds. Test binary SHA-256 values were
+`7e8d0f315daf5dc003f4e3f5209a4cba672497b678b5f6ece07fc1156bf6d3d3` on
+Fortress and
+`084ab026f614893489ca1c86c4b2c8cdd9d412d71a6b06c22896d9013306d0d9` on the
+VM.
+
+During this rerun, Fortress captured UDP on all interfaces for the test ports
+40000 and 40101. `tcpdump` reported 489 packets captured, 0 dropped by the
+kernel. Neither the randomized TCP application marker nor the UDP application
+marker appears in the raw capture. Its SHA-256 is
+`00cc8c3fe43263d5427788967fffc9c233b73b4113edad7751640129ad600375`. The
+capture is retained on Fortress with mode 0600 outside the repository because
+it contains underlay metadata. This is evidence for encryption of this test
+flow, not a general audit of all host traffic.
+
+Fortress was Debian 13, x86_64, kernel `6.12.113+deb13-amd64`; the VM was
+Debian 13, aarch64, kernel `6.12.111+deb13-cloud-arm64`. The VM shared the
+development Mac as its physical host and used QEMU user-mode networking with a
+static UDP forward. This proves traffic between two Linux kernels on separate
+hosts, but not between independent physical failure domains. A Conductor
+manager was not running; the test injected short-lived peer configuration.
+Manager bootstrap and outage, host-resolver DNS/Hickory application discovery,
+independent physical failure domains, performance limits, worker daemon/host restart,
+revocation, expiry, MTU, queue pressure, host-route preservation during
+successful setup/cleanup, and blocked direct UDP between hosts remain
+unqualified. Keep those #156 acceptance criteria open.
+
+On the same source revision, three Linux lifecycle tests passed on Fortress in
+disposable network namespaces: `managed_interface_routes_reconcile_and_restart_cleanly`
+(0.04 seconds), `helper_process_owns_tun_and_runs_overlay_dataplane` (0.16
+seconds), and `overlapping_host_route_is_preserved_when_overlay_start_is_rejected`
+(0.04 seconds). They cover route reconciliation/restart, helper startup and
+reconfiguration/shutdown/restart, and preservation of a conflicting unrelated
+host route. The `linux_overlay` test binary SHA-256 was
+`84cc938cd9bf045cd734fec87ecf986e773acd2096f73b3c38ecebc04edb5647` on
+Fortress. The ignored `unavailable_direct_candidate_reports_failure_within_bound`
+test also passed there in 13.02 seconds, reporting failure within its 12-second
+connection bound. Its test binary SHA-256 was
+`7e8d0f315daf5dc003f4e3f5209a4cba672497b678b5f6ece07fc1156bf6d3d3`.
+
+The privileged tests ran with `sudo -n unshare --net -- env RUST_TEST_THREADS=1
+timeout 35s <test-binary> --include-ignored --exact <test-name> --nocapture
+--test-threads=1`; each invocation received a fresh network namespace. The
+cross-host test used the role-specific `CONDUCTOR_OVERLAY_TEST_ROLE`, bind-port,
+and direct-candidate variables documented in `tests/transport.rs`; it ran each
+role binary with `--include-ignored --exact
+independent_linux_hosts_exchange_tcp_and_udp_over_iroh_tun --nocapture
+--test-threads=1` and a 70-second process bound. These are implementation-level
+tests, not full manager, daemon crash-recovery, or physical-host qualification.
+
 ## Partial direct-host application test
 
 On 2026-10-20, exact source revision
@@ -431,5 +498,21 @@ Linux worker ownership fix. The managed-port probe
 passed a 64 KiB loopback smoke transfer on 2026-10-20. These checks do not qualify
 two-host overlay behavior, DNS-discovered traffic through an installed host
 resolver, packet-capture encryption, or the platform privilege boundary.
-GitHub Actions were not awaited because of the reported outage. Replace this
-evidence record when independent-host runs are performed.
+The current source snapshot also passed `python3
+scripts/check-dependency-policy.py`, `cargo fmt --all -- --check`, workspace
+Clippy, and `cargo test --workspace --locked --all-targets --all-features`
+(301 passed, 1 ignored, 33 suites; 40.50 seconds). The two-host TCP+UDP test is
+compiled but remains pending a fresh two-role run. GitHub Actions were not
+awaited because of the reported outage. Replace this evidence record when
+independent-host runs are performed.
+
+On 2026-10-20, the helper's active peer-map reconfiguration path was changed to
+close the previous Iroh endpoint before route reconciliation, then recreate it
+with the same worker key and refresh its direct candidates. This ensures
+connections and packet readers from the old snapshot are terminated before the
+new snapshot starts. The worker immediately republishes the replacement
+endpoint's candidates using the updated peer generation. The Linux-only helper test
+`endpoint_replacement_closes_old_endpoint_and_preserves_identity` passed on
+Fortress with Rust 1.99.1. It verified that replacement closes the old endpoint
+and retains the worker EndpointId. This is a focused lifecycle test, not a
+cross-host revocation or active-traffic test.

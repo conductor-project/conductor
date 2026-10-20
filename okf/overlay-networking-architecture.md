@@ -3,7 +3,7 @@ type: Architecture decision
 title: Overlay networking architecture
 description: Selected Rust-native direct-only host overlay contracts for encrypted worker-to-worker workload traffic.
 status: selected
-source_revision: 0fd23ee30a2486c317aff72e2cda1f98b559e6b4
+source_revision: 93ca0917679bc12fd575236c475dcc0c00dfe9fd
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../crates/conductor-core/src/lib.rs
@@ -185,6 +185,14 @@ maximum lease, the stated revocation bound is at most five minutes from the
 last configuration delivery that included the peer, plus the configured clock
 skew allowance. This bound is a policy proposal, not a measurement. MVP5 must
 measure delivery and expiry timing, including restart and an offline peer.
+When the helper applies a newer peer map, it closes the prior Iroh endpoint
+before reconciling routes, then starts a new endpoint using the same worker key.
+This terminates detached packet readers and active connections authorized by
+the previous snapshot; the endpoint identity remains stable while peer
+authorization changes. The worker immediately advertises the replacement
+endpoint's direct candidates to the manager using the new peer generation, so
+the manager does not keep distributing the closed socket address until the
+normal candidate refresh interval.
 
 The initial overlay uses only directly reachable UDP candidates on declared
 LAN/VPC or explicitly configured underlay topologies. Iroh relay mode and
@@ -235,16 +243,27 @@ Source review at `source_revision` confirms that `conductor-core` owns
 transport-neutral contracts, `conductor-manager` owns desired state, the
 worker owns local supervision, and `conductor-transport` already provides an
 authenticated manager-worker path. The current platform page records Linux
-x86_64, Linux arm64, and Apple silicon CI, but no independent-host overlay
-qualification.
+x86_64, Linux arm64, and Apple silicon CI. It does not expand general platform
+support.
 
 PR #187 adds the pinned Iroh release and manager identity/address contracts;
 PR #188 adds direct candidate advertisements, `tun-rs`, the Conductor packet
 adapter, and the Linux helper route lifecycle. Local unit and workspace tests
 cover packet validation, peer authorization, candidate fencing, and manager
-migrations. They do not demonstrate independent-host traffic or exercise the
-privileged Linux helper. Issue #156 must still qualify manager-enrolled
-identities, direct-only packet forwarding, an application request/reply, MTU,
-reconnect, throughput, and packet loss on separate hosts with relays and public
-discovery unavailable. Keep versions, enabled features, transitive footprint,
-and third-party safety boundaries in the dependency decision.
+migrations. On 2026-10-20, the ignored direct-only Linux transport test passed
+TCP and UDP application traffic between Fortress (Debian 13 x86_64) and a
+Debian 13 ARM64 QEMU VM. A bounded capture of the test UDP ports contained
+neither application marker. The helper startup/reconfigure/shutdown/restart,
+owned-route reconciliation, route-conflict preservation, and bounded direct
+candidate failure tests also passed in disposable network namespaces on
+Fortress. The VM shares the development Mac's physical host, and the test
+injected short-lived peer configuration rather than starting a manager.
+
+These results do not qualify independent physical failure domains, manager
+bootstrap/outage, actual host-resolver DNS discovery, worker daemon/host
+restart, revocation, expiry, MTU, queue pressure, performance, or blocked direct
+UDP between hosts. Issue #156 remains open for those cases and the operator
+walkthrough. Keep versions, enabled features, transitive footprint, and
+third-party safety boundaries in the dependency decision. Detailed commands,
+binary hashes, capture hash, and limits are in
+`docs/mvp5-overlay-qualification.md`.

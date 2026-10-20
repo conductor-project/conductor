@@ -142,9 +142,15 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         validate_reconfiguration(&updated, &worker_id, &configuration, &interface)?;
                         configured_packet_router(&updated, &worker_id, now_ms())
                             .map_err(|_| "manager overlay configuration is invalid")?;
+                        // A fresh peer map revokes the old map immediately. Closing
+                        // the endpoint also terminates detached packet readers from
+                        // the cancelled dataplane future before they can retain old
+                        // peer authorization or consume resources.
+                        endpoint = replace_endpoint(endpoint, secret_key).await?;
                         let peers = updated.peers.iter().map(|peer| peer.worker_address).collect::<BTreeSet<_>>();
                         interface.reconcile_routes(&peers).await?;
                         configuration = updated;
+                        direct_candidates = endpoint_direct_candidates(&endpoint);
                         runtime_status.clear().await;
                         write_configuration_response("applied", &worker_id, &interface, &configuration, &direct_candidates, &runtime_status).await?;
                         continue 'dataplane;
@@ -200,6 +206,15 @@ async fn create_endpoint(
     conductor_overlay::create_endpoint(iroh_base::SecretKey::from_bytes(&secret_key))
         .await
         .map_err(|_| "could not start the overlay endpoint".into())
+}
+
+#[cfg(target_os = "linux")]
+async fn replace_endpoint(
+    endpoint: iroh::Endpoint,
+    secret_key: [u8; 32],
+) -> Result<iroh::Endpoint, Box<dyn std::error::Error>> {
+    endpoint.close().await;
+    create_endpoint(secret_key).await
 }
 
 #[cfg(target_os = "linux")]
@@ -325,5 +340,25 @@ mod tests {
                 .kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[tokio::test]
+    async fn endpoint_replacement_closes_old_endpoint_and_preserves_identity() {
+        let secret_key = [23_u8; 32];
+        let old = create_endpoint(secret_key)
+            .await
+            .expect("create relay-free old endpoint");
+        let old_id = old.id();
+        let old_closed = old.closed();
+
+        let replacement = replace_endpoint(old, secret_key)
+            .await
+            .expect("replace endpoint for the updated peer authorization");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), old_closed)
+            .await
+            .expect("old endpoint closes before peer map is re-applied");
+        assert_eq!(replacement.id(), old_id);
+        replacement.close().await;
     }
 }

@@ -1138,6 +1138,16 @@ async fn run_worker_overlay(
                         .await;
                         return Err("worker overlay helper rejected a manager configuration update".to_owned());
                     }
+                    let acknowledgement = client
+                        .advertise_overlay_candidates(
+                            &domain_id,
+                            updated.peer_generation,
+                            helper.direct_candidates(),
+                        )
+                        .await
+                        .map_err(|_| "worker could not publish refreshed overlay candidates".to_owned())?;
+                    candidate_refresh_at_ms =
+                        candidate_refresh_at(acknowledgement.candidates_expires_at_ms);
                     configuration = updated;
                 }
                 let helper_runtime = helper.status().await.ok().flatten();
