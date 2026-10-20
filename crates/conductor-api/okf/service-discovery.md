@@ -136,8 +136,11 @@ NODATA, and revoking the peer withdraws its SRV answer. This exercises
 manager-backed DNS publication and withdrawal. It does not yet exercise an
 installed host resolver or an application connection through the overlay.
 
-At source revision `a1baa9ebca3923663b91181fde02a3465ad151f6`, the new access
-control test passed. Dependency policy, formatting, workspace Clippy, and the
-full workspace debug suite passed (302 tests, 1 ignored across 33 suites).
+At source revision `1bfbca0fb09ff493a20bb011d204279d6c7b579a`, both live DNS
+listener tests passed. Dependency policy, formatting, workspace Clippy, and
+the full workspace debug suite passed (303 tests, 1 ignored across 33 suites).
+The manager-backed overlay DNS test also passed on Fortress (Debian 13 x86_64,
+Rust 1.99.1) using the test source file SHA-256
+`6990e2dabf96d163c8398eff58eb1e7fa2ecd03dd8ac4ef5fbbd3e623df988b8`.
 Overlay DNS still needs verification through an installed host resolver and a
-DNS-discovered application on independent Linux workers.
+DNS-discovered application on the actual overlay path.

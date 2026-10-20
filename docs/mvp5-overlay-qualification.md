@@ -523,3 +523,9 @@ It verifies the SRV port and endpoint-target A address, host-network suffix
 compatibility, overlay AAAA NODATA, and withdrawal after peer revocation. The
 test uses a loopback DNS client and does not install a host resolver or send
 application traffic through the overlay.
+The focused test also passed on Fortress (Debian 13 x86_64, Rust 1.99.1) using
+the exact `crates/conductor-api/src/dns.rs` test file with SHA-256
+`6990e2dabf96d163c8398eff58eb1e7fa2ecd03dd8ac4ef5fbbd3e623df988b8` in a
+disposable Linux qualification checkout previously used for PR #199. This validates
+the DNS listener path on Linux but does not expand the two-host network
+qualification evidence above.
