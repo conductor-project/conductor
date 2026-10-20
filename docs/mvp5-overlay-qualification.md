@@ -3,7 +3,7 @@ type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
 status: partial TCP/UDP and manager-backed DNS coverage; deployment qualification pending
-source_revision: 5d0a934d0448e144930784180debbb8e22b917e6
+source_revision: a2a1498cc541ab2a9a3f74442b9cb7ababdd901a
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
@@ -351,6 +351,30 @@ independent physical failure domains, performance limits, worker daemon/host res
 revocation, expiry, MTU, queue pressure, host-route preservation during
 successful setup/cleanup, and blocked direct UDP between hosts remain
 unqualified. Keep those #156 acceptance criteria open.
+
+## PR #200 combined DNS and application rerun
+
+At source revision `a2a1498cc541ab2a9a3f74442b9cb7ababdd901a`, the ignored
+`independent_linux_hosts_exchange_tcp_and_udp_over_iroh_tun` test was run with
+role B on Fortress and role A on the Debian 13 ARM64 QEMU VM. The test binaries
+were built with Rust 1.99.1 from this source revision. Their SHA-256 values are
+`384e0bb1cebe8b65050ecfab9f8df0dff42b7ebea6244ca65c4af9806d3316c2` on
+Fortress and
+`b1621dc874d691c5cc4209ef253c5c25b34291433e1784f789e7a8c8604bdcb8` on the
+VM.
+
+Both roles failed before authenticated path establishment with
+`no authenticated direct Iroh path` and zero transmitted or received overlay
+packets. Fortress captured 21 UDP packets from
+`192.168.0.238:40000` to the Mac host-forward candidate
+`192.168.1.4:40000`; no replies were captured. The capture SHA-256 is
+`c061aa1dea351e03e223e6551ce2de15d31ca7430aa428b9b47c3a776c40f5aa` and it is
+retained on Fortress with mode 0600 outside the repository. No application
+payload was exchanged, and this run does not qualify the DNS-to-application
+path. It exposes a topology limitation: the QEMU user-mode NAT candidate did
+not provide the return path required for this direct-only test. The VM resolver
+was restored to its DHCP-provided server (`10.0.2.3`) after the run. This is a
+failed same-physical-host VM attempt, not independent-host qualification.
 
 On the same source revision, three Linux lifecycle tests passed on Fortress in
 disposable network namespaces: `managed_interface_routes_reconcile_and_restart_cleanly`
