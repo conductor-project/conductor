@@ -3,7 +3,7 @@ type: Reference
 title: Core identifiers and validated contracts
 description: Newtypes and constructors enforce stable IDs and validated job inputs before manager persistence or worker execution.
 status: stable
-source_revision: e10f326
+source_revision: 36b84f6c94acd728a47a83516d1d575bb989c5ce
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/lib.rs

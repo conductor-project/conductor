@@ -3,7 +3,7 @@ type: Reference
 title: Manager desired state and persistence
 description: SQLite stores immutable job/revision records, mutable deployment state, run reservations, worker records, commands, allocations, audit, and overlay membership.
 status: stable
-source_revision: e10f326
+source_revision: 36b84f6c94acd728a47a83516d1d575bb989c5ce
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/lib.rs
