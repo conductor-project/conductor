@@ -908,7 +908,7 @@ fn run_worker(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
     ))?);
     let worker = Arc::new(conductor_worker::WorkerService::open_with_log_policy(
         worker_data_dir,
-        worker_id,
+        worker_id.clone(),
         concurrency,
         conductor_worker::LogPolicy {
             max_bytes_per_stream: config.log_max_bytes_per_stream,
