@@ -76,6 +76,23 @@ impl JobService {
         )
     }
 
+    pub fn advertise_overlay_candidates(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        worker_id: &WorkerId,
+        peer_generation: u64,
+        candidates: &[std::net::SocketAddr],
+        now_ms: i64,
+    ) -> Result<conductor_core::OverlayDirectCandidateAcknowledgement, OverlayNetworkError> {
+        self.repository.advertise_overlay_candidates(
+            network_domain_id,
+            worker_id,
+            peer_generation,
+            candidates,
+            now_ms,
+        )
+    }
+
     pub fn revoke_overlay_peer(
         &self,
         network_domain_id: &conductor_core::NetworkDomainId,

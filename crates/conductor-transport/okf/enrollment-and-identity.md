@@ -3,7 +3,7 @@ type: Reference
 title: Worker enrollment and identity
 description: Single-use manager credentials authorize a worker-generated key and certificate, which are persisted and used for mutual TLS.
 status: stable
-source_revision: 5a56d84
+source_revision: de95885
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/identity.rs
@@ -42,7 +42,13 @@ worker address and generations. Key replacement increments the peer
 generation; a revoked or expired endpoint is retired and cannot be replayed.
 
 `GET /v1/worker/network-domains/{id}` returns that worker's bounded desired
-peer configuration. `POST /v1/worker/network-domains/{id}/observation` records
+peer configuration. `POST /v1/worker/network-domains/{id}/candidates` accepts
+up to eight direct UDP IP:port candidates from the authenticated worker and
+requires its current peer generation. The manager rejects unroutable,
+duplicate, oversized, or stale advertisements, advances the peer-map
+generation when the set changes, and returns that generation with the
+unchanged authorization expiry. Candidate addresses are hints, not identity
+or authorization. `POST /v1/worker/network-domains/{id}/observation` records
 the worker's applied generation and status; the manager timestamps the report
 and rejects identity mismatches and stale generations. The private Iroh key
 and workload packets never cross these endpoints. These control-plane routes

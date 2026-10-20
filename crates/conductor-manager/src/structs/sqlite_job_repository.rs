@@ -334,6 +334,7 @@ impl CommandJournal for SqliteJobRepository {
 }
 
 const MAX_OVERLAY_PEERS_PER_DOMAIN: usize = 128;
+const MAX_OVERLAY_CANDIDATE_LEASE_MS: i64 = 5 * 60 * 1_000;
 const MAX_OVERLAY_LEASE_MS: i64 = 5 * 60 * 1_000;
 const OVERLAY_CLOCK_SKEW_MS: i64 = 30_000;
 
@@ -920,7 +921,8 @@ impl JobRepository for SqliteJobRepository {
                 transaction
                     .execute(
                         "UPDATE overlay_peers SET endpoint_id = ?1, peer_generation = ?2,
-                         expires_at_ms = ?3, state = 'active', quarantine_until_ms = NULL
+                         expires_at_ms = ?3, state = 'active', quarantine_until_ms = NULL,
+                         direct_candidates_json = '[]', direct_candidates_expires_at_ms = NULL
                          WHERE network_domain_id = ?4 AND worker_id = ?5",
                         params![
                             endpoint_id.as_str(),
@@ -1023,6 +1025,114 @@ impl JobRepository for SqliteJobRepository {
             .commit()
             .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
         Ok(result)
+    }
+
+    fn advertise_overlay_candidates(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        worker_id: &WorkerId,
+        peer_generation: u64,
+        candidates: &[std::net::SocketAddr],
+        now_ms: i64,
+    ) -> Result<conductor_core::OverlayDirectCandidateAcknowledgement, OverlayNetworkError> {
+        if now_ms < 0 || !conductor_core::valid_overlay_direct_candidates(candidates) {
+            return Err(OverlayNetworkError::InvalidDirectCandidates);
+        }
+        let peer_generation =
+            i64::try_from(peer_generation).map_err(|_| OverlayNetworkError::StaleGeneration)?;
+        let candidates_json = serde_json::to_string(candidates)
+            .map_err(|_| OverlayNetworkError::InvalidDirectCandidates)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        expire_overlay_peers(&transaction, network_domain_id, now_ms)?;
+
+        let identity_is_active: bool = transaction
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM worker_identities
+                 WHERE worker_id = ?1 AND revoked_at_ms IS NULL)",
+                [worker_id.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        if !identity_is_active {
+            return Err(OverlayNetworkError::IdentityUnavailable);
+        }
+
+        let current = transaction
+            .query_row(
+                "SELECT p.peer_generation, p.expires_at_ms,
+                        p.direct_candidates_expires_at_ms, d.network_generation
+                 FROM overlay_peers p JOIN overlay_network_domains d USING (network_domain_id)
+                 WHERE p.network_domain_id = ?1 AND p.worker_id = ?2
+                   AND p.state = 'active' AND p.expires_at_ms > ?3",
+                params![network_domain_id.as_str(), worker_id.as_str(), now_ms],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?
+            .ok_or(OverlayNetworkError::PeerNotFound)?;
+        let (
+            current_peer_generation,
+            peer_expires_at_ms,
+            _current_candidates_expires_at_ms,
+            mut network_generation,
+        ) = current;
+        if current_peer_generation != peer_generation {
+            return Err(OverlayNetworkError::StaleGeneration);
+        }
+        let candidates_expires_at_ms = (!candidates.is_empty()).then(|| {
+            now_ms
+                .saturating_add(MAX_OVERLAY_CANDIDATE_LEASE_MS)
+                .min(peer_expires_at_ms)
+        });
+        network_generation = next_overlay_generation(network_generation)?;
+        transaction
+            .execute(
+                "UPDATE overlay_peers SET direct_candidates_json = ?1,
+                 direct_candidates_expires_at_ms = ?2
+                 WHERE network_domain_id = ?3 AND worker_id = ?4 AND peer_generation = ?5
+                   AND state = 'active' AND expires_at_ms > ?6",
+                params![
+                    candidates_json,
+                    candidates_expires_at_ms,
+                    network_domain_id.as_str(),
+                    worker_id.as_str(),
+                    peer_generation,
+                    now_ms
+                ],
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        transaction
+            .execute(
+                "UPDATE overlay_network_domains SET network_generation = ?1
+                 WHERE network_domain_id = ?2",
+                params![network_generation, network_domain_id.as_str()],
+            )
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let acknowledgement = conductor_core::OverlayDirectCandidateAcknowledgement {
+            worker_id: worker_id.clone(),
+            peer_generation: u64::try_from(current_peer_generation)
+                .map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+            network_generation: u64::try_from(network_generation)
+                .map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+            candidates_expires_at_ms,
+        };
+        transaction
+            .commit()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        Ok(acknowledgement)
     }
 
     fn revoke_overlay_peer(
@@ -1164,7 +1274,8 @@ impl JobRepository for SqliteJobRepository {
         };
         let mut statement = transaction
             .prepare(
-                "SELECT worker_id, endpoint_id, worker_address, peer_generation
+                "SELECT worker_id, endpoint_id, worker_address, peer_generation,
+                        direct_candidates_json, direct_candidates_expires_at_ms
                  FROM overlay_peers WHERE network_domain_id = ?1 AND worker_id != ?2
                    AND state = 'active' AND expires_at_ms > ?3
                  ORDER BY worker_address LIMIT ?4",
@@ -1184,14 +1295,30 @@ impl JobRepository for SqliteJobRepository {
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, Option<i64>>(5)?,
                     ))
                 },
             )
             .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
         let peers = rows
             .map(|row| {
-                let (worker, endpoint, address, generation) =
-                    row.map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+                let (
+                    worker,
+                    endpoint,
+                    address,
+                    generation,
+                    direct_candidates_json,
+                    direct_candidates_expires_at_ms,
+                ) = row.map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+                let direct_candidates = if direct_candidates_expires_at_ms
+                    .is_some_and(|expires_at_ms| expires_at_ms > now_ms)
+                {
+                    serde_json::from_str(&direct_candidates_json)
+                        .map_err(|_| OverlayNetworkError::StorageUnavailable)?
+                } else {
+                    Vec::new()
+                };
                 Ok(OverlayPeer {
                     worker_id: WorkerId::new(worker)
                         .map_err(|_| OverlayNetworkError::StorageUnavailable)?,
@@ -1200,6 +1327,8 @@ impl JobRepository for SqliteJobRepository {
                     worker_address: overlay_address(address)?,
                     peer_generation: u64::try_from(generation)
                         .map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+                    direct_candidates,
+                    direct_candidates_expires_at_ms,
                 })
             })
             .collect::<Result<Vec<_>, OverlayNetworkError>>()?;

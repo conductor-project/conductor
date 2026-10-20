@@ -1,6 +1,33 @@
 use super::*;
 
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+/// Maximum number of direct UDP underlay candidates advertised by one worker.
+pub const MAX_OVERLAY_DIRECT_CANDIDATES: usize = 8;
+
+/// Validate a bounded, canonical set of directly reachable UDP socket candidates.
+pub fn valid_overlay_direct_candidates(candidates: &[SocketAddr]) -> bool {
+    candidates.len() <= MAX_OVERLAY_DIRECT_CANDIDATES
+        && candidates.iter().enumerate().all(|(index, candidate)| {
+            candidate.port() != 0
+                && match candidate.ip() {
+                    IpAddr::V4(ip) => {
+                        !ip.is_unspecified()
+                            && !ip.is_loopback()
+                            && !ip.is_multicast()
+                            && !ip.is_link_local()
+                            && ip != Ipv4Addr::BROADCAST
+                    }
+                    IpAddr::V6(ip) => {
+                        !ip.is_unspecified()
+                            && !ip.is_loopback()
+                            && !ip.is_multicast()
+                            && !ip.is_unicast_link_local()
+                    }
+                }
+                && !candidates[..index].contains(candidate)
+        })
+}
 
 /// Canonical lowercase hexadecimal Iroh Ed25519 endpoint identity.
 ///
@@ -75,6 +102,8 @@ pub struct OverlayPeer {
     pub endpoint_id: OverlayEndpointId,
     pub worker_address: Ipv4Addr,
     pub peer_generation: u64,
+    pub direct_candidates: Vec<SocketAddr>,
+    pub direct_candidates_expires_at_ms: Option<i64>,
 }
 
 /// Durable address and key assignment returned after authenticated enrollment.
@@ -90,6 +119,24 @@ pub struct OverlayPeerAssignment {
     pub expires_at_ms: i64,
     pub state: OverlayPeerState,
     pub quarantine_until_ms: Option<i64>,
+}
+
+/// Authenticated worker advertisement of direct UDP underlay addresses.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OverlayDirectCandidateAdvertisement {
+    pub peer_generation: u64,
+    pub candidates: Vec<SocketAddr>,
+}
+
+/// Manager acknowledgement for a generation-scoped candidate update.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OverlayDirectCandidateAcknowledgement {
+    pub worker_id: WorkerId,
+    pub peer_generation: u64,
+    pub network_generation: u64,
+    pub candidates_expires_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -17,7 +17,10 @@ use axum::routing::post;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use axum_server_mtls::{MtlsAcceptor, PeerCertificates};
 use base64::Engine;
-use conductor_core::{NetworkDomainId, OverlayEndpointId, OverlayPeerObservation, WorkerId};
+use conductor_core::{
+    NetworkDomainId, OverlayDirectCandidateAdvertisement, OverlayEndpointId,
+    OverlayPeerObservation, WorkerId, valid_overlay_direct_candidates,
+};
 use conductor_manager::{JobRepository, SqliteJobRepository, WorkerIdentityError};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, Issuer,
@@ -450,6 +453,10 @@ impl WorkerEnrollmentService {
                 "/v1/worker/network-domains/{id}/observation",
                 post(overlay_observation_handler),
             )
+            .route(
+                "/v1/worker/network-domains/{id}/candidates",
+                post(overlay_candidates_handler),
+            )
             .layer(DefaultBodyLimit::max(super::MAX_TRANSPORT_BODY_BYTES))
             .with_state(Arc::clone(self))
     }
@@ -692,6 +699,55 @@ async fn overlay_observation_handler(
             (StatusCode::SERVICE_UNAVAILABLE, "overlay state unavailable").into_response()
         }
         Err(_) => (StatusCode::BAD_REQUEST, "overlay observation rejected").into_response(),
+    }
+}
+
+async fn overlay_candidates_handler(
+    State(service): State<Arc<WorkerEnrollmentService>>,
+    AxumPath(raw_domain_id): AxumPath<String>,
+    certificates: Option<Extension<PeerCertificates>>,
+    Json(advertisement): Json<OverlayDirectCandidateAdvertisement>,
+) -> Response {
+    let Ok(domain_id) = NetworkDomainId::new(raw_domain_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid network domain").into_response();
+    };
+    let Some(worker_id) = authenticated_worker(&service, certificates) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "active worker certificate required",
+        )
+            .into_response();
+    };
+    if !valid_overlay_direct_candidates(&advertisement.candidates) {
+        return (StatusCode::BAD_REQUEST, "invalid direct candidates").into_response();
+    }
+    let Ok(now) = now_ms() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "manager clock unavailable").into_response();
+    };
+    match service.repository.advertise_overlay_candidates(
+        &domain_id,
+        &worker_id,
+        advertisement.peer_generation,
+        &advertisement.candidates,
+        now,
+    ) {
+        Ok(acknowledgement) => Json(acknowledgement).into_response(),
+        Err(conductor_manager::OverlayNetworkError::IdentityUnavailable) => {
+            (StatusCode::UNAUTHORIZED, "worker identity is unavailable").into_response()
+        }
+        Err(conductor_manager::OverlayNetworkError::PeerNotFound) => {
+            (StatusCode::NOT_FOUND, "active overlay assignment not found").into_response()
+        }
+        Err(conductor_manager::OverlayNetworkError::StaleGeneration) => {
+            (StatusCode::CONFLICT, "stale overlay peer generation").into_response()
+        }
+        Err(conductor_manager::OverlayNetworkError::InvalidDirectCandidates) => {
+            (StatusCode::BAD_REQUEST, "invalid direct candidates").into_response()
+        }
+        Err(conductor_manager::OverlayNetworkError::StorageUnavailable) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "overlay state unavailable").into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "network domain not found").into_response(),
     }
 }
 
@@ -1156,6 +1212,41 @@ mod tests {
         let assignment: conductor_core::OverlayPeerAssignment =
             enrollment.json().await.expect("decode overlay assignment");
         assert_eq!(assignment.worker_id, worker_id);
+        let direct_candidate = "192.168.50.12:42500";
+        let candidate_report = worker_client
+            .post(format!(
+                "https://localhost:{}/v1/worker/network-domains/overlay-test/candidates",
+                address.port()
+            ))
+            .json(&serde_json::json!({
+                "peerGeneration": assignment.peer_generation,
+                "candidates": [direct_candidate]
+            }))
+            .send()
+            .await
+            .expect("advertise direct candidate over mTLS");
+        assert_eq!(candidate_report.status(), reqwest::StatusCode::OK);
+        let candidate_ack: conductor_core::OverlayDirectCandidateAcknowledgement = candidate_report
+            .json()
+            .await
+            .expect("decode candidate acknowledgement");
+        assert_eq!(candidate_ack.peer_generation, assignment.peer_generation);
+        let stale_candidate_report = worker_client
+            .post(format!(
+                "https://localhost:{}/v1/worker/network-domains/overlay-test/candidates",
+                address.port()
+            ))
+            .json(&serde_json::json!({
+                "peerGeneration": assignment.peer_generation.saturating_sub(1),
+                "candidates": [direct_candidate]
+            }))
+            .send()
+            .await
+            .expect("submit stale candidate generation");
+        assert_eq!(
+            stale_candidate_report.status(),
+            reqwest::StatusCode::CONFLICT
+        );
         let configuration = worker_client
             .get(format!(
                 "https://localhost:{}/v1/worker/network-domains/overlay-test",
@@ -1171,7 +1262,7 @@ mod tests {
             network_domain_id: assignment.network_domain_id.clone(),
             worker_id: worker_id.clone(),
             peer_generation: assignment.peer_generation,
-            applied_network_generation: assignment.network_generation,
+            applied_network_generation: candidate_ack.network_generation,
             observed_at_ms: 0,
             status: conductor_core::OverlayPeerObservationStatus::Applied,
         };

@@ -29,7 +29,7 @@ use serde::Serialize;
 
 /// Temporary limit for active jobs. Pagination is a later milestone.
 pub const MAX_JOBS: usize = 1_000;
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 /// Current manager database schema understood by this build.
 pub const CURRENT_SCHEMA_VERSION: i64 = SCHEMA_VERSION;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
@@ -136,6 +136,7 @@ pub enum OverlayNetworkError {
     EndpointIdentityReplay,
     PeerQuarantined,
     InvalidLease,
+    InvalidDirectCandidates,
     StaleGeneration,
     PeerNotFound,
     ObservationConflict,
@@ -302,6 +303,14 @@ pub trait JobRepository: Send + Sync + CommandJournal {
         expires_at_ms: i64,
         now_ms: i64,
     ) -> Result<conductor_core::OverlayPeerAssignment, OverlayNetworkError>;
+    fn advertise_overlay_candidates(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        worker_id: &WorkerId,
+        peer_generation: u64,
+        candidates: &[std::net::SocketAddr],
+        now_ms: i64,
+    ) -> Result<conductor_core::OverlayDirectCandidateAcknowledgement, OverlayNetworkError>;
     fn revoke_overlay_peer(
         &self,
         network_domain_id: &conductor_core::NetworkDomainId,
@@ -627,7 +636,7 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
             .prepare("SELECT network_domain_id, worker_address_pool, service_address_pool, network_generation FROM overlay_network_domains LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
         connection
-            .prepare("SELECT network_domain_id, worker_id, endpoint_id, worker_address, peer_generation, expires_at_ms, state, quarantine_until_ms FROM overlay_peers LIMIT 0")
+            .prepare("SELECT network_domain_id, worker_id, endpoint_id, worker_address, peer_generation, expires_at_ms, state, quarantine_until_ms, direct_candidates_json, direct_candidates_expires_at_ms FROM overlay_peers LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
         connection
             .prepare("SELECT network_domain_id, endpoint_id, worker_id, peer_generation, retired_at_ms FROM overlay_endpoint_history LIMIT 0")
@@ -643,6 +652,23 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
             .unchecked_transaction()
             .map_err(MigrationError::Sqlite)?;
         create_overlay_network_schema(&transaction).map_err(MigrationError::Sqlite)?;
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(MigrationError::Sqlite)?;
+        transaction.commit().map_err(MigrationError::Sqlite)?;
+        return migrate(connection);
+    }
+
+    if version == 13 {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(MigrationError::Sqlite)?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE overlay_peers ADD COLUMN direct_candidates_json TEXT NOT NULL DEFAULT '[]' CHECK(length(direct_candidates_json) <= 4096);
+                 ALTER TABLE overlay_peers ADD COLUMN direct_candidates_expires_at_ms INTEGER CHECK(direct_candidates_expires_at_ms IS NULL OR direct_candidates_expires_at_ms >= 0);",
+            )
+            .map_err(MigrationError::Sqlite)?;
         transaction
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(MigrationError::Sqlite)?;
@@ -947,6 +973,8 @@ fn create_overlay_network_schema(transaction: &rusqlite::Transaction<'_>) -> rus
              expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms >= 0),
              state TEXT NOT NULL CHECK (state IN ('active', 'quarantined')),
              quarantine_until_ms INTEGER CHECK (quarantine_until_ms IS NULL OR quarantine_until_ms >= 0),
+             direct_candidates_json TEXT NOT NULL DEFAULT '[]' CHECK(length(direct_candidates_json) <= 4096),
+             direct_candidates_expires_at_ms INTEGER CHECK(direct_candidates_expires_at_ms IS NULL OR direct_candidates_expires_at_ms >= 0),
              PRIMARY KEY (network_domain_id, worker_id),
              UNIQUE (network_domain_id, endpoint_id),
              UNIQUE (network_domain_id, worker_address),
@@ -2884,6 +2912,71 @@ mod overlay_network_tests {
                 32
             ),
             Err(OverlayNetworkError::EndpointIdentityReplay)
+        );
+    }
+
+    #[test]
+    fn direct_candidates_are_generation_fenced_and_distributed_in_peer_maps() {
+        let database = TestDatabase::new();
+        let repository = database.open();
+        let first = enroll(&repository, "worker-a", 1);
+        let second = enroll(&repository, "worker-b", 2);
+        let domain = domain();
+        repository
+            .create_overlay_network_domain(&domain, 1)
+            .expect("create domain");
+        repository
+            .register_overlay_peer(&domain.network_domain_id, &first, &endpoint(1), 60_000, 2)
+            .expect("assign first peer");
+        let assignment = repository
+            .register_overlay_peer(&domain.network_domain_id, &second, &endpoint(2), 60_000, 2)
+            .expect("assign peer");
+        let candidates = ["192.168.50.12:42500".parse().expect("candidate address")];
+        let acknowledgement = repository
+            .advertise_overlay_candidates(
+                &domain.network_domain_id,
+                &second,
+                assignment.peer_generation,
+                &candidates,
+                3,
+            )
+            .expect("accept authenticated candidate advertisement");
+        assert_eq!(acknowledgement.peer_generation, assignment.peer_generation);
+        assert_eq!(acknowledgement.candidates_expires_at_ms, Some(60_000));
+        assert_eq!(
+            acknowledgement.network_generation,
+            assignment.network_generation + 1
+        );
+        let config = repository
+            .overlay_peer_configuration(&domain.network_domain_id, &first, 4)
+            .expect("read peer map")
+            .expect("first worker configuration exists");
+        assert_eq!(config.peers[0].direct_candidates, candidates);
+        assert_eq!(
+            config.peers[0].direct_candidates_expires_at_ms,
+            Some(60_000)
+        );
+
+        assert_eq!(
+            repository.advertise_overlay_candidates(
+                &domain.network_domain_id,
+                &second,
+                assignment.peer_generation - 1,
+                &candidates,
+                5,
+            ),
+            Err(OverlayNetworkError::StaleGeneration)
+        );
+        let invalid = ["127.0.0.1:42500".parse().expect("loopback address")];
+        assert_eq!(
+            repository.advertise_overlay_candidates(
+                &domain.network_domain_id,
+                &second,
+                assignment.peer_generation,
+                &invalid,
+                5,
+            ),
+            Err(OverlayNetworkError::InvalidDirectCandidates)
         );
     }
 

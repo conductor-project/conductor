@@ -3,7 +3,7 @@ type: Reference
 title: Manager desired state and persistence
 description: SQLite stores immutable job/revision records, mutable deployment state, run reservations, worker records, commands, allocations, audit, and overlay membership.
 status: stable
-source_revision: 5a56d84
+source_revision: de95885
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../src/lib.rs
@@ -29,7 +29,7 @@ and idempotency records, worker identities/inventory, command outbox rows,
 execution revisions, deployments, scheduling sequence, service instances and
 allocations, service attempts/catalog ownership, worker drains, and audit
 events. The exact tables evolve through transactional migrations. Current
-`SCHEMA_VERSION` is **13** in `src/lib.rs`; this number describes the manager DB
+`SCHEMA_VERSION` is **14** in `src/lib.rs`; this number describes the manager DB
 only and must not be reused for worker state.
 
 SQLite uses WAL mode and full synchronization. Startup migrates supported older
@@ -58,6 +58,15 @@ Retired endpoint IDs remain tombstoned after address reuse. A worker certificate
 revocation also quarantines all of that worker's overlay memberships. Config
 snapshots include only active, unexpired peers and are bounded to the domain's
 128-peer limit.
+
+Schema 14 persists each worker's bounded direct UDP candidate advertisement.
+Workers submit candidate updates over mTLS with their current peer generation;
+the manager rejects stale generations and invalid or duplicate addresses.
+Changed candidates increment the domain's peer-map generation, and the
+acknowledgement returns that generation and the existing peer authorization
+expiry. Candidates are reachability hints, not identity or authorization, and
+expire with the peer lease. Peer snapshots distribute the candidates to other
+authorized workers.
 
 These rows are in the normal manager SQLite snapshot and restore unit. No
 network-domain deletion operation is exposed; address pools and replay

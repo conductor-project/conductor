@@ -3,7 +3,7 @@ type: Reference
 title: Documentation migration map
 description: Every former documentation page and long README reference section maps to canonical repository or crate knowledge pages.
 status: stable
-source_revision: 5a56d84
+source_revision: de95885
 source_reviewed_at: 2026-10-19
 sources:
   - resource: ../docs
@@ -63,7 +63,7 @@ sections maps as follows:
 
 # Factual reconciliation performed
 
-- Manager schema version is 13; worker schema version is 4 in the reviewed
+- Manager schema version is 14; worker schema version is 4 in the reviewed
   source. The prior version 5/3 documentation is replaced by those references.
 - Host inventory and platform statements are scoped to current code and CI;
   Linux arm64 and Intel macOS are not represented as qualified.

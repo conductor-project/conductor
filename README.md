@@ -240,10 +240,16 @@ Iroh endpoint ID over the existing mTLS control channel; the manager binds it
 to the authenticated worker identity and assigns a leased address. The Iroh
 private key stays on the worker.
 
-This milestone slice provides durable identity, address allocation, expiry,
-and revocation state. It does not yet route workload packets: the Iroh adapter,
-TUN interface, and host route lifecycle are separate MVP5 implementation and
-qualification work. See the [overlay architecture](okf/overlay-networking-architecture.md)
+An enrolled worker can advertise up to eight direct UDP underlay candidates
+over mTLS, fenced by its peer generation. The manager validates and distributes
+those reachability hints in versioned peer maps; candidates do not authenticate
+or authorize a peer. The initial Iroh topology requires directly reachable
+UDP and disables relays, public/default address discovery, and NAT traversal.
+
+This milestone slice provides durable identity, address allocation, candidate
+distribution, expiry, and revocation state. It does not yet route workload
+packets: the Iroh adapter, TUN interface, and host route lifecycle are separate
+MVP5 implementation and qualification work. See the [overlay architecture](okf/overlay-networking-architecture.md)
 and [manager/API contracts](crates/conductor-manager/okf/desired-state-and-persistence.md).
 
 ## Command output and recovery

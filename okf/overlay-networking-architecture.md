@@ -3,7 +3,7 @@ type: Architecture decision
 title: Overlay networking architecture
 description: Selected Rust-native direct-only host overlay contracts for encrypted worker-to-worker workload traffic.
 status: selected
-source_revision: 958bdc7103db9413704767462f2959423f7838b7
+source_revision: de95885
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../crates/conductor-core/src/lib.rs
@@ -122,6 +122,14 @@ that do not overlap networks outside Conductor's view.
 | `networkGeneration` | Manager-monotonic version of the complete desired peer and route snapshot for a domain. |
 | `peerGeneration` | Manager-monotonic worker incarnation/key generation. Re-enrollment and key replacement increment it. |
 | `issuedAt` / `expiresAt` | Manager-issued configuration lease. Workers reject stale snapshots and fail closed after lease expiry. Initial maximum lease: five minutes; this is a design bound to validate, not measured evidence. |
+
+Workers advertise at most eight distinct direct UDP `IP:port` candidates over
+the mTLS `POST /v1/worker/network-domains/{id}/candidates` endpoint, including
+their current `peerGeneration`. The manager rejects stale generations,
+unspecified, loopback, multicast, and link-local addresses, and non-usable
+ports. A changed candidate set advances `networkGeneration`; the acknowledgement
+does not extend the peer authorization lease. Candidates expire with that
+lease and are distributed only inside authorized peer snapshots.
 
 Control messages are versioned JSON contracts carried through the existing
 authenticated worker transport. A snapshot names the domain, both generations,

@@ -1,6 +1,7 @@
 use conductor_core::{
-    NetworkDomainId, OverlayEndpointId, OverlayNetworkDomainConfig, OverlayPeer,
-    OverlayPeerObservation, OverlayPeerObservationStatus, OverlayPeerState, WorkerId,
+    MAX_OVERLAY_DIRECT_CANDIDATES, NetworkDomainId, OverlayEndpointId, OverlayNetworkDomainConfig,
+    OverlayPeer, OverlayPeerObservation, OverlayPeerObservationStatus, OverlayPeerState, WorkerId,
+    valid_overlay_direct_candidates,
 };
 
 #[test]
@@ -29,6 +30,8 @@ fn overlay_contracts_use_bounded_strict_json_shapes() {
         endpoint_id: OverlayEndpointId::new("cd".repeat(32)).unwrap(),
         worker_address: "10.88.0.1".parse().unwrap(),
         peer_generation: 2,
+        direct_candidates: Vec::new(),
+        direct_candidates_expires_at_ms: None,
     };
     assert_eq!(peer.worker_address.to_string(), "10.88.0.1");
     assert_eq!(
@@ -46,4 +49,22 @@ fn overlay_contracts_use_bounded_strict_json_shapes() {
     let observation_json = serde_json::to_value(observation).unwrap();
     assert_eq!(observation_json["status"], "applied");
     assert_eq!(observation_json["observedAtMs"], 10);
+}
+
+#[test]
+fn direct_underlay_candidate_list_is_bounded_and_routable() {
+    let valid = ["192.168.50.12:42500".parse().unwrap()];
+    assert!(valid_overlay_direct_candidates(&valid));
+    let loopback = ["127.0.0.1:42500".parse().unwrap()];
+    assert!(!valid_overlay_direct_candidates(&loopback));
+    let duplicates = [
+        "192.168.50.12:42500".parse().unwrap(),
+        "192.168.50.12:42500".parse().unwrap(),
+    ];
+    assert!(!valid_overlay_direct_candidates(&duplicates));
+    let oversized = (0..=MAX_OVERLAY_DIRECT_CANDIDATES)
+        .map(|index| format!("192.168.50.{}:{}", index + 1, 42500 + index))
+        .map(|candidate| candidate.parse().unwrap())
+        .collect::<Vec<_>>();
+    assert!(!valid_overlay_direct_candidates(&oversized));
 }
