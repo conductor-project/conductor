@@ -21,10 +21,9 @@ use conductor_manager::{JobService, SqliteJobRepository, WorkerPort, WorkerPortE
 #[cfg(target_os = "linux")]
 use conductor_overlay::{LinuxOverlayInterface, OverlayRuntimeStatus, run_packet_dataplane};
 #[cfg(target_os = "linux")]
-use hickory_server::proto::{
-    op::{Message, MessageType, OpCode, ResponseCode},
-    rr::{Name, RData, RecordType},
-};
+use hickory_resolver::TokioResolver;
+#[cfg(target_os = "linux")]
+use hickory_resolver::proto::rr::RData;
 #[cfg(target_os = "linux")]
 use iroh::{Endpoint, RelayMode, endpoint::presets::Minimal};
 #[cfg(target_os = "linux")]
@@ -620,6 +619,11 @@ async fn start_cross_host_dns(
         .expect("role B DNS listener bind address is configured")
         .parse::<SocketAddr>()
         .expect("valid DNS bind address");
+    assert_eq!(
+        listen.port(),
+        53,
+        "system-config resolvers use the standard DNS port"
+    );
     let allowed_clients = std::env::var("CONDUCTOR_OVERLAY_TEST_DNS_ALLOWED_CLIENTS")
         .expect("DNS client ranges are configured")
         .split(',')
@@ -792,11 +796,7 @@ async fn exchange_overlay_tcp_and_udp(
             std::process::id(),
             unix_time_ms()
         );
-        let dns_server = std::env::var("CONDUCTOR_OVERLAY_TEST_DNS_SERVER")
-            .expect("manager DNS server is configured")
-            .parse::<SocketAddr>()
-            .expect("valid manager DNS server address");
-        let service_endpoint = resolve_overlay_service(dns_server).await?;
+        let service_endpoint = resolve_overlay_service().await?;
         if service_endpoint.ip() != remote_address {
             return Err(format!(
                 "manager DNS returned overlay address {}, expected {remote_address}",
@@ -863,31 +863,25 @@ async fn exchange_overlay_tcp_and_udp(
 }
 
 #[cfg(target_os = "linux")]
-async fn resolve_overlay_service(
-    server: SocketAddr,
-) -> Result<SocketAddr, Box<dyn std::error::Error>> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
+async fn resolve_overlay_service() -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let resolver = TokioResolver::builder_tokio()?.build()?;
+    // Omit the suffix so the configured system search domain is part of the
+    // path under test. The host resolver must route that suffix to role B's
+    // manager-backed Hickory listener.
+    let query = "_http._tcp.cross-host-dns-backend.default.service";
+    println!("dns_resolver=host-system-configuration srv_query={query}");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let target = loop {
-        let srv_response = dns_request(
-            &socket,
-            server,
-            "_http._tcp.cross-host-dns-backend.default.service.overlay.internal.",
-            RecordType::SRV,
-        )
-        .await;
-        if let Some((target, port)) = srv_response.and_then(|message| {
-            if message.metadata.response_code != ResponseCode::NoError {
-                return None;
-            }
-            message
-                .answers
-                .iter()
-                .find_map(|record| match &record.data {
-                    RData::SRV(srv) => Some((srv.target.clone(), srv.port)),
-                    _ => None,
-                })
-        }) {
+    let (target, port) = loop {
+        resolver.clear_cache();
+        let lookup = tokio::time::timeout(Duration::from_secs(2), resolver.srv_lookup(query)).await;
+        if let Ok(Ok(response)) = lookup
+            && let Some((target, port)) = response.answers().iter().find_map(|record| match &record
+                .data
+            {
+                RData::SRV(srv) => Some((srv.target.to_ascii(), srv.port)),
+                _ => None,
+            })
+        {
             break (target, port);
         }
         if tokio::time::Instant::now() >= deadline {
@@ -895,42 +889,20 @@ async fn resolve_overlay_service(
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    let target_response = dns_request(&socket, server, &target.0.to_ascii(), RecordType::A)
-        .await
-        .ok_or("manager DNS did not return an SRV target address")?;
-    if target_response.metadata.response_code != ResponseCode::NoError {
-        return Err("manager DNS target lookup did not succeed".into());
-    }
+    let target_response = tokio::time::timeout(
+        Duration::from_secs(2),
+        resolver.ipv4_lookup(target.as_str()),
+    )
+    .await??;
     let address = target_response
-        .answers
+        .answers()
         .iter()
         .find_map(|record| match &record.data {
             RData::A(address) => Some(address.0),
             _ => None,
         })
         .ok_or("manager DNS target did not have an A record")?;
-    Ok(SocketAddr::from((address, target.1)))
-}
-
-#[cfg(target_os = "linux")]
-async fn dns_request(
-    socket: &UdpSocket,
-    server: SocketAddr,
-    name: &str,
-    record_type: RecordType,
-) -> Option<Message> {
-    use hickory_server::proto::op::Query;
-
-    let mut request = Message::new(47, MessageType::Query, OpCode::Query);
-    request.add_query(Query::query(Name::from_ascii(name).ok()?, record_type));
-    let bytes = request.to_vec().ok()?;
-    socket.send_to(&bytes, server).await.ok()?;
-    let mut buffer = [0_u8; 2048];
-    let (length, _) = tokio::time::timeout(Duration::from_secs(2), socket.recv_from(&mut buffer))
-        .await
-        .ok()?
-        .ok()?;
-    Message::from_vec(&buffer[..length]).ok()
+    Ok(SocketAddr::from((address, port)))
 }
 
 #[cfg(target_os = "linux")]

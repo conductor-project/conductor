@@ -161,21 +161,28 @@ the HTTP result to the manager. Retain its accepted manager diagnostic and the
 payload-verifying request as separate evidence.
 
 The ignored Linux test `independent_linux_hosts_exchange_tcp_and_udp_over_iroh_tun`
-also exercises DNS-discovered application traffic. On role B, set
-`CONDUCTOR_OVERLAY_TEST_DNS_BIND` to an underlay-reachable Hickory listener
-address and `CONDUCTOR_OVERLAY_TEST_DNS_ALLOWED_CLIENTS` to the role A source
-CIDR. On role A, set `CONDUCTOR_OVERLAY_TEST_DNS_SERVER` to role B's DNS
-listener address. Role B starts a live Hickory listener over an isolated
-manager database with an enrolled peer, an active overlay assignment, and a
-ready named TCP service. Role A queries the SRV record and its target A record,
-then connects to the returned IP and port over the TUN/Iroh path and verifies
-the echoed application payload. The application connection uses the SRV
-answer's address/port pair rather than a hard-coded endpoint. The test queries
-the manager listener directly over DNS; it does not install or exercise the
-operating system's host resolver or exercise a production manager daemon. The
-host-resolver setup and rollback procedure above still needs deployment-host
-qualification. The combined cross-host DNS-to-application test is present but
-has not yet been executed on Linux at this source revision.
+also exercises DNS-discovered application traffic through host resolver
+configuration. On role B, set `CONDUCTOR_OVERLAY_TEST_DNS_BIND` to its
+underlay-reachable address on UDP port 53 and set
+`CONDUCTOR_OVERLAY_TEST_DNS_ALLOWED_CLIENTS` to the role A source CIDR. Configure
+role A's host resolver to forward `overlay.internal` queries to role B and add
+`overlay.internal` as a search domain; preserve and restore the host's previous
+resolver configuration around the run. Hickory's Tokio resolver reads the
+system resolver configuration (on Unix, `/etc/resolv.conf`) and issues the SRV
+and target A lookups through its configured nameserver. The SRV query omits the
+search suffix so the host search setting is exercised. This verifies the
+configured DNS resolver path, not libc NSS modules or every application DNS
+API.
+
+Role B starts a live Hickory listener over an isolated manager database with an
+enrolled peer, an active overlay assignment, and a ready named TCP service.
+Role A resolves the SRV record and its target A record, then connects to the
+returned IP and port over the TUN/Iroh path and verifies the echoed application
+payload. The application connection uses the SRV answer's address/port pair
+rather than a hard-coded endpoint. This harness uses an isolated manager
+fixture rather than a production manager daemon. The combined cross-host
+DNS-to-application test is present but has not yet been executed on Linux at
+this source revision.
 
 # Basic traffic procedure
 
