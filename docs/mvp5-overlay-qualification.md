@@ -287,12 +287,38 @@ remaining #156 failure matrix.
 The worker-routing slice adds an isolated Linux route-overlap test. On
 Fortress, overlay setup was rejected with `AddrInUse` when its peer route
 overlapped an unrelated static host route, and the pre-existing route remained
-installed. The separate-host transport test has since been extended to check
-both TCP and UDP application echo over the relay-disabled TUN path, including a
-bounded graceful TCP close. That expanded test compiles and the local workspace
-suite passes, but it has not yet been rerun across the two Linux systems. The
-TCP-only result above remains the latest cross-host application-traffic
-evidence; do not treat the new UDP check as qualified until both roles pass.
+installed.
+
+## TCP and UDP cross-host rerun
+
+On 2026-10-20, exact source revision
+`e9eae8522e123dea79371715fa5d820673e335a6` passed the ignored
+`independent_linux_hosts_exchange_tcp_and_udp_over_iroh_tun` test on Fortress
+and the separately booted Debian 13 ARM64 QEMU VM. Both role binaries were
+compiled from that source with Rust 1.99.1. Relay mode was disabled, each
+process ran with the privileges required to create its owned TUN and route,
+and each used the explicit direct UDP candidate supplied for the other role.
+The test exchanged and compared a 65,536-byte TCP payload and echo, echoed a
+24-byte UDP application payload, exchanged completion acknowledgments, and
+completed a bounded TCP half-close. Both role processes passed: A in 1.32
+seconds and B in 17.21 seconds. Test binary SHA-256 values were
+`7e8d0f315daf5dc003f4e3f5209a4cba672497b678b5f6ece07fc1156bf6d3d3` on
+Fortress and
+`084ab026f614893489ca1c86c4b2c8cdd9d412d71a6b06c22896d9013306d0d9` on the
+VM.
+
+Fortress was Debian 13, x86_64, kernel `6.12.113+deb13-amd64`; the VM was
+Debian 13, aarch64, kernel `6.12.111+deb13-cloud-arm64`. The VM shared the
+development Mac as its physical host and used QEMU user-mode networking with a
+static UDP forward. This proves traffic between two Linux kernels on separate
+hosts, but not between independent physical failure domains. A Conductor
+manager was not running; the test injected short-lived peer configuration.
+There was no underlay packet capture in this rerun, so encryption at the
+underlay boundary is not newly demonstrated by this result. Manager bootstrap
+and outage, host-resolver DNS/Hickory application discovery, independent
+physical failure domains, performance limits, restart, revocation, expiry,
+MTU, queue pressure, route preservation, and blocked direct UDP remain
+unqualified. Keep those #156 acceptance criteria open.
 
 ## Partial direct-host application test
 
