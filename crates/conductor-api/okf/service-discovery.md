@@ -3,7 +3,7 @@ type: Reference
 title: Service catalog and DNS discovery
 description: The API exposes observed service endpoints over HTTP and can serve DNS records from the manager catalog.
 status: stable
-source_revision: 5d0a934d0448e144930784180debbb8e22b917e6
+source_revision: a46413101bc2dcc12dcdfcf6c41e34e9566e4ae5
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/server.rs
@@ -149,5 +149,11 @@ the full workspace debug suite passed (303 tests, 1 ignored across 33 suites).
 The manager-backed overlay DNS test also passed on Fortress (Debian 13 x86_64,
 Rust 1.99.1) using the test source file SHA-256
 `6990e2dabf96d163c8398eff58eb1e7fa2ecd03dd8ac4ef5fbbd3e623df988b8`.
-Overlay DNS still needs verification through an installed host resolver and a
-DNS-discovered application on the actual overlay path.
+At the reviewed source revision `a46413101bc2dcc12dcdfcf6c41e34e9566e4ae5`,
+the combined cross-host DNS/application test uses Hickory's system-config
+resolver and its SRV/target-A helpers compile and pass Linux-target Clippy. The
+combined test has not been executed at this revision. Hickory reads the
+configured nameserver and search domains but resolves in process; it does not
+exercise libc NSS modules. Overlay DNS still needs live verification through
+the deployment host's resolver path and a DNS-discovered application on the
+actual overlay.
