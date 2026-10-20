@@ -3,7 +3,7 @@ type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
 status: pending external testbed
-source_revision: 9752cfc376a66f31808b2ddf900ed41d12c1dfe2
+source_revision: acc2f11597938804b986f64b770b55f50bc7200e
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
@@ -20,9 +20,10 @@ sources:
 
 # Qualification status
 
-No independent-host traffic result is recorded yet. The user is arranging
-two independent Linux hosts. Do not treat local tests as cross-host evidence or
-mark acceptance rows as passed until the run is performed on those hosts.
+No independent-host traffic result is recorded yet. One separate Linux host is
+available; a second independently booted Linux worker host is still needed.
+Do not treat local tests as cross-host evidence or mark acceptance rows as
+passed until the run is performed on both hosts.
 
 The code under review supports a Linux TUN with a 1,000-byte IPv4 packet
 limit and a direct-only Iroh topology. Iroh relay use, public/default address
@@ -61,9 +62,13 @@ diagnostics distinguish desired membership, helper-reported TUN/address/MTU
 and installed routes, active direct Iroh links, selected direct IP path, last
 handshake time, and transport byte counters. Reports are generation- and
 freshness-tagged; counters measure QUIC UDP traffic including protocol overhead,
-not application payload. The manager's `reachability` field remains
-`not_verified`; the local `conductor overlay probe` reports its result only to
-the operator and does not persist it in manager state.
+not application payload. `conductor overlay probe` reports locally by default.
+With the source worker's `--config`, a completed HTTP response is submitted
+over mTLS and appears as a directional application probe in manager diagnostics.
+The manager marks reachability `verified` only while the report is no more than
+60 seconds old, its source generations are current, and the same target address
+belongs to an active peer. Retain the separate payload/hash check as evidence of
+content integrity.
 
 # DNS-discovered application traffic
 
@@ -120,7 +125,8 @@ is worker A's assigned overlay address:
 
 ```sh
 dig +short A SRV_TARGET.
-conductor overlay probe --target-ip WORKER_A_OVERLAY_IP --port SRV_PORT \
+conductor overlay --config /etc/conductor/worker-b.json probe \
+  --target-ip WORKER_A_OVERLAY_IP --port SRV_PORT \
   --path /probe/READY_NONCE --timeout-ms 5000
 python3 scripts/qualify-overlay-traffic.py request \
   --host SRV_TARGET --port SRV_PORT \
@@ -135,9 +141,9 @@ host-network suffix and confirm it still returns the worker's configured
 advertised address. Overlay addresses are IPv4 in this implementation, so an
 AAAA query in the overlay namespace is expected to return NODATA. A DNS answer
 alone does not prove that the direct Iroh path or application traffic works.
-The bounded CLI probe reports a local HTTP result but does not update the
-manager's `reachability` field; retain both it and the payload-verifying
-request as separate evidence.
+The bounded CLI probe reports locally and, with the worker config above, sends
+the HTTP result to the manager. Retain its accepted manager diagnostic and the
+payload-verifying request as separate evidence.
 
 # Basic traffic procedure
 
@@ -150,8 +156,9 @@ request as separate evidence.
 2. Create the network domain using `conductor operator overlay create`, then
    inspect it and wait for both active peer assignments. Confirm each worker's
    `observationFresh` is true and its reported network generation matches the
-   desired generation. `reachability` must remain `not_verified` until traffic
-   below succeeds.
+   desired generation. Reachability starts as `not_verified`; a manager-accepted
+   bounded HTTP response can mark its direction `verified` for 60 seconds,
+   while the payload-verifying request remains a separate qualification step.
 3. On worker A, bind a native HTTP server to its assigned overlay address and
    serve a unique random marker file of at least 64 KiB:
 
@@ -215,9 +222,9 @@ worker status, Iroh handshake, ping, or timeout alone.
 | Orderly and forced shutdown | Owned routes/interface are removed; unrelated network state is unchanged | Not run on independent hosts |
 
 For each failure, save the manager peer listing before and after, including
-desired peer generation, observation generation, observation timestamp,
-freshness, lease expiry, and state. Keep `reachability: not_verified` in the
-manager output; save any separate application probe output alongside it.
+desired peer generation, observation generation, application-probe outcome and
+freshness, lease expiry, and state. A failed or stale application probe must
+not be treated as verified reachability.
 
 # Existing local evidence
 
@@ -230,10 +237,12 @@ the probe's hash and output handling only. These are single-host results; they
 did not exercise two-host Iroh traffic, underlay encryption, deployment
 privileges, host reboot, or direct traffic on independent hosts.
 
-On 2026-10-20, the current source passed a Rust 1.99.1 Linux arm64 workspace
-`cargo check --workspace --locked --all-targets --all-features`. This compiles
-the current Linux helper, TUN, route, and worker startup code; it does not run
-that helper or qualify host networking.
+On 2026-10-20, source commit `9752cfc376a66f31808b2ddf900ed41d12c1dfe2`
+passed a Rust 1.99.1 Linux arm64 workspace `cargo check --offline --workspace
+--locked --all-targets --all-features`. This compiles the Linux helper, TUN,
+route, and worker startup code at that revision; it does not run the helper or
+qualify host networking. The later manager-persisted probe report change has
+not yet been rechecked in the Linux container.
 
 A historical workspace debug suite passed 291 tests on the local macOS host for
 source commit `5e23aea68b4a99e424e96842a04ce756fa79795f`; that revision predates
