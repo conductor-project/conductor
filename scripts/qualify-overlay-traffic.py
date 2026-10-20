@@ -8,6 +8,7 @@ import hashlib
 import http.server
 import http.client
 import json
+import os
 import secrets
 import sys
 import time
@@ -28,6 +29,16 @@ def parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=18080)
     serve.add_argument("--bytes", type=int, default=65_536, dest="payload_bytes")
     serve.add_argument("--timeout-seconds", type=float, default=120)
+    managed = subcommands.add_parser(
+        "serve-managed", help="serve a bounded payload on a Conductor-allocated service port"
+    )
+    managed.add_argument("--bind", required=True, help="worker overlay IPv4 address")
+    managed.add_argument(
+        "--port-env", default="CONDUCTOR_PORT_HTTP", help="Conductor-assigned port environment key"
+    )
+    managed.add_argument("--bytes", type=int, default=65_536, dest="payload_bytes")
+    managed.add_argument("--timeout-seconds", type=float, default=600)
+    managed.add_argument("--max-requests", type=int, default=32)
     request = subcommands.add_parser("request", help="fetch and verify a server payload")
     request.add_argument("--host", required=True, help="server's assigned overlay IPv4")
     request.add_argument("--port", type=int, default=18080)
@@ -156,11 +167,91 @@ def run_request(args: argparse.Namespace) -> int:
         connection.close()
 
 
+def run_managed_server(args: argparse.Namespace) -> int:
+    if not 1 <= args.payload_bytes <= MAX_PAYLOAD_BYTES:
+        raise ValueError(f"--bytes must be between 1 and {MAX_PAYLOAD_BYTES}")
+    if not 1 <= args.timeout_seconds <= 3600:
+        raise ValueError("--timeout-seconds must be between 1 and 3600")
+    if not 1 <= args.max_requests <= 128:
+        raise ValueError("--max-requests must be between 1 and 128")
+    if args.payload_bytes < 32:
+        raise ValueError("--bytes must be at least 32 to include the capture marker")
+    port_name = args.port_env.removeprefix("CONDUCTOR_PORT_")
+    if not port_name or any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_" for character in port_name):
+        raise ValueError("--port-env must name a Conductor-assigned service port")
+    port_value = os.environ.get(args.port_env)
+    if port_value is None or not port_value.isascii() or not port_value.isdecimal():
+        raise ValueError("the configured Conductor service port is unavailable")
+    port = int(port_value)
+    if not 1 <= port <= 65535:
+        raise ValueError("the configured Conductor service port is invalid")
+
+    marker = secrets.token_hex(16)
+    payload = marker.encode("ascii") + secrets.token_bytes(args.payload_bytes - len(marker))
+    nonce = secrets.token_hex(16)
+    digest = hashlib.sha256(payload).hexdigest()
+    expected_path = f"/probe/{nonce}"
+    started = time.monotonic()
+    request_count = 0
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            nonlocal request_count
+            if self.path != expected_path:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+            request_count += 1
+            emit(
+                {
+                    "event": "request_complete",
+                    "remoteAddress": self.client_address[0],
+                    "remotePort": self.client_address[1],
+                    "bytesSent": len(payload),
+                    "sha256": digest,
+                    "elapsedMs": round((time.monotonic() - started) * 1000, 3),
+                }
+            )
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    server = http.server.HTTPServer((args.bind, port), Handler)
+    deadline = started + args.timeout_seconds
+    emit(
+        {
+            "event": "ready",
+            "bindAddress": args.bind,
+            "port": port,
+            "portEnvironment": args.port_env,
+            "nonce": nonce,
+            "captureMarker": marker,
+            "payloadBytes": len(payload),
+            "sha256": digest,
+            "timeoutSeconds": args.timeout_seconds,
+            "maxRequests": args.max_requests,
+        }
+    )
+    try:
+        while time.monotonic() < deadline and request_count < args.max_requests:
+            server.timeout = min(0.5, max(0, deadline - time.monotonic()))
+            server.handle_request()
+    finally:
+        server.server_close()
+    return 0
+
+
 def main() -> int:
     args = parser().parse_args()
     try:
         if args.mode == "serve":
             return run_server(args)
+        if args.mode == "serve-managed":
+            return run_managed_server(args)
         return run_request(args)
     except (OSError, ValueError) as error:
         print(f"overlay traffic probe: {error}", file=sys.stderr)

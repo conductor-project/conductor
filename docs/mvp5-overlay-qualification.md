@@ -3,7 +3,7 @@ type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
 status: pending external testbed
-source_revision: 36b84f6c94acd728a47a83516d1d575bb989c5ce
+source_revision: bbd5f027864045d8abc30a9fd0cf0504c0829015
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
@@ -59,6 +59,75 @@ provides no relay fallback or public/default address lookup; a blocked direct
 path is expected to fail within the documented bound. Current operator
 diagnostics distinguish desired membership and helper-applied generation, but
 do not report Iroh connection state, selected path, or counters.
+
+# DNS-discovered application traffic
+
+This test exercises the manager-hosted Hickory listener from #155 through the
+worker host resolver. Before deploying the test service, configure the manager's
+`service_dns` listener with `overlayNetworkDomainId`, `overlaySuffix`, and an
+`allowedClients` range containing the worker hosts. The network domain can be
+created after the manager starts. Configure the host resolver to forward
+`service.<overlaySuffix>` to that listener; retain the host-network suffix as a
+separate zone. The root [service discovery runbook](../okf/service-discovery.md)
+contains resolver setup and rollback steps.
+
+Deploy one service replica to worker A with a named TCP port `http`. The
+workload command should start the managed probe on worker A's assigned overlay
+IPv4 address and read the port Conductor injects:
+
+```json
+{
+  "command": [
+    "/usr/bin/python3",
+    "/opt/conductor/scripts/qualify-overlay-traffic.py",
+    "serve-managed",
+    "--bind",
+    "WORKER_A_OVERLAY_IP",
+    "--port-env",
+    "CONDUCTOR_PORT_HTTP",
+    "--bytes",
+    "65536",
+    "--timeout-seconds",
+    "600"
+  ],
+  "workload": {
+    "kind": "service",
+    "identity": {"namespace": "default", "name": "dns-probe"},
+    "ports": [{"name": "http", "protocol": "tcp"}]
+  }
+}
+```
+
+Use the normal service revision API fields for the executable digest, resource
+request, and worker placement. Bind to the worker overlay address (or a wildcard
+address) so the assigned TUN address accepts the service port. Save the probe's
+`ready` log record with its nonce, payload size, and SHA-256.
+
+From worker B, query the configured host resolver rather than supplying the
+underlay or overlay address directly:
+
+```sh
+dig +short SRV _http._tcp.dns-probe.default.service.overlay.internal.
+```
+
+For an SRV row, retain its target and port, then confirm the target's A record
+is worker A's assigned overlay address:
+
+```sh
+dig +short A SRV_TARGET.
+python3 scripts/qualify-overlay-traffic.py request \
+  --host SRV_TARGET --port SRV_PORT \
+  --nonce READY_NONCE --sha256 READY_SHA256 --bytes 65536 \
+  --timeout-seconds 30
+```
+
+Save the SRV answer, target A answer, `probe_complete` record, and server's
+`request_complete` log. The probe uses the host resolver to look up the SRV
+Target's A record and verifies the returned bytes. Also query the matching
+host-network suffix and confirm it still returns the worker's configured
+advertised address. Overlay addresses are IPv4 in this implementation, so an
+AAAA query in the overlay namespace is expected to return NODATA. A DNS answer
+alone does not prove that the direct Iroh path or application traffic works.
 
 # Basic traffic procedure
 
@@ -132,7 +201,7 @@ worker status, Iroh handshake, ping, or timeout alone.
 | Peer revoked while worker is disconnected from manager | Revocation is delivered on reconnect or the old lease expires; no indefinite stale authorization | Not run |
 | Oversized IPv4 packet | Adapter rejects packets over 1,000 bytes without panic or unbounded growth | Not run on hosts; packet unit tests cover local validation |
 | Direct UDP blocked | Connection fails within the documented bound and never invokes relay or public address lookup | Not run |
-| Overlay DNS discovery | A/AAAA and SRV preserve endpoint address/port pairing and an SRV-aware client exchanges application traffic | Blocked pending #155 overlay-aware Hickory publication |
+| Overlay DNS discovery | Host resolver returns the assigned worker overlay A record and SRV port; an SRV-aware application transfers the expected payload | Not run on independent hosts |
 | Orderly and forced shutdown | Owned routes/interface are removed; unrelated network state is unchanged | Not run on independent hosts |
 
 For each failure, save the manager peer listing before and after, including
@@ -154,11 +223,14 @@ privileges, host reboot, or direct traffic on independent hosts.
 A historical workspace debug suite passed 291 tests on the local macOS host for
 source commit `5e23aea68b4a99e424e96842a04ce756fa79795f`; that revision predates
 the current direct-only rework and is not evidence for this snapshot. For source
-revision `36b84f6c94acd728a47a83516d1d575bb989c5ce`, the dependency policy,
+revision `929d001fa66a983ac4ef5b07d0bdd142e6bab7be`, the dependency policy,
 formatting, workspace Clippy, workspace check, and full workspace test suite
-passed locally (292 tests across 32 suites). The probe also passed a 64 KiB
-loopback smoke transfer on 2026-10-20. These checks do not qualify two-host
-overlay behavior, DNS-discovered traffic, packet-capture encryption, or the
-platform privilege boundary. GitHub Actions were not awaited because of the
-reported outage. Replace this evidence record when independent-host runs are
-performed.
+passed locally. After the DNS startup-order fix in `bbd5f027864045d8abc30a9fd0cf0504c0829015`,
+the focused API DNS suite passed, covering the overlay suffix, active peer
+lease filtering, SRV address/port pairing, and domain bootstrap after listener
+startup. The managed-port probe passed a 64 KiB loopback smoke transfer on
+2026-10-20. These checks do not qualify
+two-host overlay behavior, DNS-discovered traffic through an installed host
+resolver, packet-capture encryption, or the platform privilege boundary.
+GitHub Actions were not awaited because of the reported outage. Replace this
+evidence record when independent-host runs are performed.
