@@ -128,6 +128,14 @@ a client outside `allowedClients` receives `REFUSED` on both transports. This
 verifies the Hickory listener's address-range gate, not client authentication
 or host resolver installation.
 
+A live listener integration test now builds a ready named-port service and an
+active enrolled overlay peer through manager APIs. It verifies that the SRV
+answer preserves the assigned port, its target A answer uses the manager's
+overlay address, host-network A publication remains unchanged, overlay AAAA is
+NODATA, and revoking the peer withdraws its SRV answer. This exercises
+manager-backed DNS publication and withdrawal. It does not yet exercise an
+installed host resolver or an application connection through the overlay.
+
 At source revision `a1baa9ebca3923663b91181fde02a3465ad151f6`, the new access
 control test passed. Dependency policy, formatting, workspace Clippy, and the
 full workspace debug suite passed (302 tests, 1 ignored across 33 suites).

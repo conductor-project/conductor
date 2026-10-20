@@ -516,3 +516,10 @@ endpoint's candidates using the updated peer generation. The Linux-only helper t
 Fortress with Rust 1.99.1. It verified that replacement closes the old endpoint
 and retains the worker EndpointId. This is a focused lifecycle test, not a
 cross-host revocation or active-traffic test.
+
+The live DNS listener integration test creates its ready named-port service,
+enrolled worker, active overlay assignment, and service port using manager APIs.
+It verifies the SRV port and endpoint-target A address, host-network suffix
+compatibility, overlay AAAA NODATA, and withdrawal after peer revocation. The
+test uses a loopback DNS client and does not install a host resolver or send
+application traffic through the overlay.
