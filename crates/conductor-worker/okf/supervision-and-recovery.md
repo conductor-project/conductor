@@ -3,8 +3,8 @@ type: Reference
 title: Worker supervision and recovery
 description: The worker persists command acceptance and observations around run supervision, then reconciles uncertain work on restart.
 status: stable
-source_revision: db60ba9
-source_reviewed_at: 2026-10-19
+source_revision: a622643
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/lib.rs
     title: Startup recovery and supervision
@@ -42,7 +42,7 @@ manager keeps the corresponding reservation until an operator resolves it.
 
 The worker database has its own migration series; current source sets
 `SCHEMA_VERSION` to **4** in `src/lib.rs`. It is independent of manager schema
-version 12. Worker records include runs/logs, metadata/incarnation, accepted
+version 14. Worker records include runs/logs, metadata/incarnation, accepted
 commands, and report state.
 
 The `conductor upgrade preflight` command reads the worker's `PRAGMA user_version`

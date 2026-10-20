@@ -3,8 +3,8 @@ type: Component
 title: conductor-manager overview
 description: Manager operations own desired state, durable scheduling decisions, worker-facing commands, and reconciliation.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
-source_reviewed_at: 2026-10-19
+source_revision: a622643
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/lib.rs
     title: Manager contracts and service facade
@@ -30,7 +30,7 @@ SQLite repository methods serialize manager transactions and persist the
 manager's view of state. Worker observations are received through the port and
 reconciled; worker-local accepted commands, run logs, and process state remain
 owned by the worker. The manager DB schema version in this reviewed source is
-12. See [persistence and migrations](desired-state-and-persistence.md).
+14. See [persistence and migrations](desired-state-and-persistence.md).
 
 # Evidence
 

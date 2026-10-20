@@ -3,8 +3,8 @@ type: Reference
 title: HTTP routes and contracts
 description: Routes expose jobs, runs, service revisions/deployments, workers, drains, metrics, and readiness; the feature-gated typed client calls these contracts with bounded JSON responses.
 status: stable
-source_revision: 663bd0f
-source_reviewed_at: 2026-10-19
+source_revision: a622643
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/server.rs
     title: Route registration and handlers
@@ -61,10 +61,19 @@ let run: conductor_core::RunObservation = api
 | Runs | `POST /v1/jobs/{id}/runs`, `GET /v1/runs`, `GET /v1/runs/{id}`, `POST /v1/runs/{id}/stop`, `POST /v1/runs/{id}/resolve`, `GET /v1/runs/{id}/logs` |
 | Service revisions and deployments | `POST /v1/jobs/{id}/revisions`, `GET /v1/jobs/{id}/revisions/{revision}`, `GET/PUT/DELETE /v1/jobs/{id}/deployment`, deployment scale/suspend/resume/rollback |
 | Workers and operations | worker status, drain/cancel drain, metrics, service attempt and endpoint/catalog reads/watch |
+| Overlay identity and allocation | `POST /v1/network-domains`, `GET /v1/network-domains/{id}`, `GET /v1/network-domains/{id}/peers`, `DELETE /v1/network-domains/{id}/peers/{workerId}` |
 
 The exact methods, paths, body types, query parameters, and conditions are
 registered in `src/server.rs`. API tests are closest to the canonical behavior;
 the [README](../../../README.md) is a shorter successful one-shot flow.
+
+Overlay domain creation and peer revocation are audited operator mutations.
+Peer status contains public endpoint IDs, assigned addresses, generations,
+expiry, and quarantine state; it contains no Iroh private key. Worker identity
+enrollment, configuration delivery, and observations use the separate mTLS
+worker transport endpoints described in the transport bundle. These routes
+manage membership and desired state only; they do not configure a tunnel or
+host route.
 
 # Important run semantics
 

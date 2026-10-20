@@ -3,8 +3,8 @@ type: Runbook
 title: Operations and recovery
 description: Use health and readiness correctly, plan graceful shutdown, and resolve uncertain work after restart.
 status: stable
-source_revision: 379e733
-source_reviewed_at: 2026-10-19
+source_revision: a622643
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../crates/conductor-api/src/lib.rs
     title: Readiness and metrics routes
@@ -82,7 +82,7 @@ closure, not success; it releases the held reservation. Do not report an
 `unknown` or `abandoned` run as successful. See the [API route guide](../crates/conductor-api/okf/routes-and-contracts.md#resolving-an-uncertain-run)
 for the request and conflict behavior.
 
-The manager schema is version 12 and worker schema version 4 in the reviewed
+The manager schema is version 14 and worker schema version 4 in the reviewed
 source. Their migration sequences are independent; see the [manager schema
 page](../crates/conductor-manager/okf/desired-state-and-persistence.md) and
 [worker persistence page](../crates/conductor-worker/okf/supervision-and-recovery.md).
@@ -174,7 +174,7 @@ recovery decision have been verified.
 ## Upgrade compatibility policy
 
 The current source reports Conductor `0.0.1`, HTTP API `v1`, manager-worker
-protocol `3`, manager database schema `12`, and worker database schema `4`.
+protocol `3`, manager database schema `14`, and worker database schema `4`.
 Manager and worker databases have independent schema sequences. The release
 policy supports the latest and immediately preceding minor lines for at least
 12 months from each line's first stable release. The first supported release,

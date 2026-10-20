@@ -10,15 +10,18 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 use axum::Json;
-use axum::extract::{DefaultBodyLimit, Extension, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use axum_server_mtls::{MtlsAcceptor, PeerCertificates};
 use base64::Engine;
-use conductor_core::WorkerId;
-use conductor_manager::{SqliteJobRepository, WorkerIdentityError};
+use conductor_core::{
+    NetworkDomainId, OverlayDirectCandidateAdvertisement, OverlayEndpointId,
+    OverlayPeerObservation, WorkerId, valid_overlay_direct_candidates,
+};
+use conductor_manager::{JobRepository, SqliteJobRepository, WorkerIdentityError};
 use rcgen::{
     BasicConstraints, CertificateParams, DistinguishedName, ExtendedKeyUsagePurpose, IsCa, Issuer,
     KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
@@ -35,6 +38,7 @@ const CREDENTIAL_BYTES: usize = 32;
 const DEFAULT_CERTIFICATE_LIFETIME: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 const MAX_ENROLLMENT_CREDENTIAL_LIFETIME: Duration = Duration::from_secs(24 * 60 * 60);
 const MAX_CSR_BYTES: usize = 16 * 1024;
+const OVERLAY_PEER_LEASE_MS: i64 = 5 * 60 * 1_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum IdentityError {
@@ -146,6 +150,12 @@ struct EnrollmentRequest {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RenewalRequest {
     csr_pem: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct OverlayEndpointRequest {
+    endpoint_id: OverlayEndpointId,
 }
 
 /// Holds the manager's CA signing key. The key is created once with mode 0600 on Unix,
@@ -431,6 +441,22 @@ impl WorkerEnrollmentService {
         axum::Router::new()
             .route("/v1/worker/enroll", post(enroll_handler))
             .route("/v1/worker/renew", post(renew_handler))
+            .route(
+                "/v1/worker/network-domains/{id}/identity",
+                axum::routing::put(register_overlay_endpoint_handler),
+            )
+            .route(
+                "/v1/worker/network-domains/{id}",
+                axum::routing::get(overlay_configuration_handler),
+            )
+            .route(
+                "/v1/worker/network-domains/{id}/observation",
+                post(overlay_observation_handler),
+            )
+            .route(
+                "/v1/worker/network-domains/{id}/candidates",
+                post(overlay_candidates_handler),
+            )
             .layer(DefaultBodyLimit::max(super::MAX_TRANSPORT_BODY_BYTES))
             .with_state(Arc::clone(self))
     }
@@ -548,6 +574,191 @@ async fn renew_handler(
         )
             .into_response(),
     }
+}
+
+async fn register_overlay_endpoint_handler(
+    State(service): State<Arc<WorkerEnrollmentService>>,
+    AxumPath(raw_domain_id): AxumPath<String>,
+    certificates: Option<Extension<PeerCertificates>>,
+    Json(request): Json<OverlayEndpointRequest>,
+) -> Response {
+    let Ok(domain_id) = NetworkDomainId::new(raw_domain_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid network domain").into_response();
+    };
+    let Some(worker_id) = authenticated_worker(&service, certificates) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "active worker certificate required",
+        )
+            .into_response();
+    };
+    if !is_canonical_iroh_endpoint_id(&request.endpoint_id) {
+        return (StatusCode::BAD_REQUEST, "invalid Iroh endpoint identity").into_response();
+    }
+    let Ok(now) = now_ms() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "manager clock unavailable").into_response();
+    };
+    match service.repository.register_overlay_peer(
+        &domain_id,
+        &worker_id,
+        &request.endpoint_id,
+        now.saturating_add(OVERLAY_PEER_LEASE_MS),
+        now,
+    ) {
+        Ok(assignment) => (StatusCode::OK, Json(assignment)).into_response(),
+        Err(conductor_manager::OverlayNetworkError::IdentityUnavailable) => {
+            (StatusCode::UNAUTHORIZED, "worker identity is unavailable").into_response()
+        }
+        Err(conductor_manager::OverlayNetworkError::DomainNotFound) => {
+            (StatusCode::NOT_FOUND, "network domain not found").into_response()
+        }
+        Err(conductor_manager::OverlayNetworkError::StorageUnavailable) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "overlay state unavailable").into_response()
+        }
+        Err(_) => (StatusCode::CONFLICT, "overlay identity rejected").into_response(),
+    }
+}
+
+fn is_canonical_iroh_endpoint_id(endpoint_id: &OverlayEndpointId) -> bool {
+    endpoint_id
+        .as_str()
+        .parse::<iroh_base::EndpointId>()
+        .is_ok_and(|parsed| parsed.to_string() == endpoint_id.as_str())
+}
+
+async fn overlay_configuration_handler(
+    State(service): State<Arc<WorkerEnrollmentService>>,
+    AxumPath(raw_domain_id): AxumPath<String>,
+    certificates: Option<Extension<PeerCertificates>>,
+) -> Response {
+    let Ok(domain_id) = NetworkDomainId::new(raw_domain_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid network domain").into_response();
+    };
+    let Some(worker_id) = authenticated_worker(&service, certificates) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "active worker certificate required",
+        )
+            .into_response();
+    };
+    let Ok(now) = now_ms() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "manager clock unavailable").into_response();
+    };
+    match service
+        .repository
+        .overlay_peer_configuration(&domain_id, &worker_id, now)
+    {
+        Ok(Some(configuration)) => Json(configuration).into_response(),
+        Ok(None) => (StatusCode::NOT_FOUND, "active overlay assignment not found").into_response(),
+        Err(conductor_manager::OverlayNetworkError::StorageUnavailable) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "overlay state unavailable").into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "network domain not found").into_response(),
+    }
+}
+
+async fn overlay_observation_handler(
+    State(service): State<Arc<WorkerEnrollmentService>>,
+    AxumPath(raw_domain_id): AxumPath<String>,
+    certificates: Option<Extension<PeerCertificates>>,
+    Json(mut observation): Json<OverlayPeerObservation>,
+) -> Response {
+    let Ok(domain_id) = NetworkDomainId::new(raw_domain_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid network domain").into_response();
+    };
+    let Some(worker_id) = authenticated_worker(&service, certificates) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "active worker certificate required",
+        )
+            .into_response();
+    };
+    if observation.network_domain_id != domain_id || observation.worker_id != worker_id {
+        return (
+            StatusCode::FORBIDDEN,
+            "worker observation identity mismatch",
+        )
+            .into_response();
+    }
+    let Ok(now) = now_ms() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "manager clock unavailable").into_response();
+    };
+    observation.observed_at_ms = now;
+    match service
+        .repository
+        .record_overlay_peer_observation(&observation)
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(conductor_manager::OverlayNetworkError::StaleGeneration) => {
+            (StatusCode::CONFLICT, "stale overlay observation").into_response()
+        }
+        Err(conductor_manager::OverlayNetworkError::PeerNotFound) => {
+            (StatusCode::NOT_FOUND, "active overlay assignment not found").into_response()
+        }
+        Err(conductor_manager::OverlayNetworkError::StorageUnavailable) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "overlay state unavailable").into_response()
+        }
+        Err(_) => (StatusCode::BAD_REQUEST, "overlay observation rejected").into_response(),
+    }
+}
+
+async fn overlay_candidates_handler(
+    State(service): State<Arc<WorkerEnrollmentService>>,
+    AxumPath(raw_domain_id): AxumPath<String>,
+    certificates: Option<Extension<PeerCertificates>>,
+    Json(advertisement): Json<OverlayDirectCandidateAdvertisement>,
+) -> Response {
+    let Ok(domain_id) = NetworkDomainId::new(raw_domain_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid network domain").into_response();
+    };
+    let Some(worker_id) = authenticated_worker(&service, certificates) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "active worker certificate required",
+        )
+            .into_response();
+    };
+    if !valid_overlay_direct_candidates(&advertisement.candidates) {
+        return (StatusCode::BAD_REQUEST, "invalid direct candidates").into_response();
+    }
+    let Ok(now) = now_ms() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "manager clock unavailable").into_response();
+    };
+    match service.repository.advertise_overlay_candidates(
+        &domain_id,
+        &worker_id,
+        advertisement.peer_generation,
+        &advertisement.candidates,
+        now,
+    ) {
+        Ok(acknowledgement) => Json(acknowledgement).into_response(),
+        Err(conductor_manager::OverlayNetworkError::IdentityUnavailable) => {
+            (StatusCode::UNAUTHORIZED, "worker identity is unavailable").into_response()
+        }
+        Err(conductor_manager::OverlayNetworkError::PeerNotFound) => {
+            (StatusCode::NOT_FOUND, "active overlay assignment not found").into_response()
+        }
+        Err(conductor_manager::OverlayNetworkError::StaleGeneration) => {
+            (StatusCode::CONFLICT, "stale overlay peer generation").into_response()
+        }
+        Err(conductor_manager::OverlayNetworkError::InvalidDirectCandidates) => {
+            (StatusCode::BAD_REQUEST, "invalid direct candidates").into_response()
+        }
+        Err(conductor_manager::OverlayNetworkError::StorageUnavailable) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "overlay state unavailable").into_response()
+        }
+        Err(_) => (StatusCode::NOT_FOUND, "network domain not found").into_response(),
+    }
+}
+
+fn authenticated_worker(
+    service: &WorkerEnrollmentService,
+    certificates: Option<Extension<PeerCertificates>>,
+) -> Option<WorkerId> {
+    let certificate = certificates?.0.leaf()?.clone();
+    service
+        .authenticate_certificate(certificate.as_ref())
+        .ok()?
 }
 
 #[derive(Clone)]
@@ -947,6 +1158,124 @@ mod tests {
             .timeout(Duration::from_secs(3))
             .build()
             .expect("mTLS worker client");
+        repository
+            .create_overlay_network_domain(
+                &conductor_core::OverlayNetworkDomainConfig {
+                    network_domain_id: NetworkDomainId::new("overlay-test").expect("domain ID"),
+                    worker_address_pool: "10.90.0.0/24".to_owned(),
+                    service_address_pool: "10.90.1.0/24".to_owned(),
+                },
+                now_ms().expect("clock"),
+            )
+            .expect("create overlay domain");
+        let anonymous_overlay = no_identity_client
+            .get(format!(
+                "https://localhost:{}/v1/worker/network-domains/overlay-test",
+                address.port()
+            ))
+            .send()
+            .await
+            .expect("anonymous TLS overlay request");
+        assert_eq!(
+            anonymous_overlay.status(),
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+        let malformed_endpoint_id = OverlayEndpointId::new("ab".repeat(32)).expect("endpoint ID");
+        let malformed_enrollment = worker_client
+            .put(format!(
+                "https://localhost:{}/v1/worker/network-domains/overlay-test/identity",
+                address.port()
+            ))
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({ "endpointId": malformed_endpoint_id }))
+            .send()
+            .await
+            .expect("mTLS malformed overlay identity enrollment");
+        assert_eq!(
+            malformed_enrollment.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+
+        let endpoint_id = OverlayEndpointId::new(format!("58{}", "66".repeat(31)))
+            .expect("valid Iroh Ed25519 endpoint ID");
+        let enrollment = worker_client
+            .put(format!(
+                "https://localhost:{}/v1/worker/network-domains/overlay-test/identity",
+                address.port()
+            ))
+            .header("content-type", "application/json")
+            .json(&serde_json::json!({ "endpointId": endpoint_id }))
+            .send()
+            .await
+            .expect("mTLS overlay identity enrollment");
+        assert_eq!(enrollment.status(), reqwest::StatusCode::OK);
+        let assignment: conductor_core::OverlayPeerAssignment =
+            enrollment.json().await.expect("decode overlay assignment");
+        assert_eq!(assignment.worker_id, worker_id);
+        let direct_candidate = "192.168.50.12:42500";
+        let candidate_report = worker_client
+            .post(format!(
+                "https://localhost:{}/v1/worker/network-domains/overlay-test/candidates",
+                address.port()
+            ))
+            .json(&serde_json::json!({
+                "peerGeneration": assignment.peer_generation,
+                "candidates": [direct_candidate]
+            }))
+            .send()
+            .await
+            .expect("advertise direct candidate over mTLS");
+        assert_eq!(candidate_report.status(), reqwest::StatusCode::OK);
+        let candidate_ack: conductor_core::OverlayDirectCandidateAcknowledgement = candidate_report
+            .json()
+            .await
+            .expect("decode candidate acknowledgement");
+        assert_eq!(candidate_ack.peer_generation, assignment.peer_generation);
+        let stale_candidate_report = worker_client
+            .post(format!(
+                "https://localhost:{}/v1/worker/network-domains/overlay-test/candidates",
+                address.port()
+            ))
+            .json(&serde_json::json!({
+                "peerGeneration": assignment.peer_generation.saturating_sub(1),
+                "candidates": [direct_candidate]
+            }))
+            .send()
+            .await
+            .expect("submit stale candidate generation");
+        assert_eq!(
+            stale_candidate_report.status(),
+            reqwest::StatusCode::CONFLICT
+        );
+        let configuration = worker_client
+            .get(format!(
+                "https://localhost:{}/v1/worker/network-domains/overlay-test",
+                address.port()
+            ))
+            .send()
+            .await
+            .expect("read worker overlay configuration");
+        assert_eq!(configuration.status(), reqwest::StatusCode::OK);
+        let configuration_body = configuration.text().await.expect("configuration JSON");
+        assert!(!configuration_body.contains(&first_key));
+        let observation = OverlayPeerObservation {
+            network_domain_id: assignment.network_domain_id.clone(),
+            worker_id: worker_id.clone(),
+            peer_generation: assignment.peer_generation,
+            applied_network_generation: candidate_ack.network_generation,
+            observed_at_ms: 0,
+            status: conductor_core::OverlayPeerObservationStatus::Applied,
+        };
+        let report = worker_client
+            .post(format!(
+                "https://localhost:{}/v1/worker/network-domains/overlay-test/observation",
+                address.port()
+            ))
+            .json(&observation)
+            .send()
+            .await
+            .expect("report overlay observation over mTLS");
+        assert_eq!(report.status(), reqwest::StatusCode::NO_CONTENT);
         let poll_url = format!("https://localhost:{}/v1/worker/poll", address.port());
         let mismatched_poll = super::super::WorkerPollRequest {
             worker_id: WorkerId::new("worker-impostor").expect("impostor id"),

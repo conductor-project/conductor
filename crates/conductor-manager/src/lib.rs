@@ -29,7 +29,7 @@ use serde::Serialize;
 
 /// Temporary limit for active jobs. Pagination is a later milestone.
 pub const MAX_JOBS: usize = 1_000;
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 14;
 /// Current manager database schema understood by this build.
 pub const CURRENT_SCHEMA_VERSION: i64 = SCHEMA_VERSION;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
@@ -120,6 +120,26 @@ pub enum WorkerIdentityError {
     CredentialInvalid,
     IdentityExists,
     IdentityUnavailable,
+    StorageUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OverlayNetworkError {
+    DomainExists,
+    DomainNotFound,
+    InvalidAddressPool,
+    AddressPoolOverlap,
+    AddressPoolExhausted,
+    PeerLimitReached,
+    IdentityUnavailable,
+    EndpointIdentityConflict,
+    EndpointIdentityReplay,
+    PeerQuarantined,
+    InvalidLease,
+    InvalidDirectCandidates,
+    StaleGeneration,
+    PeerNotFound,
+    ObservationConflict,
     StorageUnavailable,
 }
 
@@ -266,6 +286,53 @@ pub trait JobRepository: Send + Sync + CommandJournal {
     fn record_audit_event(&self, event: &AuditEventInput) -> Result<(), ExecutionStoreError>;
     fn list_audit_events(&self, limit: usize) -> Result<Vec<AuditEvent>, ExecutionStoreError>;
     fn operational_metrics(&self) -> Result<OperationalMetrics, ExecutionStoreError>;
+    fn create_overlay_network_domain(
+        &self,
+        config: &conductor_core::OverlayNetworkDomainConfig,
+        now_ms: i64,
+    ) -> Result<(), OverlayNetworkError>;
+    fn get_overlay_network_domain(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+    ) -> Result<Option<conductor_core::OverlayNetworkDomainConfig>, OverlayNetworkError>;
+    fn register_overlay_peer(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        worker_id: &WorkerId,
+        endpoint_id: &conductor_core::OverlayEndpointId,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<conductor_core::OverlayPeerAssignment, OverlayNetworkError>;
+    fn advertise_overlay_candidates(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        worker_id: &WorkerId,
+        peer_generation: u64,
+        candidates: &[std::net::SocketAddr],
+        now_ms: i64,
+    ) -> Result<conductor_core::OverlayDirectCandidateAcknowledgement, OverlayNetworkError>;
+    fn revoke_overlay_peer(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        worker_id: &WorkerId,
+        now_ms: i64,
+    ) -> Result<bool, OverlayNetworkError>;
+    fn overlay_peer_configuration(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        worker_id: &WorkerId,
+        now_ms: i64,
+    ) -> Result<Option<conductor_core::OverlayPeerConfiguration>, OverlayNetworkError>;
+    fn record_overlay_peer_observation(
+        &self,
+        observation: &conductor_core::OverlayPeerObservation,
+    ) -> Result<(), OverlayNetworkError>;
+    fn list_overlay_peers(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<Vec<conductor_core::OverlayPeerAssignment>, OverlayNetworkError>;
     fn insert(&self, job: JobSpec) -> Result<(), JobStoreError>;
     fn get(&self, id: &JobId) -> Result<Option<JobSpec>, JobStoreError>;
     fn list_jobs_page(
@@ -565,7 +632,48 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
         connection
             .prepare("SELECT event_sequence, occurred_at_ms, principal, action, resource_type, resource_id, outcome, status_code FROM audit_events LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare("SELECT network_domain_id, worker_address_pool, service_address_pool, network_generation FROM overlay_network_domains LIMIT 0")
+            .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare("SELECT network_domain_id, worker_id, endpoint_id, worker_address, peer_generation, expires_at_ms, state, quarantine_until_ms, direct_candidates_json, direct_candidates_expires_at_ms FROM overlay_peers LIMIT 0")
+            .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare("SELECT network_domain_id, endpoint_id, worker_id, peer_generation, retired_at_ms FROM overlay_endpoint_history LIMIT 0")
+            .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare("SELECT network_domain_id, worker_id, peer_generation, applied_network_generation, observed_at_ms, status FROM overlay_peer_observations LIMIT 0")
+            .map_err(MigrationError::Sqlite)?;
         return Ok(());
+    }
+
+    if version == 12 {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(MigrationError::Sqlite)?;
+        create_overlay_network_schema(&transaction).map_err(MigrationError::Sqlite)?;
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(MigrationError::Sqlite)?;
+        transaction.commit().map_err(MigrationError::Sqlite)?;
+        return migrate(connection);
+    }
+
+    if version == 13 {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(MigrationError::Sqlite)?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE overlay_peers ADD COLUMN direct_candidates_json TEXT NOT NULL DEFAULT '[]' CHECK(length(direct_candidates_json) <= 4096);
+                 ALTER TABLE overlay_peers ADD COLUMN direct_candidates_expires_at_ms INTEGER CHECK(direct_candidates_expires_at_ms IS NULL OR direct_candidates_expires_at_ms >= 0);",
+            )
+            .map_err(MigrationError::Sqlite)?;
+        transaction
+            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(MigrationError::Sqlite)?;
+        transaction.commit().map_err(MigrationError::Sqlite)?;
+        return migrate(connection);
     }
 
     if version == 11 {
@@ -574,7 +682,7 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
             .map_err(MigrationError::Sqlite)?;
         create_audit_schema(&transaction).map_err(MigrationError::Sqlite)?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 12)
             .map_err(MigrationError::Sqlite)?;
         transaction.commit().map_err(MigrationError::Sqlite)?;
         return migrate(connection);
@@ -822,6 +930,7 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
     create_service_catalog_owner_schema(&transaction).map_err(MigrationError::Sqlite)?;
     create_worker_drain_schema(&transaction).map_err(MigrationError::Sqlite)?;
     create_audit_schema(&transaction).map_err(MigrationError::Sqlite)?;
+    create_overlay_network_schema(&transaction).map_err(MigrationError::Sqlite)?;
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(MigrationError::Sqlite)?;
@@ -843,6 +952,55 @@ fn create_audit_schema(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Res
          CREATE INDEX IF NOT EXISTS audit_events_by_time ON audit_events(occurred_at_ms DESC, event_sequence DESC);
          CREATE TRIGGER IF NOT EXISTS audit_events_no_update BEFORE UPDATE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;
          CREATE TRIGGER IF NOT EXISTS audit_events_no_delete BEFORE DELETE ON audit_events BEGIN SELECT RAISE(ABORT, 'audit events are append-only'); END;",
+    )
+}
+
+fn create_overlay_network_schema(transaction: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE overlay_network_domains (
+             network_domain_id TEXT PRIMARY KEY NOT NULL,
+             worker_address_pool TEXT NOT NULL,
+             service_address_pool TEXT NOT NULL,
+             network_generation INTEGER NOT NULL CHECK (network_generation > 0),
+             created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0)
+         );
+         CREATE TABLE overlay_peers (
+             network_domain_id TEXT NOT NULL REFERENCES overlay_network_domains(network_domain_id),
+             worker_id TEXT NOT NULL,
+             endpoint_id TEXT NOT NULL,
+             worker_address INTEGER NOT NULL CHECK (worker_address BETWEEN 0 AND 4294967295),
+             peer_generation INTEGER NOT NULL CHECK (peer_generation > 0),
+             expires_at_ms INTEGER NOT NULL CHECK (expires_at_ms >= 0),
+             state TEXT NOT NULL CHECK (state IN ('active', 'quarantined')),
+             quarantine_until_ms INTEGER CHECK (quarantine_until_ms IS NULL OR quarantine_until_ms >= 0),
+             direct_candidates_json TEXT NOT NULL DEFAULT '[]' CHECK(length(direct_candidates_json) <= 4096),
+             direct_candidates_expires_at_ms INTEGER CHECK(direct_candidates_expires_at_ms IS NULL OR direct_candidates_expires_at_ms >= 0),
+             PRIMARY KEY (network_domain_id, worker_id),
+             UNIQUE (network_domain_id, endpoint_id),
+             UNIQUE (network_domain_id, worker_address),
+             CHECK ((state = 'active' AND quarantine_until_ms IS NULL) OR
+                    (state = 'quarantined' AND quarantine_until_ms IS NOT NULL))
+         );
+         CREATE INDEX overlay_peers_by_domain_state ON overlay_peers(network_domain_id, state, worker_address);
+         CREATE TABLE overlay_endpoint_history (
+             network_domain_id TEXT NOT NULL REFERENCES overlay_network_domains(network_domain_id),
+             endpoint_id TEXT NOT NULL,
+             worker_id TEXT NOT NULL,
+             peer_generation INTEGER NOT NULL CHECK (peer_generation > 0),
+             retired_at_ms INTEGER NOT NULL CHECK (retired_at_ms >= 0),
+             PRIMARY KEY (network_domain_id, endpoint_id)
+         );
+         CREATE TABLE overlay_peer_observations (
+             network_domain_id TEXT NOT NULL,
+             worker_id TEXT NOT NULL,
+             peer_generation INTEGER NOT NULL CHECK (peer_generation > 0),
+             applied_network_generation INTEGER NOT NULL CHECK (applied_network_generation >= 0),
+             observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+             status TEXT NOT NULL CHECK (status IN ('applied', 'rejected', 'unavailable')),
+             PRIMARY KEY (network_domain_id, worker_id),
+             FOREIGN KEY (network_domain_id, worker_id)
+                 REFERENCES overlay_peers(network_domain_id, worker_id)
+         );",
     )
 }
 
@@ -2511,11 +2669,24 @@ mod audit_metrics_tests {
                      DROP TRIGGER audit_events_no_delete;
                      DROP INDEX audit_events_by_time;
                      DROP TABLE audit_events;
+                     DROP TABLE overlay_peer_observations;
+                     DROP TABLE overlay_endpoint_history;
+                     DROP TABLE overlay_peers;
+                     DROP TABLE overlay_network_domains;
                      PRAGMA user_version = 11;",
                 )
                 .expect("restore schema 11 shape");
         }
         let repository = database.open();
+        assert_eq!(
+            repository
+                .connection
+                .lock()
+                .expect("lock migrated connection")
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .expect("read schema version"),
+            super::CURRENT_SCHEMA_VERSION
+        );
         repository
             .record_audit_event(&AuditEventInput {
                 principal: "operator".to_owned(),
@@ -2533,5 +2704,589 @@ mod audit_metrics_tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn schema_twelve_migrates_overlay_storage_transactionally() {
+        let database = TestDatabase::new();
+        drop(database.open());
+        {
+            let connection = rusqlite::Connection::open(&database.0).expect("open old database");
+            connection
+                .execute_batch(
+                    "DROP TABLE overlay_peer_observations;
+                     DROP TABLE overlay_endpoint_history;
+                     DROP TABLE overlay_peers;
+                     DROP TABLE overlay_network_domains;
+                     PRAGMA user_version = 12;",
+                )
+                .expect("restore schema 12 shape");
+        }
+        let repository = database.open();
+        let schema_version: i64 = repository
+            .connection
+            .lock()
+            .expect("lock migrated connection")
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read schema version");
+        assert_eq!(schema_version, super::CURRENT_SCHEMA_VERSION);
+        assert_eq!(
+            repository
+                .get_overlay_network_domain(
+                    &conductor_core::NetworkDomainId::new("missing").expect("valid domain ID")
+                )
+                .expect("query migrated table"),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod overlay_network_tests {
+    use std::sync::Arc;
+    use std::thread;
+
+    use super::{JobRepository, OverlayNetworkError, SqliteJobRepository};
+    use conductor_core::{
+        NetworkDomainId, OverlayEndpointId, OverlayNetworkDomainConfig, OverlayPeerObservation,
+        OverlayPeerObservationStatus, OverlayPeerState, WorkerId,
+    };
+
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    include!("structs/test_database.rs");
+
+    impl TestDatabase {
+        fn new() -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos();
+            let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "conductor-overlay-{}-{nonce}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&directory).expect("create temporary repository directory");
+            Self(directory.join("manager.sqlite3"))
+        }
+
+        fn open(&self) -> SqliteJobRepository {
+            SqliteJobRepository::open(&self.0).expect("open test repository")
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            if let Some(directory) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(directory);
+            }
+        }
+    }
+
+    fn endpoint(index: u8) -> OverlayEndpointId {
+        OverlayEndpointId::new(format!("{index:02x}").repeat(32)).expect("valid endpoint ID")
+    }
+
+    fn enroll(repository: &SqliteJobRepository, id: &str, index: u8) -> WorkerId {
+        let worker = WorkerId::new(id).expect("valid worker ID");
+        let token = [index; 32];
+        let fingerprint = [index.wrapping_add(100); 32];
+        repository
+            .create_enrollment_credential(&token, &worker, 100_000)
+            .expect("create enrollment credential");
+        repository
+            .enroll_worker_identity(
+                &token,
+                &fingerprint,
+                &format!("certificate-{id}"),
+                1,
+                100_000,
+                2,
+            )
+            .expect("enroll worker identity");
+        worker
+    }
+
+    fn domain() -> OverlayNetworkDomainConfig {
+        OverlayNetworkDomainConfig {
+            network_domain_id: NetworkDomainId::new("overlay-a").expect("valid domain ID"),
+            worker_address_pool: "10.88.0.0/24".to_owned(),
+            service_address_pool: "10.88.1.0/24".to_owned(),
+        }
+    }
+
+    #[test]
+    fn domain_pools_reject_public_or_overlapping_ranges() {
+        let database = TestDatabase::new();
+        let repository = database.open();
+        let mut invalid = domain();
+        invalid.worker_address_pool = "192.0.2.0/24".to_owned();
+        assert_eq!(
+            repository.create_overlay_network_domain(&invalid, 1),
+            Err(OverlayNetworkError::InvalidAddressPool)
+        );
+        let mut overlapping = domain();
+        overlapping.service_address_pool = "10.88.0.128/25".to_owned();
+        assert_eq!(
+            repository.create_overlay_network_domain(&overlapping, 1),
+            Err(OverlayNetworkError::AddressPoolOverlap)
+        );
+        repository
+            .create_overlay_network_domain(&domain(), 1)
+            .expect("create domain");
+        let mut second = domain();
+        second.network_domain_id = NetworkDomainId::new("overlay-b").expect("valid domain ID");
+        second.worker_address_pool = "10.88.0.0/25".to_owned();
+        second.service_address_pool = "10.88.2.0/24".to_owned();
+        assert_eq!(
+            repository.create_overlay_network_domain(&second, 2),
+            Err(OverlayNetworkError::AddressPoolOverlap)
+        );
+    }
+
+    #[test]
+    fn allocation_is_durable_bounded_and_identity_replay_is_rejected() {
+        let database = TestDatabase::new();
+        let repository = database.open();
+        let first = enroll(&repository, "worker-a", 1);
+        let second = enroll(&repository, "worker-b", 2);
+        let domain = domain();
+        repository
+            .create_overlay_network_domain(&domain, 1)
+            .expect("create domain");
+        let first_assignment = repository
+            .register_overlay_peer(&domain.network_domain_id, &first, &endpoint(1), 60_000, 2)
+            .expect("assign first peer");
+        let second_assignment = repository
+            .register_overlay_peer(&domain.network_domain_id, &second, &endpoint(2), 60_000, 3)
+            .expect("assign second peer");
+        assert_eq!(first_assignment.worker_address.to_string(), "10.88.0.1");
+        assert_eq!(second_assignment.worker_address.to_string(), "10.88.0.2");
+        assert_eq!(
+            second_assignment.network_generation,
+            first_assignment.network_generation + 1
+        );
+        let config = repository
+            .overlay_peer_configuration(&domain.network_domain_id, &first, 10)
+            .expect("read peer config")
+            .expect("active peer has config");
+        assert_eq!(config.peers.len(), 1);
+        assert_eq!(config.peers[0].worker_id, second);
+        drop(repository);
+
+        let repository = database.open();
+        let restored = repository
+            .register_overlay_peer(&domain.network_domain_id, &first, &endpoint(1), 70_000, 20)
+            .expect("same identity renews after restart");
+        assert_eq!(restored.worker_address, first_assignment.worker_address);
+        assert_eq!(restored.peer_generation, first_assignment.peer_generation);
+        assert_eq!(
+            repository.register_overlay_peer(
+                &domain.network_domain_id,
+                &second,
+                &endpoint(1),
+                70_000,
+                21
+            ),
+            Err(OverlayNetworkError::EndpointIdentityConflict)
+        );
+        repository
+            .revoke_overlay_peer(&domain.network_domain_id, &first, 30)
+            .expect("revoke peer");
+        assert_eq!(
+            repository.register_overlay_peer(
+                &domain.network_domain_id,
+                &first,
+                &endpoint(1),
+                70_000,
+                31
+            ),
+            Err(OverlayNetworkError::PeerQuarantined)
+        );
+        assert_eq!(
+            repository.register_overlay_peer(
+                &domain.network_domain_id,
+                &second,
+                &endpoint(1),
+                70_000,
+                32
+            ),
+            Err(OverlayNetworkError::EndpointIdentityReplay)
+        );
+    }
+
+    #[test]
+    fn endpoint_rotation_preserves_address_fences_generation_and_retires_old_key() {
+        let database = TestDatabase::new();
+        let repository = database.open();
+        let worker = enroll(&repository, "worker-a", 1);
+        let other_worker = enroll(&repository, "worker-b", 2);
+        let domain = domain();
+        repository
+            .create_overlay_network_domain(&domain, 1)
+            .expect("create domain");
+        repository
+            .register_overlay_peer(
+                &domain.network_domain_id,
+                &other_worker,
+                &endpoint(2),
+                60_000,
+                2,
+            )
+            .expect("assign another active peer");
+        let old_assignment = repository
+            .register_overlay_peer(&domain.network_domain_id, &worker, &endpoint(1), 60_000, 2)
+            .expect("assign original endpoint");
+        let candidate: std::net::SocketAddr = "192.168.50.12:42500"
+            .parse()
+            .expect("valid direct candidate");
+        repository
+            .advertise_overlay_candidates(
+                &domain.network_domain_id,
+                &worker,
+                old_assignment.peer_generation,
+                &[candidate],
+                3,
+            )
+            .expect("advertise original endpoint candidate");
+
+        let rotated = repository
+            .register_overlay_peer(&domain.network_domain_id, &worker, &endpoint(3), 70_000, 4)
+            .expect("rotate endpoint for authenticated worker");
+        assert_eq!(rotated.worker_address, old_assignment.worker_address);
+        assert_eq!(rotated.peer_generation, old_assignment.peer_generation + 1);
+        assert!(rotated.network_generation > old_assignment.network_generation);
+        let configuration = repository
+            .overlay_peer_configuration(&domain.network_domain_id, &other_worker, 5)
+            .expect("read configuration for another peer")
+            .expect("other peer remains active");
+        let rotated_peer = configuration
+            .peers
+            .iter()
+            .find(|peer| peer.worker_id == worker)
+            .expect("rotated peer remains assigned");
+        assert_eq!(rotated_peer.endpoint_id, endpoint(3));
+        assert!(rotated_peer.direct_candidates.is_empty());
+        assert_eq!(rotated_peer.direct_candidates_expires_at_ms, None);
+        assert_eq!(
+            repository.register_overlay_peer(
+                &domain.network_domain_id,
+                &worker,
+                &endpoint(1),
+                70_000,
+                6
+            ),
+            Err(OverlayNetworkError::EndpointIdentityReplay)
+        );
+        assert_eq!(
+            repository.register_overlay_peer(
+                &domain.network_domain_id,
+                &other_worker,
+                &endpoint(3),
+                70_000,
+                7
+            ),
+            Err(OverlayNetworkError::EndpointIdentityConflict)
+        );
+    }
+
+    #[test]
+    fn expired_offline_authorization_stays_expired_across_repository_restart() {
+        let database = TestDatabase::new();
+        let repository = database.open();
+        let worker = enroll(&repository, "worker-a", 1);
+        let domain = domain();
+        repository
+            .create_overlay_network_domain(&domain, 1)
+            .expect("create domain");
+        let assignment = repository
+            .register_overlay_peer(&domain.network_domain_id, &worker, &endpoint(1), 1_000, 2)
+            .expect("assign bounded peer authorization");
+        drop(repository);
+
+        let repository = database.open();
+        assert!(
+            repository
+                .overlay_peer_configuration(&domain.network_domain_id, &worker, 1_000)
+                .expect("read expired peer configuration")
+                .is_none()
+        );
+        let peers = repository
+            .list_overlay_peers(&domain.network_domain_id, 10, 1_000)
+            .expect("read expired peer state");
+        assert_eq!(peers[0].state, OverlayPeerState::Quarantined);
+        assert_eq!(peers[0].quarantine_until_ms, Some(31_000));
+        assert_eq!(
+            repository.register_overlay_peer(
+                &domain.network_domain_id,
+                &worker,
+                &endpoint(1),
+                60_000,
+                1_001
+            ),
+            Err(OverlayNetworkError::PeerQuarantined)
+        );
+        drop(repository);
+
+        let repository = database.open();
+        let replacement = repository
+            .register_overlay_peer(
+                &domain.network_domain_id,
+                &worker,
+                &endpoint(2),
+                60_000,
+                31_001,
+            )
+            .expect("new endpoint can rejoin after durable quarantine");
+        assert_eq!(replacement.worker_address, assignment.worker_address);
+        assert!(replacement.peer_generation > assignment.peer_generation);
+        assert_eq!(
+            repository.register_overlay_peer(
+                &domain.network_domain_id,
+                &worker,
+                &endpoint(1),
+                60_000,
+                31_002
+            ),
+            Err(OverlayNetworkError::EndpointIdentityReplay)
+        );
+    }
+
+    #[test]
+    fn direct_candidates_are_generation_fenced_and_distributed_in_peer_maps() {
+        let database = TestDatabase::new();
+        let repository = database.open();
+        let first = enroll(&repository, "worker-a", 1);
+        let second = enroll(&repository, "worker-b", 2);
+        let domain = domain();
+        repository
+            .create_overlay_network_domain(&domain, 1)
+            .expect("create domain");
+        repository
+            .register_overlay_peer(&domain.network_domain_id, &first, &endpoint(1), 60_000, 2)
+            .expect("assign first peer");
+        let assignment = repository
+            .register_overlay_peer(&domain.network_domain_id, &second, &endpoint(2), 60_000, 2)
+            .expect("assign peer");
+        let candidates = ["192.168.50.12:42500".parse().expect("candidate address")];
+        let acknowledgement = repository
+            .advertise_overlay_candidates(
+                &domain.network_domain_id,
+                &second,
+                assignment.peer_generation,
+                &candidates,
+                3,
+            )
+            .expect("accept authenticated candidate advertisement");
+        assert_eq!(acknowledgement.peer_generation, assignment.peer_generation);
+        assert_eq!(acknowledgement.candidates_expires_at_ms, Some(60_000));
+        assert_eq!(
+            acknowledgement.network_generation,
+            assignment.network_generation + 1
+        );
+        let config = repository
+            .overlay_peer_configuration(&domain.network_domain_id, &first, 4)
+            .expect("read peer map")
+            .expect("first worker configuration exists");
+        assert_eq!(config.peers[0].direct_candidates, candidates);
+        assert_eq!(
+            config.peers[0].direct_candidates_expires_at_ms,
+            Some(60_000)
+        );
+
+        assert_eq!(
+            repository.advertise_overlay_candidates(
+                &domain.network_domain_id,
+                &second,
+                assignment.peer_generation - 1,
+                &candidates,
+                5,
+            ),
+            Err(OverlayNetworkError::StaleGeneration)
+        );
+        let invalid = ["127.0.0.1:42500".parse().expect("loopback address")];
+        assert_eq!(
+            repository.advertise_overlay_candidates(
+                &domain.network_domain_id,
+                &second,
+                assignment.peer_generation,
+                &invalid,
+                5,
+            ),
+            Err(OverlayNetworkError::InvalidDirectCandidates)
+        );
+    }
+
+    #[test]
+    fn concurrent_enrollment_allocates_unique_addresses() {
+        let database = TestDatabase::new();
+        let repository = Arc::new(database.open());
+        let domain = domain();
+        repository
+            .create_overlay_network_domain(&domain, 1)
+            .expect("create domain");
+        let workers = (0..8)
+            .map(|index| enroll(&repository, &format!("worker-{index}"), index + 1))
+            .collect::<Vec<_>>();
+        let threads = workers
+            .into_iter()
+            .enumerate()
+            .map(|(index, worker)| {
+                let repository = Arc::clone(&repository);
+                let domain_id = domain.network_domain_id.clone();
+                thread::spawn(move || {
+                    repository
+                        .register_overlay_peer(
+                            &domain_id,
+                            &worker,
+                            &endpoint(index as u8 + 1),
+                            60_000,
+                            2,
+                        )
+                        .expect("allocate concurrently")
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut addresses = threads
+            .into_iter()
+            .map(|thread| {
+                thread
+                    .join()
+                    .expect("allocation thread completes")
+                    .worker_address
+            })
+            .collect::<Vec<_>>();
+        addresses.sort_unstable();
+        addresses.dedup();
+        assert_eq!(addresses.len(), 8);
+    }
+
+    #[test]
+    fn observations_reject_stale_or_future_generations() {
+        let database = TestDatabase::new();
+        let repository = database.open();
+        let worker = enroll(&repository, "worker-a", 1);
+        let domain = domain();
+        repository
+            .create_overlay_network_domain(&domain, 1)
+            .expect("create domain");
+        let assignment = repository
+            .register_overlay_peer(&domain.network_domain_id, &worker, &endpoint(1), 60_000, 2)
+            .expect("assign peer");
+        let observation = OverlayPeerObservation {
+            network_domain_id: domain.network_domain_id.clone(),
+            worker_id: worker.clone(),
+            peer_generation: assignment.peer_generation,
+            applied_network_generation: assignment.network_generation,
+            observed_at_ms: 3,
+            status: OverlayPeerObservationStatus::Applied,
+        };
+        repository
+            .record_overlay_peer_observation(&observation)
+            .expect("record current observation");
+        let mut stale = observation.clone();
+        stale.observed_at_ms = 2;
+        assert_eq!(
+            repository.record_overlay_peer_observation(&stale),
+            Err(OverlayNetworkError::StaleGeneration)
+        );
+        let mut future = observation;
+        future.applied_network_generation += 10;
+        assert_eq!(
+            repository.record_overlay_peer_observation(&future),
+            Err(OverlayNetworkError::ObservationConflict)
+        );
+        assert_eq!(
+            repository
+                .list_overlay_peers(&domain.network_domain_id, 10, 10)
+                .expect("list peer status")[0]
+                .state,
+            OverlayPeerState::Active
+        );
+    }
+
+    #[test]
+    fn expired_peer_is_retired_then_its_address_is_reused_after_quarantine() {
+        let database = TestDatabase::new();
+        let repository = database.open();
+        let first = enroll(&repository, "worker-a", 1);
+        let second = enroll(&repository, "worker-b", 2);
+        let domain = OverlayNetworkDomainConfig {
+            network_domain_id: NetworkDomainId::new("overlay-small").expect("valid domain ID"),
+            worker_address_pool: "10.89.0.0/30".to_owned(),
+            service_address_pool: "10.89.1.0/30".to_owned(),
+        };
+        repository
+            .create_overlay_network_domain(&domain, 1)
+            .expect("create domain");
+        repository
+            .register_overlay_peer(&domain.network_domain_id, &first, &endpoint(1), 1_000, 2)
+            .expect("assign first peer");
+
+        let peers = repository
+            .list_overlay_peers(&domain.network_domain_id, 10, 1_000)
+            .expect("list expired peer");
+        assert_eq!(peers[0].state, OverlayPeerState::Quarantined);
+        assert_eq!(peers[0].quarantine_until_ms, Some(31_000));
+        assert_eq!(
+            repository.register_overlay_peer(
+                &domain.network_domain_id,
+                &first,
+                &endpoint(1),
+                60_000,
+                1_001
+            ),
+            Err(OverlayNetworkError::PeerQuarantined)
+        );
+        let second_assignment = repository
+            .register_overlay_peer(
+                &domain.network_domain_id,
+                &second,
+                &endpoint(2),
+                60_000,
+                31_001,
+            )
+            .expect("reuse released address after quarantine");
+        assert_eq!(second_assignment.worker_address.to_string(), "10.89.0.1");
+        assert_eq!(
+            repository.register_overlay_peer(
+                &domain.network_domain_id,
+                &first,
+                &endpoint(1),
+                60_000,
+                31_002
+            ),
+            Err(OverlayNetworkError::EndpointIdentityReplay)
+        );
+    }
+
+    #[test]
+    fn worker_certificate_revocation_quarantines_overlay_membership() {
+        let database = TestDatabase::new();
+        let repository = database.open();
+        let worker = enroll(&repository, "worker-a", 1);
+        let domain = domain();
+        repository
+            .create_overlay_network_domain(&domain, 1)
+            .expect("create domain");
+        repository
+            .register_overlay_peer(&domain.network_domain_id, &worker, &endpoint(1), 60_000, 2)
+            .expect("assign peer");
+        assert!(
+            repository
+                .revoke_worker_identity(&worker, 3)
+                .expect("revoke worker identity")
+        );
+        assert!(
+            repository
+                .overlay_peer_configuration(&domain.network_domain_id, &worker, 4)
+                .expect("read revoked peer config")
+                .is_none()
+        );
+        let peers = repository
+            .list_overlay_peers(&domain.network_domain_id, 10, 4)
+            .expect("list peer state");
+        assert_eq!(peers[0].state, OverlayPeerState::Quarantined);
+        assert_eq!(peers[0].quarantine_until_ms, Some(90_000));
     }
 }

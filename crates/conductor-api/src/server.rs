@@ -25,11 +25,13 @@ use base64::Engine;
 use conductor_core::{
     DEFAULT_LOG_CHUNK_BYTES, DeploymentMutation, DeploymentStatus, DeploymentUpdateStrategy, JobId,
     JobRevisionDraft, JobRevisionId, JobSpec, LogStream, MAX_DEPLOYMENT_REPLICAS,
-    MAX_LOG_CHUNK_BYTES, ReadRunLogs, RunId, RunState, ServiceIdentity, WorkerId, Workload,
+    MAX_LOG_CHUNK_BYTES, NetworkDomainId, OverlayNetworkDomainConfig, ReadRunLogs, RunId, RunState,
+    ServiceIdentity, WorkerId, Workload,
 };
 use conductor_manager::{
-    DEFAULT_PAGE_SIZE, ExecutionStoreError, JobService, MAX_PAGE_SIZE, ManagerError, QueryError,
-    ServiceAttemptRecord as ManagerServiceAttemptRecord, ServiceCatalogEndpoint, WorkerPort,
+    DEFAULT_PAGE_SIZE, ExecutionStoreError, JobService, MAX_PAGE_SIZE, ManagerError,
+    OverlayNetworkError, QueryError, ServiceAttemptRecord as ManagerServiceAttemptRecord,
+    ServiceCatalogEndpoint, WorkerPort,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -317,6 +319,13 @@ fn router_with_recovery(
             get(watch_catalog_endpoints),
         )
         .route("/v1/workers", get(list_workers))
+        .route("/v1/network-domains", post(create_network_domain))
+        .route("/v1/network-domains/{id}", get(get_network_domain))
+        .route("/v1/network-domains/{id}/peers", get(list_network_peers))
+        .route(
+            "/v1/network-domains/{id}/peers/{worker_id}",
+            axum::routing::delete(revoke_network_peer),
+        )
         .route("/v1/workers/{id}", get(get_worker))
         .route(
             "/v1/workers/{id}/drain",
@@ -1361,6 +1370,10 @@ fn audit_descriptor<'a>(
         (["jobs", id, "runs"], "POST") => Some(("run.start", "job", Some(*id))),
         (["workers", id, "drain"], "POST") => Some(("worker.drain.request", "worker", Some(*id))),
         (["workers", id, "drain"], "DELETE") => Some(("worker.drain.cancel", "worker", Some(*id))),
+        (["network-domains"], "POST") => Some(("worker.overlay.domain.create", "worker", None)),
+        (["network-domains", _id, "peers", worker_id], "DELETE") => {
+            Some(("worker.overlay.peer.revoke", "worker", Some(*worker_id)))
+        }
         (["runs", id, "stop"], "POST") => Some(("run.stop", "run", Some(*id))),
         (["runs", id, "resolve"], "POST") => Some(("run.resolve", "run", Some(*id))),
         _ => None,
@@ -1592,6 +1605,157 @@ async fn list_workers(State(state): State<Arc<ApiState>>) -> Response {
     match query_worker_statuses(&state).await {
         Ok(statuses) => (StatusCode::OK, Json(statuses)).into_response(),
         Err(error) => manager_error(error),
+    }
+}
+
+async fn create_network_domain(
+    State(state): State<Arc<ApiState>>,
+    payload: Result<Json<OverlayNetworkDomainConfig>, JsonRejection>,
+) -> Response {
+    let Json(config) = match payload {
+        Ok(payload) => payload,
+        Err(rejection) => return json_rejection(rejection),
+    };
+    let manager = Arc::clone(&state.manager);
+    let input = config.clone();
+    match run_blocking(&state, BlockingClass::Control, move || {
+        manager.create_overlay_network_domain(&input, manager_timestamp_ms())
+    })
+    .await
+    {
+        Ok(Ok(())) => {
+            let mut response = (StatusCode::CREATED, Json(config.clone())).into_response();
+            response
+                .extensions_mut()
+                .insert(AuditResourceId(config.network_domain_id.to_string()));
+            response
+        }
+        Ok(Err(problem)) => overlay_network_error(problem),
+        Err(problem) => blocking_error(problem),
+    }
+}
+
+async fn get_network_domain(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+) -> Response {
+    let Ok(network_domain_id) = NetworkDomainId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_network_domain_id",
+            "the network domain ID is invalid",
+        );
+    };
+    let manager = Arc::clone(&state.manager);
+    match run_blocking(&state, BlockingClass::General, move || {
+        manager.get_overlay_network_domain(&network_domain_id)
+    })
+    .await
+    {
+        Ok(Ok(Some(domain))) => Json(domain).into_response(),
+        Ok(Ok(None)) => error(
+            StatusCode::NOT_FOUND,
+            "network_domain_not_found",
+            "the network domain does not exist",
+        ),
+        Ok(Err(problem)) => overlay_network_error(problem),
+        Err(problem) => blocking_error(problem),
+    }
+}
+
+async fn list_network_peers(
+    State(state): State<Arc<ApiState>>,
+    Path(raw_id): Path<String>,
+) -> Response {
+    let Ok(network_domain_id) = NetworkDomainId::new(raw_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_network_domain_id",
+            "the network domain ID is invalid",
+        );
+    };
+    let manager = Arc::clone(&state.manager);
+    match run_blocking(&state, BlockingClass::General, move || {
+        manager.list_overlay_peers(&network_domain_id, 128, manager_timestamp_ms())
+    })
+    .await
+    {
+        Ok(Ok(peers)) => Json(peers).into_response(),
+        Ok(Err(problem)) => overlay_network_error(problem),
+        Err(problem) => blocking_error(problem),
+    }
+}
+
+async fn revoke_network_peer(
+    State(state): State<Arc<ApiState>>,
+    Path((raw_domain_id, raw_worker_id)): Path<(String, String)>,
+) -> Response {
+    let Ok(network_domain_id) = NetworkDomainId::new(raw_domain_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_network_domain_id",
+            "the network domain ID is invalid",
+        );
+    };
+    let Ok(worker_id) = WorkerId::new(raw_worker_id) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid_worker_id",
+            "the worker ID is invalid",
+        );
+    };
+    let manager = Arc::clone(&state.manager);
+    match run_blocking(&state, BlockingClass::Control, move || {
+        manager.revoke_overlay_peer(&network_domain_id, &worker_id, manager_timestamp_ms())
+    })
+    .await
+    {
+        Ok(Ok(_)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Err(problem)) => overlay_network_error(problem),
+        Err(problem) => blocking_error(problem),
+    }
+}
+
+fn overlay_network_error(problem: OverlayNetworkError) -> Response {
+    match problem {
+        OverlayNetworkError::DomainExists
+        | OverlayNetworkError::AddressPoolOverlap
+        | OverlayNetworkError::EndpointIdentityConflict
+        | OverlayNetworkError::EndpointIdentityReplay
+        | OverlayNetworkError::PeerQuarantined
+        | OverlayNetworkError::StaleGeneration
+        | OverlayNetworkError::ObservationConflict => error(
+            StatusCode::CONFLICT,
+            "overlay_state_conflict",
+            "the requested overlay state conflicts with current manager state",
+        ),
+        OverlayNetworkError::DomainNotFound | OverlayNetworkError::PeerNotFound => error(
+            StatusCode::NOT_FOUND,
+            "overlay_resource_not_found",
+            "the overlay resource does not exist",
+        ),
+        OverlayNetworkError::InvalidAddressPool
+        | OverlayNetworkError::InvalidLease
+        | OverlayNetworkError::InvalidDirectCandidates => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_overlay_request",
+            "the overlay request is invalid",
+        ),
+        OverlayNetworkError::AddressPoolExhausted | OverlayNetworkError::PeerLimitReached => error(
+            StatusCode::CONFLICT,
+            "overlay_capacity_reached",
+            "the overlay address or peer capacity is exhausted",
+        ),
+        OverlayNetworkError::IdentityUnavailable => error(
+            StatusCode::FORBIDDEN,
+            "worker_identity_unavailable",
+            "the worker identity is not active",
+        ),
+        OverlayNetworkError::StorageUnavailable => error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            "the manager could not access overlay state",
+        ),
     }
 }
 
@@ -2685,6 +2849,10 @@ fn timestamp_ms() -> u128 {
         .unwrap_or_default()
 }
 
+fn manager_timestamp_ms() -> i64 {
+    timestamp_ms().min(i64::MAX as u128) as i64
+}
+
 #[cfg(test)]
 mod access_tests {
     use std::path::PathBuf;
@@ -2864,6 +3032,10 @@ mod access_tests {
             ("DELETE", "/v1/jobs/job-a"),
             ("GET", "/v1/workers"),
             ("POST", "/v1/workers/worker-a/drain"),
+            ("POST", "/v1/network-domains"),
+            ("GET", "/v1/network-domains/overlay-a"),
+            ("GET", "/v1/network-domains/overlay-a/peers"),
+            ("DELETE", "/v1/network-domains/overlay-a/peers/worker-a"),
         ] {
             let response = router
                 .clone()
@@ -2897,6 +3069,60 @@ mod access_tests {
             .await
             .expect("authorized diagnostics response");
         assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn overlay_domain_and_peer_status_routes_are_authenticated_and_audited() {
+        let database = TestDatabase::new();
+        let router = router(&database);
+        let body = r#"{"networkDomainId":"overlay-a","workerAddressPool":"10.88.0.0/24","serviceAddressPool":"10.88.1.0/24"}"#;
+        let created = router
+            .clone()
+            .oneshot(authorized_request(
+                "POST",
+                "/v1/network-domains",
+                body,
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("create overlay domain");
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let domain = router
+            .clone()
+            .oneshot(request(
+                "GET",
+                "/v1/network-domains/overlay-a",
+                Some(std::str::from_utf8(TOKEN).unwrap()),
+            ))
+            .await
+            .expect("read overlay domain");
+        assert_eq!(domain.status(), StatusCode::OK);
+        let peers = router
+            .oneshot(request(
+                "GET",
+                "/v1/network-domains/overlay-a/peers",
+                Some(std::str::from_utf8(TOKEN).unwrap()),
+            ))
+            .await
+            .expect("list overlay peer status");
+        assert_eq!(peers.status(), StatusCode::OK);
+        let body = to_bytes(peers.into_body(), 16 * 1024)
+            .await
+            .expect("read bounded peer response");
+        assert_eq!(&body[..], b"[]");
+
+        let events = database
+            .manager()
+            .list_audit_events(10)
+            .expect("read audit records");
+        assert!(events.iter().any(|event| {
+            event.action == "worker.overlay.domain.create"
+                && event.resource_id.as_deref() == Some("overlay-a")
+                && event.outcome == "success"
+        }));
     }
 
     #[tokio::test]

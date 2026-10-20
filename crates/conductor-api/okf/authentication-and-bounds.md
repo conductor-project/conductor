@@ -3,8 +3,8 @@ type: Reference
 title: API authentication, request bounds, and operations
 description: Operator routes can require bearer authentication, while request size, handler concurrency, service watches, and output are bounded.
 status: stable
-source_revision: 663bd0f
-source_reviewed_at: 2026-10-19
+source_revision: a622643
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/server.rs
     title: Auth middleware, bounds, metrics, and readiness
@@ -115,7 +115,7 @@ freshness is `unknown` before manager-enriched inventory is available. The
 bounded label vocabulary keeps the current series count below 40; this is an
 implementation bound, not a general Prometheus cardinality guarantee.
 
-Manager audit events are append-only rows in schema version 12, ordered by a
+Manager audit events are append-only rows in schema version 14, ordered by a
 database sequence. HTTP mutation outcomes record principal, fixed action name,
 resource type/ID, success or failure, HTTP status, and timestamp. They omit
 request bodies, query strings, headers, credentials, commands, and environment

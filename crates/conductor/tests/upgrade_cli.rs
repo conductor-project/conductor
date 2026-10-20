@@ -101,7 +101,11 @@ fn preflight_reports_older_schemas_without_migrating_them() {
 #[test]
 fn preflight_blocks_a_newer_schema_and_allows_missing_databases() {
     let temp = TempDir::new();
-    make_database(&temp.0.join("newer"), "manager.sqlite3", 13);
+    make_database(
+        &temp.0.join("newer"),
+        "manager.sqlite3",
+        conductor_manager::CURRENT_SCHEMA_VERSION + 1,
+    );
     let blocked = preflight(&[
         "--manager-data-dir",
         temp.0.join("newer").to_str().unwrap(),

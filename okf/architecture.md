@@ -3,8 +3,8 @@ type: Architecture
 title: Conductor crate boundaries and runtime ownership
 description: The manager owns desired state, the worker owns execution, and explicit ports connect transport, API, and process layers.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
-source_reviewed_at: 2026-10-19
+source_revision: a622643
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../crates/conductor-core/src/lib.rs
     title: Transport-neutral contracts
@@ -51,11 +51,11 @@ The API calls manager operations. Manager-to-worker interaction uses command
 and report ports; remote transport implements those boundaries over HTTPS and
 mTLS. The `conductor` binary chooses composition and coordinates lifecycle.
 
-The proposed MVP5 host-network overlay, packet-tunnel boundary, addressing,
-leases, and failure behavior are described in the
-[overlay networking architecture](overlay-networking-architecture.md). That
-proposal does not change current crate ownership or claim an implemented
-network backend.
+The accepted MVP5 Iroh host-network overlay architecture, packet-tunnel
+boundary, addressing, leases, and failure behavior are described in the
+[overlay networking architecture](overlay-networking-architecture.md). The
+manager identity and address-allocation control plane is implemented; the
+Iroh packet adapter and network backend are still in progress.
 
 ## Source and verification
 

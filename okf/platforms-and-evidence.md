@@ -3,8 +3,8 @@ type: Reference
 title: Platform support and evidence
 description: Platform claims are scoped to source, tests, workflows, and the exact execution environment that produced evidence.
 status: stable
-source_revision: ad530e7f6283fb4fc51c94ef3aaf7bff924f6e2e
-source_reviewed_at: 2026-10-19
+source_revision: a622643
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../.github/workflows/pr.yml
     title: Pull request debug workflow
@@ -86,14 +86,18 @@ local-test evidence, not routed multi-host qualification, host resolver
 validation, or deployment reachability evidence. Issues #77 and #78 were
 cancelled, and no routed deployment-owned testbed evidence is available.
 
-## Proposed MVP5 overlay target
+## Selected MVP5 overlay target
 
-The [MVP5 overlay architecture](overlay-networking-architecture.md) proposes
+The [MVP5 overlay architecture](overlay-networking-architecture.md) selects
 Linux x86_64 and arm64 as its initial implementation targets, with Apple
-silicon macOS retaining host-network-only mode until its network interface,
-route cleanup, restart, and cross-host behavior are separately tested. This is
-design scope only: no overlay implementation or independent-host network
-qualification is claimed.
+silicon macOS retaining host-network-only mode until its TUN, route cleanup,
+restart, and cross-host behavior are separately tested. The supported topology
+is direct-only: workers need mutually reachable UDP underlay candidates, and
+Iroh relays, public/default address discovery, and automatic NAT traversal are
+disabled. MVP5 issue #153 implements manager-side peer identity, private
+address allocation, leases, and mTLS control endpoints. The worker packet
+adapter and independent-host qualification remain incomplete; no cross-host
+overlay behavior or platform support is yet claimed.
 
 Historical benchmark or qualification reports must retain their exact commit,
 OS, architecture, build profile, runner, workload, and command. Such reports

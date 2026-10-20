@@ -3,7 +3,7 @@ type: Architecture decision
 title: Overlay networking architecture
 description: Selected Rust-native direct-only host overlay contracts for encrypted worker-to-worker workload traffic.
 status: selected
-source_revision: 7e6beee8177b0fe7fe119191eb075efbf15a9f3f
+source_revision: a622643
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../crates/conductor-core/src/lib.rs
@@ -37,9 +37,10 @@ are a requirement. The selected stack is one Iroh endpoint per worker, the
 `tun-rs` OS TUN interface, a Conductor-owned layer-3 packet adapter, and
 manager-distributed direct underlay candidates. Relays, public/default address
 discovery, and automatic NAT traversal are disabled for the initial topology.
-The implementation PRs add the worker packet path and privilege boundary, but
-cross-host behavior has not been qualified. Issue #156 must prove the direct
-packet path before support claims change.
+Issue #153 implements manager-owned identity and address allocation. Issue
+#154 implements the worker packet path and privilege boundary. Cross-host
+behavior has not been qualified; issue #156 must prove the direct packet path
+before support claims change.
 
 ## Goal and boundary
 
@@ -199,6 +200,14 @@ that do not overlap networks outside Conductor's view.
 | `peerGeneration` | Manager-monotonic worker incarnation/key generation. Re-enrollment and key replacement increment it. |
 | `issuedAt` / `expiresAt` | Manager-issued configuration lease. Workers reject stale snapshots and fail closed after lease expiry. Initial maximum lease: five minutes; this is a design bound to validate, not measured evidence. |
 
+Workers advertise at most eight distinct direct UDP `IP:port` candidates over
+the mTLS `POST /v1/worker/network-domains/{id}/candidates` endpoint, including
+their current `peerGeneration`. The manager rejects stale generations,
+unspecified, loopback, multicast, and link-local addresses, and non-usable
+ports. A changed candidate set advances `networkGeneration`; the acknowledgement
+does not extend the peer authorization lease. Candidates expire with that
+lease and are distributed only inside authorized peer snapshots.
+
 Control messages are versioned JSON contracts carried through the existing
 authenticated worker transport. A snapshot names the domain, both generations,
 the worker's assigned address, allowed peer public identities and direct
@@ -336,9 +345,13 @@ graph. Local unit and workspace tests cover packet validation, peer
 authorization, candidate fencing, and manager migrations. They do not
 demonstrate independent-host traffic or exercise the privileged Linux helper.
 Issue #156 must still execute the plan above and qualify manager-enrolled
-identities, direct-only packet forwarding, application traffic, MTU, restart,
-throughput, and packet loss on separate hosts with relays and public discovery
-unavailable. This plan is not evidence that qualification has passed.
+identities, direct-only TUN packet forwarding, the selected Iroh datagram
+framing, real application traffic, MTU, restart, throughput, and packet loss
+on separate hosts with relays and public discovery unavailable. Confirm the
+direct UDP prerequisites and bounded failure when they are not met. This plan
+is not evidence that qualification has passed. Keep versions, enabled
+features, transitive footprint, and third-party safety boundaries in the
+dependency decision.
 
 This source review did not run tests, construct an overlay, validate a
 privileged helper, or access a two-host testbed. No network behavior or

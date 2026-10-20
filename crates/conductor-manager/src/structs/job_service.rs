@@ -42,6 +42,94 @@ impl JobService {
         self.repository.operational_metrics()
     }
 
+    pub fn create_overlay_network_domain(
+        &self,
+        config: &conductor_core::OverlayNetworkDomainConfig,
+        now_ms: i64,
+    ) -> Result<(), OverlayNetworkError> {
+        self.repository
+            .create_overlay_network_domain(config, now_ms)
+    }
+
+    pub fn get_overlay_network_domain(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+    ) -> Result<Option<conductor_core::OverlayNetworkDomainConfig>, OverlayNetworkError> {
+        self.repository
+            .get_overlay_network_domain(network_domain_id)
+    }
+
+    pub fn register_overlay_peer(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        worker_id: &WorkerId,
+        endpoint_id: &conductor_core::OverlayEndpointId,
+        expires_at_ms: i64,
+        now_ms: i64,
+    ) -> Result<conductor_core::OverlayPeerAssignment, OverlayNetworkError> {
+        self.repository.register_overlay_peer(
+            network_domain_id,
+            worker_id,
+            endpoint_id,
+            expires_at_ms,
+            now_ms,
+        )
+    }
+
+    pub fn advertise_overlay_candidates(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        worker_id: &WorkerId,
+        peer_generation: u64,
+        candidates: &[std::net::SocketAddr],
+        now_ms: i64,
+    ) -> Result<conductor_core::OverlayDirectCandidateAcknowledgement, OverlayNetworkError> {
+        self.repository.advertise_overlay_candidates(
+            network_domain_id,
+            worker_id,
+            peer_generation,
+            candidates,
+            now_ms,
+        )
+    }
+
+    pub fn revoke_overlay_peer(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        worker_id: &WorkerId,
+        now_ms: i64,
+    ) -> Result<bool, OverlayNetworkError> {
+        self.repository
+            .revoke_overlay_peer(network_domain_id, worker_id, now_ms)
+    }
+
+    pub fn overlay_peer_configuration(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        worker_id: &WorkerId,
+        now_ms: i64,
+    ) -> Result<Option<conductor_core::OverlayPeerConfiguration>, OverlayNetworkError> {
+        self.repository
+            .overlay_peer_configuration(network_domain_id, worker_id, now_ms)
+    }
+
+    pub fn record_overlay_peer_observation(
+        &self,
+        observation: &conductor_core::OverlayPeerObservation,
+    ) -> Result<(), OverlayNetworkError> {
+        self.repository.record_overlay_peer_observation(observation)
+    }
+
+    pub fn list_overlay_peers(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<Vec<conductor_core::OverlayPeerAssignment>, OverlayNetworkError> {
+        self.repository
+            .list_overlay_peers(network_domain_id, limit, now_ms)
+    }
+
     pub fn reconcile_metrics(&self) -> ReconcileMetrics {
         self.telemetry.snapshot()
     }

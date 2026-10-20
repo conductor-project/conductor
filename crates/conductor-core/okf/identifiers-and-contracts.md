@@ -3,8 +3,8 @@ type: Reference
 title: Core identifiers and validated contracts
 description: Newtypes and constructors enforce stable IDs and validated job inputs before manager persistence or worker execution.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
-source_reviewed_at: 2026-10-19
+source_revision: a622643
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/lib.rs
     title: ID types, states, commands, and errors
@@ -27,6 +27,12 @@ interchangeable strings. Constructors validate externally supplied values
 before they reach storage or transport. A run ID is not an operating-system
 process ID. A worker ID is stable across connections; its incarnation
 distinguishes a worker restart and fences stale sessions.
+
+Overlay contracts add a stable network-domain ID and a canonical lowercase
+hexadecimal Iroh endpoint public ID. Peer assignments use IPv4 addresses and
+monotonic peer/network generations. Configuration snapshots contain public
+peer identities only; secret endpoint keys remain worker-local. These shared
+types describe control-plane state and do not implement packet transport.
 
 # Job contracts
 
