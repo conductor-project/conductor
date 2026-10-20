@@ -3,7 +3,7 @@ type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
 status: pending external testbed
-source_revision: d236e7a4e184fe9b965e95eccd4170f6a3b82d7b
+source_revision: 5b01de74599664962f6234fe86f72601fa7e67a1
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
@@ -119,6 +119,8 @@ is worker A's assigned overlay address:
 
 ```sh
 dig +short A SRV_TARGET.
+conductor overlay probe --target-ip WORKER_A_OVERLAY_IP --port SRV_PORT \
+  --path /probe/READY_NONCE --timeout-ms 5000
 python3 scripts/qualify-overlay-traffic.py request \
   --host SRV_TARGET --port SRV_PORT \
   --nonce READY_NONCE --sha256 READY_SHA256 --bytes 65536 \
@@ -132,6 +134,9 @@ host-network suffix and confirm it still returns the worker's configured
 advertised address. Overlay addresses are IPv4 in this implementation, so an
 AAAA query in the overlay namespace is expected to return NODATA. A DNS answer
 alone does not prove that the direct Iroh path or application traffic works.
+The bounded CLI probe reports a local HTTP result but does not update the
+manager's `reachability` field; retain both it and the payload-verifying
+request as separate evidence.
 
 # Basic traffic procedure
 
@@ -234,8 +239,10 @@ source commit `5e23aea68b4a99e424e96842a04ce756fa79795f`; that revision predates
 the current direct-only rework and is not evidence for this snapshot. For the
 current integrated source, the dependency policy, formatting, workspace
 Clippy, workspace check, and full workspace test suite passed on the local
-macOS host; the focused core contract test and Linux arm64 all-target check
-also passed after the final Linux worker ownership fix. The managed-port probe
+macOS host; the new bounded overlay probe's successful response and oversized
+body tests passed over an ephemeral loopback listener. The focused core
+contract test and Linux arm64 all-target check also passed after the final
+Linux worker ownership fix. The managed-port probe
 passed a 64 KiB loopback smoke transfer on 2026-10-20. These checks do not qualify
 two-host overlay behavior, DNS-discovered traffic through an installed host
 resolver, packet-capture encryption, or the platform privilege boundary.
