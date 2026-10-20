@@ -14,6 +14,8 @@ use conductor_overlay::{LinuxOverlayInterface, OverlayRuntimeStatus, run_packet_
 #[cfg(target_os = "linux")]
 use iroh::{Endpoint, RelayMode, endpoint::presets::Minimal};
 #[cfg(target_os = "linux")]
+use std::net::{Ipv6Addr, SocketAddrV6};
+#[cfg(target_os = "linux")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(target_os = "linux")]
 use tokio::net::{TcpListener, TcpStream};
@@ -170,7 +172,11 @@ async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
     let remote_secret = SecretKey::from_bytes(if role == "a" { &[62; 32] } else { &[61; 32] });
     let local_endpoint = endpoint_on_ports(
         local_secret,
-        std::env::var("CONDUCTOR_OVERLAY_TEST_BIND_PORT")
+        std::env::var("CONDUCTOR_OVERLAY_TEST_BIND_PORT_V4")
+            .expect("test bind port is configured")
+            .parse::<u16>()
+            .expect("test bind port is valid"),
+        std::env::var("CONDUCTOR_OVERLAY_TEST_BIND_PORT_V6")
             .expect("test bind port is configured")
             .parse::<u16>()
             .expect("test bind port is valid"),
@@ -239,12 +245,17 @@ async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
 }
 
 #[cfg(target_os = "linux")]
-async fn endpoint_on_ports(secret_key: SecretKey, port: u16) -> Endpoint {
+async fn endpoint_on_ports(secret_key: SecretKey, ipv4_port: u16, ipv6_port: u16) -> Endpoint {
     Endpoint::builder(Minimal)
         .clear_ip_transports()
-        .bind_addr(SocketAddr::from(([0, 0, 0, 0], port)))
+        .bind_addr(SocketAddr::from(([0, 0, 0, 0], ipv4_port)))
         .expect("valid IPv4 bind address")
-        .bind_addr(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], port)))
+        .bind_addr(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::UNSPECIFIED,
+            ipv6_port,
+            0,
+            0,
+        )))
         .expect("valid IPv6 bind address")
         .secret_key(secret_key)
         .relay_mode(RelayMode::Disabled)
