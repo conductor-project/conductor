@@ -322,7 +322,26 @@ async fn exchange_overlay_tcp(
             return Err("application payload marker was not received".into());
         }
         stream.write_all(&request).await?;
-        stream.shutdown().await?;
+        stream.flush().await?;
+        let mut acknowledgment = [0; 3];
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read_exact(&mut acknowledgment),
+        )
+        .await??;
+        if &acknowledgment != b"ACK" {
+            return Err("application response acknowledgment did not match".into());
+        }
+        stream.write_all(b"ACK2").await?;
+        stream.flush().await?;
+        let mut trailing = [0; 1];
+        let bytes_read =
+            tokio::time::timeout(Duration::from_secs(10), stream.read(&mut trailing)).await??;
+        if bytes_read != 0 {
+            return Err(
+                "application sent unexpected bytes after the response acknowledgment".into(),
+            );
+        }
     } else {
         let marker = format!(
             "conductor-cross-host-{}-{}",
@@ -338,12 +357,27 @@ async fn exchange_overlay_tcp(
         )
         .await??;
         stream.write_all(&payload).await?;
-        stream.shutdown().await?;
+        stream.flush().await?;
         let mut response = vec![0; payload.len()];
         tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut response)).await??;
         if response != payload {
             return Err("application response payload differs from the request".into());
         }
+        stream.write_all(b"ACK").await?;
+        stream.flush().await?;
+        let mut acknowledgment = [0; 4];
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            stream.read_exact(&mut acknowledgment),
+        )
+        .await??;
+        if &acknowledgment != b"ACK2" {
+            return Err("application completion acknowledgment did not match".into());
+        }
+        stream.shutdown().await?;
+        // Keep the overlay alive long enough for the server to observe the
+        // client's FIN before the test tears down the TUN and endpoint.
+        tokio::time::sleep(Duration::from_secs(1)).await;
         println!("application_bytes={} payload_match=true", response.len());
     }
     Ok(())
