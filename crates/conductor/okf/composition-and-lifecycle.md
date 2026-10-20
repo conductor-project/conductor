@@ -3,8 +3,8 @@ type: Reference
 title: conductor composition, enrollment, and lifecycle
 description: The executable wires local or separated manager/worker roles and controls state locks, startup reconciliation, and graceful shutdown.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
-source_reviewed_at: 2026-10-19
+source_revision: e10f326
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/main.rs
     title: Runtime assembly, enrollment, shutdown

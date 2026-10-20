@@ -3,8 +3,8 @@ type: Reference
 title: Conductor configuration and paths
 description: Strict JSON selects daemon roles, listeners, persistent state, worker identity, and optional host enforcement.
 status: stable
-source_revision: a739b4c20dd8e81ded656dfa7bb9859f48d73f9e
-source_reviewed_at: 2026-10-19
+source_revision: e10f326
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../crates/conductor/src/main.rs
     title: Configuration types and validation

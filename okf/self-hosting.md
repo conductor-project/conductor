@@ -3,8 +3,8 @@ type: Runbook
 title: Self-hosting Conductor
 description: Install from source, configure a daemon account, operate combined or separate roles, and protect persistent state.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
-source_reviewed_at: 2026-10-19
+source_revision: e10f326
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../README.md
     title: First-run workflow
