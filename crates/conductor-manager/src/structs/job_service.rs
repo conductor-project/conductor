@@ -120,6 +120,15 @@ impl JobService {
         self.repository.record_overlay_peer_observation(observation)
     }
 
+    pub fn record_overlay_application_probe(
+        &self,
+        report: &conductor_core::OverlayApplicationProbeReport,
+        observed_at_ms: i64,
+    ) -> Result<(), OverlayNetworkError> {
+        self.repository
+            .record_overlay_application_probe(report, observed_at_ms)
+    }
+
     pub fn list_overlay_peers(
         &self,
         network_domain_id: &conductor_core::NetworkDomainId,
@@ -128,6 +137,16 @@ impl JobService {
     ) -> Result<Vec<conductor_core::OverlayPeerAssignment>, OverlayNetworkError> {
         self.repository
             .list_overlay_peers(network_domain_id, limit, now_ms)
+    }
+
+    pub fn list_overlay_peer_diagnostics(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<Vec<conductor_core::OverlayPeerDiagnostic>, OverlayNetworkError> {
+        self.repository
+            .list_overlay_peer_diagnostics(network_domain_id, limit, now_ms)
     }
 
     pub fn reconcile_metrics(&self) -> ReconcileMetrics {

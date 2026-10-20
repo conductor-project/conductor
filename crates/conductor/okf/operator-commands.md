@@ -3,8 +3,8 @@ type: Runbook
 title: Operate Conductor with the CLI
 description: Select named manager connection contexts, submit and manage jobs and revisions, observe and control runs, follow bounded logs, inspect workers and services, mutate desired state safely, drain workers, and page history.
 status: stable
-source_revision: 122a219e9d6dad1755fb1c5664923e4ece5d27e1
-source_reviewed_at: 2026-10-19
+source_revision: 59a3cc8f4c3383e51a363ffae06c743a2dddb320
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/operator_cli.rs
     title: Operator command parsing and requests
@@ -190,6 +190,54 @@ conductor run list --job-id frontend --state unknown --limit 25
 
 Run-list pages expose `nextCursor`; pass it with `--cursor` for the next page.
 Use `worker undrain` only after drain status reports `completed`.
+
+# Configure and inspect worker overlays
+
+Overlay commands create and inspect manager-owned network domains, list desired
+peer assignments with lease state and the latest worker apply report, and revoke
+a worker peer. Use the operator API; do not edit manager SQLite state directly.
+A report is fresh only when it matches the desired generation and its timestamp
+is within the last 60 seconds. It separates the helper's last successful
+configuration apply from reported TUN address/MTU, installed routes, active
+direct Iroh links, handshake times, and transport UDP byte counters. Those
+counters include protocol overhead, not application payload. Peer assignments
+also expose manager-accepted direct underlay candidates and their separate
+freshness deadline. Each worker runtime report records the last direct
+connection attempt as a bounded outcome such as `no_candidates`,
+`candidates_expired`, `timed_out`, `underlay_unavailable`,
+`authentication_failed`, or `identity_mismatch`. This distinguishes missing or
+stale reachability hints, transport failure, and authenticated connection
+failure without exposing raw error text. A successful Iroh handshake confirms
+peer identity, but does not prove application reachability; `reachability`
+remains `not_verified` until an operator runs an explicit probe. On an
+overlay-enabled worker,
+`conductor overlay probe` performs a bounded HTTP GET over the local worker's
+overlay route to an assigned private IPv4 address and workload port. Supply a
+safe health path explicitly. The probe disables proxies and redirects, limits
+the total request to five seconds and the response body to 65,536 bytes. It
+reports probe success only after receiving a 2xx response; any complete HTTP
+response is separately marked `application_response_received`, including
+non-2xx status codes. It tests application traffic from that worker; it is not
+a manager-side or cross-host qualification and does not measure throughput.
+Pass `--config /path/to/worker.json` to report a completed HTTP response over
+the worker's authenticated manager transport. The manager accepts the report
+only for the authenticated worker, current peer-map generations, and a target
+address assigned to an active peer. Diagnostics retain the latest directional
+result for 60 seconds; a fresh HTTP response marks reachability `verified`,
+including non-2xx responses, while the outcome separately records whether the
+application returned success. Without `--config`, the result stays local.
+Revoke output continues to mark reachability `not_verified`.
+
+```sh
+conductor operator --context production overlay create workers-east \
+  --worker-address-pool 10.90.0.0/24 \
+  --service-address-pool 10.90.1.0/24
+conductor operator --context production overlay inspect workers-east
+conductor operator --context production --output json overlay peers workers-east
+conductor operator --context production overlay revoke workers-east worker-17
+conductor overlay probe --target-ip 10.90.0.17 --port 8080 --path /health
+conductor overlay --config /etc/conductor/worker.json probe --target-ip 10.90.0.17 --port 8080 --path /health
+```
 
 # Retrieve logs
 

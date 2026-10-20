@@ -199,6 +199,7 @@ fn schema_thirteen_migrates_overlay_direct_candidate_storage() {
         .execute_batch(
             "ALTER TABLE overlay_peers DROP COLUMN direct_candidates_json;
              ALTER TABLE overlay_peers DROP COLUMN direct_candidates_expires_at_ms;
+             ALTER TABLE overlay_peer_observations DROP COLUMN runtime_json;
              PRAGMA user_version = 13;",
         )
         .expect("restore schema 13 layout");
@@ -210,7 +211,7 @@ fn schema_thirteen_migrates_overlay_direct_candidate_storage() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .expect("read migrated schema version");
-    assert_eq!(version, 14);
+    assert_eq!(version, conductor_manager::CURRENT_SCHEMA_VERSION);
     let has_candidate_column: bool = connection
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM pragma_table_info('overlay_peers')
@@ -3035,7 +3036,7 @@ fn schema_five_migrates_execution_tables_without_losing_jobs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, conductor_manager::CURRENT_SCHEMA_VERSION);
     assert!(table_exists(&connection, "job_revisions"));
     assert!(table_exists(&connection, "job_deployments"));
     assert!(table_exists(&connection, "execution_idempotency"));
@@ -3063,7 +3064,7 @@ fn schema_six_adds_durable_scheduling_tables() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, conductor_manager::CURRENT_SCHEMA_VERSION);
     assert!(table_exists(&connection, "service_instances"));
     assert!(table_exists(&connection, "allocations"));
     assert!(table_exists(&connection, "scheduling_sequence"));
@@ -3086,7 +3087,7 @@ fn schema_seven_migrates_service_attempt_state() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, conductor_manager::CURRENT_SCHEMA_VERSION);
     assert!(table_exists(&connection, "service_attempts"));
 }
 
@@ -3193,7 +3194,7 @@ fn legacy_schema_migrates_transactionally_and_repeated_startup_is_stable() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .expect("read migrated schema and fixture");
-    assert_eq!(version, 14);
+    assert_eq!(version, conductor_manager::CURRENT_SCHEMA_VERSION);
     assert_eq!(created_at, 1234);
     assert_eq!(deleted_at, None);
 }
@@ -3243,7 +3244,7 @@ fn schema_two_migration_adds_idempotency_and_indexed_run_order() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, conductor_manager::CURRENT_SCHEMA_VERSION);
     assert!(columns.iter().any(|column| column == "idempotency_key"));
     assert!(columns.iter().any(|column| column == "request_fingerprint"));
     assert!(columns.iter().any(|column| column == "run_order"));
@@ -3366,7 +3367,7 @@ fn schema_four_identity_layout_migrates_with_command_outbox_without_losing_token
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
     let outbox_exists = table_exists(&connection, "manager_commands");
-    assert_eq!(version, 14);
+    assert_eq!(version, conductor_manager::CURRENT_SCHEMA_VERSION);
     assert!(outbox_exists);
 }
 
@@ -3408,7 +3409,7 @@ fn schema_four_command_layout_migrates_with_identity_tables_without_resetting_se
         )
         .unwrap();
     let identity_exists = table_exists(&connection, "worker_identities");
-    assert_eq!(version, 14);
+    assert_eq!(version, conductor_manager::CURRENT_SCHEMA_VERSION);
     assert_eq!(sequence, 17);
     assert!(identity_exists);
 }
@@ -3704,7 +3705,7 @@ fn version_one_manager_database_migrates_runs_and_accepts_timeout_specs() {
     let version: i64 = connection
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 14);
+    assert_eq!(version, conductor_manager::CURRENT_SCHEMA_VERSION);
 }
 
 struct FullWorker(WorkerId);

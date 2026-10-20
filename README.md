@@ -205,7 +205,12 @@ prove that the address is reachable from the caller. Use `watch` to long-poll
 for a catalog change. The current API does not provide watch cursors or
 versions, so the CLI retries transient connection and capacity failures within
 the requested deadline; Ctrl-C stops observation without changing deployment
-state.
+state. The optional manager Hickory listener can expose these services through
+a separate overlay DNS suffix, resolving active workers to their assigned
+overlay addresses while preserving the existing host-network suffix. Overlay
+TCP SRV records preserve each assigned service port; see the [service
+discovery reference](crates/conductor-api/okf/service-discovery.md) for
+configuration and resolver limits.
 
 ```sh
 ./target/debug/conductor service endpoints mvp3-demo-service --output json
@@ -245,6 +250,21 @@ over mTLS, fenced by its peer generation. The manager validates and distributes
 those reachability hints in versioned peer maps; candidates do not authenticate
 or authorize a peer. The initial Iroh topology requires directly reachable
 UDP and disables relays, public/default address discovery, and NAT traversal.
+
+Operators can create and inspect network domains with
+`conductor operator overlay create|inspect|peers|revoke`; peer diagnostics
+distinguish desired membership, helper-reported TUN/routes, and active direct
+Iroh paths with their handshake time and transport counters. Those observations
+are bounded and generation/freshness tagged; they do not prove application
+reachability. From an overlay-enabled worker, run `conductor overlay probe`
+with an assigned private overlay IP, service port, and explicit safe HTTP GET
+path to verify that an application response returns through that worker's
+local route. The probe is capped at five seconds and 64 KiB; it does not run
+through the manager or change service state. Add `--config /path/to/worker.json`
+to report a completed HTTP response over worker mTLS; diagnostics retain the
+directional result for 60 seconds only while its peer and network generations
+and target assignment remain current. See the [operator command
+guide](crates/conductor/okf/operator-commands.md).
 
 The worker overlay crate validates IPv4 packets, routes them by the manager's
 peer map, and carries them in authenticated Iroh datagrams with relays and

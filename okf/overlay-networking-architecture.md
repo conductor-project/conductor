@@ -3,7 +3,7 @@ type: Architecture decision
 title: Overlay networking architecture
 description: Selected Rust-native direct-only host overlay contracts for encrypted worker-to-worker workload traffic.
 status: selected
-source_revision: e10f326
+source_revision: 0fd23ee30a2486c317aff72e2cda1f98b559e6b4
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../crates/conductor-core/src/lib.rs
@@ -50,7 +50,15 @@ streams, and datagrams; it is not a ready-made virtual-IP network. Conductor
 uses one Iroh endpoint per worker for all local services. It connects the
 `tun-rs` TUN interface to authorized Iroh peers, preserves IP packet
 boundaries, routes packets by manager-assigned address, and reports transport
-and interface state separately. Iroh relay mode and public/default address
+and interface state separately. The helper reports its interface address/MTU,
+installed owned routes, selected direct IP paths, handshake timestamps, and
+QUIC UDP byte counters; these counters include transport overhead and are not
+application payload measurements. Such a worker observation does not assert
+application reachability. An operator can run `conductor overlay probe` on an
+overlay-enabled worker to check a bounded HTTP response through its local
+overlay route. With an explicit worker config, the CLI reports the result over
+the authenticated manager transport, where it is retained separately from TUN
+and Iroh telemetry with a short freshness window. Iroh relay mode and public/default address
 discovery are explicitly disabled. Managers distribute EndpointIds and
 validated direct IP:port candidates over the authenticated control plane;
 peers must be directly reachable on the declared LAN/VPC or configured
@@ -139,10 +147,11 @@ candidates are reachability hints, never identity or authorization. Workers
 advertise bounded direct candidates through the authenticated worker session;
 the manager validates and distributes them with the peer map. Unknown fields
 are rejected. No Iroh secret key or workload payload crosses the manager API.
-Reports separately identify desired generation, applied generation, local
-interface/route state, authenticated Iroh connection state, selected direct
-path, and bounded probe results. A connection or handshake is not evidence
-that an application listener is reachable.
+Worker reports separately identify desired generation, applied generation,
+local interface/route state, authenticated Iroh connection state, and selected
+direct path. The local bounded CLI probe is separate from worker reports and
+manager state. A connection or handshake is not evidence that an application
+listener is reachable.
 
 Workers persist the highest accepted generation per domain and peer
 incarnation. Lower generations and retired peer identities are rejected,

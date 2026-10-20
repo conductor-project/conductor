@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
-const MAX_HELPER_RESPONSE_BYTES: usize = 4096;
+const MAX_HELPER_RESPONSE_BYTES: usize = 65_536;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -20,6 +20,7 @@ struct HelperResponse {
     network_generation: Option<u64>,
     expires_at_ms: Option<i64>,
     direct_candidates: Vec<SocketAddr>,
+    runtime: Option<conductor_core::OverlayRuntimeDiagnostic>,
 }
 
 #[derive(Serialize)]
@@ -33,6 +34,7 @@ enum HelperRequest<'a> {
     Reconfigure {
         configuration: &'a OverlayPeerConfiguration,
     },
+    Status,
     Shutdown,
 }
 
@@ -142,6 +144,13 @@ impl LinuxOverlayHelperClient {
         Ok(())
     }
 
+    pub async fn status(&mut self) -> io::Result<Option<conductor_core::OverlayRuntimeDiagnostic>> {
+        self.write_request(HelperRequest::Status).await?;
+        let response = self.read_response().await?;
+        self.validate_response(&response, "status", &self.configuration)?;
+        Ok(response.runtime)
+    }
+
     pub async fn shutdown(mut self) -> io::Result<()> {
         self.write_request(HelperRequest::Shutdown).await?;
         let response = self.read_response().await?;
@@ -171,6 +180,35 @@ impl LinuxOverlayHelperClient {
         expected_event: &str,
         configuration: &OverlayPeerConfiguration,
     ) -> io::Result<()> {
+        let mut expected_routes = configuration
+            .peers
+            .iter()
+            .map(|peer| peer.worker_address)
+            .collect::<Vec<_>>();
+        expected_routes.sort_unstable();
+        let runtime_valid =
+            match response.runtime.as_ref() {
+                None => expected_event == "stopped",
+                Some(runtime) => {
+                    let link_ids_valid =
+                        runtime.direct_links.len() <= crate::MAX_OVERLAY_PEERS
+                            && runtime.direct_links.iter().all(|link| {
+                                configuration.peers.iter().any(|peer| {
+                                    peer.endpoint_id.as_ref() == link.endpoint_id.as_str()
+                                }) && link.selected_address.is_none_or(|address| {
+                                    conductor_core::valid_overlay_direct_candidates(&[address])
+                                }) && link
+                                    .last_handshake_at_ms
+                                    .is_none_or(|time| (0..=current_time_ms()).contains(&time))
+                            });
+                    runtime.interface_name == self.interface_name
+                        && runtime.interface_up
+                        && runtime.local_address == configuration.worker_address
+                        && runtime.mtu as usize == crate::MAX_OVERLAY_PACKET_BYTES
+                        && runtime.installed_routes == expected_routes
+                        && link_ids_valid
+                }
+            };
         if response.event != expected_event
             || response.worker_id.as_ref() != Some(&self.worker_id)
             || response.interface_name.as_deref() != Some(self.interface_name.as_str())
@@ -179,6 +217,7 @@ impl LinuxOverlayHelperClient {
             || response.network_generation != Some(configuration.network_generation)
             || response.expires_at_ms != Some(configuration.expires_at_ms)
             || !conductor_core::valid_overlay_direct_candidates(&response.direct_candidates)
+            || !runtime_valid
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -187,6 +226,14 @@ impl LinuxOverlayHelperClient {
         }
         Ok(())
     }
+}
+
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(i64::MAX)
 }
 
 async fn read_bounded_json_line<R>(reader: &mut R, limit: usize) -> io::Result<HelperResponse>

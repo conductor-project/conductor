@@ -7,7 +7,7 @@ use std::time::Duration;
 use base64::Engine;
 use clap::{Args, Subcommand, ValueEnum};
 use conductor_api::client::{Client as ApiClient, ClientConfig};
-use conductor_core::{JobId, RunId, WorkerId};
+use conductor_core::{JobId, NetworkDomainId, RunId, WorkerId};
 use reqwest::{Method, StatusCode, Url};
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -55,6 +55,11 @@ enum OperatorCommand {
     Service {
         #[command(subcommand)]
         command: ServiceCommand,
+    },
+    /// Configure or inspect worker overlay network domains and peers.
+    Overlay {
+        #[command(subcommand)]
+        command: OverlayCommand,
     },
     /// Select an immutable revision for a service deployment.
     Deploy {
@@ -133,6 +138,27 @@ enum WorkerCommand {
 #[derive(Debug, Subcommand)]
 enum ServiceCommand {
     Inspect { job_id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum OverlayCommand {
+    /// Create a network domain with manager-owned worker and service pools.
+    Create {
+        network_domain_id: String,
+        #[arg(long)]
+        worker_address_pool: String,
+        #[arg(long)]
+        service_address_pool: String,
+    },
+    /// Read one network domain's overlay settings and address pools.
+    Inspect { network_domain_id: String },
+    /// List desired peer assignments and their lease state.
+    Peers { network_domain_id: String },
+    /// Revoke a worker peer from the network domain.
+    Revoke {
+        network_domain_id: String,
+        worker_id: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -510,6 +536,90 @@ async fn execute(client: &OperatorClient, command: OperatorCommand) -> Result<()
                     "deployment": deployment,
                     "serviceAttempts": attempts.get("serviceAttempts").cloned().unwrap_or(Value::Null),
                 }))
+            }
+        },
+        OperatorCommand::Overlay { command } => match command {
+            OverlayCommand::Create {
+                network_domain_id,
+                worker_address_pool,
+                service_address_pool,
+            } => {
+                let network_domain_id = NetworkDomainId::new(network_domain_id)
+                    .map_err(|_| "network domain ID is invalid".to_owned())?;
+                let response = client
+                    .request(
+                        Method::POST,
+                        "v1/network-domains",
+                        &[],
+                        &[],
+                        Some(json!({
+                            "networkDomainId": network_domain_id,
+                            "workerAddressPool": worker_address_pool,
+                            "serviceAddressPool": service_address_pool,
+                        })),
+                    )
+                    .await?;
+                client.print_response(response)
+            }
+            OverlayCommand::Inspect { network_domain_id } => {
+                let network_domain_id = NetworkDomainId::new(network_domain_id)
+                    .map_err(|_| "network domain ID is invalid".to_owned())?;
+                let response = client
+                    .request(
+                        Method::GET,
+                        &format!("v1/network-domains/{}", network_domain_id.as_str()),
+                        &[],
+                        &[],
+                        None,
+                    )
+                    .await?;
+                client.print_response(response)
+            }
+            OverlayCommand::Peers { network_domain_id } => {
+                let network_domain_id = NetworkDomainId::new(network_domain_id)
+                    .map_err(|_| "network domain ID is invalid".to_owned())?;
+                let response = client
+                    .request(
+                        Method::GET,
+                        &format!("v1/network-domains/{}/peers", network_domain_id.as_str()),
+                        &[],
+                        &[],
+                        None,
+                    )
+                    .await?;
+                client.print_response(response)
+            }
+            OverlayCommand::Revoke {
+                network_domain_id,
+                worker_id,
+            } => {
+                let network_domain_id = NetworkDomainId::new(network_domain_id)
+                    .map_err(|_| "network domain ID is invalid".to_owned())?;
+                let worker_id =
+                    WorkerId::new(worker_id).map_err(|_| "worker ID is invalid".to_owned())?;
+                let response = client
+                    .request(
+                        Method::DELETE,
+                        &format!(
+                            "v1/network-domains/{}/peers/{}",
+                            network_domain_id.as_str(),
+                            worker_id.as_str()
+                        ),
+                        &[],
+                        &[],
+                        None,
+                    )
+                    .await?;
+                if response.status.is_success() {
+                    client.write_value(&json!({
+                        "networkDomainId": network_domain_id,
+                        "workerId": worker_id,
+                        "state": "revoked",
+                        "reachability": "not_verified",
+                    }))
+                } else {
+                    client.print_response(response)
+                }
             }
         },
         OperatorCommand::Deploy {

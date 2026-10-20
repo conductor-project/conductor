@@ -29,7 +29,7 @@ use serde::Serialize;
 
 /// Temporary limit for active jobs. Pagination is a later milestone.
 pub const MAX_JOBS: usize = 1_000;
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 16;
 /// Current manager database schema understood by this build.
 pub const CURRENT_SCHEMA_VERSION: i64 = SCHEMA_VERSION;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
@@ -327,12 +327,23 @@ pub trait JobRepository: Send + Sync + CommandJournal {
         &self,
         observation: &conductor_core::OverlayPeerObservation,
     ) -> Result<(), OverlayNetworkError>;
+    fn record_overlay_application_probe(
+        &self,
+        report: &conductor_core::OverlayApplicationProbeReport,
+        observed_at_ms: i64,
+    ) -> Result<(), OverlayNetworkError>;
     fn list_overlay_peers(
         &self,
         network_domain_id: &conductor_core::NetworkDomainId,
         limit: usize,
         now_ms: i64,
     ) -> Result<Vec<conductor_core::OverlayPeerAssignment>, OverlayNetworkError>;
+    fn list_overlay_peer_diagnostics(
+        &self,
+        network_domain_id: &conductor_core::NetworkDomainId,
+        limit: usize,
+        now_ms: i64,
+    ) -> Result<Vec<conductor_core::OverlayPeerDiagnostic>, OverlayNetworkError>;
     fn insert(&self, job: JobSpec) -> Result<(), JobStoreError>;
     fn get(&self, id: &JobId) -> Result<Option<JobSpec>, JobStoreError>;
     fn list_jobs_page(
@@ -642,7 +653,10 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
             .prepare("SELECT network_domain_id, endpoint_id, worker_id, peer_generation, retired_at_ms FROM overlay_endpoint_history LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
         connection
-            .prepare("SELECT network_domain_id, worker_id, peer_generation, applied_network_generation, observed_at_ms, status FROM overlay_peer_observations LIMIT 0")
+            .prepare("SELECT network_domain_id, worker_id, peer_generation, applied_network_generation, observed_at_ms, status, runtime_json FROM overlay_peer_observations LIMIT 0")
+            .map_err(MigrationError::Sqlite)?;
+        connection
+            .prepare("SELECT network_domain_id, source_worker_id, target_worker_id, target_address, target_port, peer_generation, network_generation, observed_at_ms, outcome, http_status, response_bytes, elapsed_ms FROM overlay_application_probes LIMIT 0")
             .map_err(MigrationError::Sqlite)?;
         return Ok(());
     }
@@ -669,6 +683,34 @@ fn migrate(connection: &Connection) -> Result<(), MigrationError> {
                  ALTER TABLE overlay_peers ADD COLUMN direct_candidates_expires_at_ms INTEGER CHECK(direct_candidates_expires_at_ms IS NULL OR direct_candidates_expires_at_ms >= 0);",
             )
             .map_err(MigrationError::Sqlite)?;
+        transaction
+            .pragma_update(None, "user_version", 14)
+            .map_err(MigrationError::Sqlite)?;
+        transaction.commit().map_err(MigrationError::Sqlite)?;
+        return migrate(connection);
+    }
+
+    if version == 14 {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(MigrationError::Sqlite)?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE overlay_peer_observations ADD COLUMN runtime_json TEXT CHECK(runtime_json IS NULL OR length(runtime_json) <= 65536);",
+            )
+            .map_err(MigrationError::Sqlite)?;
+        transaction
+            .pragma_update(None, "user_version", 15)
+            .map_err(MigrationError::Sqlite)?;
+        transaction.commit().map_err(MigrationError::Sqlite)?;
+        return migrate(connection);
+    }
+
+    if version == 15 {
+        let transaction = connection
+            .unchecked_transaction()
+            .map_err(MigrationError::Sqlite)?;
+        create_overlay_application_probe_schema(&transaction).map_err(MigrationError::Sqlite)?;
         transaction
             .pragma_update(None, "user_version", SCHEMA_VERSION)
             .map_err(MigrationError::Sqlite)?;
@@ -997,8 +1039,34 @@ fn create_overlay_network_schema(transaction: &rusqlite::Transaction<'_>) -> rus
              applied_network_generation INTEGER NOT NULL CHECK (applied_network_generation >= 0),
              observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
              status TEXT NOT NULL CHECK (status IN ('applied', 'rejected', 'unavailable')),
+             runtime_json TEXT CHECK(runtime_json IS NULL OR length(runtime_json) <= 65536),
              PRIMARY KEY (network_domain_id, worker_id),
              FOREIGN KEY (network_domain_id, worker_id)
+                 REFERENCES overlay_peers(network_domain_id, worker_id)
+         );",
+    )?;
+    create_overlay_application_probe_schema(transaction)
+}
+
+fn create_overlay_application_probe_schema(
+    transaction: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<()> {
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS overlay_application_probes (
+             network_domain_id TEXT NOT NULL,
+             source_worker_id TEXT NOT NULL,
+             target_worker_id TEXT NOT NULL,
+             target_address TEXT NOT NULL,
+             target_port INTEGER NOT NULL CHECK (target_port BETWEEN 1 AND 65535),
+             peer_generation INTEGER NOT NULL CHECK (peer_generation > 0),
+             network_generation INTEGER NOT NULL CHECK (network_generation >= 0),
+             observed_at_ms INTEGER NOT NULL CHECK (observed_at_ms >= 0),
+             outcome TEXT NOT NULL CHECK (outcome IN ('succeeded', 'http_status', 'timeout', 'connect_failed', 'response_too_large', 'response_failed', 'request_failed')),
+             http_status INTEGER CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 599),
+             response_bytes INTEGER NOT NULL CHECK (response_bytes BETWEEN 0 AND 65537),
+             elapsed_ms INTEGER NOT NULL CHECK (elapsed_ms BETWEEN 0 AND 5000),
+             PRIMARY KEY (network_domain_id, source_worker_id),
+             FOREIGN KEY (network_domain_id, source_worker_id)
                  REFERENCES overlay_peers(network_domain_id, worker_id)
          );",
     )
@@ -3093,6 +3161,15 @@ mod overlay_network_tests {
             config.peers[0].direct_candidates_expires_at_ms,
             Some(60_000)
         );
+        let peers = repository
+            .list_overlay_peers(&domain.network_domain_id, 10, 4)
+            .expect("read peer diagnostics");
+        let advertised = peers
+            .iter()
+            .find(|peer| peer.worker_id == second)
+            .expect("advertised peer remains visible");
+        assert_eq!(advertised.direct_candidates, candidates);
+        assert_eq!(advertised.direct_candidates_expires_at_ms, Some(60_000));
 
         assert_eq!(
             repository.advertise_overlay_candidates(
@@ -3180,10 +3257,22 @@ mod overlay_network_tests {
             applied_network_generation: assignment.network_generation,
             observed_at_ms: 3,
             status: OverlayPeerObservationStatus::Applied,
+            runtime: Some(conductor_core::OverlayRuntimeDiagnostic {
+                interface_name: "cnd-abcdef01234".to_owned(),
+                interface_up: true,
+                local_address: assignment.worker_address,
+                mtu: 1280,
+                installed_routes: Vec::new(),
+                direct_links: Vec::new(),
+            }),
         };
         repository
             .record_overlay_peer_observation(&observation)
             .expect("record current observation");
+        let diagnostics = repository
+            .list_overlay_peer_diagnostics(&domain.network_domain_id, 10, 10)
+            .expect("read stored runtime diagnostics");
+        assert_eq!(diagnostics[0].runtime, observation.runtime);
         let mut stale = observation.clone();
         stale.observed_at_ms = 2;
         assert_eq!(

@@ -3,7 +3,7 @@ type: Reference
 title: HTTP routes and contracts
 description: Routes expose jobs, runs, service revisions/deployments, workers, drains, metrics, and readiness; the feature-gated typed client calls these contracts with bounded JSON responses.
 status: stable
-source_revision: e10f326
+source_revision: 59a3cc8f4c3383e51a363ffae06c743a2dddb320
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/server.rs
@@ -70,11 +70,23 @@ the [README](../../../README.md) is a shorter successful one-shot flow.
 Overlay domain creation requires disjoint private IPv4 worker and service
 pools. Domain creation and peer revocation are audited operator mutations.
 Peer status contains public endpoint IDs, assigned addresses, generations,
-expiry, and quarantine state; it contains no Iroh private key. Worker identity
-enrollment, configuration delivery, and observations use the separate mTLS
-worker transport endpoints described in the transport bundle. These routes
-manage membership and desired state only; they do not configure a tunnel or
-host route.
+expiry, quarantine state, manager-accepted direct underlay candidates and their
+separate expiry, and the latest worker application report with its generation
+and a freshness bit; it contains no Iroh private key. A fresh runtime
+observation separately reports helper-owned interface state, installed routes,
+active direct Iroh paths, last handshake and connection-attempt outcome, and
+QUIC/UDP byte counters. Attempt outcomes distinguish missing/expired candidates,
+timeouts, underlay failures, authentication failures, and endpoint identity
+mismatches without storing raw transport errors. These byte counters include
+encrypted transport overhead and do not represent application payload bytes.
+These are worker-reported transport facts, not proof of application traffic. A
+separate, directional HTTP probe report marks reachability verified only while
+the response is fresh and source generations and active target assignment still
+match. Worker identity enrollment,
+configuration delivery, observations, and probe reports use the separate mTLS
+worker transport endpoints described in the transport bundle. The helper
+configures the TUN and owned routes; operator API routes expose their reported
+state but do not configure them directly.
 
 # Important run semantics
 

@@ -3,7 +3,7 @@ type: Reference
 title: Manager desired state and persistence
 description: SQLite stores immutable job/revision records, mutable deployment state, run reservations, worker records, commands, allocations, audit, and overlay membership.
 status: stable
-source_revision: e10f326
+source_revision: 0fd23ee30a2486c317aff72e2cda1f98b559e6b4
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/lib.rs
@@ -70,9 +70,27 @@ authorized workers.
 
 These rows are in the normal manager SQLite snapshot and restore unit. No
 network-domain deletion operation is exposed; address pools and replay
-tombstones therefore remain reserved. This is identity and allocation state,
-not proof that a worker has installed a tunnel or withdrawn a route. The Iroh
-packet adapter and worker-side expiry enforcement are separate MVP5 work.
+tombstones therefore remain reserved. The peer-list diagnostic joins that
+desired state with the latest worker report and marks it fresh only when its
+timestamp is nonnegative, no later than manager time, and at most 60 seconds
+old, and its network generation matches desired state. The diagnostic includes
+the report generation so older applies remain visible as stale. A bounded
+runtime payload also records the helper's interface address/MTU, installed
+Conductor routes, active direct Iroh links, handshake timestamps, and transport
+UDP byte counters (including protocol overhead, not application payload).
+Runtime payloads are capped at 64 KiB, validated against the
+authenticated worker assignment, and stored with the report. They are
+worker-reported state, not a route probe or proof of peer/application
+reachability. The separate latest directional application probe is submitted
+over worker mTLS and stored independently. It is fresh only for the current
+source peer and network generations, an active target assignment with the same
+address, and an observation no more than 60 seconds old. Any fresh HTTP status
+verifies that an application response returned; the separate outcome records
+2xx success versus non-2xx or transport failure. Local `conductor overlay
+probe` results stay local unless `--config` is supplied, in which case the CLI
+reports the bounded response through the worker's authenticated manager
+transport. An unavailable manager does not turn a local result into manager
+evidence.
 
 ## Run-history retention
 

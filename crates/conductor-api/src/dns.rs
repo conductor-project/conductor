@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{
@@ -5,9 +6,12 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use conductor_core::{ServiceIdentity, ServicePortProtocol, WorkerStatus};
+use conductor_core::{
+    NetworkDomainId, OverlayPeerState, ServiceIdentity, ServicePortProtocol, WorkerId, WorkerStatus,
+};
 use conductor_manager::{JobService, WorkerPort};
 use hickory_server::{
     net::runtime::Time,
@@ -37,28 +41,35 @@ pub struct ServiceDnsConfig {
     pub listen: SocketAddr,
     /// Suffix without a trailing root dot, e.g. `conductor.internal`.
     pub suffix: String,
+    /// Optional overlay publication uses a separate suffix to preserve the
+    /// existing host-network DNS namespace and its address semantics.
+    pub overlay: Option<OverlayDnsConfig>,
     /// Client address ranges permitted to use this DNS listener.
     pub allowed_clients: Vec<IpNet>,
 }
 
+#[derive(Clone, Debug)]
+pub struct OverlayDnsConfig {
+    pub network_domain_id: NetworkDomainId,
+    /// Overlay suffix without a trailing root dot, e.g. `overlay.internal`.
+    pub suffix: String,
+}
+
 impl ServiceDnsConfig {
     pub fn validate(&self) -> Result<(), &'static str> {
-        let suffix = self.suffix.as_str();
-        if suffix.is_empty()
-            || suffix.len() > 104
-            || suffix.ends_with('.')
-            || suffix.split('.').any(|label| {
-                label.is_empty()
-                    || label.len() > 63
-                    || label.starts_with('-')
-                    || label.ends_with('-')
-                    || !label.bytes().all(|byte| {
-                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
-                    })
-            })
-        {
+        if !valid_suffix(&self.suffix) {
             return Err(
                 "DNS suffix must contain valid lowercase DNS labels, be at most 104 bytes, and have no trailing dot",
+            );
+        }
+        if let Some(overlay) = &self.overlay
+            && (!valid_suffix(&overlay.suffix)
+                || overlay.suffix == self.suffix
+                || overlay.suffix.ends_with(&format!(".{}", self.suffix))
+                || self.suffix.ends_with(&format!(".{}", overlay.suffix)))
+        {
+            return Err(
+                "overlay DNS suffix must be valid and separate from the host-network suffix",
             );
         }
         if self.allowed_clients.is_empty() {
@@ -66,6 +77,21 @@ impl ServiceDnsConfig {
         }
         Ok(())
     }
+}
+
+fn valid_suffix(suffix: &str) -> bool {
+    !suffix.is_empty()
+        && suffix.len() <= 104
+        && !suffix.ends_with('.')
+        && suffix.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
 }
 
 /// Run the UDP and TCP DNS listeners until the daemon shutdown flag is set.
@@ -82,6 +108,7 @@ pub async fn serve_service_dns(
         manager,
         workers: Arc::from(workers),
         suffix: config.suffix,
+        overlay: config.overlay,
         lookup_admission: Arc::new(Semaphore::new(MAX_CONCURRENT_DNS_LOOKUPS)),
     };
     let mut server = Server::with_access(handler, [], config.allowed_clients);
@@ -107,10 +134,38 @@ async fn wait_for_shutdown(shutdown: Arc<AtomicBool>) {
     }
 }
 
+fn dns_now_ms() -> i64 {
+    i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
+fn service_zone_contains(query_name: &str, suffix: &str) -> bool {
+    let query_name = query_name.trim_end_matches('.');
+    let service_zone = format!("service.{suffix}");
+    query_name == service_zone || query_name.ends_with(&format!(".{service_zone}"))
+}
+
+fn active_overlay_addresses(
+    peers: Vec<conductor_core::OverlayPeerAssignment>,
+    now_ms: i64,
+) -> BTreeMap<WorkerId, String> {
+    peers
+        .into_iter()
+        .filter(|peer| peer.state == OverlayPeerState::Active && peer.expires_at_ms > now_ms)
+        .map(|peer| (peer.worker_id, peer.worker_address.to_string()))
+        .collect()
+}
+
 struct ServiceDnsHandler {
     manager: Arc<JobService>,
     workers: Arc<[Arc<dyn WorkerPort>]>,
     suffix: String,
+    overlay: Option<OverlayDnsConfig>,
     lookup_admission: Arc<Semaphore>,
 }
 
@@ -142,26 +197,40 @@ impl RequestHandler for ServiceDnsHandler {
             }
         };
         let qname = request_info.query.name().to_string().to_ascii_lowercase();
-        let Some(query) = parse_service_query_name(&qname, &self.suffix) else {
-            let service_zone = format!("service.{}.", self.suffix);
-            let code = if qname.ends_with(&format!(".{service_zone}")) || qname == service_zone {
-                ResponseCode::NXDomain
+        let overlay_query = self.overlay.as_ref().and_then(|overlay| {
+            parse_service_query_name(&qname, &overlay.suffix).map(|query| {
+                (
+                    query,
+                    overlay.suffix.as_str(),
+                    Some(overlay.network_domain_id.clone()),
+                )
+            })
+        });
+        let host_query = parse_service_query_name(&qname, &self.suffix)
+            .map(|query| (query, self.suffix.as_str(), None));
+        let Some((query, query_suffix, overlay_domain_id)) = overlay_query.or(host_query) else {
+            let matched_suffix = self
+                .overlay
+                .as_ref()
+                .filter(|overlay| service_zone_contains(&qname, &overlay.suffix))
+                .map(|overlay| overlay.suffix.as_str())
+                .or_else(|| {
+                    service_zone_contains(&qname, &self.suffix).then_some(self.suffix.as_str())
+                });
+            let (code, authorities) = if let Some(suffix) = matched_suffix {
+                (
+                    ResponseCode::NXDomain,
+                    soa_record(suffix).into_iter().collect(),
+                )
             } else {
-                ResponseCode::Refused
+                (ResponseCode::Refused, Vec::new())
             };
-            return send_dns_response(
-                request,
-                &mut response_handle,
-                code,
-                Vec::new(),
-                if code == ResponseCode::NXDomain {
-                    soa_record(&self.suffix).into_iter().collect()
-                } else {
-                    Vec::new()
-                },
-            )
-            .await;
+            return send_dns_response(request, &mut response_handle, code, Vec::new(), authorities)
+                .await;
         };
+        let is_overlay_query = overlay_domain_id.is_some();
+        let query_suffix = query_suffix.to_owned();
+        let now_ms = dns_now_ms();
         let Ok(permit) = Arc::clone(&self.lookup_admission).try_acquire_owned() else {
             return send_dns_response(
                 request,
@@ -184,10 +253,20 @@ impl RequestHandler for ServiceDnsHandler {
                 .collect::<Vec<_>>();
             let exists = manager.service_identity_exists(&identity_for_query)?;
             let endpoints = manager.list_service_catalog(&identity_for_query, &statuses)?;
-            Ok::<_, conductor_manager::ExecutionStoreError>((exists, endpoints))
+            let overlay_addresses = if let Some(domain_id) = overlay_domain_id {
+                active_overlay_addresses(
+                    manager
+                        .list_overlay_peers(&domain_id, 128, now_ms)
+                        .map_err(|_| conductor_manager::ExecutionStoreError::StorageUnavailable)?,
+                    now_ms,
+                )
+            } else {
+                BTreeMap::new()
+            };
+            Ok::<_, conductor_manager::ExecutionStoreError>((exists, endpoints, overlay_addresses))
         })
         .await;
-        let (exists, endpoints) = match result {
+        let (exists, endpoints, overlay_addresses) = match result {
             Ok(Ok(result)) => result,
             _ => {
                 return send_dns_response(
@@ -206,21 +285,29 @@ impl RequestHandler for ServiceDnsHandler {
                 &mut response_handle,
                 ResponseCode::NXDomain,
                 Vec::new(),
-                soa_record(&self.suffix).into_iter().collect(),
+                soa_record(&query_suffix).into_iter().collect(),
             )
             .await;
         }
         let mut answers = Vec::new();
         for endpoint in endpoints.into_iter().filter(|endpoint| endpoint.eligible) {
+            let advertised_address = if is_overlay_query {
+                let Some(address) = overlay_addresses.get(&endpoint.worker_id) else {
+                    continue;
+                };
+                address.clone()
+            } else {
+                endpoint.port.advertised_address().to_owned()
+            };
             if let Some(record) = service_endpoint_record_for_query(
                 &qname,
                 request_info.query.query_type(),
                 &query,
-                &self.suffix,
+                &query_suffix,
                 DnsEndpoint {
                     port_name: endpoint.port.name(),
                     protocol: endpoint.port.protocol(),
-                    advertised_address: endpoint.port.advertised_address(),
+                    advertised_address: &advertised_address,
                     port: endpoint.port.port(),
                 },
             ) {
@@ -228,7 +315,7 @@ impl RequestHandler for ServiceDnsHandler {
             }
         }
         let authorities = if answers.is_empty() {
-            soa_record(&self.suffix).into_iter().collect()
+            soa_record(&query_suffix).into_iter().collect()
         } else {
             Vec::new()
         };
@@ -822,14 +909,120 @@ mod tests {
         let mut config = ServiceDnsConfig {
             listen: "127.0.0.1:8053".parse().expect("socket address"),
             suffix: "conductor.internal".to_owned(),
+            overlay: None,
             allowed_clients: vec!["127.0.0.0/8".parse().expect("loopback range")],
         };
         assert!(config.validate().is_ok());
         config.suffix = "Conductor.internal".to_owned();
         assert!(config.validate().is_err());
         config.suffix = "conductor.internal".to_owned();
+        config.overlay = Some(OverlayDnsConfig {
+            network_domain_id: NetworkDomainId::new("workers-east".to_owned())
+                .expect("valid overlay domain ID"),
+            suffix: "overlay.internal".to_owned(),
+        });
+        assert!(config.validate().is_ok());
+        config.overlay.as_mut().unwrap().suffix = "conductor.internal".to_owned();
+        assert!(config.validate().is_err());
+        config.overlay.as_mut().unwrap().suffix = "Overlay.internal".to_owned();
+        assert!(config.validate().is_err());
+        config.overlay = None;
         config.allowed_clients.clear();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn overlay_dns_srv_target_pairs_the_assigned_ip_with_the_service_port() {
+        let suffix = "overlay.internal";
+        let endpoint = DnsEndpoint {
+            port_name: "http",
+            protocol: ServicePortProtocol::Tcp,
+            advertised_address: "10.91.0.23",
+            port: 31_234,
+        };
+        let query_name = "_http._tcp.backend.default.service.overlay.internal.";
+        let query = parse_service_query_name(query_name, suffix).expect("overlay SRV query");
+        let record = service_endpoint_record_for_query(
+            query_name,
+            RecordType::SRV,
+            &query,
+            suffix,
+            endpoint,
+        )
+        .expect("overlay SRV record");
+        let RData::SRV(srv) = record.data else {
+            panic!("expected SRV record");
+        };
+        assert_eq!(srv.port, 31_234);
+        let target = srv.target.to_ascii();
+        let target_query = parse_service_query_name(&target, suffix).expect("overlay SRV target");
+        let record = service_endpoint_record_for_query(
+            &target,
+            RecordType::A,
+            &target_query,
+            suffix,
+            endpoint,
+        )
+        .expect("overlay A record for SRV target");
+        let RData::A(address) = record.data else {
+            panic!("expected A record");
+        };
+        assert_eq!(address.0, Ipv4Addr::new(10, 91, 0, 23));
+    }
+
+    #[test]
+    fn overlay_dns_publishes_only_active_unexpired_worker_addresses() {
+        let domain = NetworkDomainId::new("workers-east".to_owned()).expect("domain ID");
+        let peers = vec![
+            conductor_core::OverlayPeerAssignment {
+                network_domain_id: domain.clone(),
+                worker_id: WorkerId::new("active-worker").expect("worker ID"),
+                endpoint_id: conductor_core::OverlayEndpointId::new("01".repeat(32))
+                    .expect("endpoint ID"),
+                worker_address: Ipv4Addr::new(10, 91, 0, 23),
+                peer_generation: 1,
+                network_generation: 1,
+                expires_at_ms: 20_000,
+                state: OverlayPeerState::Active,
+                quarantine_until_ms: None,
+                direct_candidates: Vec::new(),
+                direct_candidates_expires_at_ms: None,
+            },
+            conductor_core::OverlayPeerAssignment {
+                network_domain_id: domain.clone(),
+                worker_id: WorkerId::new("expired-worker").expect("worker ID"),
+                endpoint_id: conductor_core::OverlayEndpointId::new("02".repeat(32))
+                    .expect("endpoint ID"),
+                worker_address: Ipv4Addr::new(10, 91, 0, 24),
+                peer_generation: 1,
+                network_generation: 1,
+                expires_at_ms: 10_000,
+                state: OverlayPeerState::Active,
+                quarantine_until_ms: None,
+                direct_candidates: Vec::new(),
+                direct_candidates_expires_at_ms: None,
+            },
+            conductor_core::OverlayPeerAssignment {
+                network_domain_id: domain,
+                worker_id: WorkerId::new("quarantined-worker").expect("worker ID"),
+                endpoint_id: conductor_core::OverlayEndpointId::new("03".repeat(32))
+                    .expect("endpoint ID"),
+                worker_address: Ipv4Addr::new(10, 91, 0, 25),
+                peer_generation: 1,
+                network_generation: 1,
+                expires_at_ms: 20_000,
+                state: OverlayPeerState::Quarantined,
+                quarantine_until_ms: Some(20_000),
+                direct_candidates: Vec::new(),
+                direct_candidates_expires_at_ms: None,
+            },
+        ];
+        let addresses = active_overlay_addresses(peers, 10_000);
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(
+            addresses.get(&WorkerId::new("active-worker").expect("worker ID")),
+            Some(&"10.91.0.23".to_owned())
+        );
     }
 
     #[tokio::test]
@@ -849,6 +1042,7 @@ mod tests {
             ServiceDnsConfig {
                 listen,
                 suffix: "conductor.internal".to_owned(),
+                overlay: None,
                 allowed_clients: vec!["127.0.0.0/8".parse().expect("loopback CIDR")],
             },
             manager,
@@ -902,6 +1096,66 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn overlay_dns_suffix_uses_its_configured_network_domain() {
+        let state = IsolatedDnsState::new();
+        let manager = Arc::new(
+            JobService::open_sqlite(state.0.join("manager.sqlite3"))
+                .expect("open isolated manager database"),
+        );
+        let domain_id = NetworkDomainId::new("workers-east".to_owned()).expect("domain ID");
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve DNS port");
+        let listen = probe.local_addr().expect("read reserved port");
+        drop(probe);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let _stop_on_drop = StopDnsOnDrop(Arc::clone(&shutdown));
+        let server = tokio::spawn(serve_service_dns(
+            ServiceDnsConfig {
+                listen,
+                suffix: "conductor.internal".to_owned(),
+                overlay: Some(OverlayDnsConfig {
+                    network_domain_id: domain_id.clone(),
+                    suffix: "overlay.internal".to_owned(),
+                }),
+                allowed_clients: vec!["127.0.0.0/8".parse().expect("loopback CIDR")],
+            },
+            Arc::clone(&manager),
+            Vec::new(),
+            Arc::clone(&shutdown),
+        ));
+        manager
+            .create_overlay_network_domain(
+                &conductor_core::OverlayNetworkDomainConfig {
+                    network_domain_id: domain_id.clone(),
+                    worker_address_pool: "10.91.0.0/24".to_owned(),
+                    service_address_pool: "10.91.1.0/24".to_owned(),
+                },
+                1_000,
+            )
+            .expect("create overlay domain after DNS listener starts");
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind DNS client");
+        let response = dns_exchange(
+            &socket,
+            listen,
+            dns_query("missing.default.service.overlay.internal."),
+        )
+        .await;
+        assert_eq!(response.metadata.response_code, ResponseCode::NXDomain);
+        assert!(response.authorities.iter().any(|record| {
+            record.name.to_ascii() == "service.overlay.internal."
+                && record.record_type() == RecordType::SOA
+        }));
+
+        shutdown.store(true, Ordering::Release);
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("DNS server stops after shutdown")
+            .expect("DNS task joins")
+            .expect("DNS server exits cleanly");
     }
 
     fn dns_query(name: &str) -> Vec<u8> {

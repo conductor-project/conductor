@@ -1676,7 +1676,7 @@ async fn list_network_peers(
     };
     let manager = Arc::clone(&state.manager);
     match run_blocking(&state, BlockingClass::General, move || {
-        manager.list_overlay_peers(&network_domain_id, 128, manager_timestamp_ms())
+        manager.list_overlay_peer_diagnostics(&network_domain_id, 128, manager_timestamp_ms())
     })
     .await
     {

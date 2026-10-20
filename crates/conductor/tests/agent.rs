@@ -1921,6 +1921,56 @@ fn operator_cli_authenticates_inspects_paginates_and_reads_bounded_logs() {
     let worker: serde_json::Value = serde_json::from_slice(&worker.stdout).unwrap();
     assert_eq!(worker["workerId"], "test-worker");
 
+    let domain = operator_command(
+        address,
+        &token_path,
+        &[
+            "overlay",
+            "create",
+            "operator-overlay",
+            "--worker-address-pool",
+            "10.95.0.0/24",
+            "--service-address-pool",
+            "10.95.1.0/24",
+        ],
+    );
+    assert!(
+        domain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&domain.stderr)
+    );
+    let domain: serde_json::Value = serde_json::from_slice(&domain.stdout).unwrap();
+    assert_eq!(domain["networkDomainId"], "operator-overlay");
+    assert_eq!(domain["workerAddressPool"], "10.95.0.0/24");
+
+    let inspected = operator_command(
+        address,
+        &token_path,
+        &["overlay", "inspect", "operator-overlay"],
+    );
+    assert!(
+        inspected.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspected.stderr)
+    );
+    let inspected: serde_json::Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(inspected["workerAddressPool"], "10.95.0.0/24");
+
+    let peers = operator_command(
+        address,
+        &token_path,
+        &["overlay", "peers", "operator-overlay"],
+    );
+    assert!(
+        peers.status.success(),
+        "{}",
+        String::from_utf8_lossy(&peers.stderr)
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&peers.stdout).unwrap(),
+        serde_json::json!([])
+    );
+
     let body = job_json("operator-cli-logs", &["/usr/bin/printf", "%0500d", "0"]);
     let (status, _, response) = http_with_custom_headers(
         address,
