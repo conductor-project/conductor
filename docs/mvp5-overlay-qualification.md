@@ -307,16 +307,23 @@ Fortress and
 `084ab026f614893489ca1c86c4b2c8cdd9d412d71a6b06c22896d9013306d0d9` on the
 VM.
 
+During this rerun, Fortress captured UDP on all interfaces for the test ports
+40000 and 40101. `tcpdump` reported 489 packets captured, 0 dropped by the
+kernel. Neither the randomized TCP application marker nor the UDP application
+marker appears in the raw capture. Its SHA-256 is
+`00cc8c3fe43263d5427788967fffc9c233b73b4113edad7751640129ad600375`. The
+capture is retained on Fortress with mode 0600 outside the repository because
+it contains underlay metadata. This is evidence for encryption of this test
+flow, not a general audit of all host traffic.
+
 Fortress was Debian 13, x86_64, kernel `6.12.113+deb13-amd64`; the VM was
 Debian 13, aarch64, kernel `6.12.111+deb13-cloud-arm64`. The VM shared the
 development Mac as its physical host and used QEMU user-mode networking with a
 static UDP forward. This proves traffic between two Linux kernels on separate
 hosts, but not between independent physical failure domains. A Conductor
 manager was not running; the test injected short-lived peer configuration.
-There was no underlay packet capture in this rerun, so encryption at the
-underlay boundary is not newly demonstrated by this result. Manager bootstrap
-and outage, host-resolver DNS/Hickory application discovery, independent
-physical failure domains, performance limits, worker daemon/host restart,
+Manager bootstrap and outage, host-resolver DNS/Hickory application discovery,
+independent physical failure domains, performance limits, worker daemon/host restart,
 revocation, expiry, MTU, queue pressure, host-route preservation during
 successful setup/cleanup, and blocked direct UDP between hosts remain
 unqualified. Keep those #156 acceptance criteria open.
