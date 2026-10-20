@@ -211,6 +211,13 @@ reports probe success only after receiving a 2xx response; any complete HTTP
 response is separately marked `application_response_received`, including
 non-2xx status codes. It tests application traffic from that worker; it is not
 a manager-side or cross-host qualification and does not measure throughput.
+Pass `--config /path/to/worker.json` to report a completed HTTP response over
+the worker's authenticated manager transport. The manager accepts the report
+only for the authenticated worker, current peer-map generations, and a target
+address assigned to an active peer. Diagnostics retain the latest directional
+result for 60 seconds; a fresh HTTP response marks reachability `verified`,
+including non-2xx responses, while the outcome separately records whether the
+application returned success. Without `--config`, the result stays local.
 Revoke output continues to mark reachability `not_verified`.
 
 ```sh
@@ -221,6 +228,7 @@ conductor operator --context production overlay inspect workers-east
 conductor operator --context production --output json overlay peers workers-east
 conductor operator --context production overlay revoke workers-east worker-17
 conductor overlay probe --target-ip 10.90.0.17 --port 8080 --path /health
+conductor overlay --config /etc/conductor/worker.json probe --target-ip 10.90.0.17 --port 8080 --path /health
 ```
 
 # Retrieve logs

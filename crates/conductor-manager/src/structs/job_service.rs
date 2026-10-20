@@ -120,6 +120,15 @@ impl JobService {
         self.repository.record_overlay_peer_observation(observation)
     }
 
+    pub fn record_overlay_application_probe(
+        &self,
+        report: &conductor_core::OverlayApplicationProbeReport,
+        observed_at_ms: i64,
+    ) -> Result<(), OverlayNetworkError> {
+        self.repository
+            .record_overlay_application_probe(report, observed_at_ms)
+    }
+
     pub fn list_overlay_peers(
         &self,
         network_domain_id: &conductor_core::NetworkDomainId,

@@ -37,11 +37,11 @@ control-plane state and do not implement packet transport.
 Peer diagnostics keep the latest worker apply report separate from desired
 assignment and carry its network generation and freshness. Runtime observations
 can report helper-owned TUN state, installed routes, active direct Iroh paths,
-handshake times, and transport byte counters. `not_verified` remains the only
-reachability state remains `not_verified`; the local bounded overlay CLI probe
-is not part of these shared contracts and does not persist its result through
-the manager. Interface state, routes, and a peer handshake do not imply
-workload connectivity.
+handshake times, and transport byte counters. A separate directional
+application-probe contract records a bounded HTTP outcome and freshness; only
+a fresh response from an assigned active peer marks application reachability
+verified. Interface state, routes, and a peer handshake do not imply workload
+connectivity.
 
 # Job contracts
 

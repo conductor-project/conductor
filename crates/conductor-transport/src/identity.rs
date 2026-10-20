@@ -18,8 +18,8 @@ use axum_server::tls_rustls::{RustlsAcceptor, RustlsConfig};
 use axum_server_mtls::{MtlsAcceptor, PeerCertificates};
 use base64::Engine;
 use conductor_core::{
-    NetworkDomainId, OverlayDirectCandidateAdvertisement, OverlayEndpointId,
-    OverlayPeerObservation, WorkerId, valid_overlay_direct_candidates,
+    NetworkDomainId, OverlayApplicationProbeReport, OverlayDirectCandidateAdvertisement,
+    OverlayEndpointId, OverlayPeerObservation, WorkerId, valid_overlay_direct_candidates,
 };
 use conductor_manager::{JobRepository, SqliteJobRepository, WorkerIdentityError};
 use rcgen::{
@@ -454,6 +454,10 @@ impl WorkerEnrollmentService {
                 post(overlay_observation_handler),
             )
             .route(
+                "/v1/worker/network-domains/{id}/probe",
+                post(overlay_application_probe_handler),
+            )
+            .route(
                 "/v1/worker/network-domains/{id}/candidates",
                 post(overlay_candidates_handler),
             )
@@ -699,6 +703,49 @@ async fn overlay_observation_handler(
             (StatusCode::SERVICE_UNAVAILABLE, "overlay state unavailable").into_response()
         }
         Err(_) => (StatusCode::BAD_REQUEST, "overlay observation rejected").into_response(),
+    }
+}
+
+async fn overlay_application_probe_handler(
+    State(service): State<Arc<WorkerEnrollmentService>>,
+    AxumPath(raw_domain_id): AxumPath<String>,
+    certificates: Option<Extension<PeerCertificates>>,
+    Json(report): Json<OverlayApplicationProbeReport>,
+) -> Response {
+    let Ok(domain_id) = NetworkDomainId::new(raw_domain_id) else {
+        return (StatusCode::BAD_REQUEST, "invalid network domain").into_response();
+    };
+    let Some(worker_id) = authenticated_worker(&service, certificates) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "active worker certificate required",
+        )
+            .into_response();
+    };
+    if report.network_domain_id != domain_id || report.worker_id != worker_id {
+        return (StatusCode::FORBIDDEN, "worker probe identity mismatch").into_response();
+    }
+    if !report.is_valid() {
+        return (StatusCode::BAD_REQUEST, "invalid application probe report").into_response();
+    }
+    let Ok(now) = now_ms() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "manager clock unavailable").into_response();
+    };
+    match service
+        .repository
+        .record_overlay_application_probe(&report, now)
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(conductor_manager::OverlayNetworkError::StaleGeneration) => {
+            (StatusCode::CONFLICT, "stale overlay probe").into_response()
+        }
+        Err(conductor_manager::OverlayNetworkError::PeerNotFound) => {
+            (StatusCode::NOT_FOUND, "active overlay assignment not found").into_response()
+        }
+        Err(conductor_manager::OverlayNetworkError::StorageUnavailable) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "overlay state unavailable").into_response()
+        }
+        Err(_) => (StatusCode::BAD_REQUEST, "overlay probe rejected").into_response(),
     }
 }
 

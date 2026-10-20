@@ -81,9 +81,16 @@ UDP byte counters (including protocol overhead, not application payload).
 Runtime payloads are capped at 64 KiB, validated against the
 authenticated worker assignment, and stored with the report. They are
 worker-reported state, not a route probe or proof of peer/application
-reachability. `reachability` remains `not_verified` in manager diagnostics.
-The local `conductor overlay probe` reports a bounded HTTP result to its caller
-but does not persist that result in manager state.
+reachability. The separate latest directional application probe is submitted
+over worker mTLS and stored independently. It is fresh only for the current
+source peer and network generations, an active target assignment with the same
+address, and an observation no more than 60 seconds old. Any fresh HTTP status
+verifies that an application response returned; the separate outcome records
+2xx success versus non-2xx or transport failure. Local `conductor overlay
+probe` results stay local unless `--config` is supplied, in which case the CLI
+reports the bounded response through the worker's authenticated manager
+transport. An unavailable manager does not turn a local result into manager
+evidence.
 
 ## Run-history retention
 

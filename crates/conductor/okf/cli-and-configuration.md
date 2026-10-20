@@ -127,8 +127,12 @@ Run `conductor overlay probe --target-ip <private-ip> --port <port> --path
 <safe-health-path>` on an overlay-enabled worker to send a bounded HTTP GET
 through its local route. The total deadline is at most five seconds and the
 response body is limited to 65,536 bytes. The probe does not use operator API
-credentials, does not follow redirects or proxies, and does not update manager
-reachability state.
+credentials, does not follow redirects or proxies, and stays local by default.
+To persist a completed HTTP response to the manager, add
+`--config /path/to/worker.json` before the `probe` subcommand. This uses the
+worker's existing protected identity and CA files, requires the target address
+to appear in its current manager-issued peer configuration, and reports the
+result over worker mTLS.
 
 # Path resolution
 

@@ -50,7 +50,12 @@ generation when the set changes, and returns that generation with the
 unchanged authorization expiry. Candidate addresses are hints, not identity
 or authorization. `POST /v1/worker/network-domains/{id}/observation` records
 the worker's applied generation and status; the manager timestamps the report
-and rejects identity mismatches and stale generations. The private Iroh key
+and rejects identity mismatches and stale generations. A bounded
+`POST /v1/worker/network-domains/{id}/probe` records a completed application
+HTTP probe from the authenticated worker. The manager checks source generations
+and derives the target worker from its active address assignment; it never
+trusts a caller-provided target worker ID. Probe results are separate from
+helper-reported interface and Iroh telemetry. The private Iroh key
 and workload packets never cross these endpoints. These control-plane routes
 do not create a TUN device or install a host route.
 

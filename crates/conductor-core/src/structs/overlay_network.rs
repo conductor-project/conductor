@@ -30,6 +30,8 @@ pub fn valid_overlay_direct_candidates(candidates: &[SocketAddr]) -> bool {
 }
 
 pub const OVERLAY_PEER_CONFIGURATION_SCHEMA_VERSION: u32 = 1;
+pub const MAX_OVERLAY_APPLICATION_PROBE_TIMEOUT_MS: u32 = 5_000;
+pub const MAX_OVERLAY_APPLICATION_PROBE_RESPONSE_BYTES: u32 = 65_536;
 
 /// Canonical lowercase hexadecimal Iroh Ed25519 endpoint identity.
 ///
@@ -176,6 +178,91 @@ pub struct OverlayPeerObservation {
     pub runtime: Option<OverlayRuntimeDiagnostic>,
 }
 
+/// Result of one bounded HTTP application probe initiated by an enrolled worker.
+/// The manager derives the target worker from its active address assignment.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OverlayApplicationProbeReport {
+    pub network_domain_id: NetworkDomainId,
+    pub worker_id: WorkerId,
+    pub peer_generation: u64,
+    pub network_generation: u64,
+    pub target_address: Ipv4Addr,
+    pub target_port: u16,
+    pub outcome: OverlayApplicationProbeOutcome,
+    pub http_status: Option<u16>,
+    /// Capped to 65,537 as an explicit over-limit sentinel.
+    pub response_bytes: u32,
+    pub elapsed_ms: u32,
+}
+
+/// Bounded terminal outcomes for a worker-initiated application probe.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OverlayApplicationProbeOutcome {
+    Succeeded,
+    HttpStatus,
+    Timeout,
+    ConnectFailed,
+    ResponseTooLarge,
+    ResponseFailed,
+    RequestFailed,
+}
+
+impl OverlayApplicationProbeReport {
+    pub fn is_valid(&self) -> bool {
+        let status_is_success = self
+            .http_status
+            .is_some_and(|status| (200..300).contains(&status));
+        let status_is_failure = self
+            .http_status
+            .is_some_and(|status| !(200..300).contains(&status));
+        self.target_port != 0
+            && self.elapsed_ms <= MAX_OVERLAY_APPLICATION_PROBE_TIMEOUT_MS
+            && self.response_bytes <= MAX_OVERLAY_APPLICATION_PROBE_RESPONSE_BYTES + 1
+            && self
+                .http_status
+                .is_none_or(|status| (100..=599).contains(&status))
+            && match self.outcome {
+                OverlayApplicationProbeOutcome::Succeeded => {
+                    status_is_success
+                        && self.response_bytes <= MAX_OVERLAY_APPLICATION_PROBE_RESPONSE_BYTES
+                }
+                OverlayApplicationProbeOutcome::HttpStatus => {
+                    status_is_failure
+                        && self.response_bytes <= MAX_OVERLAY_APPLICATION_PROBE_RESPONSE_BYTES
+                }
+                OverlayApplicationProbeOutcome::Timeout
+                | OverlayApplicationProbeOutcome::ResponseFailed => {
+                    self.response_bytes <= MAX_OVERLAY_APPLICATION_PROBE_RESPONSE_BYTES
+                }
+                OverlayApplicationProbeOutcome::ConnectFailed
+                | OverlayApplicationProbeOutcome::RequestFailed => {
+                    self.http_status.is_none() && self.response_bytes == 0
+                }
+                OverlayApplicationProbeOutcome::ResponseTooLarge => {
+                    self.http_status.is_some()
+                        && self.response_bytes == MAX_OVERLAY_APPLICATION_PROBE_RESPONSE_BYTES + 1
+                }
+            }
+    }
+}
+
+/// Latest bounded probe outcome from this worker to another active overlay peer.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OverlayApplicationProbeDiagnostic {
+    pub target_worker_id: WorkerId,
+    pub target_address: Ipv4Addr,
+    pub target_port: u16,
+    pub outcome: OverlayApplicationProbeOutcome,
+    pub http_status: Option<u16>,
+    pub response_bytes: u32,
+    pub elapsed_ms: u32,
+    pub observed_at_ms: i64,
+    pub fresh: bool,
+}
+
 /// Bounded runtime state observed by the worker's privileged overlay helper.
 /// This reports interface and direct transport state; it is not an application
 /// reachability assertion.
@@ -214,6 +301,8 @@ pub struct OverlayPeerDiagnostic {
     pub observation_at_ms: Option<i64>,
     pub observation_fresh: bool,
     pub runtime: Option<OverlayRuntimeDiagnostic>,
+    /// Directional result from this worker to the last probed peer.
+    pub application_probe: Option<OverlayApplicationProbeDiagnostic>,
     pub reachability: OverlayReachability,
 }
 
@@ -221,6 +310,7 @@ pub struct OverlayPeerDiagnostic {
 #[serde(rename_all = "snake_case")]
 pub enum OverlayReachability {
     NotVerified,
+    Verified,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

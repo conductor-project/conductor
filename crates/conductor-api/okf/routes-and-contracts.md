@@ -75,11 +75,14 @@ generation and a freshness bit; it contains no Iroh private key. A fresh runtime
 observation separately reports helper-owned interface state, installed routes,
 active direct Iroh paths, last handshake time, and QUIC/UDP byte counters. These
 byte counters include encrypted transport overhead and do not represent
-application payload bytes. These are worker-reported transport facts, not proof of application traffic;
-`reachability` remains `not_verified`. Worker identity enrollment, configuration delivery, and
-observations use the separate mTLS worker transport endpoints described in the
-transport bundle. The helper configures the TUN and owned routes; operator API
-routes expose their reported state but do not configure them directly.
+application payload bytes. These are worker-reported transport facts, not proof
+of application traffic. A separate, directional HTTP probe report marks
+reachability verified only while the response is fresh and source generations
+and active target assignment still match. Worker identity enrollment,
+configuration delivery, observations, and probe reports use the separate mTLS
+worker transport endpoints described in the transport bundle. The helper
+configures the TUN and owned routes; operator API routes expose their reported
+state but do not configure them directly.
 
 # Important run semantics
 

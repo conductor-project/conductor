@@ -1,6 +1,7 @@
 //! Bounded application reachability checks from the local worker host.
 
 use std::net::Ipv4Addr;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -12,6 +13,9 @@ const MAX_PROBE_RESPONSE_BYTES: usize = 65_536;
 
 #[derive(Debug, Args)]
 pub struct OverlayArgs {
+    /// Optional worker configuration for reporting the result to its manager.
+    #[arg(long)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: OverlayCommand,
 }
@@ -54,10 +58,17 @@ pub fn run(args: OverlayArgs) -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                 };
-                return match runtime.block_on(probe(target_ip, port, path, timeout_ms)) {
-                    Ok(result) => {
+                let config_path = args.config;
+                return match runtime.block_on(run_probe(
+                    target_ip,
+                    port,
+                    path,
+                    timeout_ms,
+                    config_path,
+                )) {
+                    Ok((result, success)) => {
                         println!("{result}");
-                        if result["state"] == "succeeded" {
+                        if success {
                             ExitCode::SUCCESS
                         } else {
                             ExitCode::FAILURE
@@ -84,6 +95,111 @@ pub fn run(args: OverlayArgs) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+async fn run_probe(
+    target_ip: Ipv4Addr,
+    port: u16,
+    path: String,
+    timeout_ms: u64,
+    config_path: Option<PathBuf>,
+) -> Result<(serde_json::Value, bool), (&'static str, &'static str, u64)> {
+    let mut result = match probe(target_ip, port, path, timeout_ms).await {
+        Ok(result) => result,
+        Err((code, message, elapsed_ms)) => {
+            return Err((code, message, elapsed_ms));
+        }
+    };
+    let success = result["state"] == "succeeded";
+    if let Some(config_path) = config_path {
+        match report_probe(&config_path, target_ip, port, timeout_ms, &result).await {
+            Ok(()) => result["managerReport"] = json!("accepted"),
+            Err(()) => result["managerReport"] = json!("unavailable_or_rejected"),
+        }
+    } else {
+        result["managerReport"] = json!("not_requested");
+    }
+    Ok((result, success))
+}
+
+async fn report_probe(
+    config_path: &std::path::Path,
+    target_ip: Ipv4Addr,
+    port: u16,
+    timeout_ms: u64,
+    result: &serde_json::Value,
+) -> Result<(), ()> {
+    let source_config_path = std::fs::canonicalize(config_path).map_err(|_| ())?;
+    let config_text = std::fs::read_to_string(config_path).map_err(|_| ())?;
+    let mut config: super::Config = serde_json::from_str(&config_text).map_err(|_| ())?;
+    config.source_config_path = source_config_path;
+    let configured_role = config.role;
+    super::resolve_config_paths(&mut config, configured_role, false);
+    config.role = configured_role;
+    super::validate(&config).map_err(|_| ())?;
+    if !matches!(config.role, super::Role::Worker | super::Role::All) {
+        return Err(());
+    }
+    let domain = conductor_core::NetworkDomainId::new(
+        config.worker_overlay_network_domain_id.clone().ok_or(())?,
+    )
+    .map_err(|_| ())?;
+    let identity_path = config.worker_identity_file.as_deref().ok_or(())?;
+    let ca_path = config.manager_ca_file.as_deref().ok_or(())?;
+    let endpoint = config.manager_endpoint.as_deref().ok_or(())?;
+    let identity = super::read_private_pem(identity_path).map_err(|_| ())?;
+    let ca = std::fs::read(ca_path).map_err(|_| ())?;
+    let client = conductor_transport::WorkerTransportClient::from_pem_identity_with_root(
+        endpoint, &identity, &ca,
+    )
+    .map_err(|_| ())?;
+    let configuration = client
+        .overlay_configuration(&domain)
+        .await
+        .map_err(|_| ())?;
+    if !configuration
+        .peers
+        .iter()
+        .any(|peer| peer.worker_address == target_ip)
+    {
+        return Err(());
+    }
+    let worker_id = conductor_core::WorkerId::new(config.worker_id.ok_or(())?).map_err(|_| ())?;
+    let status = u16::try_from(result["httpStatus"].as_u64().ok_or(())?).map_err(|_| ())?;
+    let report = conductor_core::OverlayApplicationProbeReport {
+        network_domain_id: domain.clone(),
+        worker_id,
+        peer_generation: configuration.peer_generation,
+        network_generation: configuration.network_generation,
+        target_address: target_ip,
+        target_port: port,
+        outcome: if (200..300).contains(&status) {
+            conductor_core::OverlayApplicationProbeOutcome::Succeeded
+        } else {
+            conductor_core::OverlayApplicationProbeOutcome::HttpStatus
+        },
+        http_status: Some(status),
+        response_bytes: result["responseBytes"]
+            .as_u64()
+            .ok_or(())?
+            .try_into()
+            .map_err(|_| ())?,
+        elapsed_ms: result["elapsedMs"]
+            .as_u64()
+            .unwrap_or(timeout_ms)
+            .min(u64::from(
+                conductor_core::MAX_OVERLAY_APPLICATION_PROBE_TIMEOUT_MS,
+            ))
+            .try_into()
+            .map_err(|_| ())?,
+    };
+    if !report.is_valid() {
+        return Err(());
+    }
+    client
+        .report_overlay_application_probe(&domain, &report)
+        .await
+        .map_err(|_| ())
 }
 
 fn validate_probe(target_ip: Ipv4Addr, port: u16, path: &str) -> Option<&'static str> {

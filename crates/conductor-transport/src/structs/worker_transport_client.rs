@@ -169,6 +169,34 @@ impl WorkerTransportClient {
         Ok(())
     }
 
+    pub async fn report_overlay_application_probe(
+        &self,
+        domain_id: &conductor_core::NetworkDomainId,
+        report: &conductor_core::OverlayApplicationProbeReport,
+    ) -> Result<(), TransportError> {
+        let url = self
+            .endpoint
+            .join(&format!(
+                "v1/worker/network-domains/{}/probe",
+                domain_id.as_str()
+            ))
+            .map_err(|_| TransportError::InvalidEndpoint)?;
+        let mut body = BoundedJsonBody(Vec::new());
+        serde_json::to_writer(&mut body, report).map_err(|_| TransportError::InvalidCommand)?;
+        let response = self
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body.0)
+            .send()
+            .await
+            .map_err(|_| TransportError::Http)?;
+        if response.status() != reqwest::StatusCode::NO_CONTENT {
+            return Err(transport_error_for_status(response.status()));
+        }
+        Ok(())
+    }
+
     pub(super) async fn send_report(
         &self,
         report: &WorkerReport,

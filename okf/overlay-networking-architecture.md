@@ -56,8 +56,9 @@ QUIC UDP byte counters; these counters include transport overhead and are not
 application payload measurements. Such a worker observation does not assert
 application reachability. An operator can run `conductor overlay probe` on an
 overlay-enabled worker to check a bounded HTTP response through its local
-overlay route; the result is local CLI evidence and is not persisted to the
-manager. Iroh relay mode and public/default address
+overlay route. With an explicit worker config, the CLI reports the result over
+the authenticated manager transport, where it is retained separately from TUN
+and Iroh telemetry with a short freshness window. Iroh relay mode and public/default address
 discovery are explicitly disabled. Managers distribute EndpointIds and
 validated direct IP:port candidates over the authenticated control plane;
 peers must be directly reachable on the declared LAN/VPC or configured

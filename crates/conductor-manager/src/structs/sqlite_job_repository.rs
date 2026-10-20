@@ -1542,6 +1542,89 @@ impl JobRepository for SqliteJobRepository {
             .map_err(|_| OverlayNetworkError::StorageUnavailable)
     }
 
+    fn record_overlay_application_probe(
+        &self,
+        report: &conductor_core::OverlayApplicationProbeReport,
+        observed_at_ms: i64,
+    ) -> Result<(), OverlayNetworkError> {
+        if !report.is_valid() || observed_at_ms < 0 {
+            return Err(OverlayNetworkError::ObservationConflict);
+        }
+        let peer_generation = i64::try_from(report.peer_generation)
+            .map_err(|_| OverlayNetworkError::StaleGeneration)?;
+        let network_generation = i64::try_from(report.network_generation)
+            .map_err(|_| OverlayNetworkError::StaleGeneration)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        let (stored_peer_generation, stored_network_generation) = transaction
+            .query_row(
+                "SELECT p.peer_generation, d.network_generation FROM overlay_peers p
+             JOIN overlay_network_domains d USING (network_domain_id)
+             WHERE p.network_domain_id = ?1 AND p.worker_id = ?2 AND p.state = 'active'",
+                params![report.network_domain_id.as_str(), report.worker_id.as_str()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?
+            .ok_or(OverlayNetworkError::PeerNotFound)?;
+        if peer_generation != stored_peer_generation
+            || network_generation != stored_network_generation
+        {
+            return Err(OverlayNetworkError::StaleGeneration);
+        }
+        let target_worker_id: String = transaction
+            .query_row(
+                "SELECT worker_id FROM overlay_peers
+             WHERE network_domain_id = ?1 AND worker_address = ?2 AND state = 'active'",
+                params![
+                    report.network_domain_id.as_str(),
+                    i64::from(u32::from(report.target_address))
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)?
+            .ok_or(OverlayNetworkError::PeerNotFound)?;
+        if target_worker_id == report.worker_id.as_str() {
+            return Err(OverlayNetworkError::ObservationConflict);
+        }
+        let outcome = match report.outcome {
+            conductor_core::OverlayApplicationProbeOutcome::Succeeded => "succeeded",
+            conductor_core::OverlayApplicationProbeOutcome::HttpStatus => "http_status",
+            conductor_core::OverlayApplicationProbeOutcome::Timeout => "timeout",
+            conductor_core::OverlayApplicationProbeOutcome::ConnectFailed => "connect_failed",
+            conductor_core::OverlayApplicationProbeOutcome::ResponseTooLarge => {
+                "response_too_large"
+            }
+            conductor_core::OverlayApplicationProbeOutcome::ResponseFailed => "response_failed",
+            conductor_core::OverlayApplicationProbeOutcome::RequestFailed => "request_failed",
+        };
+        transaction.execute(
+            "INSERT INTO overlay_application_probes
+             (network_domain_id, source_worker_id, target_worker_id, target_address, target_port,
+              peer_generation, network_generation, observed_at_ms, outcome, http_status, response_bytes, elapsed_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(network_domain_id, source_worker_id) DO UPDATE SET
+                target_worker_id = excluded.target_worker_id, target_address = excluded.target_address,
+                target_port = excluded.target_port, peer_generation = excluded.peer_generation,
+                network_generation = excluded.network_generation, observed_at_ms = excluded.observed_at_ms,
+                outcome = excluded.outcome, http_status = excluded.http_status,
+                response_bytes = excluded.response_bytes, elapsed_ms = excluded.elapsed_ms",
+            params![report.network_domain_id.as_str(), report.worker_id.as_str(), target_worker_id,
+                report.target_address.to_string(), i64::from(report.target_port), peer_generation,
+                network_generation, observed_at_ms, outcome, report.http_status.map(i64::from),
+                i64::from(report.response_bytes), i64::from(report.elapsed_ms)],
+        ).map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| OverlayNetworkError::StorageUnavailable)
+    }
+
     fn list_overlay_peers(
         &self,
         network_domain_id: &conductor_core::NetworkDomainId,
@@ -1685,6 +1768,63 @@ impl JobRepository for SqliteJobRepository {
                 } else {
                     (None, None, None, false, None)
                 };
+                let application_probe = connection
+                    .query_row(
+                        "SELECT p.target_worker_id, p.target_address, p.target_port, p.peer_generation,
+                                p.network_generation, p.observed_at_ms, p.outcome, p.http_status,
+                                p.response_bytes, p.elapsed_ms, target.worker_address, target.state
+                         FROM overlay_application_probes p
+                         LEFT JOIN overlay_peers target
+                           ON target.network_domain_id = p.network_domain_id AND target.worker_id = p.target_worker_id
+                         WHERE p.network_domain_id = ?1 AND p.source_worker_id = ?2",
+                        params![network_domain_id.as_str(), assignment.worker_id.as_str()],
+                        |row| Ok((
+                            row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?,
+                            row.get::<_, String>(6)?, row.get::<_, Option<i64>>(7)?,
+                            row.get::<_, i64>(8)?, row.get::<_, i64>(9)?,
+                            row.get::<_, Option<i64>>(10)?, row.get::<_, Option<String>>(11)?,
+                        )),
+                    )
+                    .optional()
+                    .map_err(|_| OverlayNetworkError::StorageUnavailable)?
+                    .map(|(target_worker_id, address, port, peer_generation, network_generation,
+                           observed_at_ms, outcome, status, bytes, elapsed, current_address, target_state)| {
+                        let target_address = address.parse().map_err(|_| OverlayNetworkError::StorageUnavailable)?;
+                        let outcome = match outcome.as_str() {
+                            "succeeded" => conductor_core::OverlayApplicationProbeOutcome::Succeeded,
+                            "http_status" => conductor_core::OverlayApplicationProbeOutcome::HttpStatus,
+                            "timeout" => conductor_core::OverlayApplicationProbeOutcome::Timeout,
+                            "connect_failed" => conductor_core::OverlayApplicationProbeOutcome::ConnectFailed,
+                            "response_too_large" => conductor_core::OverlayApplicationProbeOutcome::ResponseTooLarge,
+                            "response_failed" => conductor_core::OverlayApplicationProbeOutcome::ResponseFailed,
+                            "request_failed" => conductor_core::OverlayApplicationProbeOutcome::RequestFailed,
+                            _ => return Err(OverlayNetworkError::StorageUnavailable),
+                        };
+                        let current_address = current_address.and_then(|value| u32::try_from(value).ok())
+                            .map(std::net::Ipv4Addr::from);
+                        let fresh = peer_generation >= 0
+                            && peer_generation as u64 == assignment.peer_generation
+                            && network_generation >= 0
+                            && network_generation as u64 == assignment.network_generation
+                            && observed_at_ms >= 0
+                            && observed_at_ms <= now_ms
+                            && now_ms.saturating_sub(observed_at_ms) <= 60_000
+                            && target_state.as_deref() == Some("active")
+                            && current_address == Some(target_address);
+                        Ok(conductor_core::OverlayApplicationProbeDiagnostic {
+                            target_worker_id: WorkerId::new(target_worker_id).map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+                            target_address,
+                            target_port: u16::try_from(port).map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+                            outcome,
+                            http_status: status.map(|value| u16::try_from(value).map_err(|_| OverlayNetworkError::StorageUnavailable)).transpose()?,
+                            response_bytes: u32::try_from(bytes).map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+                            elapsed_ms: u32::try_from(elapsed).map_err(|_| OverlayNetworkError::StorageUnavailable)?,
+                            observed_at_ms,
+                            fresh,
+                        })
+                    })
+                    .transpose()?;
                 Ok(conductor_core::OverlayPeerDiagnostic {
                     assignment,
                     observation_status,
@@ -1692,7 +1832,12 @@ impl JobRepository for SqliteJobRepository {
                     observation_at_ms,
                     observation_fresh,
                     runtime,
-                    reachability: conductor_core::OverlayReachability::NotVerified,
+                    reachability: if application_probe.as_ref().is_some_and(|probe| probe.fresh && probe.http_status.is_some()) {
+                        conductor_core::OverlayReachability::Verified
+                    } else {
+                        conductor_core::OverlayReachability::NotVerified
+                    },
+                    application_probe,
                 })
             })
             .collect()

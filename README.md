@@ -260,7 +260,10 @@ reachability. From an overlay-enabled worker, run `conductor overlay probe`
 with an assigned private overlay IP, service port, and explicit safe HTTP GET
 path to verify that an application response returns through that worker's
 local route. The probe is capped at five seconds and 64 KiB; it does not run
-through the manager or change service state. See the [operator command
+through the manager or change service state. Add `--config /path/to/worker.json`
+to report a completed HTTP response over worker mTLS; diagnostics retain the
+directional result for 60 seconds only while its peer and network generations
+and target assignment remain current. See the [operator command
 guide](crates/conductor/okf/operator-commands.md).
 
 The worker overlay crate validates IPv4 packets, routes them by the manager's
