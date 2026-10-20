@@ -201,10 +201,9 @@ async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
         peers: vec![peer],
     };
     let interface_name = conductor_overlay::interface_name_for_worker(&local_worker);
-    let mut interface =
-        LinuxOverlayInterface::start(&interface_name, local_address, [remote_address])
-            .await
-            .expect("create owned TUN and peer route");
+    let interface = LinuxOverlayInterface::start(&interface_name, local_address, [remote_address])
+        .await
+        .expect("create owned TUN and peer route");
     let runtime_status = OverlayRuntimeStatus::default();
     let run_configuration = configuration.clone();
     let run_worker = local_worker.clone();
