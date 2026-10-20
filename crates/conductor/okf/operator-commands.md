@@ -3,7 +3,7 @@ type: Runbook
 title: Operate Conductor with the CLI
 description: Select named manager connection contexts, submit and manage jobs and revisions, observe and control runs, follow bounded logs, inspect workers and services, mutate desired state safely, drain workers, and page history.
 status: stable
-source_revision: 28dd056a30bf9ce7ab11165548ae17b66c473713
+source_revision: c3fbba5483c79e27e0687e445fde1a89ace9d872
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/operator_cli.rs

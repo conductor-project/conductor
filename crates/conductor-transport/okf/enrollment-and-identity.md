@@ -3,7 +3,7 @@ type: Reference
 title: Worker enrollment and identity
 description: Single-use manager credentials authorize a worker-generated key and certificate, which are persisted and used for mutual TLS.
 status: stable
-source_revision: a622643
+source_revision: c3fbba5483c79e27e0687e445fde1a89ace9d872
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/identity.rs
