@@ -25,6 +25,7 @@ surrounding repository checkout.
 ## Project structure
 
 - [Architecture](architecture.md) - crate boundaries and manager/worker ownership.
+- [Overlay networking architecture](overlay-networking-architecture.md) - proposed MVP5 peer transport, IP addressing, lease, and privilege contracts.
 - [Contributing](contributing.md) - local workflow and policy links.
 - [Documentation migration map](migration-map.md) - old docs and README sections to canonical pages.
 

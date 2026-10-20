@@ -86,6 +86,15 @@ local-test evidence, not routed multi-host qualification, host resolver
 validation, or deployment reachability evidence. Issues #77 and #78 were
 cancelled, and no routed deployment-owned testbed evidence is available.
 
+## Proposed MVP5 overlay target
+
+The [MVP5 overlay architecture](overlay-networking-architecture.md) proposes
+Linux x86_64 and arm64 as its initial implementation targets, with Apple
+silicon macOS retaining host-network-only mode until its network interface,
+route cleanup, restart, and cross-host behavior are separately tested. This is
+design scope only: no overlay implementation or independent-host network
+qualification is claimed.
+
 Historical benchmark or qualification reports must retain their exact commit,
 OS, architecture, build profile, runner, workload, and command. Such reports
 are evidence for that run only; they are not current workflow guarantees or
