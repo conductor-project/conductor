@@ -2,8 +2,8 @@
 type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
-status: partial direct TUN/TCP test passed; deployment qualification pending
-source_revision: e1003ad016084731ac334b5063959a91bebded7b
+status: partial direct TUN/TCP test passed; TCP/UDP rerun and deployment qualification pending
+source_revision: 270b2e7f6e2aa3b9debdb34310f0ec7f506a5d2f
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
@@ -284,6 +284,16 @@ Fortress transport test binary above. This exercises one local unreachable
 candidate; it is not a two-host firewall-blockage run and does not replace the
 remaining #156 failure matrix.
 
+The worker-routing slice adds an isolated Linux route-overlap test. On
+Fortress, overlay setup was rejected with `AddrInUse` when its peer route
+overlapped an unrelated static host route, and the pre-existing route remained
+installed. The separate-host transport test has since been extended to check
+both TCP and UDP application echo over the relay-disabled TUN path, including a
+bounded graceful TCP close. That expanded test compiles and the local workspace
+suite passes, but it has not yet been rerun across the two Linux systems. The
+TCP-only result above remains the latest cross-host application-traffic
+evidence; do not treat the new UDP check as qualified until both roles pass.
+
 ## Partial direct-host application test
 
 On 2026-10-20, exact source revision
@@ -431,5 +441,10 @@ Linux worker ownership fix. The managed-port probe
 passed a 64 KiB loopback smoke transfer on 2026-10-20. These checks do not qualify
 two-host overlay behavior, DNS-discovered traffic through an installed host
 resolver, packet-capture encryption, or the platform privilege boundary.
-GitHub Actions were not awaited because of the reported outage. Replace this
-evidence record when independent-host runs are performed.
+The current source snapshot also passed `python3
+scripts/check-dependency-policy.py`, `cargo fmt --all -- --check`, workspace
+Clippy, and `cargo test --workspace --locked --all-targets --all-features`
+(301 passed, 1 ignored, 33 suites; 40.50 seconds). The two-host TCP+UDP test is
+compiled but remains pending a fresh two-role run. GitHub Actions were not
+awaited because of the reported outage. Replace this evidence record when
+independent-host runs are performed.
