@@ -3,7 +3,7 @@ type: Reference
 title: Service catalog and DNS discovery
 description: The API exposes observed service endpoints over HTTP and can serve DNS records from the manager catalog.
 status: stable
-source_revision: bbd5f027864045d8abc30a9fd0cf0504c0829015
+source_revision: a1baa9ebca3923663b91181fde02a3465ad151f6
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/server.rs
@@ -30,9 +30,11 @@ configured separately from the operator API. In the `conductor` configuration,
 omitting `allowedClients` uses the loopback-only default when the listener
 binds to loopback. A non-loopback listener requires explicit client CIDRs; an
 empty list is rejected by the DNS listener configuration. This address filter
-is not authentication. Resolver installation is host-specific and should be
-performed by an administrator; see the [service discovery operations guide](../../../okf/service-discovery.md)
-for host setup and rollback procedures.
+is not authentication. Requests from outside the configured CIDRs receive
+`REFUSED` over both UDP and TCP. Resolver installation is host-specific and
+should be performed by an administrator; see the [service discovery operations
+guide](../../../okf/service-discovery.md) for host setup and rollback
+procedures.
 
 The existing `suffix` publishes host-network addresses. To publish overlay
 addresses as a separate namespace, configure both `overlayNetworkDomainId`
@@ -86,6 +88,7 @@ The listener currently responds as follows:
 
 | Query condition | DNS response | Cache behavior |
 | --- | --- | --- |
+| Client source address is outside the configured `allowedClients` ranges | `REFUSED` | No negative cache record |
 | Eligible endpoint and supported A, AAAA, or TCP SRV record | `NOERROR` with answer | Answer TTL 2 seconds |
 | Existing service but no eligible endpoint or no matching record type/port | `NOERROR` with no answer (NODATA) and SOA | Negative SOA TTL 1 second |
 | Unknown service identity or invalid name inside the service zone | `NXDOMAIN` with SOA | Negative SOA TTL 1 second |
@@ -119,3 +122,14 @@ record construction and current-catalog filtering; they do not qualify routed
 multi-host behavior, resolver installation, or network reachability. Issues
 #77 and #78 were cancelled, and no deployment-owned routed testbed is
 available.
+
+The UDP and TCP listener access filter is exercised by a bounded loopback test:
+a client outside `allowedClients` receives `REFUSED` on both transports. This
+verifies the Hickory listener's address-range gate, not client authentication
+or host resolver installation.
+
+At source revision `a1baa9ebca3923663b91181fde02a3465ad151f6`, the new access
+control test passed. Dependency policy, formatting, workspace Clippy, and the
+full workspace debug suite passed (302 tests, 1 ignored across 33 suites).
+Overlay DNS still needs verification through an installed host resolver and a
+DNS-discovered application on independent Linux workers.
