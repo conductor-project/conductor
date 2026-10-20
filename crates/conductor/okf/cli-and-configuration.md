@@ -3,7 +3,7 @@ type: Reference
 title: conductor CLI and configuration
 description: Clap commands select daemon operation, named operator contexts, and strict JSON configuration selects role-specific listeners, state, and identity paths.
 status: stable
-source_revision: e10f326
+source_revision: 929d001fa66a983ac4ef5b07d0bdd142e6bab7be
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/main.rs

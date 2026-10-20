@@ -3,8 +3,8 @@ type: Runbook
 title: Configure host service discovery
 description: Route Conductor service DNS through host resolvers and roll resolver changes back safely.
 status: stable
-source_revision: a739b4c20dd8e81ded656dfa7bb9859f48d73f9e
-source_reviewed_at: 2026-10-19
+source_revision: 929d001fa66a983ac4ef5b07d0bdd142e6bab7be
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../crates/conductor-api/src/dns.rs
     title: DNS listener validation, access, and records
