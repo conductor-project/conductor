@@ -237,20 +237,25 @@ async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
         .await
     });
 
-    let result = tokio::select! {
+    let (result, dataplane_finished) = tokio::select! {
         result = exchange_overlay_tcp(
             role.as_str(),
             local_address,
             remote_address,
             &runtime_status,
-        ) => result,
-        dataplane_result = &mut dataplane => Err(format!(
-            "overlay dataplane exited before application exchange: {dataplane_result:?}"
-        ).into()),
+        ) => (result, false),
+        dataplane_result = &mut dataplane => (
+            Err(format!(
+                "overlay dataplane exited before application exchange: {dataplane_result:?}"
+            ).into()),
+            true,
+        ),
     };
 
-    dataplane.abort();
-    let _ = dataplane.await;
+    if !dataplane_finished {
+        dataplane.abort();
+        let _ = dataplane.await;
+    }
     local_endpoint.close().await;
     let cleanup = interface.shutdown().await;
     cleanup.expect("remove only the test-owned interface and route");
