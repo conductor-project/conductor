@@ -182,6 +182,15 @@ async fn independent_linux_hosts_exchange_tcp_over_iroh_tun() {
             .expect("test bind port is valid"),
     )
     .await;
+    println!(
+        "role={role} endpoint_id={} bound_candidates={:?} peer_candidate={candidate}",
+        local_endpoint.id(),
+        local_endpoint
+            .addr()
+            .ip_addrs()
+            .copied()
+            .collect::<Vec<_>>()
+    );
     let candidate = std::env::var("CONDUCTOR_OVERLAY_TEST_PEER_CANDIDATE")
         .expect("peer candidate is configured")
         .parse::<SocketAddr>()
@@ -284,7 +293,11 @@ async fn exchange_overlay_tcp(
             break address;
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err("no authenticated direct Iroh path within 30 seconds".into());
+            return Err(format!(
+                "no authenticated direct Iroh path within 30 seconds: {:?}",
+                runtime_status.direct_links().await
+            )
+            .into());
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
