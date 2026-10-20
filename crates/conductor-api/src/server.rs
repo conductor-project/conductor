@@ -1734,7 +1734,9 @@ fn overlay_network_error(problem: OverlayNetworkError) -> Response {
             "overlay_resource_not_found",
             "the overlay resource does not exist",
         ),
-        OverlayNetworkError::InvalidAddressPool | OverlayNetworkError::InvalidLease => error(
+        OverlayNetworkError::InvalidAddressPool
+        | OverlayNetworkError::InvalidLease
+        | OverlayNetworkError::InvalidDirectCandidates => error(
             StatusCode::BAD_REQUEST,
             "invalid_overlay_request",
             "the overlay request is invalid",
