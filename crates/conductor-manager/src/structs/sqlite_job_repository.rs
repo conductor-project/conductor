@@ -1040,7 +1040,9 @@ impl JobRepository for SqliteJobRepository {
         }
         let peer_generation =
             i64::try_from(peer_generation).map_err(|_| OverlayNetworkError::StaleGeneration)?;
-        let candidates_json = serde_json::to_string(candidates)
+        let mut canonical_candidates = candidates.to_vec();
+        canonical_candidates.sort_unstable();
+        let candidates_json = serde_json::to_string(&canonical_candidates)
             .map_err(|_| OverlayNetworkError::InvalidDirectCandidates)?;
         let mut connection = self
             .connection
@@ -1065,7 +1067,7 @@ impl JobRepository for SqliteJobRepository {
 
         let current = transaction
             .query_row(
-                "SELECT p.peer_generation, p.expires_at_ms,
+                "SELECT p.peer_generation, p.expires_at_ms, p.direct_candidates_json,
                         p.direct_candidates_expires_at_ms, d.network_generation
                  FROM overlay_peers p JOIN overlay_network_domains d USING (network_domain_id)
                  WHERE p.network_domain_id = ?1 AND p.worker_id = ?2
@@ -1075,8 +1077,9 @@ impl JobRepository for SqliteJobRepository {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 },
             )
@@ -1086,7 +1089,8 @@ impl JobRepository for SqliteJobRepository {
         let (
             current_peer_generation,
             peer_expires_at_ms,
-            _current_candidates_expires_at_ms,
+            current_candidates_json,
+            current_candidates_expires_at_ms,
             mut network_generation,
         ) = current;
         if current_peer_generation != peer_generation {
@@ -1097,7 +1101,11 @@ impl JobRepository for SqliteJobRepository {
                 .saturating_add(MAX_OVERLAY_CANDIDATE_LEASE_MS)
                 .min(peer_expires_at_ms)
         });
-        network_generation = next_overlay_generation(network_generation)?;
+        if current_candidates_json != candidates_json
+            || current_candidates_expires_at_ms != candidates_expires_at_ms
+        {
+            network_generation = next_overlay_generation(network_generation)?;
+        }
         transaction
             .execute(
                 "UPDATE overlay_peers SET direct_candidates_json = ?1,
@@ -1334,6 +1342,7 @@ impl JobRepository for SqliteJobRepository {
             .collect::<Result<Vec<_>, OverlayNetworkError>>()?;
         drop(statement);
         let configuration = OverlayPeerConfiguration {
+            schema_version: conductor_core::OVERLAY_PEER_CONFIGURATION_SCHEMA_VERSION,
             network_domain_id: network_domain_id.clone(),
             worker_id: worker_id.clone(),
             worker_address: overlay_address(address)?,

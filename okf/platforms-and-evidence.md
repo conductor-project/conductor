@@ -3,7 +3,7 @@ type: Reference
 title: Platform support and evidence
 description: Platform claims are scoped to source, tests, workflows, and the exact execution environment that produced evidence.
 status: stable
-source_revision: a622643
+source_revision: e10f326
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../.github/workflows/pr.yml
@@ -94,10 +94,10 @@ silicon macOS retaining host-network-only mode until its TUN, route cleanup,
 restart, and cross-host behavior are separately tested. The supported topology
 is direct-only: workers need mutually reachable UDP underlay candidates, and
 Iroh relays, public/default address discovery, and automatic NAT traversal are
-disabled. MVP5 issue #153 implements manager-side peer identity, private
-address allocation, leases, and mTLS control endpoints. The worker packet
-adapter and independent-host qualification remain incomplete; no cross-host
-overlay behavior or platform support is yet claimed.
+disabled. MVP5 issues #153 and #154 implement manager-side peer identity and
+direct candidate distribution plus the worker packet adapter and Linux helper.
+Local checks do not establish independent-host behavior; cross-host
+qualification and platform support claims remain pending issue #156.
 
 Historical benchmark or qualification reports must retain their exact commit,
 OS, architecture, build profile, runner, workload, and command. Such reports

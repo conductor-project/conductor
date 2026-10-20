@@ -29,6 +29,8 @@ pub fn valid_overlay_direct_candidates(candidates: &[SocketAddr]) -> bool {
         })
 }
 
+pub const OVERLAY_PEER_CONFIGURATION_SCHEMA_VERSION: u32 = 1;
+
 /// Canonical lowercase hexadecimal Iroh Ed25519 endpoint identity.
 ///
 /// Iroh accepts hexadecimal endpoint identifiers. Keeping this transport-neutral
@@ -150,6 +152,7 @@ pub enum OverlayPeerState {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct OverlayPeerConfiguration {
+    pub schema_version: u32,
     pub network_domain_id: NetworkDomainId,
     pub worker_id: WorkerId,
     pub worker_address: Ipv4Addr,

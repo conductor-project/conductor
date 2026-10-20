@@ -7,6 +7,7 @@ members = [
     "crates/conductor-process",
     "crates/conductor-api",
     "crates/conductor-transport",
+    "crates/conductor-overlay",
 ]
 resolver = "3"
 
@@ -23,6 +24,7 @@ conductor-worker = { path = "crates/conductor-worker", default-features = false 
 conductor-process = { path = "crates/conductor-process", default-features = false }
 conductor-api = { path = "crates/conductor-api", default-features = false, features = ["client", "server"] }
 conductor-transport = { path = "crates/conductor-transport", default-features = false }
+conductor-overlay = { path = "crates/conductor-overlay", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive", "std"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 ctrlc = { version = "3.4", default-features = false, features = ["termination"] }
@@ -41,7 +43,8 @@ time = { version = "0.3.55", default-features = false, features = ["std"] }
 zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
 x509-parser = { version = "0.18.1", default-features = false }
 tower = { version = "0.5", default-features = false, features = ["util"] }
-tokio = { version = "1", default-features = false, features = ["macros", "net", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", default-features = false, features = ["io-std", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 rusqlite = { version = "0.40.2", default-features = false, features = ["backup", "bundled"] }
 nix = { version = "0.31.3", default-features = false, features = ["fs", "poll", "process", "signal"] }
 landlock = { version = "0.4.7", default-features = false }
@@ -53,6 +56,9 @@ hickory-server = { version = "0.26.3", default-features = false }
 ipnet = { version = "2.11.0", default-features = false, features = ["std"] }
 iroh = { version = "=1.3.0", default-features = false, features = ["tls-aws-lc-rs"] }
 iroh-base = { version = "=1.3.0", default-features = false, features = ["key"] }
+rtnetlink = { version = "=0.23.0", default-features = false, features = ["tokio_socket"] }
+tun-rs = { version = "=2.8.13", default-features = false, features = ["async_tokio"] }
+bytes = { version = "=1.12.1", default-features = false }
 tar = { version = "0.4.46", default-features = false }
 
 [workspace.lints.rust]

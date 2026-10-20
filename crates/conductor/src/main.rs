@@ -15,6 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::net::{SocketAddr, TcpListener};
+#[cfg(target_os = "linux")]
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{
@@ -26,9 +28,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use base64::Engine;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum, error::ErrorKind};
 use clap_complete::aot::Shell;
+#[cfg(target_os = "linux")]
+use conductor_core::OverlayEndpointId;
 use conductor_core::{
-    InspectRun, MAX_WORKER_CAPACITY, ProtocolOffer, ProtocolVersionRange, ReadRunLogs, ResolveRun,
-    StartRun, StopRun, WorkerDescriptor, WorkerId, WorkerMetadata, WorkerResourceCapacity,
+    InspectRun, MAX_WORKER_CAPACITY, NetworkDomainId, ProtocolOffer, ProtocolVersionRange,
+    ReadRunLogs, ResolveRun, StartRun, StopRun, WorkerDescriptor, WorkerId, WorkerMetadata,
+    WorkerResourceCapacity,
 };
 use conductor_manager::{WorkerPort, WorkerPortError};
 use operator_cli::OperatorArgs;
@@ -158,6 +163,10 @@ struct Config {
     manager_endpoint: Option<String>,
     #[serde(default)]
     worker_identity_file: Option<PathBuf>,
+    #[serde(default)]
+    worker_overlay_network_domain_id: Option<String>,
+    #[serde(default)]
+    worker_overlay_helper_binary: Option<PathBuf>,
     #[serde(default)]
     manager_ca_file: Option<PathBuf>,
     #[serde(default)]
@@ -349,6 +358,9 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<ExitCode, Box<dyn std::error::Error>> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .map_err(|_| "TLS crypto provider could not be selected")?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     close_fds::set_fds_cloexec_threadsafe(3, &[]);
     let cli = match Cli::try_parse() {
@@ -553,7 +565,7 @@ fn run_all(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let manager = Arc::new(conductor_manager::JobService::new(manager_repository));
     let worker = Arc::new(conductor_worker::WorkerService::open_with_log_policy(
         worker_data_dir,
-        worker_id,
+        worker_id.clone(),
         worker_concurrency,
         conductor_worker::LogPolicy {
             max_bytes_per_stream: config.log_max_bytes_per_stream,
@@ -896,7 +908,7 @@ fn run_worker(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
     ))?);
     let worker = Arc::new(conductor_worker::WorkerService::open_with_log_policy(
         worker_data_dir,
-        worker_id,
+        worker_id.clone(),
         concurrency,
         conductor_worker::LogPolicy {
             max_bytes_per_stream: config.log_max_bytes_per_stream,
@@ -911,10 +923,21 @@ fn run_worker(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
             endpoint, &identity, &ca,
         )?,
     );
+    let overlay_domain = config
+        .worker_overlay_network_domain_id
+        .as_deref()
+        .map(|id| NetworkDomainId::new(id.to_owned()))
+        .transpose()?;
+    #[cfg(not(target_os = "linux"))]
+    if overlay_domain.is_some() {
+        return Err("worker overlay networking currently requires Linux".into());
+    }
     let shutdown = Arc::new(AtomicBool::new(false));
     let signal_shutdown = Arc::clone(&shutdown);
+    let shutdown_after_run = Arc::clone(&shutdown);
     let signal_worker = Arc::clone(&worker);
     let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+    let overlay_shutdown_sender = shutdown_sender.clone();
     ctrlc::set_handler(move || {
         signal_worker.begin_shutdown();
         signal_shutdown.store(true, Ordering::SeqCst);
@@ -926,23 +949,214 @@ fn run_worker(config: Config) -> Result<ExitCode, Box<dyn std::error::Error>> {
         serde_json::to_string(worker.descriptor().worker_id().as_str())?,
         serde_json::to_string(endpoint)?
     );
-    let run_result = runtime.block_on(client.run(
-        Arc::clone(&worker),
-        ProtocolOffer::new(
-            ProtocolVersionRange::current(),
-            BTreeSet::from([
-                conductor_core::ProtocolCapability::OrderedReports,
-                conductor_core::ProtocolCapability::WorkerIncarnations,
-                conductor_core::ProtocolCapability::WorkerResourceInventory,
-            ]),
-            BTreeSet::from([conductor_core::ProtocolCapability::WorkerResourceInventory]),
-        )?,
-        shutdown_receiver,
-    ));
+    let protocol_offer = ProtocolOffer::new(
+        ProtocolVersionRange::current(),
+        BTreeSet::from([
+            conductor_core::ProtocolCapability::OrderedReports,
+            conductor_core::ProtocolCapability::WorkerIncarnations,
+            conductor_core::ProtocolCapability::WorkerResourceInventory,
+        ]),
+        BTreeSet::from([conductor_core::ProtocolCapability::WorkerResourceInventory]),
+    )?;
+    #[cfg(target_os = "linux")]
+    let overlay_task = runtime.block_on(async {
+        if let Some(domain_id) = overlay_domain {
+            let helper_path = required(
+                &config.worker_overlay_helper_binary,
+                "worker_overlay_helper_binary",
+            )?
+            .clone();
+            let overlay_key = load_or_create_overlay_key(worker_data_dir)?;
+            let endpoint_id = OverlayEndpointId::try_from(
+                iroh_base::SecretKey::from_bytes(&overlay_key)
+                    .public()
+                    .to_string(),
+            )?;
+            client
+                .register_overlay_identity(&domain_id, &endpoint_id)
+                .await
+                .map_err(|_| "worker overlay identity registration failed")?;
+            let configuration = client
+                .overlay_configuration(&domain_id)
+                .await
+                .map_err(|_| "worker overlay configuration could not be fetched")?;
+            if configuration.network_domain_id != domain_id || configuration.worker_id != worker_id
+            {
+                return Err(
+                    "manager returned an overlay configuration for a different worker or domain"
+                        .into(),
+                );
+            }
+            let mut helper = conductor_overlay::LinuxOverlayHelperClient::start(
+                &helper_path,
+                &worker_id,
+                overlay_key,
+                &configuration,
+            )
+            .await
+            .map_err(|_| "worker overlay helper could not be started")?;
+            let acknowledgement = client
+                .advertise_overlay_candidates(
+                    &domain_id,
+                    configuration.peer_generation,
+                    helper.direct_candidates(),
+                )
+                .await
+                .map_err(|_| "worker direct candidates could not be advertised")?;
+            let configuration = client
+                .overlay_configuration(&domain_id)
+                .await
+                .map_err(|_| "worker overlay configuration could not be refreshed")?;
+            helper
+                .reconfigure(&configuration)
+                .await
+                .map_err(|_| "worker overlay helper could not apply its peer map")?;
+            let candidate_refresh_at_ms =
+                candidate_refresh_at(acknowledgement.candidates_expires_at_ms);
+            Ok::<_, Box<dyn std::error::Error>>(Some(tokio::spawn(run_worker_overlay(
+                Arc::clone(&client),
+                domain_id,
+                worker_id.clone(),
+                helper,
+                configuration,
+                candidate_refresh_at_ms,
+                shutdown_receiver.clone(),
+            ))))
+        } else {
+            Ok(None)
+        }
+    })?;
+    let run_result = runtime.block_on(async {
+        #[cfg(target_os = "linux")]
+        let result = if let Some(mut overlay_task) = overlay_task {
+            tokio::select! {
+                result = client.run(Arc::clone(&worker), protocol_offer, shutdown_receiver) => {
+                    shutdown_after_run.store(true, Ordering::SeqCst);
+                    let _ = overlay_shutdown_sender.send(true);
+                    overlay_task.await
+                        .map_err(|_| conductor_transport::TransportError::Unavailable)?
+                        .map_err(|_| conductor_transport::TransportError::Unavailable)?;
+                    result
+                }
+                overlay_result = &mut overlay_task => {
+                    if shutdown.load(Ordering::SeqCst) {
+                        Ok(())
+                    } else {
+                        worker.begin_shutdown();
+                        Err(match overlay_result {
+                            Ok(Err(_)) | Err(_) => conductor_transport::TransportError::Unavailable,
+                            Ok(Ok(())) => conductor_transport::TransportError::Unavailable,
+                        })
+                    }
+                }
+            }
+        } else {
+            client
+                .run(Arc::clone(&worker), protocol_offer, shutdown_receiver)
+                .await
+        };
+        #[cfg(not(target_os = "linux"))]
+        let result = client
+            .run(Arc::clone(&worker), protocol_offer, shutdown_receiver)
+            .await;
+        shutdown_after_run.store(true, Ordering::SeqCst);
+        let _ = overlay_shutdown_sender.send(true);
+        result
+    });
     let worker_shutdown = worker.shutdown();
     run_result?;
     worker_shutdown?;
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(target_os = "linux")]
+async fn run_worker_overlay(
+    client: Arc<conductor_transport::WorkerTransportClient>,
+    domain_id: NetworkDomainId,
+    worker_id: WorkerId,
+    mut helper: conductor_overlay::LinuxOverlayHelperClient,
+    mut configuration: conductor_core::OverlayPeerConfiguration,
+    mut candidate_refresh_at_ms: i64,
+    mut shutdown: watch::Receiver<bool>,
+) -> Result<(), String> {
+    let mut refresh = tokio::time::interval(Duration::from_secs(15));
+    refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    refresh.tick().await;
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return helper.shutdown().await.map_err(|_| "worker overlay helper shutdown failed".to_owned());
+                }
+            }
+            _ = refresh.tick() => {
+                if overlay_now_ms() >= candidate_refresh_at_ms {
+                    if let Ok(acknowledgement) = client.advertise_overlay_candidates(
+                        &domain_id,
+                        configuration.peer_generation,
+                        helper.direct_candidates(),
+                    ).await {
+                        candidate_refresh_at_ms = candidate_refresh_at(acknowledgement.candidates_expires_at_ms);
+                    } else {
+                        candidate_refresh_at_ms = overlay_now_ms().saturating_add(30_000);
+                    }
+                }
+                let updated = client.overlay_configuration(&domain_id).await;
+                let Ok(updated) = updated else { continue; };
+                if updated.network_domain_id != domain_id || updated.worker_id != worker_id {
+                    return Err("manager returned an overlay configuration for a different worker or domain".to_owned());
+                }
+                if updated != configuration {
+                    helper.reconfigure(&updated).await
+                        .map_err(|_| "worker overlay helper rejected a manager configuration update".to_owned())?;
+                    configuration = updated;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn candidate_refresh_at(expires_at_ms: Option<i64>) -> i64 {
+    expires_at_ms.map_or_else(
+        || overlay_now_ms().saturating_add(60_000),
+        |expiry| expiry.saturating_sub(60_000),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn overlay_now_ms() -> i64 {
+    i64::try_from(timestamp_ms()).unwrap_or(i64::MAX)
+}
+
+#[cfg(target_os = "linux")]
+fn load_or_create_overlay_key(
+    worker_data_dir: &std::path::Path,
+) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    let path = worker_data_dir.join("overlay-identity.key");
+    let mut generated = [0_u8; 32];
+    getrandom::fill(&mut generated).map_err(|_| "overlay identity key generation failed")?;
+    match state_lock::write_secret_file_once(&path, &generated) {
+        Ok(()) => Ok(generated),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let mut file = state_lock::open_secret_file_no_follow(&path)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() {
+                return Err("overlay identity key must be a regular file".into());
+            }
+            #[cfg(unix)]
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err("overlay identity key permissions are too broad".into());
+            }
+            let mut existing = Vec::new();
+            file.read_to_end(&mut existing)?;
+            let key: [u8; 32] = existing
+                .try_into()
+                .map_err(|_| "overlay identity key has an invalid length")?;
+            Ok(key)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -1373,6 +1587,8 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 || config.manager_server_name.is_some()
                 || config.manager_endpoint.is_some()
                 || config.worker_identity_file.is_some()
+                || config.worker_overlay_network_domain_id.is_some()
+                || config.worker_overlay_helper_binary.is_some()
                 || config.manager_ca_file.is_some()
                 || config.worker_enrollment_credential_file.is_some()
                 || config.worker_transport_capacity.is_some()
@@ -1387,6 +1603,8 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 || config.worker_concurrency.is_some()
                 || config.manager_endpoint.is_some()
                 || config.worker_identity_file.is_some()
+                || config.worker_overlay_network_domain_id.is_some()
+                || config.worker_overlay_helper_binary.is_some()
                 || config.manager_ca_file.is_some()
                 || config.worker_enrollment_credential_file.is_some()
             {
@@ -1414,6 +1632,24 @@ fn validate(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 || config.service_dns.is_some()
             {
                 return Err("manager-only fields cannot be used with role 'worker'".into());
+            }
+            if config.worker_overlay_network_domain_id.is_some()
+                != config.worker_overlay_helper_binary.is_some()
+            {
+                return Err(
+                    "worker overlay network domain and helper binary must be configured together"
+                        .into(),
+                );
+            }
+            if let Some(domain_id) = &config.worker_overlay_network_domain_id {
+                NetworkDomainId::new(domain_id.clone())?;
+                let helper = required(
+                    &config.worker_overlay_helper_binary,
+                    "worker_overlay_helper_binary",
+                )?;
+                if !helper.is_absolute() {
+                    return Err("worker_overlay_helper_binary must be an absolute path".into());
+                }
             }
         }
     }
@@ -1754,6 +1990,8 @@ mod tests {
             manager_server_name: None,
             manager_endpoint: None,
             worker_identity_file: None,
+            worker_overlay_network_domain_id: None,
+            worker_overlay_helper_binary: None,
             manager_ca_file: None,
             worker_enrollment_credential_file: None,
             worker_transport_capacity: None,

@@ -3,7 +3,7 @@ type: Reference
 title: HTTP routes and contracts
 description: Routes expose jobs, runs, service revisions/deployments, workers, drains, metrics, and readiness; the feature-gated typed client calls these contracts with bounded JSON responses.
 status: stable
-source_revision: a622643
+source_revision: e10f326
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/server.rs
@@ -67,7 +67,8 @@ The exact methods, paths, body types, query parameters, and conditions are
 registered in `src/server.rs`. API tests are closest to the canonical behavior;
 the [README](../../../README.md) is a shorter successful one-shot flow.
 
-Overlay domain creation and peer revocation are audited operator mutations.
+Overlay domain creation requires disjoint private IPv4 worker and service
+pools. Domain creation and peer revocation are audited operator mutations.
 Peer status contains public endpoint IDs, assigned addresses, generations,
 expiry, and quarantine state; it contains no Iroh private key. Worker identity
 enrollment, configuration delivery, and observations use the separate mTLS

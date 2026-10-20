@@ -3,7 +3,7 @@ type: Reference
 title: Core identifiers and validated contracts
 description: Newtypes and constructors enforce stable IDs and validated job inputs before manager persistence or worker execution.
 status: stable
-source_revision: a622643
+source_revision: e10f326
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/lib.rs
@@ -30,9 +30,10 @@ distinguishes a worker restart and fences stale sessions.
 
 Overlay contracts add a stable network-domain ID and a canonical lowercase
 hexadecimal Iroh endpoint public ID. Peer assignments use IPv4 addresses and
-monotonic peer/network generations. Configuration snapshots contain public
-peer identities only; secret endpoint keys remain worker-local. These shared
-types describe control-plane state and do not implement packet transport.
+monotonic peer/network generations. Configuration snapshots carry a schema
+version, bounded direct UDP candidates, and candidate expiry. They contain
+public peer identities only; secret endpoint keys remain worker-local. These shared types describe
+control-plane state and do not implement packet transport.
 
 # Job contracts
 

@@ -3,8 +3,8 @@ type: Reference
 title: conductor CLI and configuration
 description: Clap commands select daemon operation, named operator contexts, and strict JSON configuration selects role-specific listeners, state, and identity paths.
 status: stable
-source_revision: 4f95c85
-source_reviewed_at: 2026-10-19
+source_revision: e10f326
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/main.rs
     title: CLI and serde configuration
@@ -102,6 +102,14 @@ descriptors. Worker configuration specifies the manager HTTPS endpoint, CA,
 worker state/ID, and either an enrollment credential or existing identity.
 Use the checked-in examples as complete field-level references rather than
 copying an outdated schema description.
+
+Linux standalone workers may additionally set both
+`worker_overlay_network_domain_id` and the absolute
+`worker_overlay_helper_binary` path to join an overlay domain. The helper owns
+one worker Iroh endpoint, packet adapter, TUN interface, and overlay routes; it
+is a separate process and should be installed with only `CAP_NET_ADMIN`. These
+fields are rejected for `all` and `manager` roles. Other platforms reject
+overlay-enabled workers.
 
 # Path resolution
 

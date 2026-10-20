@@ -3,7 +3,7 @@ type: Architecture decision
 title: Overlay networking architecture
 description: Selected Rust-native direct-only host overlay contracts for encrypted worker-to-worker workload traffic.
 status: selected
-source_revision: a622643
+source_revision: e10f326
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../crates/conductor-core/src/lib.rs
@@ -12,14 +12,8 @@ sources:
     title: Authenticated manager-worker transport
   - resource: platforms-and-evidence.md
     title: Current platform and qualification scope
-  - resource: ../dependency-decisions.md
-    title: Selected overlay dependency versions and boundaries
-  - resource: https://github.com/conductor-project/conductor/pull/188
-    title: Worker packet adapter and route lifecycle implementation reference
   - resource: https://github.com/n0-computer/iroh
     title: Iroh networking library
-  - resource: https://github.com/tun-rs/tun-rs
-    title: tun-rs TUN device library
   - resource: https://docs.rs/iroh/latest/iroh/
     title: Iroh API and transport model
   - resource: https://github.com/slackhq/nebula
@@ -109,77 +103,6 @@ encapsulation, or route lifecycle behavior. Its selected release and enabled
 features must remain recorded in the dependency decision.
 
 ## Protocol and ownership contracts
-
-### Worker addresses, DNS, Service VIPs, and bootstrap
-
-These are separate control-plane concerns. The manager durably assigns each
-worker one overlay address and distributes a worker peer map from that address
-to the stable `workerId`, authorized Iroh `EndpointId`, and validated direct
-underlay candidates. That peer map is the dataplane routing authority; DNS
-records are not consulted per packet or used to authenticate a peer.
-
-The existing manager-hosted Hickory service owns service-name discovery.
-Overlay-aware service records may publish a worker's overlay address and its
-allocated workload port through A/AAAA and SRV records, while the existing
-host-network discovery mode remains explicit. DNS names and SRV ports identify
-workload endpoints; they do not allocate worker addresses or carry routing
-state. MVP6's Service virtual IP range is reserved separately and is not
-allocated or forwarded by this MVP5 worker overlay.
-
-Manager bootstrap and worker enrollment use the existing authenticated
-manager-worker transport, with operator-provisioned trust, before overlay
-configuration is applied. This path is independent of Hickory service DNS and
-the workload overlay, so workers can enroll, refresh authorization, and report
-overlay failure when workload networking or service DNS is unavailable.
-
-The relay-free bootstrap sequence is:
-
-1. An operator provisions the manager URL and trust material; each worker
-   enrolls over the existing host-network mTLS control path.
-2. Each enrolled worker's Iroh endpoint identity and bounded direct UDP
-   candidates are authenticated to the manager over that control path.
-3. The manager persists the worker address and generation, then distributes
-   authorized peer maps containing the peer overlay address, EndpointId, and
-   direct candidates under a finite configuration lease.
-4. Workers dial those explicit IP:port candidates using the overlay ALPN. No
-   Iroh relay, public EndpointId lookup, workload DNS query, or overlay route
-   is needed to perform bootstrap. If the configured underlay does not route
-   direct UDP between a pair, that pair fails explicitly.
-
-### Worker dataplane contract
-
-The worker endpoint registers the versioned Iroh ALPN
-`conductor/overlay/1`. A connection using another ALPN is rejected. The
-dataplane sends one complete IPv4 packet per Iroh QUIC datagram; it adds no
-second packet envelope and does not use Iroh streams for workload IP traffic.
-This preserves the IP packet boundary and the workload's TCP or UDP semantics.
-QUIC datagrams are unreliable and unordered: an inner TCP flow can recover
-loss through TCP, while inner UDP applications may observe loss or reordering.
-
-The initial packet contract is IPv4 only, with a 1,000-byte TUN MTU and a
-1,000-byte maximum complete IPv4 packet. The adapter rejects malformed packets,
-packets above that limit, and packets above the negotiated QUIC datagram size;
-it does not silently fragment or reassemble them. IPv6 and stream-based packet
-fallback are unsupported.
-
-For an outbound TUN packet, Conductor validates its IPv4 header and maps the
-destination address through the current manager-authorized peer map to one
-stable worker identity, EndpointId, and direct candidate set. It sends the
-whole packet only on that authenticated Iroh connection. On receive, Conductor
-checks the peer EndpointId against the active authorization and requires the
-packet's source IPv4 address to equal that peer's assigned worker address; the
-destination must be the local overlay address before the packet is written to
-the TUN. Underlay candidates are reachability hints, not identities or source
-authorization.
-
-Packet processing uses a bounded queue of 128 packets. Producers apply
-backpressure while the queue is full; packet processing must not create
-unbounded secondary buffers. A direct connection attempt has a ten-second
-deadline; reconnect delay starts at 250 ms and grows to a 30-second cap. No
-connection attempt starts after the peer authorization expires, and expiry
-closes an established connection and stops packet acceptance. Unsupported
-datagrams, oversize packets, and unreachable candidates fail explicitly; none
-trigger relay fallback.
 
 The initial network is an explicitly configured IPv4 overlay. IPv6 is not
 claimed until addressing, forwarding, MTU, and recovery behavior are qualified
@@ -297,35 +220,6 @@ Peer-link encryption does not isolate services from one another. Any
 per-service policy or virtual-IP forwarding semantics remain future work and
 must be enforced separately from peer encryption.
 
-## Cross-host qualification plan
-
-Issue #156 executes this plan; passing library or single-host tests does not
-qualify the Conductor overlay. Use a manager and at least two independently
-booted Linux worker hosts on a declared LAN/VPC or explicitly configured
-underlay that permits direct UDP between their advertised candidates. The
-initial support matrix is Linux x86_64 and arm64. Disable Iroh relays, public
-address discovery, and NAT traversal on every worker. A blocked direct path
-must fail within the bounded retry interval without looking up or connecting
-to a relay.
-
-| Qualification area | Procedure and evidence |
-| --- | --- |
-| Topology and privilege | Record OS/kernel/architecture, underlay interfaces and firewall rules, manager and worker versions, source and binary hashes, TUN/helper setup, and pre-run host routes. Verify only the helper receives the required network-administration authority and workload processes do not receive root or `CAP_NET_ADMIN`. |
-| Application traffic | Send real TCP request/reply and UDP payloads between services bound to assigned overlay addresses and allocated ports in both directions. Verify byte counts and payload hashes; record latency distributions and throughput. A handshake or ping alone is not a pass. |
-| Direct encrypted transport | Record each advertised direct candidate and selected path. Capture underlay UDP on both workers during a transfer, retain capture hashes, and check that a unique application marker is absent from the encrypted transport. Correlate the capture with the selected direct Iroh path and the source-reviewed relay-disabled configuration; marker absence alone is not encryption proof. |
-| CPU, memory, and throughput | Measure manager, worker, helper, and workload CPU/RSS during synchronized repeated transfers. Record CPU model/governor, background load, payload size, iteration count, throughput, and latency percentiles; include host-network baseline measurements and report observed values rather than extrapolating from loopback. |
-| MTU and packet bounds | Verify an effective 1,000-byte TUN MTU, successful delivery up to the configured packet limit, and bounded rejection above it or above the negotiated QUIC datagram size. Record outcomes for both TCP and UDP workloads and confirm no silent adapter fragmentation. |
-| Restart and cleanup | Exercise orderly and forced worker/helper restart, daemon restart, and host reboot. Verify the same authorized identity/address returns without duplicate interfaces/routes, expired state fails closed, owned resources are removed, and normalized unrelated host routes remain unchanged. |
-| Failure and recovery | Block direct UDP, interrupt a peer, partition a worker from the manager, and exercise revocation/expiry. Measure the failure and recovery bounds, confirm cached authorized peers work only through their lease, and verify there is no relay or public-discovery fallback. |
-
-Use unique run and payload markers, isolated state, bounded readiness polling,
-and cleanup even on failure. Retain exact commands, candidate/path observations,
-configuration generations and expiries, payload hashes, packet captures,
-resource samples, normalized before/after routes, checksums, and limitations.
-Record unrun scenarios as unrun. A single-host simulation, a failed attempt
-between unsupported platforms, or a peer handshake cannot satisfy the
-independent Linux host acceptance criterion.
-
 ## Verification and next steps
 
 Source review at `source_revision` confirms that `conductor-core` owns
@@ -335,24 +229,13 @@ authenticated manager-worker path. The current platform page records Linux
 x86_64, Linux arm64, and Apple silicon CI, but no independent-host overlay
 qualification.
 
-PR #186 records the selected dependency versions, dataplane contract, and
-cross-host qualification plan. PR #187 implements the manager identity/address
-contracts and adds Iroh dependencies; PR #188 adds direct candidate
-advertisements, `tun-rs`, the Conductor packet adapter, and Linux helper route
-lifecycle. Later implementation PRs must keep the selected versions and
-features aligned with `dependency-decisions.md` and the resolved `Cargo.lock`
-graph. Local unit and workspace tests cover packet validation, peer
-authorization, candidate fencing, and manager migrations. They do not
-demonstrate independent-host traffic or exercise the privileged Linux helper.
-Issue #156 must still execute the plan above and qualify manager-enrolled
-identities, direct-only TUN packet forwarding, the selected Iroh datagram
-framing, real application traffic, MTU, restart, throughput, and packet loss
-on separate hosts with relays and public discovery unavailable. Confirm the
-direct UDP prerequisites and bounded failure when they are not met. This plan
-is not evidence that qualification has passed. Keep versions, enabled
-features, transitive footprint, and third-party safety boundaries in the
-dependency decision.
-
-This source review did not run tests, construct an overlay, validate a
-privileged helper, or access a two-host testbed. No network behavior or
-platform qualification is claimed.
+PR #187 adds the pinned Iroh release and manager identity/address contracts;
+PR #188 adds direct candidate advertisements, `tun-rs`, the Conductor packet
+adapter, and the Linux helper route lifecycle. Local unit and workspace tests
+cover packet validation, peer authorization, candidate fencing, and manager
+migrations. They do not demonstrate independent-host traffic or exercise the
+privileged Linux helper. Issue #156 must still qualify manager-enrolled
+identities, direct-only packet forwarding, an application request/reply, MTU,
+reconnect, throughput, and packet loss on separate hosts with relays and public
+discovery unavailable. Keep versions, enabled features, transitive footprint,
+and third-party safety boundaries in the dependency decision.

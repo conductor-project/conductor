@@ -3,8 +3,8 @@ type: Runbook
 title: Self-hosting Conductor
 description: Install from source, configure a daemon account, operate combined or separate roles, and protect persistent state.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
-source_reviewed_at: 2026-10-19
+source_revision: e10f326
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../README.md
     title: First-run workflow
@@ -53,6 +53,15 @@ inbound listener. Separate roles require explicit manager identity, enrollment,
 and endpoint configuration. See the [conductor CLI and composition bundle](../crates/conductor/okf/cli-and-configuration.md)
 and [transport identity bundle](../crates/conductor-transport/okf/enrollment-and-identity.md)
 for the exact configuration and enrollment behavior.
+
+On Linux, a standalone worker may opt into manager-assigned overlay networking
+with `worker_overlay_network_domain_id` and
+`worker_overlay_helper_binary`. Only the helper needs `CAP_NET_ADMIN`; do not
+grant that capability to the main agent or workload processes. The helper runs
+one worker Iroh endpoint with the manager-distributed direct candidate map and
+the tun-rs packet adapter. Iroh relays, public/default address discovery, and
+automatic NAT traversal are disabled; peers must be directly reachable on the
+declared LAN/VPC or configured underlay.
 
 The API listener is loopback-only. To permit remote operator access, use a
 trusted local TLS proxy and configure operator-token authentication. The

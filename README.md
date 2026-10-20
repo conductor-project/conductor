@@ -246,10 +246,12 @@ those reachability hints in versioned peer maps; candidates do not authenticate
 or authorize a peer. The initial Iroh topology requires directly reachable
 UDP and disables relays, public/default address discovery, and NAT traversal.
 
-This milestone slice provides durable identity, address allocation, candidate
-distribution, expiry, and revocation state. It does not yet route workload
-packets: the Iroh adapter, TUN interface, and host route lifecycle are separate
-MVP5 implementation and qualification work. See the [overlay architecture](okf/overlay-networking-architecture.md)
+The worker overlay crate validates IPv4 packets, routes them by the manager's
+peer map, and carries them in authenticated Iroh datagrams with relays and
+address lookup disabled. On Linux, a separate helper owns the tun-rs device
+and Conductor-managed routes; ordinary worker mode starts one endpoint for its
+local services. This implementation has local tests, but no independent-host
+traffic qualification yet. See the [overlay architecture](okf/overlay-networking-architecture.md)
 and [manager/API contracts](crates/conductor-manager/okf/desired-state-and-persistence.md).
 
 ## Command output and recovery

@@ -3,8 +3,8 @@ type: Reference
 title: conductor composition, enrollment, and lifecycle
 description: The executable wires local or separated manager/worker roles and controls state locks, startup reconciliation, and graceful shutdown.
 status: stable
-source_revision: f0d7e23f83ae770450f7b3302e5dd8eb71bf5c9a
-source_reviewed_at: 2026-10-19
+source_revision: e10f326
+source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/main.rs
     title: Runtime assembly, enrollment, shutdown
@@ -66,6 +66,22 @@ its unique `worker_id`, `worker_data_dir`, `manager_endpoint`,
 consumed and removed after the identity is persisted; later starts reuse the
 identity file and do not need the enrollment credential. Each worker needs a
 separate state directory, identity file, and credential.
+
+An opt-in Linux worker can join a manager-owned overlay domain by setting
+`worker_overlay_network_domain_id` and the absolute path
+`worker_overlay_helper_binary`. Install the helper as a root-owned executable
+available only to the Conductor service account, and grant only that helper
+`CAP_NET_ADMIN`; the main `conductor` process and workload processes must not
+receive it. The helper runs the worker's single Iroh endpoint and packet
+adapter alongside the TUN and route lifecycle. The worker stores its Iroh secret in
+`worker_data_dir/overlay-identity.key` with owner-only permissions, registers
+the derived endpoint identity over worker mTLS, and refreshes its peer snapshot
+from the manager. The selected topology is direct-only: workers exchange
+authenticated EndpointIds and direct UDP candidates through the manager, and
+Iroh relays, public/default address discovery, and automatic NAT traversal are
+disabled. Peers must be directly reachable on the configured LAN/VPC or
+underlay topology. This currently requires Linux; blocked direct paths fail
+without relay fallback.
 
 Revoke a worker from the manager host:
 
