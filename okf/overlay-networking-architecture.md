@@ -131,6 +131,20 @@ configuration is applied. This path is independent of Hickory service DNS and
 the workload overlay, so workers can enroll, refresh authorization, and report
 overlay failure when workload networking or service DNS is unavailable.
 
+The relay-free bootstrap sequence is:
+
+1. An operator provisions the manager URL and trust material; each worker
+   enrolls over the existing host-network mTLS control path.
+2. Each enrolled worker's Iroh endpoint identity and bounded direct UDP
+   candidates are authenticated to the manager over that control path.
+3. The manager persists the worker address and generation, then distributes
+   authorized peer maps containing the peer overlay address, EndpointId, and
+   direct candidates under a finite configuration lease.
+4. Workers dial those explicit IP:port candidates using the overlay ALPN. No
+   Iroh relay, public EndpointId lookup, workload DNS query, or overlay route
+   is needed to perform bootstrap. If the configured underlay does not route
+   direct UDP between a pair, that pair fails explicitly.
+
 ### Worker dataplane contract
 
 The worker endpoint registers the versioned Iroh ALPN
