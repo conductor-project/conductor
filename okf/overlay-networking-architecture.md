@@ -189,7 +189,10 @@ When the helper applies a newer peer map, it closes the prior Iroh endpoint
 before reconciling routes, then starts a new endpoint using the same worker key.
 This terminates detached packet readers and active connections authorized by
 the previous snapshot; the endpoint identity remains stable while peer
-authorization changes.
+authorization changes. The worker immediately advertises the replacement
+endpoint's direct candidates to the manager using the new peer generation, so
+the manager does not keep distributing the closed socket address until the
+normal candidate refresh interval.
 
 The initial overlay uses only directly reachable UDP candidates on declared
 LAN/VPC or explicitly configured underlay topologies. Iroh relay mode and

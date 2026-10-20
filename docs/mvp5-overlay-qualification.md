@@ -510,7 +510,8 @@ On 2026-10-20, the helper's active peer-map reconfiguration path was changed to
 close the previous Iroh endpoint before route reconciliation, then recreate it
 with the same worker key and refresh its direct candidates. This ensures
 connections and packet readers from the old snapshot are terminated before the
-new snapshot starts. The Linux-only helper test
+new snapshot starts. The worker immediately republishes the replacement
+endpoint's candidates using the updated peer generation. The Linux-only helper test
 `endpoint_replacement_closes_old_endpoint_and_preserves_identity` passed on
 Fortress with Rust 1.99.1. It verified that replacement closes the old endpoint
 and retains the worker EndpointId. This is a focused lifecycle test, not a
