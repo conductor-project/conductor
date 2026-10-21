@@ -181,10 +181,11 @@ returned IP and port over the TUN/Iroh path and verifies the echoed application
 payload. The application connection uses the SRV answer's address/port pair
 rather than a hard-coded endpoint. This harness uses an isolated manager
 fixture rather than a production manager daemon. The combined cross-host
-DNS-to-application test was executed on Linux at the recorded source revision,
-but the current QEMU NAT attempt failed before path establishment. See the PR
-#200 rerun below. Successful host-resolver DNS-to-application traffic remains
-unqualified.
+DNS-to-application test was executed on Linux at the recorded source revision.
+An initial IPv4 QEMU host-forward candidate failed before path establishment;
+a later run using direct IPv6 candidates passed the manager-backed DNS and
+application exchange. See the PR #200 reruns below. Independent physical-host
+qualification remains open.
 
 # Basic traffic procedure
 
@@ -354,7 +355,7 @@ revocation, expiry, MTU, queue pressure, host-route preservation during
 successful setup/cleanup, and blocked direct UDP between hosts remain
 unqualified. Keep those #156 acceptance criteria open.
 
-## PR #200 combined DNS and application rerun
+## PR #200 combined DNS and application IPv4 attempt
 
 At source revision `a2a1498cc541ab2a9a3f74442b9cb7ababdd901a`, the ignored
 `independent_linux_hosts_exchange_tcp_and_udp_over_iroh_tun` test was run with
@@ -373,10 +374,41 @@ packets. Fortress captured 21 UDP packets from
 `c061aa1dea351e03e223e6551ce2de15d31ca7430aa428b9b47c3a776c40f5aa` and it is
 retained on Fortress with mode 0600 outside the repository. No application
 payload was exchanged, and this run does not qualify the DNS-to-application
-path. It exposes a topology limitation: the QEMU user-mode NAT candidate did
-not provide the return path required for this direct-only test. The VM resolver
-was restored to its DHCP-provided server (`10.0.2.3`) after the run. This is a
-failed same-physical-host VM attempt, not independent-host qualification.
+path. The QEMU user-mode NAT IPv4 host-forward candidate did not provide the
+return path required for this direct-only test. The VM resolver was restored
+to its DHCP-provided server (`10.0.2.3`) after the run. This was a failed
+same-physical-host VM attempt, not independent-host qualification.
+
+## PR #200 combined DNS and application IPv6 rerun
+
+At the same source revision, `a2a1498cc541ab2a9a3f74442b9cb7ababdd901a`, the
+test passed on 2026-10-21 with role B on Fortress (Debian 13 x86_64) and role A
+on the Debian 13 ARM64 QEMU VM. Both binaries used Rust 1.99.1. Their SHA-256
+values are `7551abb9ec6f2bbad8f4bad5e24c514f1e3c16b2ec4ee14b9911f883cd86d189`
+on Fortress and
+`b1621dc874d691c5cc4209ef253c5c25b34291433e1784f789e7a8c8604bdcb8` on the
+VM. Role A passed in 1.44 seconds and role B in 7.06 seconds.
+
+Both roles used explicit IPv6 direct candidates with Iroh relays and public
+address discovery disabled. Fortress selected
+`[2401:4900:1f2d:303f:d8df:2235:23a6:bb80]:63292` for the VM; the VM selected
+`[2401:4900:1f2d:303f:bc99:48fa:7253:91ae]:40102` for Fortress. The VM's
+systemd-resolved link was temporarily configured to use Fortress's DNS listener
+and `overlay.internal` search domain, then reverted to its DHCP settings. The
+test resolved the manager-published SRV target and overlay A record as
+`10.91.0.2:18080`, exchanged and compared a 65,536-byte TCP payload and echo,
+and echoed the 24-byte UDP application payload.
+
+Fortress captured 357 IPv6 UDP packets for the test ports. Neither the
+randomized TCP marker (`conductor-cross-host-27268-1792559166220`) nor the UDP
+marker (`conductor-cross-host-udp`) appeared in the capture. Its SHA-256 is
+`90c835e889c871d3a67f5bb0d95c667abd8fbf6d39c185fcb057afbc9c285bce`; the
+capture is retained on Fortress with mode 0600 outside the repository. This
+supports encryption for this test flow but is not a general audit of host
+traffic. The VM shared the development Mac's physical host and used QEMU
+user-mode networking; this is not independent-physical-host qualification.
+The test left no overlay TUN interface, route, listener, or resolver override
+on either host.
 
 On the same source revision, three Linux lifecycle tests passed on Fortress in
 disposable network namespaces: `managed_interface_routes_reconcile_and_restart_cleanly`
