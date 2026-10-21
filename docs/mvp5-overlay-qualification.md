@@ -391,13 +391,28 @@ VM. Role A passed in 1.44 seconds and role B in 7.06 seconds.
 
 Both roles used explicit IPv6 direct candidates with Iroh relays and public
 address discovery disabled. Fortress selected
-`[2401:4900:1f2d:303f:d8df:2235:23a6:bb80]:63292` for the VM; the VM selected
-`[2401:4900:1f2d:303f:bc99:48fa:7253:91ae]:40102` for Fortress. The VM's
-systemd-resolved link was temporarily configured to use Fortress's DNS listener
-and `overlay.internal` search domain, then reverted to its DHCP settings. The
-test resolved the manager-published SRV target and overlay A record as
+`<VM-mapped-global-IPv6>:63292` for the VM; the VM selected
+`<Fortress-global-IPv6>:40102` for Fortress. These routable host addresses are
+omitted from this public repository copy; the protected capture on Fortress
+retains the exact underlay headers. The VM's systemd-resolved link was
+temporarily configured to use `<Fortress-global-IPv6>` as its DNS server and
+`overlay.internal` as its search domain, then reverted to its DHCP settings.
+The test resolved the manager-published SRV target and overlay A record as
 `10.91.0.2:18080`, exchanged and compared a 65,536-byte TCP payload and echo,
 and echoed the 24-byte UDP application payload.
+
+For reproduction, bind role B on Fortress to IPv6 UDP port `40102`, set
+`CONDUCTOR_OVERLAY_TEST_DNS_BIND` to `[<Fortress-global-IPv6>]:53`, and allow
+`<VM-mapped-global-IPv6>/128`. Set role B's
+`CONDUCTOR_OVERLAY_TEST_PEER_CANDIDATE` to
+`[<VM-mapped-global-IPv6>]:63292`. Bind role A on the VM to IPv6 UDP port
+`41002`, set its peer candidate to `[<Fortress-global-IPv6>]:40102`, and
+temporarily set the system resolver's nameserver/search domain as above. Invoke
+both role-specific test binaries with
+`--ignored --exact independent_linux_hosts_exchange_tcp_and_udp_over_iroh_tun
+--nocapture`; revert the VM's per-link resolver settings immediately after the
+test. The VM-mapped candidate was obtained from a bounded UDP echo probe from
+the same guest bind port to Fortress.
 
 Fortress captured 357 IPv6 UDP packets for the test ports. Neither the
 randomized TCP marker (`conductor-cross-host-27268-1792559166220`) nor the UDP
