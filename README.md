@@ -283,6 +283,12 @@ record](docs/mvp5-overlay-qualification.md), [overlay
 architecture](okf/overlay-networking-architecture.md), and [manager/API
 contracts](crates/conductor-manager/okf/desired-state-and-persistence.md).
 
+The Linux overlay helper needs `CAP_NET_ADMIN`, but workloads run as the same
+daemon account and could invoke a file-capability helper directly. Do not grant
+that capability to the helper for workers running untrusted workloads; the
+separate authenticated privilege boundary and safe package integration remain
+unfinished.
+
 ## Command output and recovery
 
 The manager and combined `all` role expose the management API; a standalone

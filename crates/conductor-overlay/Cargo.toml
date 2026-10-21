@@ -20,5 +20,11 @@ tun-rs.workspace = true
 rtnetlink.workspace = true
 futures-util.workspace = true
 
+[dev-dependencies]
+conductor-api = { workspace = true, features = ["server"] }
+conductor-manager.workspace = true
+hickory-server.workspace = true
+hickory-resolver.workspace = true
+
 [lints]
 workspace = true

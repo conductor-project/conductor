@@ -8,13 +8,37 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 #[cfg(target_os = "linux")]
-use conductor_core::{NetworkDomainId, OverlayPeerConfiguration};
+use conductor_api::dns::{OverlayDnsConfig, ServiceDnsConfig, serve_service_dns};
+#[cfg(target_os = "linux")]
+use conductor_core::{
+    Architecture, DeploymentMutation, EnforcementCapability, ExecutionBackend, JobRevisionDraft,
+    NetworkDomainId, OperatingSystem, OverlayPeerConfiguration, ReadinessState, RunObservation,
+    RunState, WorkerCapabilities, WorkerDescriptor, WorkerInventory, WorkerResourceCapacity,
+    WorkerServiceNetwork, WorkerStatus,
+};
+#[cfg(target_os = "linux")]
+use conductor_manager::{JobService, SqliteJobRepository, WorkerPort, WorkerPortError};
 #[cfg(target_os = "linux")]
 use conductor_overlay::{LinuxOverlayInterface, OverlayRuntimeStatus, run_packet_dataplane};
 #[cfg(target_os = "linux")]
+use hickory_resolver::TokioResolver;
+#[cfg(target_os = "linux")]
+use hickory_resolver::proto::rr::RData;
+#[cfg(target_os = "linux")]
 use iroh::{Endpoint, RelayMode, endpoint::presets::Minimal};
 #[cfg(target_os = "linux")]
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "linux")]
 use std::net::{Ipv6Addr, SocketAddrV6};
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+#[cfg(target_os = "linux")]
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
+};
+#[cfg(target_os = "linux")]
+use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "linux")]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[cfg(target_os = "linux")]
@@ -159,14 +183,14 @@ async fn independent_linux_hosts_exchange_tcp_and_udp_over_iroh_tun() {
     })
     .expect("valid remote worker ID");
     let local_address = if role == "a" {
-        Ipv4Addr::new(198, 18, 14, 1)
+        Ipv4Addr::new(10, 91, 0, 1)
     } else {
-        Ipv4Addr::new(198, 18, 14, 2)
+        Ipv4Addr::new(10, 91, 0, 2)
     };
     let remote_address = if role == "a" {
-        Ipv4Addr::new(198, 18, 14, 2)
+        Ipv4Addr::new(10, 91, 0, 2)
     } else {
-        Ipv4Addr::new(198, 18, 14, 1)
+        Ipv4Addr::new(10, 91, 0, 1)
     };
     let local_secret = SecretKey::from_bytes(if role == "a" { &[61; 32] } else { &[62; 32] });
     let remote_secret = SecretKey::from_bytes(if role == "a" { &[62; 32] } else { &[61; 32] });
@@ -241,6 +265,18 @@ async fn independent_linux_hosts_exchange_tcp_and_udp_over_iroh_tun() {
     if role == "b" {
         println!("role=b tcp_and_udp_applications=ready");
     }
+    let dns_service = if role == "b" {
+        Some(
+            start_cross_host_dns(
+                &local_worker,
+                local_endpoint.id().to_string(),
+                local_address,
+            )
+            .await,
+        )
+    } else {
+        None
+    };
     let runtime_status = OverlayRuntimeStatus::default();
     let run_configuration = configuration.clone();
     let run_worker = local_worker.clone();
@@ -279,6 +315,14 @@ async fn independent_linux_hosts_exchange_tcp_and_udp_over_iroh_tun() {
     if !dataplane_finished {
         dataplane.abort();
         let _ = dataplane.await;
+    }
+    if let Some(mut dns_service) = dns_service {
+        dns_service.shutdown.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(2), &mut dns_service.task)
+            .await
+            .expect("manager DNS listener shuts down within two seconds")
+            .expect("manager DNS task joins")
+            .expect("manager DNS listener stops cleanly");
     }
     local_endpoint.close().await;
     let cleanup = interface.shutdown().await;
@@ -393,6 +437,272 @@ async fn endpoint_on_ports(secret_key: SecretKey, ipv4_port: u16, ipv6_port: u16
 }
 
 #[cfg(target_os = "linux")]
+struct CrossHostDnsState(PathBuf);
+
+#[cfg(target_os = "linux")]
+impl CrossHostDnsState {
+    fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock after Unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "conductor-cross-host-dns-{}-{now}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).expect("create isolated cross-host DNS state");
+        Self(path)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for CrossHostDnsState {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct CrossHostDnsService {
+    _state: CrossHostDnsState,
+    shutdown: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+}
+
+#[cfg(target_os = "linux")]
+async fn start_cross_host_dns(
+    service_worker_id: &WorkerId,
+    service_endpoint_id: String,
+    service_address: Ipv4Addr,
+) -> CrossHostDnsService {
+    let state = CrossHostDnsState::new();
+    let database_path = state.0.join("manager.sqlite3");
+    let manager = Arc::new(JobService::open_sqlite(&database_path).expect("open test manager"));
+    let now_ms = unix_time_ms();
+    let resource_domain = WorkerId::new("cross-host-dns-host").expect("resource domain ID");
+    let capacity =
+        WorkerResourceCapacity::new(2_000, 2_147_483_648).expect("positive test worker capacity");
+    let capabilities = WorkerCapabilities::new(
+        OperatingSystem::Linux,
+        Architecture::X86_64,
+        BTreeSet::from([ExecutionBackend::NativeProcess]),
+        BTreeSet::from([
+            EnforcementCapability::CgroupV2,
+            EnforcementCapability::Landlock,
+        ]),
+    )
+    .expect("valid test worker capabilities");
+    let inventory = WorkerInventory::new(capabilities, capacity, capacity, 4)
+        .expect("valid test worker inventory");
+    let service_network = WorkerServiceNetwork::new(
+        service_worker_id.clone(),
+        18_080,
+        18_080,
+        service_address.to_string(),
+    )
+    .expect("test worker service port range");
+    let worker_status = WorkerStatus::new(
+        WorkerDescriptor::new(service_worker_id.clone(), 4, true),
+        0,
+        0,
+        true,
+        false,
+        now_ms,
+    )
+    .with_inventory(inventory)
+    .with_manager_metadata(resource_domain, capacity, BTreeMap::new(), now_ms, true)
+    .expect("attach fresh test worker metadata")
+    .with_service_network(service_network)
+    .expect("attach test service port range");
+    let worker: Arc<dyn WorkerPort> = Arc::new(CrossHostDnsWorker {
+        worker_id: service_worker_id.clone(),
+        status: worker_status.clone(),
+    });
+    let revision: JobRevisionDraft = serde_json::from_value(serde_json::json!({
+        "definition": {
+            "id": "cross-host-dns-backend",
+            "command": ["/usr/bin/true"],
+            "cwd": "/tmp",
+            "terminationGraceMs": 5000
+        },
+        "workload": {
+            "kind": "service",
+            "identity": {"namespace": "default", "name": "cross-host-dns-backend"},
+            "ports": [{"name": "http"}]
+        },
+        "executableDigest": {"algorithm": "sha256", "value": "a".repeat(64)},
+        "executionRequirements": {},
+        "resourceRequest": {"cpuMillis": 250, "memoryBytes": 268435456}
+    }))
+    .expect("valid cross-host DNS service revision");
+    let revision = manager
+        .create_revision(&revision, "cross-host-dns-revision")
+        .expect("register cross-host DNS service revision");
+    manager
+        .mutate_deployment_with_workers(
+            revision.id().job_id(),
+            None,
+            &DeploymentMutation::Deploy {
+                revision: 1,
+                replicas: 1,
+                strategy: conductor_core::DeploymentUpdateStrategy::default(),
+            },
+            "cross-host-dns-deploy",
+            std::slice::from_ref(&worker_status),
+        )
+        .expect("place the DNS test service");
+    manager
+        .reconcile_services(std::slice::from_ref(&worker))
+        .expect("mark the DNS test service ready");
+
+    let domain_id = NetworkDomainId::new("cross-host-test").expect("test domain ID");
+    manager
+        .create_overlay_network_domain(
+            &conductor_core::OverlayNetworkDomainConfig {
+                network_domain_id: domain_id.clone(),
+                worker_address_pool: "10.91.0.0/24".to_owned(),
+                service_address_pool: "10.91.1.0/24".to_owned(),
+            },
+            now_ms,
+        )
+        .expect("create manager overlay domain");
+    let identities = SqliteJobRepository::open(&database_path).expect("open test identities");
+    let peer_a = WorkerId::new("cross-host-a").expect("worker A identity");
+    let peer_b_id = OverlayEndpointId::new(service_endpoint_id).expect("worker B endpoint ID");
+    let peer_a_endpoint =
+        OverlayEndpointId::new(SecretKey::from_bytes(&[61; 32]).public().to_string())
+            .expect("worker A endpoint ID");
+    for (worker_id, seed) in [(&peer_a, 71_u8), (service_worker_id, 72_u8)] {
+        let credential_hash = [seed; 32];
+        let certificate_fingerprint = [seed.wrapping_add(1); 32];
+        let certificate_serial = format!("cross-host-test-certificate-{seed}");
+        identities
+            .create_enrollment_credential(
+                &credential_hash,
+                worker_id,
+                now_ms.saturating_add(60_000),
+            )
+            .expect("create test enrollment credential");
+        identities
+            .enroll_worker_identity(
+                &credential_hash,
+                &certificate_fingerprint,
+                &certificate_serial,
+                now_ms,
+                now_ms.saturating_add(60_000),
+                now_ms,
+            )
+            .expect("enroll test worker identity");
+    }
+    manager
+        .register_overlay_peer(
+            &domain_id,
+            &peer_a,
+            &peer_a_endpoint,
+            now_ms.saturating_add(60_000),
+            now_ms,
+        )
+        .expect("assign worker A first in the test range");
+    let assignment = manager
+        .register_overlay_peer(
+            &domain_id,
+            service_worker_id,
+            &peer_b_id,
+            now_ms.saturating_add(60_000),
+            now_ms,
+        )
+        .expect("assign worker B's service address");
+    assert_eq!(assignment.worker_address, service_address);
+
+    let listen = std::env::var("CONDUCTOR_OVERLAY_TEST_DNS_BIND")
+        .expect("role B DNS listener bind address is configured")
+        .parse::<SocketAddr>()
+        .expect("valid DNS bind address");
+    assert_eq!(
+        listen.port(),
+        53,
+        "system-config resolvers use the standard DNS port"
+    );
+    let allowed_clients = std::env::var("CONDUCTOR_OVERLAY_TEST_DNS_ALLOWED_CLIENTS")
+        .expect("DNS client ranges are configured")
+        .split(',')
+        .map(|range| range.parse().expect("valid allowed client range"))
+        .collect();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn(serve_service_dns(
+        ServiceDnsConfig {
+            listen,
+            suffix: "conductor.internal".to_owned(),
+            overlay: Some(OverlayDnsConfig {
+                network_domain_id: domain_id,
+                suffix: "overlay.internal".to_owned(),
+            }),
+            allowed_clients,
+        },
+        manager,
+        vec![worker],
+        Arc::clone(&shutdown),
+    ));
+    CrossHostDnsService {
+        _state: state,
+        shutdown,
+        task,
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct CrossHostDnsWorker {
+    worker_id: WorkerId,
+    status: WorkerStatus,
+}
+
+#[cfg(target_os = "linux")]
+impl WorkerPort for CrossHostDnsWorker {
+    fn descriptor(&self) -> WorkerDescriptor {
+        WorkerDescriptor::new(self.worker_id.clone(), 4, true)
+    }
+
+    fn start(&self, command: conductor_core::StartRun) -> Result<RunObservation, WorkerPortError> {
+        let started_at_ms = unix_time_ms();
+        Ok(RunObservation::requested(command.spec(), 1)
+            .next_revision(
+                RunState::Running,
+                Some(started_at_ms),
+                None,
+                None,
+                None,
+                None,
+            )
+            .ok_or(WorkerPortError::Unavailable)?
+            .with_readiness(ReadinessState::Ready))
+    }
+
+    fn inspect(
+        &self,
+        _command: conductor_core::InspectRun,
+    ) -> Result<Option<RunObservation>, WorkerPortError> {
+        Ok(None)
+    }
+
+    fn stop(&self, _command: conductor_core::StopRun) -> Result<RunObservation, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
+
+    fn status(&self) -> Result<WorkerStatus, WorkerPortError> {
+        Ok(self.status.clone())
+    }
+
+    fn read_logs(
+        &self,
+        _command: conductor_core::ReadRunLogs,
+    ) -> Result<conductor_core::RunLogChunk, WorkerPortError> {
+        Err(WorkerPortError::Unavailable)
+    }
+}
+
+#[cfg(target_os = "linux")]
 async fn exchange_overlay_tcp_and_udp(
     role: &str,
     local_address: Ipv4Addr,
@@ -487,12 +797,21 @@ async fn exchange_overlay_tcp_and_udp(
             std::process::id(),
             unix_time_ms()
         );
+        let service_endpoint = resolve_overlay_service().await?;
+        if service_endpoint.ip() != remote_address {
+            return Err(format!(
+                "manager DNS returned overlay address {}, expected {remote_address}",
+                service_endpoint.ip()
+            )
+            .into());
+        }
+        println!("role=a dns_discovered_service_endpoint={service_endpoint} application=SRV-aware");
         println!("capture_marker={marker}");
         let mut payload = vec![0x5a; 65_536];
         payload[..marker.len()].copy_from_slice(marker.as_bytes());
         let mut stream = tokio::time::timeout(
             Duration::from_secs(30),
-            TcpStream::connect(SocketAddr::from((remote_address, 18080))),
+            TcpStream::connect(service_endpoint),
         )
         .await??;
         println!("role=a application=connected");
@@ -542,6 +861,49 @@ async fn exchange_overlay_tcp_and_udp(
         println!("application_bytes={} payload_match=true", payload.len());
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn resolve_overlay_service() -> Result<SocketAddr, Box<dyn std::error::Error>> {
+    let resolver = TokioResolver::builder_tokio()?.build()?;
+    // Omit the suffix so the configured system search domain is part of the
+    // path under test. The host resolver must route that suffix to role B's
+    // manager-backed Hickory listener.
+    let query = "_http._tcp.cross-host-dns-backend.default.service";
+    println!("dns_resolver=host-system-configuration srv_query={query}");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let (target, port) = loop {
+        resolver.clear_cache();
+        let lookup = tokio::time::timeout(Duration::from_secs(2), resolver.srv_lookup(query)).await;
+        if let Ok(Ok(response)) = lookup
+            && let Some((target, port)) = response.answers().iter().find_map(|record| match &record
+                .data
+            {
+                RData::SRV(srv) => Some((srv.target.to_ascii(), srv.port)),
+                _ => None,
+            })
+        {
+            break (target, port);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("manager DNS did not publish the SRV endpoint within ten seconds".into());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let target_response = tokio::time::timeout(
+        Duration::from_secs(2),
+        resolver.ipv4_lookup(target.as_str()),
+    )
+    .await??;
+    let address = target_response
+        .answers()
+        .iter()
+        .find_map(|record| match &record.data {
+            RData::A(address) => Some(address.0),
+            _ => None,
+        })
+        .ok_or("manager DNS target did not have an A record")?;
+    Ok(SocketAddr::from((address, port)))
 }
 
 #[cfg(target_os = "linux")]

@@ -595,10 +595,13 @@ async fn send_dns_response<R: ResponseHandler>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicU64;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use conductor_core::{ReadinessState, RunObservation, RunState, WorkerStatus};
+    use conductor_manager::{WorkerPort, WorkerPortError};
     use hickory_server::proto::op::{Message, MessageType, OpCode, ResponseCode};
     use tokio::time::timeout;
 
@@ -1099,6 +1102,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dns_listener_refuses_clients_outside_configured_ranges_over_udp_and_tcp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let state = IsolatedDnsState::new();
+        let manager = Arc::new(
+            JobService::open_sqlite(state.0.join("manager.sqlite3"))
+                .expect("open isolated manager database"),
+        );
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve DNS port");
+        let listen = probe.local_addr().expect("read reserved port");
+        drop(probe);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let _stop_on_drop = StopDnsOnDrop(Arc::clone(&shutdown));
+        let server = tokio::spawn(serve_service_dns(
+            ServiceDnsConfig {
+                listen,
+                suffix: "conductor.internal".to_owned(),
+                overlay: None,
+                allowed_clients: vec!["192.0.2.0/24".parse().expect("non-local test CIDR")],
+            },
+            manager,
+            Vec::new(),
+            Arc::clone(&shutdown),
+        ));
+
+        let query = dns_query("missing.default.service.conductor.internal.");
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind disallowed DNS client");
+        let response = dns_exchange(&socket, listen, query.clone()).await;
+        assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+
+        let mut stream = timeout(
+            Duration::from_secs(2),
+            tokio::net::TcpStream::connect(listen),
+        )
+        .await
+        .expect("connect to DNS-over-TCP listener")
+        .expect("TCP connection succeeds");
+        let length = u16::try_from(query.len()).expect("DNS query fits TCP frame");
+        stream
+            .write_all(&length.to_be_bytes())
+            .await
+            .expect("write DNS-over-TCP frame length");
+        stream
+            .write_all(&query)
+            .await
+            .expect("write DNS-over-TCP query");
+        let response_length = timeout(Duration::from_secs(2), stream.read_u16())
+            .await
+            .expect("DNS-over-TCP response length arrives")
+            .expect("read DNS-over-TCP response length");
+        let mut response_bytes = vec![0; usize::from(response_length)];
+        timeout(
+            Duration::from_secs(2),
+            stream.read_exact(&mut response_bytes),
+        )
+        .await
+        .expect("DNS-over-TCP response arrives")
+        .expect("read DNS-over-TCP response");
+        let response = Message::from_vec(&response_bytes).expect("decode TCP DNS response");
+        assert_eq!(response.metadata.response_code, ResponseCode::Refused);
+
+        shutdown.store(true, Ordering::Release);
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("DNS server stops after shutdown")
+            .expect("DNS task joins")
+            .expect("DNS server exits cleanly");
+    }
+
+    #[tokio::test]
     async fn overlay_dns_suffix_uses_its_configured_network_domain() {
         let state = IsolatedDnsState::new();
         let manager = Arc::new(
@@ -1158,6 +1233,226 @@ mod tests {
             .expect("DNS server exits cleanly");
     }
 
+    #[tokio::test]
+    async fn live_overlay_dns_publishes_manager_assigned_service_ip_and_port() {
+        use conductor_core::{
+            Architecture, DeploymentMutation, EnforcementCapability, ExecutionBackend,
+            JobRevisionDraft, OperatingSystem, WorkerCapabilities, WorkerDescriptor,
+            WorkerInventory, WorkerResourceCapacity, WorkerServiceNetwork,
+        };
+        use conductor_manager::SqliteJobRepository;
+
+        let state = IsolatedDnsState::new();
+        let manager = Arc::new(
+            JobService::open_sqlite(state.0.join("manager.sqlite3"))
+                .expect("open isolated manager database"),
+        );
+        let worker_id = WorkerId::new("dns-overlay-worker").expect("worker ID");
+        let resource_domain = WorkerId::new("dns-overlay-host").expect("resource domain");
+        let capacity =
+            WorkerResourceCapacity::new(2_000, 2_147_483_648).expect("positive resource capacity");
+        let capabilities = WorkerCapabilities::new(
+            OperatingSystem::Linux,
+            Architecture::X86_64,
+            BTreeSet::from([ExecutionBackend::NativeProcess]),
+            BTreeSet::from([
+                EnforcementCapability::CgroupV2,
+                EnforcementCapability::Landlock,
+            ]),
+        )
+        .expect("valid worker capabilities");
+        let inventory = WorkerInventory::new(capabilities, capacity, capacity, 4)
+            .expect("valid worker inventory");
+        let service_network =
+            WorkerServiceNetwork::new(worker_id.clone(), 31_234, 31_234, "192.0.2.23")
+                .expect("valid service port range");
+        let observed_at_ms = dns_now_ms();
+        let status = WorkerStatus::new(
+            WorkerDescriptor::new(worker_id.clone(), 4, true),
+            0,
+            0,
+            true,
+            false,
+            observed_at_ms,
+        )
+        .with_inventory(inventory)
+        .with_manager_metadata(
+            resource_domain,
+            capacity,
+            BTreeMap::new(),
+            observed_at_ms,
+            true,
+        )
+        .expect("attach fresh manager worker metadata")
+        .with_service_network(service_network)
+        .expect("attach manager-assigned service port range");
+        let worker = Arc::new(DnsReadyWorker {
+            worker_id: worker_id.clone(),
+            status: status.clone(),
+        });
+        let worker_port: Arc<dyn WorkerPort> = worker.clone();
+        let draft: JobRevisionDraft = serde_json::from_value(serde_json::json!({
+            "definition": {
+                "id": "dns-backend",
+                "command": ["/usr/bin/true"],
+                "cwd": "/tmp",
+                "terminationGraceMs": 5000
+            },
+            "workload": {
+                "kind": "service",
+                "identity": {"namespace": "default", "name": "dns-backend"},
+                "ports": [{"name": "http"}]
+            },
+            "executableDigest": {"algorithm": "sha256", "value": "a".repeat(64)},
+            "executionRequirements": {},
+            "resourceRequest": {"cpuMillis": 250, "memoryBytes": 268435456}
+        }))
+        .expect("valid named-port service revision");
+        let revision = manager
+            .create_revision(&draft, "overlay-dns-revision")
+            .expect("register service revision");
+        manager
+            .mutate_deployment_with_workers(
+                revision.id().job_id(),
+                None,
+                &DeploymentMutation::Deploy {
+                    revision: 1,
+                    replicas: 1,
+                    strategy: conductor_core::DeploymentUpdateStrategy::default(),
+                },
+                "overlay-dns-deploy",
+                std::slice::from_ref(&status),
+            )
+            .expect("place one service replica on the overlay worker");
+        manager
+            .reconcile_services(std::slice::from_ref(&worker_port))
+            .expect("start and observe the ready service replica");
+
+        let domain_id = NetworkDomainId::new("dns-workers-east").expect("domain ID");
+        manager
+            .create_overlay_network_domain(
+                &conductor_core::OverlayNetworkDomainConfig {
+                    network_domain_id: domain_id.clone(),
+                    worker_address_pool: "10.91.0.0/24".to_owned(),
+                    service_address_pool: "10.91.1.0/24".to_owned(),
+                },
+                observed_at_ms,
+            )
+            .expect("create manager overlay domain");
+        let endpoint_id = conductor_core::OverlayEndpointId::new("01".repeat(32))
+            .expect("valid test endpoint identity");
+        let identities = SqliteJobRepository::open(state.0.join("manager.sqlite3"))
+            .expect("open manager identity repository");
+        let credential_hash = [41_u8; 32];
+        let certificate_fingerprint = [42_u8; 32];
+        identities
+            .create_enrollment_credential(&credential_hash, &worker_id, observed_at_ms + 60_000)
+            .expect("create one-time enrollment credential");
+        identities
+            .enroll_worker_identity(
+                &credential_hash,
+                &certificate_fingerprint,
+                "dns-test-certificate",
+                observed_at_ms,
+                observed_at_ms + 60_000,
+                observed_at_ms,
+            )
+            .expect("enroll the test worker identity");
+        let assignment = manager
+            .register_overlay_peer(
+                &domain_id,
+                &worker_id,
+                &endpoint_id,
+                observed_at_ms + 60_000,
+                observed_at_ms,
+            )
+            .expect("assign worker overlay address");
+
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve DNS port");
+        let listen = probe.local_addr().expect("read DNS port");
+        drop(probe);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let _stop_on_drop = StopDnsOnDrop(Arc::clone(&shutdown));
+        let server = tokio::spawn(serve_service_dns(
+            ServiceDnsConfig {
+                listen,
+                suffix: "conductor.internal".to_owned(),
+                overlay: Some(OverlayDnsConfig {
+                    network_domain_id: domain_id.clone(),
+                    suffix: "overlay.internal".to_owned(),
+                }),
+                allowed_clients: vec!["127.0.0.0/8".parse().expect("loopback CIDR")],
+            },
+            Arc::clone(&manager),
+            vec![worker_port],
+            Arc::clone(&shutdown),
+        ));
+        let socket = UdpSocket::bind("127.0.0.1:0")
+            .await
+            .expect("bind DNS client");
+        let srv_name = "_http._tcp.dns-backend.default.service.overlay.internal.";
+        let response = dns_exchange_type(&socket, listen, srv_name, RecordType::SRV).await;
+        assert_eq!(response.metadata.response_code, ResponseCode::NoError);
+        let srv = response
+            .answers
+            .iter()
+            .find_map(|record| match &record.data {
+                RData::SRV(srv) => Some(srv),
+                _ => None,
+            })
+            .expect("manager-published SRV answer");
+        assert_eq!(srv.port, 31_234);
+        let target = srv.target.to_ascii();
+        let target_response = dns_exchange_type(&socket, listen, &target, RecordType::A).await;
+        let target_address = target_response
+            .answers
+            .iter()
+            .find_map(|record| match &record.data {
+                RData::A(address) => Some(address.0),
+                _ => None,
+            })
+            .expect("SRV target A answer");
+        assert_eq!(target_address, assignment.worker_address);
+
+        let host_response = dns_exchange_type(
+            &socket,
+            listen,
+            "dns-backend.default.service.conductor.internal.",
+            RecordType::A,
+        )
+        .await;
+        let host_address = host_response
+            .answers
+            .iter()
+            .find_map(|record| match &record.data {
+                RData::A(address) => Some(address.0),
+                _ => None,
+            })
+            .expect("host-network service address remains published");
+        assert_eq!(host_address, Ipv4Addr::new(192, 0, 2, 23));
+
+        let aaaa_response = dns_exchange_type(&socket, listen, srv_name, RecordType::AAAA).await;
+        assert_eq!(aaaa_response.metadata.response_code, ResponseCode::NoError);
+        assert!(aaaa_response.answers.is_empty());
+
+        manager
+            .revoke_overlay_peer(&domain_id, &worker_id, dns_now_ms())
+            .expect("revoke the worker overlay assignment");
+        let withdrawn = dns_exchange_type(&socket, listen, srv_name, RecordType::SRV).await;
+        assert_eq!(withdrawn.metadata.response_code, ResponseCode::NoError);
+        assert!(withdrawn.answers.is_empty());
+        assert!(withdrawn.authorities.iter().any(|record| {
+            record.record_type() == RecordType::SOA && record.ttl == DNS_NEGATIVE_TTL_SECONDS
+        }));
+
+        shutdown.store(true, Ordering::Release);
+        timeout(Duration::from_secs(2), server)
+            .await
+            .expect("DNS server stops after shutdown")
+            .expect("DNS task joins")
+            .expect("DNS server exits cleanly");
+    }
+
     fn dns_query(name: &str) -> Vec<u8> {
         let mut message = Message::new(42, MessageType::Query, OpCode::Query);
         message.add_query(hickory_server::proto::op::Query::query(
@@ -1178,5 +1473,74 @@ mod tests {
             .expect("DNS response arrives")
             .expect("receive DNS response");
         Message::from_vec(&buffer[..length]).expect("decode DNS response")
+    }
+
+    async fn dns_exchange_type(
+        socket: &UdpSocket,
+        server: SocketAddr,
+        name: &str,
+        record_type: RecordType,
+    ) -> Message {
+        let mut message = Message::new(43, MessageType::Query, OpCode::Query);
+        message.add_query(hickory_server::proto::op::Query::query(
+            Name::from_ascii(name).expect("valid test DNS name"),
+            record_type,
+        ));
+        let query = message.to_vec().expect("encode DNS query");
+        dns_exchange(socket, server, query).await
+    }
+
+    struct DnsReadyWorker {
+        worker_id: WorkerId,
+        status: WorkerStatus,
+    }
+
+    impl WorkerPort for DnsReadyWorker {
+        fn descriptor(&self) -> conductor_core::WorkerDescriptor {
+            conductor_core::WorkerDescriptor::new(self.worker_id.clone(), 4, true)
+        }
+
+        fn start(
+            &self,
+            command: conductor_core::StartRun,
+        ) -> Result<RunObservation, WorkerPortError> {
+            let started_at_ms = dns_now_ms();
+            Ok(RunObservation::requested(command.spec(), 1)
+                .next_revision(
+                    RunState::Running,
+                    Some(started_at_ms),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .ok_or(WorkerPortError::Unavailable)?
+                .with_readiness(ReadinessState::Ready))
+        }
+
+        fn inspect(
+            &self,
+            _command: conductor_core::InspectRun,
+        ) -> Result<Option<RunObservation>, WorkerPortError> {
+            Ok(None)
+        }
+
+        fn stop(
+            &self,
+            _command: conductor_core::StopRun,
+        ) -> Result<RunObservation, WorkerPortError> {
+            Err(WorkerPortError::Unavailable)
+        }
+
+        fn status(&self) -> Result<WorkerStatus, WorkerPortError> {
+            Ok(self.status.clone())
+        }
+
+        fn read_logs(
+            &self,
+            _command: conductor_core::ReadRunLogs,
+        ) -> Result<conductor_core::RunLogChunk, WorkerPortError> {
+            Err(WorkerPortError::Unavailable)
+        }
     }
 }

@@ -3,7 +3,7 @@ type: Reference
 title: Service catalog and DNS discovery
 description: The API exposes observed service endpoints over HTTP and can serve DNS records from the manager catalog.
 status: stable
-source_revision: bbd5f027864045d8abc30a9fd0cf0504c0829015
+source_revision: a46413101bc2dcc12dcdfcf6c41e34e9566e4ae5
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../src/server.rs
@@ -30,9 +30,11 @@ configured separately from the operator API. In the `conductor` configuration,
 omitting `allowedClients` uses the loopback-only default when the listener
 binds to loopback. A non-loopback listener requires explicit client CIDRs; an
 empty list is rejected by the DNS listener configuration. This address filter
-is not authentication. Resolver installation is host-specific and should be
-performed by an administrator; see the [service discovery operations guide](../../../okf/service-discovery.md)
-for host setup and rollback procedures.
+is not authentication. Requests from outside the configured CIDRs receive
+`REFUSED` over both UDP and TCP. Resolver installation is host-specific and
+should be performed by an administrator; see the [service discovery operations
+guide](../../../okf/service-discovery.md) for host setup and rollback
+procedures.
 
 The existing `suffix` publishes host-network addresses. To publish overlay
 addresses as a separate namespace, configure both `overlayNetworkDomainId`
@@ -86,6 +88,7 @@ The listener currently responds as follows:
 
 | Query condition | DNS response | Cache behavior |
 | --- | --- | --- |
+| Client source address is outside the configured `allowedClients` ranges | `REFUSED` | No negative cache record |
 | Eligible endpoint and supported A, AAAA, or TCP SRV record | `NOERROR` with answer | Answer TTL 2 seconds |
 | Existing service but no eligible endpoint or no matching record type/port | `NOERROR` with no answer (NODATA) and SOA | Negative SOA TTL 1 second |
 | Unknown service identity or invalid name inside the service zone | `NXDOMAIN` with SOA | Negative SOA TTL 1 second |
@@ -119,3 +122,38 @@ record construction and current-catalog filtering; they do not qualify routed
 multi-host behavior, resolver installation, or network reachability. Issues
 #77 and #78 were cancelled, and no deployment-owned routed testbed is
 available.
+
+The UDP and TCP listener access filter is exercised by a bounded loopback test:
+a client outside `allowedClients` receives `REFUSED` on both transports. This
+verifies the Hickory listener's address-range gate, not client authentication
+or host resolver installation.
+
+A live listener integration test now builds a ready named-port service and an
+active enrolled overlay peer through manager APIs. It verifies that the SRV
+answer preserves the assigned port, its target A answer uses the manager's
+overlay address, host-network A publication remains unchanged, overlay AAAA is
+NODATA, and revoking the peer withdraws its SRV answer. This exercises
+manager-backed DNS publication and withdrawal. The ignored Linux cross-host
+transport test now also queries a live manager-backed DNS listener, follows
+the SRV target to its A address, and uses the returned address/port for a TCP
+application exchange through the TUN/Iroh path. It sends DNS queries directly
+through Hickory's Tokio stub resolver, configured from the host's resolver
+settings. The SRV query omits the search suffix, and the target A lookup uses
+the configured nameserver. Hickory performs the DNS lookups in process; this
+does not exercise libc NSS modules or every application DNS API. The manager
+state is isolated test state rather than a production manager daemon.
+
+At source revision `1bfbca0fb09ff493a20bb011d204279d6c7b579a`, both live DNS
+listener tests passed. Dependency policy, formatting, workspace Clippy, and
+the full workspace debug suite passed (303 tests, 1 ignored across 33 suites).
+The manager-backed overlay DNS test also passed on Fortress (Debian 13 x86_64,
+Rust 1.99.1) using the test source file SHA-256
+`6990e2dabf96d163c8398eff58eb1e7fa2ecd03dd8ac4ef5fbbd3e623df988b8`.
+At the reviewed source revision `a46413101bc2dcc12dcdfcf6c41e34e9566e4ae5`,
+the combined cross-host DNS/application test uses Hickory's system-config
+resolver and its SRV/target-A helpers compile and pass Linux-target Clippy. The
+combined test has not been executed at this revision. Hickory reads the
+configured nameserver and search domains but resolves in process; it does not
+exercise libc NSS modules. Overlay DNS still needs live verification through
+the deployment host's resolver path and a DNS-discovered application on the
+actual overlay.

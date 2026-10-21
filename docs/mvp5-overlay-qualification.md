@@ -2,8 +2,8 @@
 type: Qualification procedure
 title: MVP5 worker overlay cross-host qualification
 description: Reproducible deployment-owned Linux procedure and evidence record for Conductor's Iroh worker overlay.
-status: partial direct TUN/TCP test passed; TCP/UDP rerun and deployment qualification pending
-source_revision: 93ca0917679bc12fd575236c475dcc0c00dfe9fd
+status: partial TCP/UDP and manager-backed DNS coverage; deployment qualification pending
+source_revision: a2a1498cc541ab2a9a3f74442b9cb7ababdd901a
 source_reviewed_at: 2026-10-20
 sources:
   - resource: ../okf/overlay-networking-architecture.md
@@ -159,6 +159,33 @@ alone does not prove that the direct Iroh path or application traffic works.
 The bounded CLI probe reports locally and, with the worker config above, sends
 the HTTP result to the manager. Retain its accepted manager diagnostic and the
 payload-verifying request as separate evidence.
+
+The ignored Linux test `independent_linux_hosts_exchange_tcp_and_udp_over_iroh_tun`
+also exercises DNS-discovered application traffic through host resolver
+configuration. On role B, set `CONDUCTOR_OVERLAY_TEST_DNS_BIND` to its
+underlay-reachable address on UDP port 53 and set
+`CONDUCTOR_OVERLAY_TEST_DNS_ALLOWED_CLIENTS` to the role A source CIDR. Configure
+role A's host resolver to forward `overlay.internal` queries to role B and add
+`overlay.internal` as a search domain; preserve and restore the host's previous
+resolver configuration around the run. Hickory's Tokio resolver reads the
+system resolver configuration (on Unix, `/etc/resolv.conf`) and issues the SRV
+and target A lookups through its configured nameserver. The SRV query omits the
+search suffix so the host search setting is exercised. This verifies the
+configured DNS resolver path, not libc NSS modules or every application DNS
+API.
+
+Role B starts a live Hickory listener over an isolated manager database with an
+enrolled peer, an active overlay assignment, and a ready named TCP service.
+Role A resolves the SRV record and its target A record, then connects to the
+returned IP and port over the TUN/Iroh path and verifies the echoed application
+payload. The application connection uses the SRV answer's address/port pair
+rather than a hard-coded endpoint. This harness uses an isolated manager
+fixture rather than a production manager daemon. The combined cross-host
+DNS-to-application test was executed on Linux at the recorded source revision.
+An initial IPv4 QEMU host-forward candidate failed before path establishment;
+a later run using direct IPv6 candidates passed the manager-backed DNS and
+application exchange. See the PR #200 reruns below. Independent physical-host
+qualification remains open.
 
 # Basic traffic procedure
 
@@ -327,6 +354,76 @@ independent physical failure domains, performance limits, worker daemon/host res
 revocation, expiry, MTU, queue pressure, host-route preservation during
 successful setup/cleanup, and blocked direct UDP between hosts remain
 unqualified. Keep those #156 acceptance criteria open.
+
+## PR #200 combined DNS and application IPv4 attempt
+
+At source revision `a2a1498cc541ab2a9a3f74442b9cb7ababdd901a`, the ignored
+`independent_linux_hosts_exchange_tcp_and_udp_over_iroh_tun` test was run with
+role B on Fortress and role A on the Debian 13 ARM64 QEMU VM. The test binaries
+were built with Rust 1.99.1 from this source revision. Their SHA-256 values are
+`384e0bb1cebe8b65050ecfab9f8df0dff42b7ebea6244ca65c4af9806d3316c2` on
+Fortress and
+`b1621dc874d691c5cc4209ef253c5c25b34291433e1784f789e7a8c8604bdcb8` on the
+VM.
+
+Both roles failed before authenticated path establishment with
+`no authenticated direct Iroh path` and zero transmitted or received overlay
+packets. Fortress captured 21 UDP packets from
+`192.168.0.238:40000` to the Mac host-forward candidate
+`192.168.1.4:40000`; no replies were captured. The capture SHA-256 is
+`c061aa1dea351e03e223e6551ce2de15d31ca7430aa428b9b47c3a776c40f5aa` and it is
+retained on Fortress with mode 0600 outside the repository. No application
+payload was exchanged, and this run does not qualify the DNS-to-application
+path. The QEMU user-mode NAT IPv4 host-forward candidate did not provide the
+return path required for this direct-only test. The VM resolver was restored
+to its DHCP-provided server (`10.0.2.3`) after the run. This was a failed
+same-physical-host VM attempt, not independent-host qualification.
+
+## PR #200 combined DNS and application IPv6 rerun
+
+At the same source revision, `a2a1498cc541ab2a9a3f74442b9cb7ababdd901a`, the
+test passed on 2026-10-21 with role B on Fortress (Debian 13 x86_64) and role A
+on the Debian 13 ARM64 QEMU VM. Both binaries used Rust 1.99.1. Their SHA-256
+values are `7551abb9ec6f2bbad8f4bad5e24c514f1e3c16b2ec4ee14b9911f883cd86d189`
+on Fortress and
+`b1621dc874d691c5cc4209ef253c5c25b34291433e1784f789e7a8c8604bdcb8` on the
+VM. Role A passed in 1.44 seconds and role B in 7.06 seconds.
+
+Both roles used explicit IPv6 direct candidates with Iroh relays and public
+address discovery disabled. Fortress selected
+`<VM-mapped-global-IPv6>:63292` for the VM; the VM selected
+`<Fortress-global-IPv6>:40102` for Fortress. These routable host addresses are
+omitted from this public repository copy; the protected capture on Fortress
+retains the exact underlay headers. The VM's systemd-resolved link was
+temporarily configured to use `<Fortress-global-IPv6>` as its DNS server and
+`overlay.internal` as its search domain, then reverted to its DHCP settings.
+The test resolved the manager-published SRV target and overlay A record as
+`10.91.0.2:18080`, exchanged and compared a 65,536-byte TCP payload and echo,
+and echoed the 24-byte UDP application payload.
+
+For reproduction, bind role B on Fortress to IPv6 UDP port `40102`, set
+`CONDUCTOR_OVERLAY_TEST_DNS_BIND` to `[<Fortress-global-IPv6>]:53`, and allow
+`<VM-mapped-global-IPv6>/128`. Set role B's
+`CONDUCTOR_OVERLAY_TEST_PEER_CANDIDATE` to
+`[<VM-mapped-global-IPv6>]:63292`. Bind role A on the VM to IPv6 UDP port
+`41002`, set its peer candidate to `[<Fortress-global-IPv6>]:40102`, and
+temporarily set the system resolver's nameserver/search domain as above. Invoke
+both role-specific test binaries with
+`--ignored --exact independent_linux_hosts_exchange_tcp_and_udp_over_iroh_tun
+--nocapture`; revert the VM's per-link resolver settings immediately after the
+test. The VM-mapped candidate was obtained from a bounded UDP echo probe from
+the same guest bind port to Fortress.
+
+Fortress captured 357 IPv6 UDP packets for the test ports. Neither the
+randomized TCP marker (`conductor-cross-host-27268-1792559166220`) nor the UDP
+marker (`conductor-cross-host-udp`) appeared in the capture. Its SHA-256 is
+`90c835e889c871d3a67f5bb0d95c667abd8fbf6d39c185fcb057afbc9c285bce`; the
+capture is retained on Fortress with mode 0600 outside the repository. This
+supports encryption for this test flow but is not a general audit of host
+traffic. The VM shared the development Mac's physical host and used QEMU
+user-mode networking; this is not independent-physical-host qualification.
+The test left no overlay TUN interface, route, listener, or resolver override
+on either host.
 
 On the same source revision, three Linux lifecycle tests passed on Fortress in
 disposable network namespaces: `managed_interface_routes_reconcile_and_restart_cleanly`
@@ -516,3 +613,16 @@ endpoint's candidates using the updated peer generation. The Linux-only helper t
 Fortress with Rust 1.99.1. It verified that replacement closes the old endpoint
 and retains the worker EndpointId. This is a focused lifecycle test, not a
 cross-host revocation or active-traffic test.
+
+The live DNS listener integration test creates its ready named-port service,
+enrolled worker, active overlay assignment, and service port using manager APIs.
+It verifies the SRV port and endpoint-target A address, host-network suffix
+compatibility, overlay AAAA NODATA, and withdrawal after peer revocation. The
+test uses a loopback DNS client and does not install a host resolver or send
+application traffic through the overlay.
+The focused test also passed on Fortress (Debian 13 x86_64, Rust 1.99.1) using
+the exact `crates/conductor-api/src/dns.rs` test file with SHA-256
+`6990e2dabf96d163c8398eff58eb1e7fa2ecd03dd8ac4ef5fbbd3e623df988b8` in a
+disposable Linux qualification checkout previously used for PR #199. This validates
+the DNS listener path on Linux but does not expand the two-host network
+qualification evidence above.
